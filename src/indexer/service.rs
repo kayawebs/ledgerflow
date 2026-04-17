@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
@@ -138,38 +139,51 @@ impl IndexerService {
             info!(
                 start_block = next_block,
                 end_block = batch_end,
+                concurrency = self.config.rpc_concurrency,
                 "index batch"
             );
-            let mut refs = Vec::new();
-            let mut last_successful_block = next_block.saturating_sub(1);
-            for block_number in next_block..=batch_end {
-                let block_payload = self.get_block_with_transactions_with_retry(block_number).await?;
-                if block_payload.is_null() {
-                    warn!(block_number, "block payload missing, retry later");
-                    return Err(LedgerError::TransientIngestion(format!(
-                        "block {block_number} returned null payload"
-                    )));
-                }
-                refs.extend(extract_block_refs(self.config.chain_id, &block_payload)?);
-                last_successful_block = block_number;
-                if self.config.rpc_request_delay_ms > 0 && block_number < batch_end {
-                    sleep(Duration::from_millis(self.config.rpc_request_delay_ms)).await;
-                }
-            }
+            let refs = self.fetch_batch_refs(next_block, batch_end).await?;
             self.clickhouse.insert_refs(&refs).await?;
-            if last_successful_block >= next_block {
-                self.clickhouse
-                    .set_progress(
-                        self.config.chain_id,
-                        &self.config.worker_id,
-                        last_successful_block,
-                    )
-                    .await?;
-                next_block = last_successful_block + 1;
-            }
+            self.clickhouse
+                .set_progress(self.config.chain_id, &self.config.worker_id, batch_end)
+                .await?;
+            next_block = batch_end + 1;
         }
 
         Ok(())
+    }
+
+    async fn fetch_batch_refs(&self, start_block: u64, end_block: u64) -> LedgerResult<Vec<crate::indexer::models::AddressTxRef>> {
+        let concurrency = self.config.rpc_concurrency.max(1);
+        let mut join_set = JoinSet::new();
+        let mut refs = Vec::new();
+        let mut next_to_spawn = start_block;
+
+        while next_to_spawn <= end_block || !join_set.is_empty() {
+            while next_to_spawn <= end_block && join_set.len() < concurrency {
+                let rpc = self.rpc.clone();
+                let config = self.config.clone();
+                let chain_id = self.config.chain_id;
+                let block_number = next_to_spawn;
+                join_set.spawn(async move {
+                    fetch_block_refs_with_retry(rpc, config, chain_id, block_number).await
+                });
+                next_to_spawn += 1;
+            }
+
+            match join_set.join_next().await {
+                Some(Ok(Ok(block_refs))) => refs.extend(block_refs),
+                Some(Ok(Err(err))) => return Err(err),
+                Some(Err(err)) => {
+                    return Err(LedgerError::TransientIngestion(format!(
+                        "indexer fetch task join error: {err}"
+                    )));
+                }
+                None => break,
+            }
+        }
+
+        Ok(refs)
     }
 
     async fn get_latest_block_number_with_retry(&self) -> LedgerResult<u64> {
@@ -197,32 +211,43 @@ impl IndexerService {
         }
     }
 
-    async fn get_block_with_transactions_with_retry(
-        &self,
-        block_number: u64,
-    ) -> LedgerResult<serde_json::Value> {
-        let mut attempt = 0_u32;
-        loop {
-            match self.rpc.get_block_with_transactions(block_number).await {
-                Ok(block_payload) => return Ok(block_payload),
-                Err(err) if is_rate_limit_error(&err) && attempt < self.config.rpc_max_retries => {
-                    let delay_ms = retry_delay_ms(
-                        self.config.rpc_retry_base_ms,
-                        self.config.rpc_retry_max_ms,
-                        attempt,
-                    );
-                    warn!(
-                        block_number,
-                        attempt = attempt + 1,
-                        delay_ms,
-                        error = %err,
-                        "block fetch hit rate limit, retrying"
-                    );
-                    sleep(Duration::from_millis(delay_ms)).await;
-                    attempt += 1;
+}
+
+async fn fetch_block_refs_with_retry(
+    rpc: Arc<IndexerRpcClient>,
+    config: IndexerConfig,
+    chain_id: u32,
+    block_number: u64,
+) -> LedgerResult<Vec<crate::indexer::models::AddressTxRef>> {
+    let mut attempt = 0_u32;
+    loop {
+        if config.rpc_request_delay_ms > 0 {
+            sleep(Duration::from_millis(config.rpc_request_delay_ms)).await;
+        }
+        match rpc.get_block_with_transactions(block_number).await {
+            Ok(block_payload) => {
+                if block_payload.is_null() {
+                    warn!(block_number, "block payload missing, retry later");
+                    return Err(LedgerError::TransientIngestion(format!(
+                        "block {block_number} returned null payload"
+                    )));
                 }
-                Err(err) => return Err(err),
+                return extract_block_refs(chain_id, &block_payload);
             }
+            Err(err) if is_rate_limit_error(&err) && attempt < config.rpc_max_retries => {
+                let delay_ms =
+                    retry_delay_ms(config.rpc_retry_base_ms, config.rpc_retry_max_ms, attempt);
+                warn!(
+                    block_number,
+                    attempt = attempt + 1,
+                    delay_ms,
+                    error = %err,
+                    "block fetch hit rate limit, retrying"
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
         }
     }
 }

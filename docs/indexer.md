@@ -55,7 +55,12 @@ That table records the last fully indexed block for a named worker.
 | `LEDGERFLOW_INDEXER_CHAIN_ID` | chain id stored in rows | `8453` |
 | `LEDGERFLOW_INDEXER_START_BLOCK` | initial backfill block when no progress exists | `0` |
 | `LEDGERFLOW_INDEXER_END_BLOCK` | optional stop block for bounded backfills | unset |
-| `LEDGERFLOW_INDEXER_BATCH_SIZE` | number of blocks processed per loop | `100` |
+| `LEDGERFLOW_INDEXER_BATCH_SIZE` | number of blocks claimed and committed per batch | `500` |
+| `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | number of blocks fetched in parallel inside a batch | `8` |
+| `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS` | per-request delay before each block fetch task runs | `0` |
+| `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | base retry backoff after rate-limit errors | `500` |
+| `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | maximum retry backoff | `10000` |
+| `LEDGERFLOW_INDEXER_RPC_MAX_RETRIES` | retry count for rate-limit errors | `8` |
 | `LEDGERFLOW_INDEXER_LIVE_FOLLOW` | keep polling after catch-up | `true` |
 | `LEDGERFLOW_INDEXER_POLL_INTERVAL_MS` | polling delay when caught up or retrying | `2000` |
 | `LEDGERFLOW_INDEXER_WORKER_ID` | progress row key | `base_mainnet_top_level` |
@@ -86,6 +91,9 @@ export LEDGERFLOW_INDEXER_CLICKHOUSE_USER=ledgerflow
 export LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
 export LEDGERFLOW_INDEXER_RPC_URL=http://127.0.0.1:18545
 export LEDGERFLOW_INDEXER_BIND_ADDR=0.0.0.0:8090
+export LEDGERFLOW_INDEXER_BATCH_SIZE=500
+export LEDGERFLOW_INDEXER_RPC_CONCURRENCY=8
+export LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=0
 ```
 
 3. Start the process:
@@ -201,11 +209,39 @@ Example response shape:
 - The nginx proxy should forward to the real node on `127.0.0.1:8545` and allow only Docker subnet traffic.
 - If your node is on another machine or port, override `LEDGERFLOW_INDEXER_RPC_URL`.
 - The worker uses HTTP RPC polling right now, not WebSocket subscriptions.
+- Backfill fetches are concurrent within each batch; block order does not matter as long as every block is covered.
 - It indexes only top-level transaction `from` and `to`.
 - Contract creation transactions emit only the `from` row.
 - Self-sends emit two rows for the same address with different `direction` values.
 - `/tx-hashes` deduplicates self-sends down to one transaction hash.
 - If a block fetch returns `null`, the worker does not advance progress for that range. It retries later instead of silently skipping coverage.
+
+## Throughput tuning
+
+The main throughput knobs are:
+
+- `LEDGERFLOW_INDEXER_BATCH_SIZE`
+- `LEDGERFLOW_INDEXER_RPC_CONCURRENCY`
+- `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS`
+
+For a self-hosted Base node, a reasonable starting point is:
+
+- `LEDGERFLOW_INDEXER_BATCH_SIZE=500`
+- `LEDGERFLOW_INDEXER_RPC_CONCURRENCY=8`
+- `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=0`
+
+Then increase concurrency gradually to `16` or `32` if your node and disk can absorb it.
+
+These variables do not materially affect indexing throughput:
+
+- `LEDGERFLOW_INDEXER_POLL_INTERVAL_MS`
+  Only matters when the worker is caught up or sleeping after a batch-level failure.
+- `LEDGERFLOW_INDEXER_WORKER_ID`
+  Only identifies the progress row.
+- `LEDGERFLOW_INDEXER_QUERY_LIMIT_DEFAULT`
+  Only affects API responses.
+- `LEDGERFLOW_INDEXER_QUERY_LIMIT_MAX`
+  Only affects API responses.
 
 ## Scope boundary
 
