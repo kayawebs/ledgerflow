@@ -8,6 +8,8 @@ The current product surface is cluster-first: define an address cluster for a pe
 
 The repository also ships a standalone `ledgerflow indexer` binary for top-level Base address indexing. It scans blocks, writes `from` / `to` address references into ClickHouse, and exposes an address-to-tx query API without depending on the analysis API.
 
+For operators using a self-hosted Base node that is bound only to `127.0.0.1:8545`, the recommended setup is a host-level nginx reverse proxy that exposes a Docker-only RPC entrypoint on `18545`. See [docs/node_rpc_proxy.md](docs/node_rpc_proxy.md).
+
 ## What v0 does
 
 - Ingests raw transaction, receipt, optional trace, and target bytecode evidence.

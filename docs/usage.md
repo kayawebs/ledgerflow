@@ -37,7 +37,7 @@ LedgerFlow reads configuration from environment variables.
 | --- | --- | --- |
 | `LEDGERFLOW_BIND_ADDR` | HTTP bind address for Axum | `0.0.0.0:8080` |
 | `LEDGERFLOW_DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@localhost:5432/ledgerflow` |
-| `LEDGERFLOW_RPC_URL` | Base RPC endpoint | `http://host.docker.internal:8545` in Docker, `http://127.0.0.1:8545` for local runs |
+| `LEDGERFLOW_RPC_URL` | Base RPC endpoint | `http://host.docker.internal:18545` in Docker via nginx proxy, `http://127.0.0.1:18545` for local runs on the host |
 | `LEDGERFLOW_DEFAULT_CHAIN_ID` | Default chain for callers that omit it | `8453` |
 | `LEDGERFLOW_TRACE_ENABLED` | Enables trace fetch attempts | `false` |
 | `LEDGERFLOW_ENABLED_RECOGNIZERS` | Comma-separated recognizer ids to run by default | `selector_presence,erc20_transfer_flow,...` |
@@ -54,7 +54,7 @@ If you are running only `ledgerflow indexer`, the main variables are:
 | Variable | Purpose | Example |
 | --- | --- | --- |
 | `LEDGERFLOW_INDEXER_BIND_ADDR` | Indexer API bind address | `0.0.0.0:8090` |
-| `LEDGERFLOW_INDEXER_RPC_URL` | Base RPC endpoint used for block polling | `http://host.docker.internal:8545` in Docker, `http://127.0.0.1:8545` for local runs |
+| `LEDGERFLOW_INDEXER_RPC_URL` | Base RPC endpoint used for block polling | `http://host.docker.internal:18545` in Docker via nginx proxy, `http://127.0.0.1:18545` for local runs on the host |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_URL` | ClickHouse HTTP endpoint | `http://127.0.0.1:8123` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE` | ClickHouse database name | `ledgerflow_indexer` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_USER` | ClickHouse username | `ledgerflow` in Docker |
@@ -99,7 +99,7 @@ If you already have PostgreSQL running locally:
 
 ```bash
 export LEDGERFLOW_DATABASE_URL=postgres://postgres:postgres@localhost:5432/ledgerflow
-export LEDGERFLOW_RPC_URL=http://127.0.0.1:8545
+export LEDGERFLOW_RPC_URL=http://127.0.0.1:18545
 export LEDGERFLOW_BIND_ADDR=0.0.0.0:8080
 ```
 
@@ -130,7 +130,7 @@ To run only the standalone top-level indexer:
 export LEDGERFLOW_INDEXER_CLICKHOUSE_URL=http://127.0.0.1:8123
 export LEDGERFLOW_INDEXER_CLICKHOUSE_USER=ledgerflow
 export LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
-export LEDGERFLOW_INDEXER_RPC_URL=http://127.0.0.1:8545
+export LEDGERFLOW_INDEXER_RPC_URL=http://127.0.0.1:18545
 make run-indexer
 ```
 

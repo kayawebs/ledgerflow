@@ -1,0 +1,21 @@
+server {
+    listen 18545;
+    server_name _;
+
+    access_log /var/log/nginx/base-node-rpc-proxy.access.log;
+    error_log /var/log/nginx/base-node-rpc-proxy.error.log warn;
+
+    # Allow only Docker bridge traffic. Replace with your actual Docker subnet.
+    allow 172.17.0.0/16;
+    deny all;
+
+    location / {
+        proxy_pass http://127.0.0.1:8545;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+    }
+}
