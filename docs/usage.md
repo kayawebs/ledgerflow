@@ -45,7 +45,7 @@ LedgerFlow reads configuration from environment variables.
 | `LEDGERFLOW_WEB_BIND_ADDR` | Web process bind address | `0.0.0.0:3000` |
 | `LEDGERFLOW_API_BASE_URL` | Upstream analysis API used by the web process | `http://app:8080` |
 
-The checked-in `.env.example` is the easiest starting point.
+The checked-in `.env.example` is the easiest starting point. Copy it to `.env` before using Docker Compose, because the compose stack reads `.env` as the runtime config file.
 
 ### Standalone indexer variables
 
@@ -74,7 +74,7 @@ If you are running only `ledgerflow indexer`, the main variables are:
 
 This is the shortest path to a local instance.
 
-1. Copy `.env.example` to `.env` if you want to override defaults.
+1. Copy `.env.example` to `.env`. Docker Compose reads `.env` as the runtime config file.
 2. Start the stack:
 
 ```bash

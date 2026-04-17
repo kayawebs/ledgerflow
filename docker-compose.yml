@@ -32,7 +32,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
-      - .env.example
+      - .env
     depends_on:
       - db
     ports:
@@ -45,7 +45,7 @@ services:
     volumes:
       - .:/app
     env_file:
-      - .env.example
+      - .env
     environment:
       LEDGERFLOW_API_BASE_URL: http://app:8080
       LEDGERFLOW_WEB_BIND_ADDR: 0.0.0.0:3000
@@ -63,7 +63,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
-      - .env.example
+      - .env
     environment:
       LEDGERFLOW_INDEXER_BIND_ADDR: 0.0.0.0:8090
       LEDGERFLOW_INDEXER_CLICKHOUSE_URL: http://clickhouse:8123

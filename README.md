@@ -32,7 +32,7 @@ For operators using a self-hosted Base node that is bound only to `127.0.0.1:854
 
 ## Quick start
 
-1. Copy `.env.example` to `.env` if needed.
+1. Copy `.env.example` to `.env`. Docker Compose now reads `.env` as the runtime config file.
 2. Start Postgres and the app:
 
 ```bash
