@@ -47,7 +47,7 @@ That table records the last fully indexed block for a named worker.
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `LEDGERFLOW_INDEXER_BIND_ADDR` | HTTP bind address | `0.0.0.0:8090` |
-| `LEDGERFLOW_INDEXER_RPC_URL` | Base RPC endpoint used for `eth_blockNumber` and `eth_getBlockByNumber(..., true)` | falls back to `LEDGERFLOW_RPC_URL` |
+| `LEDGERFLOW_INDEXER_RPC_URL` | Base RPC endpoint used for `eth_blockNumber` and `eth_getBlockByNumber(..., true)` | `http://host.docker.internal:8545` in Docker, `http://127.0.0.1:8545` for local runs |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_URL` | ClickHouse HTTP endpoint | `http://127.0.0.1:8123` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE` | ClickHouse database name | `ledgerflow_indexer` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_USER` | ClickHouse username | `ledgerflow` in Docker, `default` fallback outside Docker if unset |
@@ -84,7 +84,7 @@ Local endpoints:
 export LEDGERFLOW_INDEXER_CLICKHOUSE_URL=http://127.0.0.1:8123
 export LEDGERFLOW_INDEXER_CLICKHOUSE_USER=ledgerflow
 export LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
-export LEDGERFLOW_INDEXER_RPC_URL=https://mainnet.base.org
+export LEDGERFLOW_INDEXER_RPC_URL=http://127.0.0.1:8545
 export LEDGERFLOW_INDEXER_BIND_ADDR=0.0.0.0:8090
 ```
 
@@ -197,6 +197,8 @@ Example response shape:
 
 ## Operational notes
 
+- Docker defaults are set up to target a Base node reachable at `host.docker.internal:8545`.
+- If your node is on another machine or port, override `LEDGERFLOW_INDEXER_RPC_URL`.
 - The worker uses HTTP RPC polling right now, not WebSocket subscriptions.
 - It indexes only top-level transaction `from` and `to`.
 - Contract creation transactions emit only the `from` row.

@@ -118,7 +118,7 @@ impl IndexerService {
             .unwrap_or(self.config.start_block);
 
         loop {
-            let latest_block = self.rpc.get_latest_block_number().await?;
+            let latest_block = self.get_latest_block_number_with_retry().await?;
             let target_block = self
                 .config
                 .end_block
@@ -143,7 +143,7 @@ impl IndexerService {
             let mut refs = Vec::new();
             let mut last_successful_block = next_block.saturating_sub(1);
             for block_number in next_block..=batch_end {
-                let block_payload = self.rpc.get_block_with_transactions(block_number).await?;
+                let block_payload = self.get_block_with_transactions_with_retry(block_number).await?;
                 if block_payload.is_null() {
                     warn!(block_number, "block payload missing, retry later");
                     return Err(LedgerError::TransientIngestion(format!(
@@ -152,6 +152,9 @@ impl IndexerService {
                 }
                 refs.extend(extract_block_refs(self.config.chain_id, &block_payload)?);
                 last_successful_block = block_number;
+                if self.config.rpc_request_delay_ms > 0 && block_number < batch_end {
+                    sleep(Duration::from_millis(self.config.rpc_request_delay_ms)).await;
+                }
             }
             self.clickhouse.insert_refs(&refs).await?;
             if last_successful_block >= next_block {
@@ -168,4 +171,75 @@ impl IndexerService {
 
         Ok(())
     }
+
+    async fn get_latest_block_number_with_retry(&self) -> LedgerResult<u64> {
+        let mut attempt = 0_u32;
+        loop {
+            match self.rpc.get_latest_block_number().await {
+                Ok(block_number) => return Ok(block_number),
+                Err(err) if is_rate_limit_error(&err) && attempt < self.config.rpc_max_retries => {
+                    let delay_ms = retry_delay_ms(
+                        self.config.rpc_retry_base_ms,
+                        self.config.rpc_retry_max_ms,
+                        attempt,
+                    );
+                    warn!(
+                        attempt = attempt + 1,
+                        delay_ms,
+                        error = %err,
+                        "latest block request hit rate limit, retrying"
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn get_block_with_transactions_with_retry(
+        &self,
+        block_number: u64,
+    ) -> LedgerResult<serde_json::Value> {
+        let mut attempt = 0_u32;
+        loop {
+            match self.rpc.get_block_with_transactions(block_number).await {
+                Ok(block_payload) => return Ok(block_payload),
+                Err(err) if is_rate_limit_error(&err) && attempt < self.config.rpc_max_retries => {
+                    let delay_ms = retry_delay_ms(
+                        self.config.rpc_retry_base_ms,
+                        self.config.rpc_retry_max_ms,
+                        attempt,
+                    );
+                    warn!(
+                        block_number,
+                        attempt = attempt + 1,
+                        delay_ms,
+                        error = %err,
+                        "block fetch hit rate limit, retrying"
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+fn is_rate_limit_error(error: &LedgerError) -> bool {
+    match error {
+        LedgerError::TransientIngestion(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("rate limit")
+                || message.contains("over rate limit")
+                || message.contains("\"code\":-32016")
+        }
+        _ => false,
+    }
+}
+
+fn retry_delay_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
+    let multiplier = 1_u64.checked_shl(attempt.min(16)).unwrap_or(u64::MAX);
+    base_ms.saturating_mul(multiplier).min(max_ms)
 }

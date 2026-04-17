@@ -29,6 +29,8 @@ services:
     command: sh -c "cargo run --bin ledgerflow"
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env.example
     depends_on:
@@ -58,6 +60,8 @@ services:
     command: sh -c "cargo run --bin ledgerflow_indexer"
     volumes:
       - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env.example
     environment:
@@ -66,7 +70,6 @@ services:
       LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE: ledgerflow_indexer
       LEDGERFLOW_INDEXER_CLICKHOUSE_USER: ledgerflow
       LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD: ledgerflow
-      LEDGERFLOW_INDEXER_RPC_URL: ${LEDGERFLOW_INDEXER_RPC_URL:-https://mainnet.base.org}
     depends_on:
       - clickhouse
     ports:

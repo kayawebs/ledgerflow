@@ -19,7 +19,8 @@ impl AppConfig {
             bind_addr: env::var("LEDGERFLOW_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
             database_url: env::var("LEDGERFLOW_DATABASE_URL")
                 .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/ledgerflow".to_owned()),
-            rpc_url: env::var("LEDGERFLOW_RPC_URL").unwrap_or_else(|_| "https://mainnet.base.org".to_owned()),
+            rpc_url: env::var("LEDGERFLOW_RPC_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8545".to_owned()),
             default_chain_id: env::var("LEDGERFLOW_DEFAULT_CHAIN_ID")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
