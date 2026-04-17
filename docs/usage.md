@@ -76,7 +76,7 @@ docker-compose up --build
 
 The services will be available at:
 
-- API: `http://localhost:8080`
+- API: `http://localhost:8180`
 - Web: `http://localhost:3000`
 - Indexer API: `http://localhost:8090`
 
@@ -120,6 +120,8 @@ export LEDGERFLOW_API_BASE_URL=http://127.0.0.1:8080
 make run-web
 ```
 
+When you run the API directly with Cargo, it still listens on `http://localhost:8080` unless you override `LEDGERFLOW_BIND_ADDR`.
+
 To run only the standalone top-level indexer:
 
 ```bash
@@ -138,7 +140,7 @@ The indexer-specific endpoints are:
 ## Health check
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:8180/health
 ```
 
 Expected response:
@@ -150,7 +152,7 @@ Expected response:
 ## Discover installed recognizers
 
 ```bash
-curl http://localhost:8080/recognizers | jq
+curl http://localhost:8180/recognizers | jq
 ```
 
 Use this endpoint to confirm:
@@ -185,7 +187,7 @@ Current web console actions:
 ## Create an address cluster
 
 ```bash
-curl -X POST http://localhost:8080/clusters \
+curl -X POST http://localhost:8180/clusters \
   -H 'content-type: application/json' \
   -d '{
     "chain_id": 8453,
@@ -212,7 +214,7 @@ The response returns the `cluster_id`.
 ## Request a cluster spend summary
 
 ```bash
-curl "http://localhost:8080/clusters/YOUR_CLUSTER_ID/spend-summary?start=2026-04-01T00:00:00Z&end=2026-04-30T23:59:59Z" | jq
+curl "http://localhost:8180/clusters/YOUR_CLUSTER_ID/spend-summary?start=2026-04-01T00:00:00Z&end=2026-04-30T23:59:59Z" | jq
 ```
 
 This summary is computed from already analyzed transactions whose top-level `from_address` or `to_address` matches the cluster address set.
@@ -245,7 +247,7 @@ You need the relevant transactions to have been analyzed and persisted first.
 Submit a transaction hash and chain id:
 
 ```bash
-curl -X POST http://localhost:8080/analyses/tx \
+curl -X POST http://localhost:8180/analyses/tx \
   -H 'content-type: application/json' \
   -d '{
     "chain_id": 8453,
@@ -288,7 +290,7 @@ The response includes:
 ## Fetch an existing analysis
 
 ```bash
-curl "http://localhost:8080/analyses/0xYOUR_TX_HASH?chain_id=8453" | jq
+curl "http://localhost:8180/analyses/0xYOUR_TX_HASH?chain_id=8453" | jq
 ```
 
 This reads the persisted analysis and its latest evidence pack from PostgreSQL.
@@ -296,7 +298,7 @@ This reads the persisted analysis and its latest evidence pack from PostgreSQL.
 ## Fetch an evidence pack directly
 
 ```bash
-curl http://localhost:8080/evidence-packs/YOUR_PACK_ID | jq
+curl http://localhost:8180/evidence-packs/YOUR_PACK_ID | jq
 ```
 
 Use this endpoint when you want the export artifact without the full analysis envelope.
@@ -306,7 +308,7 @@ Use this endpoint when you want the export artifact without the full analysis en
 Replay uses the same pipeline shape but lets you request a recognizer subset and validate ruleset availability.
 
 ```bash
-curl -X POST http://localhost:8080/replay/tx \
+curl -X POST http://localhost:8180/replay/tx \
   -H 'content-type: application/json' \
   -d '{
     "chain_id": 8453,

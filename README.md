@@ -48,7 +48,7 @@ For a practical operator walkthrough, read [docs/usage.md](docs/usage.md).
 
 Default local endpoints:
 
-- API: `http://localhost:8080`
+- API: `http://localhost:8180`
 - Web: `http://localhost:3000`
 - Indexer API: `http://localhost:8090`
 
@@ -105,7 +105,7 @@ For the full operational flow, read [docs/indexer.md](docs/indexer.md).
 Example:
 
 ```bash
-curl -X POST http://localhost:8080/analyses/tx \
+curl -X POST http://localhost:8180/analyses/tx \
   -H 'content-type: application/json' \
   -d '{"chain_id": 8453, "tx_hash": "0xabc"}'
 ```
