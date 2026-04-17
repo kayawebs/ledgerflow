@@ -55,12 +55,12 @@ That table records the last fully indexed block for a named worker.
 | `LEDGERFLOW_INDEXER_CHAIN_ID` | chain id stored in rows | `8453` |
 | `LEDGERFLOW_INDEXER_START_BLOCK` | initial backfill block when no progress exists | `0` |
 | `LEDGERFLOW_INDEXER_END_BLOCK` | optional stop block for bounded backfills | unset |
-| `LEDGERFLOW_INDEXER_BATCH_SIZE` | number of blocks claimed and committed per batch | `500` |
-| `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | number of blocks fetched in parallel inside a batch | `8` |
-| `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS` | per-request delay before each block fetch task runs | `0` |
-| `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | base retry backoff after rate-limit errors | `500` |
-| `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | maximum retry backoff | `10000` |
-| `LEDGERFLOW_INDEXER_RPC_MAX_RETRIES` | retry count for rate-limit errors | `8` |
+| `LEDGERFLOW_INDEXER_BATCH_SIZE` | number of blocks claimed and committed per batch | `200` |
+| `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | number of blocks fetched in parallel inside a batch | `4` |
+| `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS` | per-request delay before each block fetch task runs | `25` |
+| `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | base retry backoff after rate-limit errors | `1000` |
+| `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | maximum retry backoff | `15000` |
+| `LEDGERFLOW_INDEXER_RPC_MAX_RETRIES` | retry count for rate-limit errors | `10` |
 | `LEDGERFLOW_INDEXER_LIVE_FOLLOW` | keep polling after catch-up | `true` |
 | `LEDGERFLOW_INDEXER_POLL_INTERVAL_MS` | polling delay when caught up or retrying | `2000` |
 | `LEDGERFLOW_INDEXER_WORKER_ID` | progress row key | `base_mainnet_top_level` |
@@ -91,9 +91,9 @@ export LEDGERFLOW_INDEXER_CLICKHOUSE_USER=ledgerflow
 export LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
 export LEDGERFLOW_INDEXER_RPC_URL=http://127.0.0.1:18545
 export LEDGERFLOW_INDEXER_BIND_ADDR=0.0.0.0:8090
-export LEDGERFLOW_INDEXER_BATCH_SIZE=500
-export LEDGERFLOW_INDEXER_RPC_CONCURRENCY=8
-export LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=0
+export LEDGERFLOW_INDEXER_BATCH_SIZE=200
+export LEDGERFLOW_INDEXER_RPC_CONCURRENCY=4
+export LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=25
 ```
 
 3. Start the process:
@@ -224,11 +224,11 @@ The main throughput knobs are:
 - `LEDGERFLOW_INDEXER_RPC_CONCURRENCY`
 - `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS`
 
-For a self-hosted Base node, a reasonable starting point is:
+For a self-hosted Base node behind the local nginx proxy, a reasonable starting point is:
 
-- `LEDGERFLOW_INDEXER_BATCH_SIZE=500`
-- `LEDGERFLOW_INDEXER_RPC_CONCURRENCY=8`
-- `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=0`
+- `LEDGERFLOW_INDEXER_BATCH_SIZE=200`
+- `LEDGERFLOW_INDEXER_RPC_CONCURRENCY=4`
+- `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=25`
 
 Then increase concurrency gradually to `16` or `32` if your node and disk can absorb it.
 

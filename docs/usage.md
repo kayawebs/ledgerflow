@@ -61,12 +61,12 @@ If you are running only `ledgerflow indexer`, the main variables are:
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD` | ClickHouse password | `ledgerflow` in Docker |
 | `LEDGERFLOW_INDEXER_START_BLOCK` | Initial backfill block | `0` |
 | `LEDGERFLOW_INDEXER_END_BLOCK` | Optional bounded stop block | unset |
-| `LEDGERFLOW_INDEXER_BATCH_SIZE` | Blocks claimed and committed per indexing batch | `500` |
-| `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | Parallel block fetch count inside a batch | `8` |
-| `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS` | Per-request delay before a block fetch task runs | `0` |
-| `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | Base retry delay after rate-limit responses | `500` |
-| `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | Maximum retry delay | `10000` |
-| `LEDGERFLOW_INDEXER_RPC_MAX_RETRIES` | Retry count for rate-limit responses | `8` |
+| `LEDGERFLOW_INDEXER_BATCH_SIZE` | Blocks claimed and committed per indexing batch | `200` |
+| `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | Parallel block fetch count inside a batch | `4` |
+| `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS` | Per-request delay before a block fetch task runs | `25` |
+| `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | Base retry delay after rate-limit responses | `1000` |
+| `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | Maximum retry delay | `15000` |
+| `LEDGERFLOW_INDEXER_RPC_MAX_RETRIES` | Retry count for rate-limit responses | `10` |
 | `LEDGERFLOW_INDEXER_LIVE_FOLLOW` | Continue following new blocks | `true` |
 | `LEDGERFLOW_INDEXER_WORKER_ID` | Progress key | `base_mainnet_top_level` |
 
@@ -136,9 +136,9 @@ export LEDGERFLOW_INDEXER_CLICKHOUSE_URL=http://127.0.0.1:8123
 export LEDGERFLOW_INDEXER_CLICKHOUSE_USER=ledgerflow
 export LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
 export LEDGERFLOW_INDEXER_RPC_URL=http://127.0.0.1:18545
-export LEDGERFLOW_INDEXER_BATCH_SIZE=500
-export LEDGERFLOW_INDEXER_RPC_CONCURRENCY=8
-export LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=0
+export LEDGERFLOW_INDEXER_BATCH_SIZE=200
+export LEDGERFLOW_INDEXER_RPC_CONCURRENCY=4
+export LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=25
 make run-indexer
 ```
 
