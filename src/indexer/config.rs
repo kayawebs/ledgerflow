@@ -6,6 +6,8 @@ pub struct IndexerConfig {
     pub rpc_url: String,
     pub clickhouse_url: String,
     pub clickhouse_database: String,
+    pub clickhouse_user: String,
+    pub clickhouse_password: Option<String>,
     pub chain_id: u32,
     pub start_block: u64,
     pub end_block: Option<u64>,
@@ -29,6 +31,9 @@ impl IndexerConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:8123".to_owned()),
             clickhouse_database: env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE")
                 .unwrap_or_else(|_| "ledgerflow_indexer".to_owned()),
+            clickhouse_user: env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_USER")
+                .unwrap_or_else(|_| "default".to_owned()),
+            clickhouse_password: env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD").ok(),
             chain_id: parse_u32("LEDGERFLOW_INDEXER_CHAIN_ID").unwrap_or(8453),
             start_block: parse_u64("LEDGERFLOW_INDEXER_START_BLOCK").unwrap_or(0),
             end_block: parse_u64("LEDGERFLOW_INDEXER_END_BLOCK"),

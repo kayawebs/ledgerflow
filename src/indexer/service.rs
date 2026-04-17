@@ -25,6 +25,8 @@ impl IndexerService {
         let clickhouse = Arc::new(ClickHouseClient::new(
             config.clickhouse_url.clone(),
             config.clickhouse_database.clone(),
+            config.clickhouse_user.clone(),
+            config.clickhouse_password.clone(),
         ));
         Self {
             config,

@@ -57,6 +57,8 @@ If you are running only `ledgerflow indexer`, the main variables are:
 | `LEDGERFLOW_INDEXER_RPC_URL` | Base RPC endpoint used for block polling | `https://mainnet.base.org` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_URL` | ClickHouse HTTP endpoint | `http://127.0.0.1:8123` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE` | ClickHouse database name | `ledgerflow_indexer` |
+| `LEDGERFLOW_INDEXER_CLICKHOUSE_USER` | ClickHouse username | `ledgerflow` in Docker |
+| `LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD` | ClickHouse password | `ledgerflow` in Docker |
 | `LEDGERFLOW_INDEXER_START_BLOCK` | Initial backfill block | `0` |
 | `LEDGERFLOW_INDEXER_END_BLOCK` | Optional bounded stop block | unset |
 | `LEDGERFLOW_INDEXER_BATCH_SIZE` | Blocks per indexing loop | `100` |
@@ -126,6 +128,8 @@ To run only the standalone top-level indexer:
 
 ```bash
 export LEDGERFLOW_INDEXER_CLICKHOUSE_URL=http://127.0.0.1:8123
+export LEDGERFLOW_INDEXER_CLICKHOUSE_USER=ledgerflow
+export LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
 export LEDGERFLOW_INDEXER_RPC_URL=https://mainnet.base.org
 make run-indexer
 ```

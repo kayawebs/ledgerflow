@@ -7,14 +7,23 @@ use crate::indexer::models::{AddressTxDirection, AddressTxRef, normalize_address
 pub struct ClickHouseClient {
     base_url: String,
     database: String,
+    user: String,
+    password: Option<String>,
     client: reqwest::Client,
 }
 
 impl ClickHouseClient {
-    pub fn new(base_url: String, database: String) -> Self {
+    pub fn new(
+        base_url: String,
+        database: String,
+        user: String,
+        password: Option<String>,
+    ) -> Self {
         Self {
             base_url,
             database,
+            user,
+            password,
             client: reqwest::Client::new(),
         }
     }
@@ -207,8 +216,7 @@ impl ClickHouseClient {
 
     async fn query_json(&self, sql: &str) -> LedgerResult<Value> {
         let response = self
-            .client
-            .post(format!("{}/?database={}", self.base_url, self.database))
+            .request_builder(format!("{}/?database={}", self.base_url, self.database))
             .body(sql.to_owned())
             .send()
             .await
@@ -228,8 +236,7 @@ impl ClickHouseClient {
 
     async fn raw_post(&self, body: &str) -> Result<(), String> {
         let response = self
-            .client
-            .post(&self.base_url)
+            .request_builder(self.base_url.clone())
             .body(body.to_owned())
             .send()
             .await
@@ -240,6 +247,12 @@ impl ClickHouseClient {
             return Err(format!("clickhouse request failed: {status} {text}"));
         }
         Ok(())
+    }
+
+    fn request_builder(&self, url: String) -> reqwest::RequestBuilder {
+        self.client
+            .post(url)
+            .basic_auth(&self.user, self.password.clone())
     }
 }
 

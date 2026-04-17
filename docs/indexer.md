@@ -50,6 +50,8 @@ That table records the last fully indexed block for a named worker.
 | `LEDGERFLOW_INDEXER_RPC_URL` | Base RPC endpoint used for `eth_blockNumber` and `eth_getBlockByNumber(..., true)` | falls back to `LEDGERFLOW_RPC_URL` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_URL` | ClickHouse HTTP endpoint | `http://127.0.0.1:8123` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE` | ClickHouse database name | `ledgerflow_indexer` |
+| `LEDGERFLOW_INDEXER_CLICKHOUSE_USER` | ClickHouse username | `ledgerflow` in Docker, `default` fallback outside Docker if unset |
+| `LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD` | ClickHouse password | `ledgerflow` in Docker |
 | `LEDGERFLOW_INDEXER_CHAIN_ID` | chain id stored in rows | `8453` |
 | `LEDGERFLOW_INDEXER_START_BLOCK` | initial backfill block when no progress exists | `0` |
 | `LEDGERFLOW_INDEXER_END_BLOCK` | optional stop block for bounded backfills | unset |
@@ -80,6 +82,8 @@ Local endpoints:
 
 ```bash
 export LEDGERFLOW_INDEXER_CLICKHOUSE_URL=http://127.0.0.1:8123
+export LEDGERFLOW_INDEXER_CLICKHOUSE_USER=ledgerflow
+export LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
 export LEDGERFLOW_INDEXER_RPC_URL=https://mainnet.base.org
 export LEDGERFLOW_INDEXER_BIND_ADDR=0.0.0.0:8090
 ```

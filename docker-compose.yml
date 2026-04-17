@@ -12,6 +12,11 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:25.3
+    environment:
+      CLICKHOUSE_DB: ledgerflow_indexer
+      CLICKHOUSE_USER: ledgerflow
+      CLICKHOUSE_PASSWORD: ledgerflow
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
       - "8123:8123"
       - "9002:9000"
@@ -58,6 +63,9 @@ services:
     environment:
       LEDGERFLOW_INDEXER_BIND_ADDR: 0.0.0.0:8090
       LEDGERFLOW_INDEXER_CLICKHOUSE_URL: http://clickhouse:8123
+      LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE: ledgerflow_indexer
+      LEDGERFLOW_INDEXER_CLICKHOUSE_USER: ledgerflow
+      LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD: ledgerflow
       LEDGERFLOW_INDEXER_RPC_URL: ${LEDGERFLOW_INDEXER_RPC_URL:-https://mainnet.base.org}
     depends_on:
       - clickhouse

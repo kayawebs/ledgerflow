@@ -73,6 +73,8 @@ Run it locally:
 
 ```bash
 export LEDGERFLOW_INDEXER_CLICKHOUSE_URL=http://127.0.0.1:8123
+export LEDGERFLOW_INDEXER_CLICKHOUSE_USER=ledgerflow
+export LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
 export LEDGERFLOW_INDEXER_RPC_URL=https://mainnet.base.org
 make run-indexer
 ```
