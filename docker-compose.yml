@@ -14,7 +14,7 @@ services:
     image: clickhouse/clickhouse-server:25.3
     ports:
       - "8123:8123"
-      - "9000:9000"
+      - "9002:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
 
@@ -29,7 +29,7 @@ services:
     depends_on:
       - db
     ports:
-      - "8080:8080"
+      - "8180:8080"
 
   web:
     image: rust:1.92
