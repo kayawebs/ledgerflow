@@ -42,17 +42,24 @@ The table names remain `address_tx_refs` and `indexer_progress`, so the service 
 
 ## Public API Examples
 
+Create a verified user and API key first, then pass the key as a bearer token.
+
 ```bash
 curl -s http://127.0.0.1:8090/health | jq
-curl -s http://127.0.0.1:8090/v1/chains/base/progress | jq
-curl -s "http://127.0.0.1:8090/v1/base/address/0x1111111111111111111111111111111111111111/tx-hashes?limit=20" | jq
-curl -s "http://127.0.0.1:8090/v1/base/address/0x1111111111111111111111111111111111111111/txs?direction=from&limit=20" | jq
+export LEDGERFLOW_API_KEY=lf_live_xxx
+curl -s http://127.0.0.1:8090/v1/chains/base/progress \
+  -H "Authorization: Bearer $LEDGERFLOW_API_KEY" | jq
+curl -s "http://127.0.0.1:8090/v1/base/address/0x1111111111111111111111111111111111111111/tx-hashes?limit=20" \
+  -H "Authorization: Bearer $LEDGERFLOW_API_KEY" | jq
+curl -s "http://127.0.0.1:8090/v1/base/address/0x1111111111111111111111111111111111111111/txs?direction=from&limit=20" \
+  -H "Authorization: Bearer $LEDGERFLOW_API_KEY" | jq
 ```
 
 Batch lookup:
 
 ```bash
 curl -s http://127.0.0.1:8090/v1/base/addresses/txs \
+  -H "Authorization: Bearer $LEDGERFLOW_API_KEY" \
   -H 'content-type: application/json' \
   -d '{
     "addresses": [
@@ -89,6 +96,21 @@ curl -s http://127.0.0.1:8090/admin/api-keys \
   -H 'content-type: application/json' \
   -d '{"email":"operator@example.com","name":"production"}' | jq
 ```
+
+Submit and verify a Base ETH subscription payment:
+
+```bash
+curl -s http://127.0.0.1:8090/admin/billing/base-eth/payments \
+  -H 'content-type: application/json' \
+  -d '{
+    "email": "operator@example.com",
+    "plan_id": "developer",
+    "tx_hash": "0xPAYMENT_TX_HASH",
+    "from_address": "0xYOUR_PAYMENT_WALLET"
+  }' | jq
+```
+
+The API key becomes usable for `/v1/...` requests after an active subscription exists.
 
 ## Git Strategy
 

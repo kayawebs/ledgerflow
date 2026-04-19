@@ -3,12 +3,19 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+use crate::admin::billing::VerifiedBaseEthPayment;
 use crate::admin::models::{ApiKeyCreated, User};
 use crate::core::errors::{LedgerError, LedgerResult};
 
 #[derive(Clone)]
 pub struct PostgresAdminStore {
     pool: PgPool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthenticatedApiKey {
+    pub user_id: Uuid,
+    pub key_id: Uuid,
 }
 
 impl PostgresAdminStore {
@@ -245,24 +252,136 @@ impl PostgresAdminStore {
         })
     }
 
+    pub async fn authenticate_api_key(&self, raw_key: &str) -> LedgerResult<AuthenticatedApiKey> {
+        let key_hash = hash_secret(raw_key);
+        let key_row = sqlx::query(
+            r#"
+            select
+              k.key_id,
+              k.user_id
+            from indexer_api_keys k
+            join indexer_users u on u.user_id = k.user_id
+            where k.key_hash = $1
+              and k.revoked_at is null
+              and u.email_verified = true
+            limit 1
+            "#,
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        let Some(key_row) = key_row else {
+            return Err(LedgerError::Unauthorized("invalid api key".to_owned()));
+        };
+        let auth = AuthenticatedApiKey {
+            key_id: key_row
+                .try_get("key_id")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            user_id: key_row
+                .try_get("user_id")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        };
+
+        let has_active_subscription = sqlx::query(
+            r#"
+            select 1
+            from indexer_subscriptions
+            where user_id = $1
+              and status = 'active'
+              and current_period_start <= now()
+              and current_period_end > now()
+            order by current_period_end desc
+            limit 1
+            "#,
+        )
+        .bind(auth.user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?
+        .is_some();
+
+        if !has_active_subscription {
+            return Err(LedgerError::PaymentRequired(
+                "active subscription required".to_owned(),
+            ));
+        }
+
+        Ok(auth)
+    }
+
+    pub async fn record_usage(
+        &self,
+        user_id: Uuid,
+        api_key_id: Uuid,
+        endpoint: &str,
+    ) -> LedgerResult<()> {
+        let usage_date = Utc::now().date_naive();
+        sqlx::query(
+            r#"
+            insert into indexer_usage_daily (
+              usage_date, user_id, api_key_id, endpoint, request_count
+            )
+            values ($1, $2, $3, $4, 1)
+            on conflict (usage_date, user_id, api_key_id, endpoint)
+            do update set request_count = indexer_usage_daily.request_count + 1
+            "#,
+        )
+        .bind(usage_date)
+        .bind(user_id)
+        .bind(api_key_id)
+        .bind(endpoint)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn get_plan_price_wei(&self, plan_id: &str) -> LedgerResult<u128> {
+        let row = sqlx::query(
+            "select monthly_price_wei::text as monthly_price_wei from indexer_plans where plan_id = $1",
+        )
+        .bind(plan_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let Some(row) = row else {
+            return Err(LedgerError::Conflict(format!("unknown plan: {plan_id}")));
+        };
+        let amount: String = row
+            .try_get("monthly_price_wei")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        amount
+            .parse::<u128>()
+            .map_err(|err| LedgerError::Persistence(err.to_string()))
+    }
+
     pub async fn record_submitted_payment(
         &self,
         email: &str,
         plan_id: &str,
         tx_hash: &str,
         from_address: Option<&str>,
-    ) -> LedgerResult<Uuid> {
+    ) -> LedgerResult<(Uuid, Uuid)> {
         let email = normalize_email(email)?;
-        let user_id = sqlx::query("select user_id from indexer_users where email = $1")
-            .bind(email)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|err| LedgerError::Persistence(err.to_string()))?
-            .map(|row| row.try_get::<Uuid, _>("user_id"))
-            .transpose()
-            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let user_id = sqlx::query(
+            "select user_id from indexer_users where email = $1 and email_verified = true",
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?
+        .map(|row| row.try_get::<Uuid, _>("user_id"))
+        .transpose()
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let Some(user_id) = user_id else {
+            return Err(LedgerError::Conflict(
+                "email must be verified before payment submission".to_owned(),
+            ));
+        };
         let payment_id = Uuid::new_v4();
-        sqlx::query(
+        let row = sqlx::query(
             r#"
             insert into indexer_payments (
               payment_id, user_id, plan_id, chain_id, tx_hash, from_address, status
@@ -280,9 +399,80 @@ impl PostgresAdminStore {
         .bind(from_address)
         .fetch_one(&self.pool)
         .await
-        .map_err(|err| LedgerError::Persistence(err.to_string()))?
-        .try_get("payment_id")
-        .map_err(|err| LedgerError::Persistence(err.to_string()))
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let payment_id = row
+            .try_get("payment_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok((payment_id, user_id))
+    }
+
+    pub async fn mark_payment_verified_and_activate_subscription(
+        &self,
+        user_id: Uuid,
+        payment_id: Uuid,
+        plan_id: &str,
+        verified: &VerifiedBaseEthPayment,
+    ) -> LedgerResult<Uuid> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        sqlx::query(
+            r#"
+            update indexer_payments
+            set
+              status = 'verified',
+              from_address = $2,
+              to_address = $3,
+              amount_wei = $4::numeric,
+              metadata = jsonb_build_object(
+                'block_number', $5::bigint,
+                'confirmations', $6::bigint
+              ),
+              updated_at = now()
+            where payment_id = $1
+            "#,
+        )
+        .bind(payment_id)
+        .bind(&verified.from_address)
+        .bind(&verified.to_address)
+        .bind(&verified.amount_wei)
+        .bind(verified.block_number as i64)
+        .bind(verified.confirmations as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        let subscription_id = Uuid::new_v4();
+        let row = sqlx::query(
+            r#"
+            insert into indexer_subscriptions (
+              subscription_id,
+              user_id,
+              plan_id,
+              status,
+              current_period_start,
+              current_period_end
+            )
+            values ($1, $2, $3, 'active', now(), now() + interval '30 days')
+            returning subscription_id
+            "#,
+        )
+        .bind(subscription_id)
+        .bind(user_id)
+        .bind(plan_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        row.try_get("subscription_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))
     }
 }
 

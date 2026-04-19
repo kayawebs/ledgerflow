@@ -8,6 +8,7 @@ use std::sync::Arc;
 use axum::Router;
 use tokio::net::TcpListener;
 
+use crate::admin::billing::BaseEthPaymentVerifier;
 use crate::admin::{AdminState, PostgresAdminStore};
 use crate::core::logging::init_logging;
 use crate::indexer::{IndexerConfig, IndexerService};
@@ -24,13 +25,23 @@ async fn main() {
         .await
         .expect("indexer bootstrap should succeed");
 
-    let admin_store = PostgresAdminStore::connect(&config.admin_database_url)
-        .await
-        .expect("admin database connection should succeed");
+    let admin_store = Arc::new(
+        PostgresAdminStore::connect(&config.admin_database_url)
+            .await
+            .expect("admin database connection should succeed"),
+    );
     admin_store
         .bootstrap()
         .await
         .expect("admin database bootstrap should succeed");
+    let payment_verifier = Arc::new(
+        BaseEthPaymentVerifier::new(
+            config.rpc_url.clone(),
+            config.billing_treasury_address.clone(),
+            config.billing_min_confirmations,
+        )
+        .expect("payment verifier config should be valid"),
+    );
 
     let worker = service.clone();
     tokio::spawn(async move {
@@ -38,7 +49,8 @@ async fn main() {
     });
 
     let admin_state = AdminState {
-        store: Arc::new(admin_store),
+        store: admin_store.clone(),
+        payment_verifier,
         postmark_server_token: config.postmark_server_token.clone(),
         email_from: config.email_from.clone(),
         billing_treasury_address: config.billing_treasury_address.clone(),
@@ -46,7 +58,7 @@ async fn main() {
     };
 
     let app = Router::new()
-        .merge(public_api::router(service.clone()))
+        .merge(public_api::router(service.clone(), admin_store))
         .merge(indexer::legacy_api::router(service))
         .merge(admin::router(admin_state));
 

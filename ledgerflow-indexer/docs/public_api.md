@@ -12,13 +12,13 @@ Local development:
 http://127.0.0.1:8090
 ```
 
-Authentication is designed around API keys:
+Authentication is required for `/v1/...` endpoints:
 
 ```http
 Authorization: Bearer lf_live_xxx
 ```
 
-The first scaffold keeps the core query endpoints callable locally without auth. Production should enable API key verification and usage metering before public exposure.
+The service records daily usage per API key and requires an active subscription. `/health` and legacy internal endpoints are not part of the public metered API surface.
 
 ## Health
 
@@ -30,6 +30,7 @@ GET /health
 
 ```http
 GET /v1/chains/base/progress
+Authorization: Bearer lf_live_xxx
 ```
 
 Response:
@@ -47,6 +48,7 @@ Response:
 
 ```http
 GET /v1/base/address/{address}/tx-hashes
+Authorization: Bearer lf_live_xxx
 ```
 
 Query parameters:
@@ -73,6 +75,7 @@ Response:
 
 ```http
 GET /v1/base/address/{address}/txs
+Authorization: Bearer lf_live_xxx
 ```
 
 Response:
@@ -99,6 +102,7 @@ Response:
 
 ```http
 POST /v1/base/addresses/txs
+Authorization: Bearer lf_live_xxx
 ```
 
 Request:

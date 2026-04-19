@@ -10,6 +10,7 @@ use axum::{
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::admin::billing::BaseEthPaymentVerifier;
 use crate::admin::email::PostmarkEmailSender;
 use crate::admin::models::{
     CreateApiKeyRequest, StartEmailRequest, SubmitBaseEthPaymentRequest, VerifyEmailRequest,
@@ -20,6 +21,7 @@ use crate::core::errors::LedgerError;
 #[derive(Clone)]
 pub struct AdminState {
     pub store: Arc<PostgresAdminStore>,
+    pub payment_verifier: Arc<BaseEthPaymentVerifier>,
     pub postmark_server_token: Option<String>,
     pub email_from: String,
     pub billing_treasury_address: String,
@@ -127,7 +129,8 @@ async fn submit_base_eth_payment(
     State(state): State<AdminState>,
     Json(request): Json<SubmitBaseEthPaymentRequest>,
 ) -> Result<Json<serde_json::Value>, AdminApiError> {
-    let payment_id = state
+    let minimum_amount_wei = state.store.get_plan_price_wei(&request.plan_id).await?;
+    let (payment_id, user_id) = state
         .store
         .record_submitted_payment(
             &request.email,
@@ -136,13 +139,31 @@ async fn submit_base_eth_payment(
             request.from_address.as_deref(),
         )
         .await?;
+    let verified = state
+        .payment_verifier
+        .verify(
+            &request.tx_hash,
+            request.from_address.as_deref(),
+            minimum_amount_wei,
+        )
+        .await?;
+    let subscription_id = state
+        .store
+        .mark_payment_verified_and_activate_subscription(
+            user_id,
+            payment_id,
+            &request.plan_id,
+            &verified,
+        )
+        .await?;
     Ok(Json(json!({
-        "status": "submitted",
+        "status": "verified",
         "payment_id": payment_id,
+        "subscription_id": subscription_id,
         "chain_id": 8453,
         "treasury_address": state.billing_treasury_address,
         "required_confirmations": state.billing_min_confirmations,
-        "verification": "pending_rpc_verifier"
+        "payment": verified
     })))
 }
 
@@ -165,6 +186,14 @@ impl From<LedgerError> for AdminApiError {
         match value {
             LedgerError::Conflict(message) | LedgerError::MalformedEvidence(message) => Self {
                 status: StatusCode::CONFLICT,
+                message,
+            },
+            LedgerError::Unauthorized(message) => Self {
+                status: StatusCode::UNAUTHORIZED,
+                message,
+            },
+            LedgerError::PaymentRequired(message) => Self {
+                status: StatusCode::PAYMENT_REQUIRED,
                 message,
             },
             LedgerError::TransientIngestion(message) | LedgerError::Persistence(message) => Self {

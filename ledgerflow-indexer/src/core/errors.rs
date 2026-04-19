@@ -10,6 +10,10 @@ pub enum LedgerError {
     MalformedEvidence(String),
     #[error("persistence error: {0}")]
     Persistence(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+    #[error("payment required: {0}")]
+    PaymentRequired(String),
     #[error("conflict: {0}")]
     Conflict(String),
 }

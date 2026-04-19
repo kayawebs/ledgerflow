@@ -124,6 +124,14 @@ impl From<LedgerError> for ApiError {
                 status: StatusCode::CONFLICT,
                 message,
             },
+            LedgerError::Unauthorized(message) => Self {
+                status: StatusCode::UNAUTHORIZED,
+                message,
+            },
+            LedgerError::PaymentRequired(message) => Self {
+                status: StatusCode::PAYMENT_REQUIRED,
+                message,
+            },
             LedgerError::TransientIngestion(message) | LedgerError::Persistence(message) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 message,

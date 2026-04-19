@@ -43,13 +43,25 @@ The intended billing flow is:
 1. User selects a plan.
 2. User transfers ETH on Base to a treasury or assigned deposit address.
 3. User submits the payment transaction hash.
-4. Backend verifies:
+4. Backend verifies immediately through the configured Base RPC:
    - transaction exists on Base
    - receipt status is success
    - `to` matches the billing address
    - `from` matches the user's wallet, if bound
    - `value` satisfies the selected plan
    - block confirmations are sufficient
-5. Subscription is activated or extended.
+5. The payment is marked `verified`.
+6. A 30-day active subscription is created.
 
 For production, assigned deposit addresses are cleaner than one shared treasury because plain ETH transfers do not carry a reliable memo.
+
+## API Key Enforcement
+
+Public `/v1/...` endpoints require:
+
+- `Authorization: Bearer lf_live_xxx`
+- non-revoked API key
+- verified user email
+- active subscription whose current period includes now
+
+Every successful public request increments `indexer_usage_daily` by `(date, user_id, api_key_id, endpoint)`.
