@@ -4,7 +4,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::admin::billing::VerifiedBaseEthPayment;
-use crate::admin::models::{ApiKeyCreated, User};
+use crate::admin::models::{ApiKeyCreated, Plan, User};
 use crate::core::errors::{LedgerError, LedgerResult};
 
 #[derive(Clone)]
@@ -355,6 +355,42 @@ impl PostgresAdminStore {
         amount
             .parse::<u128>()
             .map_err(|err| LedgerError::Persistence(err.to_string()))
+    }
+
+    pub async fn list_plans(&self) -> LedgerResult<Vec<Plan>> {
+        let rows = sqlx::query(
+            r#"
+            select
+              plan_id,
+              name,
+              monthly_price_wei::text as monthly_price_wei,
+              monthly_request_quota
+            from indexer_plans
+            order by monthly_price_wei asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(Plan {
+                    plan_id: row
+                        .try_get("plan_id")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    name: row
+                        .try_get("name")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    monthly_price_wei: row
+                        .try_get("monthly_price_wei")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    monthly_request_quota: row
+                        .try_get("monthly_request_quota")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                })
+            })
+            .collect()
     }
 
     pub async fn record_submitted_payment(

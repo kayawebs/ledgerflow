@@ -17,6 +17,14 @@ pub struct ApiKeyCreated {
     pub api_key: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct Plan {
+    pub plan_id: String,
+    pub name: String,
+    pub monthly_price_wei: String,
+    pub monthly_request_quota: i64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct StartEmailRequest {
     pub email: String,

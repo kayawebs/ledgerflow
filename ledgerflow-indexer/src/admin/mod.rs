@@ -2,6 +2,7 @@ mod api;
 pub mod billing;
 mod email;
 mod models;
+mod pages;
 mod store;
 
 pub use api::{AdminState, router};

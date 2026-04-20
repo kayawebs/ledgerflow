@@ -15,6 +15,7 @@ use crate::admin::email::PostmarkEmailSender;
 use crate::admin::models::{
     CreateApiKeyRequest, StartEmailRequest, SubmitBaseEthPaymentRequest, VerifyEmailRequest,
 };
+use crate::admin::pages;
 use crate::admin::store::PostgresAdminStore;
 use crate::core::errors::LedgerError;
 
@@ -30,8 +31,14 @@ pub struct AdminState {
 
 pub fn router(state: AdminState) -> Router {
     Router::new()
-        .route("/admin", get(admin_console))
+        .route("/", get(home_page))
+        .route("/login", get(login_page))
+        .route("/dashboard", get(dashboard_page))
+        .route("/docs", get(docs_page))
+        .route("/admin", get(dashboard_page))
         .route("/admin/health", get(admin_health))
+        .route("/admin/config", get(admin_config))
+        .route("/admin/billing/plans", get(list_billing_plans))
         .route("/admin/auth/email/start", post(start_email_auth))
         .route("/admin/auth/email/verify", post(verify_email_auth))
         .route("/admin/api-keys", post(create_api_key))
@@ -42,42 +49,40 @@ pub fn router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-async fn admin_console() -> Html<&'static str> {
-    Html(
-        r#"<!doctype html>
-<html>
-<head>
-  <title>LedgerFlow Indexer Admin</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui; margin: 40px; max-width: 920px; }
-    code, pre { background: #f4f1ea; padding: 2px 4px; border-radius: 4px; }
-    section { border: 1px solid #ddd2c0; border-radius: 12px; padding: 18px; margin: 16px 0; }
-  </style>
-</head>
-<body>
-  <h1>LedgerFlow Indexer Admin</h1>
-  <p>This is the first admin shell. Use the JSON API for email verification, API keys, and Base ETH payment submission.</p>
-  <section>
-    <h2>Core endpoints</h2>
-    <pre>POST /admin/auth/email/start
-POST /admin/auth/email/verify
-POST /admin/api-keys
-POST /admin/billing/base-eth/payments</pre>
-  </section>
-  <section>
-    <h2>Public API</h2>
-    <pre>GET /v1/chains/base/progress
-GET /v1/base/address/{address}/txs
-GET /v1/base/address/{address}/tx-hashes
-POST /v1/base/addresses/txs</pre>
-  </section>
-</body>
-</html>"#,
-    )
+async fn home_page() -> Html<&'static str> {
+    Html(pages::home())
+}
+
+async fn login_page() -> Html<&'static str> {
+    Html(pages::login())
+}
+
+async fn dashboard_page() -> Html<&'static str> {
+    Html(pages::dashboard())
+}
+
+async fn docs_page() -> Html<&'static str> {
+    Html(pages::docs())
 }
 
 async fn admin_health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": "ledgerflow-indexer-admin" }))
+}
+
+async fn admin_config(State(state): State<AdminState>) -> Json<serde_json::Value> {
+    Json(json!({
+        "billing": {
+            "treasury_address": state.billing_treasury_address,
+            "required_confirmations": state.billing_min_confirmations
+        }
+    }))
+}
+
+async fn list_billing_plans(
+    State(state): State<AdminState>,
+) -> Result<Json<serde_json::Value>, AdminApiError> {
+    let plans = state.store.list_plans().await?;
+    Ok(Json(json!({ "plans": plans })))
 }
 
 async fn start_email_auth(
