@@ -58,10 +58,12 @@ async fn main() {
         billing_min_confirmations: config.billing_min_confirmations,
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(public_api::router(service.clone(), admin_store))
-        .merge(indexer::legacy_api::router(service))
         .merge(admin::router(admin_state));
+    if config.enable_legacy_api {
+        app = app.merge(indexer::legacy_api::router(service));
+    }
 
     let listener = TcpListener::bind(&bind_addr)
         .await

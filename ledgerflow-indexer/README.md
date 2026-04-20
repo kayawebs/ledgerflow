@@ -36,9 +36,12 @@ The important settings are:
 LEDGERFLOW_INDEXER_CLICKHOUSE_URL=http://127.0.0.1:8123
 LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE=ledgerflow_indexer
 LEDGERFLOW_INDEXER_WORKER_ID=base_mainnet_top_level
+LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false
 ```
 
 The table names remain `address_tx_refs` and `indexer_progress`, so the service can continue from the existing progress row.
+
+Keep `LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false` for public deployments. The legacy `/addresses/...` endpoints are intended only for internal compatibility.
 
 ## Public API Examples
 

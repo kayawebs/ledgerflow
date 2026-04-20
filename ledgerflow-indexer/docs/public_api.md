@@ -20,6 +20,8 @@ Authorization: Bearer lf_live_xxx
 
 The service records daily usage per API key and requires an active subscription. `/health` and legacy internal endpoints are not part of the public metered API surface.
 
+For public deployments, keep `LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false` so only `/v1/...`, `/admin/...`, and `/health` are mounted.
+
 ## Health
 
 ```http
