@@ -15,6 +15,7 @@ use crate::indexer::{IndexerConfig, IndexerService};
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
     init_logging();
 
     let config = IndexerConfig::from_env();
