@@ -35,12 +35,14 @@ pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/", get(home_page))
         .route("/login", get(login_page))
+        .route("/pricing", get(pricing_page))
         .route("/dashboard", get(dashboard_page))
         .route("/docs", get(docs_page))
         .route("/admin", get(dashboard_page))
         .route("/admin/health", get(admin_health))
         .route("/admin/config", get(admin_config))
         .route("/admin/billing/plans", get(list_billing_plans))
+        .route("/admin/referral", get(referral_summary))
         .route("/admin/auth/me", get(auth_me))
         .route("/admin/auth/register/start", post(register_start))
         .route("/admin/auth/register/verify", post(register_verify))
@@ -70,6 +72,10 @@ async fn home_page() -> Html<&'static str> {
 
 async fn login_page() -> Html<&'static str> {
     Html(pages::login())
+}
+
+async fn pricing_page() -> Html<&'static str> {
+    Html(pages::pricing())
 }
 
 async fn dashboard_page(
@@ -121,6 +127,20 @@ async fn auth_me(
     Ok(Json(json!({ "user": user })))
 }
 
+async fn referral_summary(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AdminApiError> {
+    let Some(token) = session_token(&headers) else {
+        return Err(LedgerError::Unauthorized("not logged in".to_owned()).into());
+    };
+    let Some(user) = state.store.get_user_by_session(token).await? else {
+        return Err(LedgerError::Unauthorized("session expired".to_owned()).into());
+    };
+    let referral = state.store.get_referral_summary(user.user_id).await?;
+    Ok(Json(json!({ "referral": referral })))
+}
+
 async fn register_start(
     State(state): State<AdminState>,
     Json(request): Json<RegisterStartRequest>,
@@ -138,7 +158,11 @@ async fn register_verify(
         .await?;
     let user = state
         .store
-        .set_user_password(&request.email, &request.password)
+        .set_user_password_with_referral(
+            &request.email,
+            &request.password,
+            request.referral_code.as_deref(),
+        )
         .await?;
     let token = state.store.create_session(user.user_id).await?;
     Ok((

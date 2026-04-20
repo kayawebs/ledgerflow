@@ -18,6 +18,7 @@ Postgres stores product state:
 - `indexer_subscriptions`
 - `indexer_payments`
 - `indexer_usage_daily`
+- `indexer_referral_rewards`
 
 This avoids mixing user data and billing state into the append-heavy index.
 
@@ -40,6 +41,32 @@ Flow:
 The local scaffold returns `email_delivery: disabled` when Postmark is not configured.
 
 Password reset uses the same email-code mechanism through `/admin/auth/password-reset/start` and `/admin/auth/password-reset/verify`.
+
+Before public launch, add Cloudflare Turnstile to registration, password reset, and login. See [cloudflare_turnstile.md](cloudflare_turnstile.md).
+
+## Launch Pricing
+
+The public product currently exposes one plan only:
+
+- Plan id: `launch`
+- Launch price: `0.009 ETH / month`
+- Regular reference price: `0.018 ETH / month`
+- Included usage: `1,000,000` API requests per month
+
+The backend seeds and lists only the `launch` plan. Payment submission rejects non-launch plans even if older plan rows still exist in a local Postgres database from previous builds.
+
+The launch price is intentionally narrow and discounted: the product is not selling a broad multi-chain RPC plan, it is selling Base address-to-top-level-transaction lookup for bots, wallet ops, and data teams.
+
+## Referral Rewards
+
+Each verified referred account grants the referrer `25,000` bonus API requests for the current month, capped at `250,000` bonus requests per month.
+
+The reward is deliberately modest because email-only referral programs are easy to farm. Production hardening should add:
+
+- Turnstile on registration and login
+- IP and ASN rate limits in Cloudflare
+- payment-required rewards for larger bonuses
+- abuse review for repeated disposable email domains
 
 ## Base ETH Subscription Payments
 

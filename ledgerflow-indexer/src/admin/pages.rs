@@ -82,6 +82,7 @@ pub fn home() -> &'static str {
     <a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a>
     <div class="navlinks">
       <a href="/docs">Docs</a>
+      <a href="/pricing">Pricing</a>
       <a href="/login">Login</a>
       <a class="pill" href="/dashboard">Dashboard</a>
     </div>
@@ -117,6 +118,71 @@ pub fn home() -> &'static str {
 </html>"##
 }
 
+pub fn pricing() -> &'static str {
+    r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pricing | LedgerFlow Indexer</title>
+  <style>
+    :root { --ink:#17130f; --paper:#fbf7ef; --line:#dacbb5; --muted:#6f675d; --accent:#b85d24; --green:#617751; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:radial-gradient(circle at 78% 12%,rgba(97,119,81,.18),transparent 26rem),linear-gradient(135deg,#fbf7ef,#efe2cf); font-family:Georgia,"Times New Roman",serif; }
+    .nav { display:flex; justify-content:space-between; align-items:center; padding:24px clamp(20px,5vw,72px); font-family:ui-sans-serif,system-ui; }
+    .brand { display:inline-flex; align-items:center; gap:10px; font-weight:850; letter-spacing:.08em; text-transform:uppercase; }
+    .brand svg { width:34px; height:34px; }
+    a { color:inherit; text-decoration:none; }
+    main { width:min(1120px,100%); margin:0 auto; padding:42px 22px 86px; }
+    h1 { font-size:clamp(46px,8vw,96px); line-height:.9; letter-spacing:-.06em; margin:0; }
+    p, li, button, .tag, .metric { font-family:ui-sans-serif,system-ui; }
+    .lede { color:var(--muted); font-size:19px; line-height:1.65; max-width:760px; }
+    .price-card { margin-top:34px; border:1px solid var(--line); border-radius:34px; background:rgba(255,250,241,.88); padding:30px; display:grid; grid-template-columns:1.05fr .95fr; gap:22px; box-shadow:0 28px 80px rgba(23,19,15,.08); }
+    .tag { display:inline-flex; border:1px solid var(--line); border-radius:999px; padding:8px 12px; color:var(--accent); background:#fffaf1; font-weight:750; }
+    .price { font-size:clamp(54px,9vw,110px); line-height:.9; letter-spacing:-.07em; margin:18px 0 8px; }
+    .strike { color:var(--muted); text-decoration:line-through; font-family:ui-sans-serif,system-ui; font-size:22px; }
+    ul { padding-left:20px; color:var(--muted); line-height:1.75; }
+    .button { display:inline-flex; margin-top:18px; border-radius:999px; padding:14px 20px; background:var(--ink); color:var(--paper); font-family:ui-sans-serif,system-ui; font-weight:760; }
+    .aside { border-radius:26px; background:#18130f; color:#f7ead8; padding:24px; }
+    .aside p { color:#dbc8b4; line-height:1.65; }
+    .referral { margin-top:18px; border:1px dashed #806b58; border-radius:22px; padding:18px; }
+    @media (max-width:840px) { .price-card { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/docs">Docs</a> &nbsp; <a href="/pricing">Pricing</a> &nbsp; <a href="/login">Login</a></div></nav>
+  <main>
+    <span class="tag">Launch pricing · limited discount</span>
+    <h1>One plan for Base builders.</h1>
+    <p class="lede">General RPC providers price broad multi-chain infrastructure; LedgerFlow Indexer is narrower and cheaper for the specific job of Base address-to-transaction discovery.</p>
+    <section class="price-card">
+      <div>
+        <div class="tag">Launch</div>
+        <div class="price">0.009 ETH</div>
+        <div class="strike">0.018 ETH / month regular price</div>
+        <p class="lede">Includes 1,000,000 metered API requests per month for Base top-level address lookup.</p>
+        <ul>
+          <li>Address transaction refs and deduplicated tx hashes</li>
+          <li>Batch address lookup for bot and EOA clusters</li>
+          <li>API key dashboard and usage metering</li>
+          <li>Base ETH subscription payment</li>
+        </ul>
+        <a class="button" href="/login">Start with launch discount</a>
+      </div>
+      <aside class="aside">
+        <h2>Referral bonus</h2>
+        <p>Invite verified users and receive bonus API usage. The reward is intentionally modest to reduce email farming incentives.</p>
+        <div class="referral">
+          <div class="metric">25,000 bonus requests</div>
+          <p>Per verified referred account, capped at 250,000 bonus requests per month.</p>
+        </div>
+      </aside>
+    </section>
+  </main>
+</body>
+</html>"##
+}
+
 pub fn login() -> &'static str {
     r##"<!doctype html>
 <html lang="en">
@@ -138,6 +204,10 @@ pub fn login() -> &'static str {
     button { width:100%; margin-top:16px; border:0; border-radius:999px; padding:14px 18px; background:var(--ink); color:var(--paper); font-weight:760; cursor:pointer; }
     button:disabled { opacity:.55; cursor:not-allowed; }
     button.secondary { background:transparent; color:var(--ink); border:1px solid var(--line); }
+    .tabs { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:8px 0 10px; }
+    .tabs button { margin:0; background:transparent; border:1px solid var(--line); color:var(--ink); }
+    .tabs button.active { background:var(--ink); color:var(--paper); border-color:var(--ink); }
+    .small-link { display:block; margin-top:12px; color:var(--muted); text-align:center; font-size:13px; }
     .status { margin-top:16px; white-space:pre-wrap; color:var(--muted); line-height:1.5; }
     .nav { position:fixed; top:22px; left:24px; right:24px; display:flex; justify-content:space-between; font-family:ui-sans-serif,system-ui; }
     .nav a { color:var(--ink); text-decoration:none; }
@@ -147,30 +217,27 @@ pub fn login() -> &'static str {
   </style>
 </head>
 <body>
-  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><a href="/docs">Docs</a></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><a href="/pricing">Pricing</a></nav>
   <main class="shell">
     <section class="panel">
       <h1>Account access for the indexer API.</h1>
       <p>Create an account with email verification and password, then use the dashboard to create API keys and activate a subscription. Verification codes can only be sent once per minute.</p>
     </section>
     <section class="panel">
-      <label for="mode">Flow</label>
-      <select id="mode">
-        <option value="login">Password login</option>
-        <option value="register">Register with email code</option>
-        <option value="reset">Forgot password</option>
-      </select>
+      <div class="tabs"><button id="login-tab" class="active">Login</button><button id="register-tab">Register</button></div>
       <label for="email">Email</label>
       <input id="email" type="email" placeholder="operator@example.com" autocomplete="email">
       <label for="password">Password</label>
       <input id="password" type="password" placeholder="at least 8 characters" autocomplete="current-password">
+      <label id="referral-label" for="referral" style="display:none">Referral code (optional)</label>
+      <input id="referral" style="display:none" placeholder="lf...">
       <div id="code-area" style="display:none">
         <button id="send">Send verification code</button>
         <label for="code">Verification code</label>
         <input id="code" placeholder="123456" inputmode="numeric">
       </div>
       <button id="submit">Continue</button>
-      <button class="secondary" onclick="location.href='/dashboard'">I already have access</button>
+      <a href="#" id="forgot" class="small-link">Forgot password?</a>
       <div id="status" class="status"></div>
     </section>
   </main>
@@ -183,15 +250,20 @@ pub fn login() -> &'static str {
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       return data;
     }
-    const modeEl = document.getElementById("mode");
+    let mode = "login";
     const sendBtn = document.getElementById("send");
     const codeArea = document.getElementById("code-area");
     let cooldownUntil = Number(localStorage.getItem("ledgerflow_code_cooldown_until") || 0);
     function updateMode() {
-      const needsCode = modeEl.value !== "login";
+      const needsCode = mode !== "login";
       codeArea.style.display = needsCode ? "block" : "none";
-      document.getElementById("password").autocomplete = modeEl.value === "login" ? "current-password" : "new-password";
-      document.getElementById("submit").textContent = modeEl.value === "login" ? "Login" : modeEl.value === "register" ? "Verify and create account" : "Reset password and login";
+      document.getElementById("referral").style.display = mode === "register" ? "block" : "none";
+      document.getElementById("referral-label").style.display = mode === "register" ? "block" : "none";
+      document.getElementById("password").autocomplete = mode === "login" ? "current-password" : "new-password";
+      document.getElementById("submit").textContent = mode === "login" ? "Login" : mode === "register" ? "Verify and create account" : "Reset password and login";
+      document.getElementById("login-tab").classList.toggle("active", mode === "login");
+      document.getElementById("register-tab").classList.toggle("active", mode === "register");
+      document.getElementById("forgot").textContent = mode === "reset" ? "Back to login" : "Forgot password?";
     }
     function updateCooldown() {
       const remaining = Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000));
@@ -204,12 +276,14 @@ pub fn login() -> &'static str {
       }
     }
     setInterval(updateCooldown, 500);
-    modeEl.onchange = updateMode;
+    document.getElementById("login-tab").onclick = () => { mode = "login"; updateMode(); };
+    document.getElementById("register-tab").onclick = () => { mode = "register"; updateMode(); };
+    document.getElementById("forgot").onclick = (event) => { event.preventDefault(); mode = mode === "reset" ? "login" : "reset"; updateMode(); };
     document.getElementById("send").onclick = async () => {
       try {
         const email = document.getElementById("email").value.trim();
         localStorage.setItem("ledgerflow_email", email);
-        const endpoint = modeEl.value === "reset" ? "/admin/auth/password-reset/start" : "/admin/auth/register/start";
+        const endpoint = mode === "reset" ? "/admin/auth/password-reset/start" : "/admin/auth/register/start";
         const data = await post(endpoint, { email });
         cooldownUntil = Date.now() + Number(data.resend_after_seconds || 60) * 1000;
         localStorage.setItem("ledgerflow_code_cooldown_until", String(cooldownUntil));
@@ -222,15 +296,20 @@ pub fn login() -> &'static str {
         const email = document.getElementById("email").value.trim();
         const password = document.getElementById("password").value;
         const code = document.getElementById("code").value.trim();
-        const data = modeEl.value === "login"
+        const data = mode === "login"
           ? await post("/admin/auth/login", { email, password })
-          : modeEl.value === "register"
-            ? await post("/admin/auth/register/verify", { email, code, password })
+          : mode === "register"
+            ? await post("/admin/auth/register/verify", { email, code, password, referral_code: document.getElementById("referral").value.trim() || null })
             : await post("/admin/auth/password-reset/verify", { email, code, new_password: password });
         localStorage.setItem("ledgerflow_email", data.user.email);
         location.href = "/dashboard";
       } catch (err) { setStatus(err.message); }
     };
+    const params = new URLSearchParams(location.search);
+    if (params.get("ref")) {
+      mode = "register";
+      document.getElementById("referral").value = params.get("ref");
+    }
     document.getElementById("email").value = localStorage.getItem("ledgerflow_email") || "";
     updateMode();
     updateCooldown();
@@ -305,6 +384,14 @@ pub fn dashboard() -> &'static str {
         <div class="status" id="payment-status">Submit a Base ETH transfer tx hash after sending payment.</div>
       </article>
 
+      <article class="card">
+        <h2>Referral bonus</h2>
+        <p class="muted">Invite verified users. Each successful referral adds 25,000 bonus requests this month, capped at 250,000.</p>
+        <label>Your referral code</label><input id="referral-code" readonly placeholder="loading...">
+        <button id="copy-referral">Copy signup link</button>
+        <div class="status" id="referral-status">Referral stats will load after login.</div>
+      </article>
+
       <article class="card wide">
         <h2>Test address lookup</h2>
         <div class="grid">
@@ -359,6 +446,18 @@ pub fn dashboard() -> &'static str {
       $("plan").innerHTML = plans.plans.map((p) => `<option value="${p.plan_id}">${p.name} · ${Number(BigInt(p.monthly_price_wei)) / 1e18} ETH / ${p.monthly_request_quota.toLocaleString()} req</option>`).join("");
     }
     $("load-config").onclick = () => loadConfig().catch((err) => alert(err.message));
+    async function loadReferral() {
+      const data = await getJson("/admin/referral");
+      const r = data.referral;
+      $("referral-code").value = r.referral_code;
+      $("referral-status").textContent = `${r.bonus_requests_this_month.toLocaleString()} bonus requests this month from ${r.rewarded_referrals_this_month} verified referrals. Monthly cap: ${r.monthly_reward_cap.toLocaleString()}.`;
+    }
+    $("copy-referral").onclick = async () => {
+      const code = $("referral-code").value;
+      const url = `${location.origin}/login?ref=${encodeURIComponent(code)}`;
+      await navigator.clipboard.writeText(url);
+      $("referral-status").textContent = `Copied: ${url}`;
+    };
 
     $("create-key").onclick = async () => {
       try {
@@ -397,6 +496,7 @@ pub fn dashboard() -> &'static str {
 
     loadMe().catch(() => { location.href = "/login"; });
     loadConfig().catch((err) => { $("treasury").textContent = err.message; });
+    loadReferral().catch((err) => { $("referral-status").textContent = err.message; });
   </script>
 </body>
 </html>"##

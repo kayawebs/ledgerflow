@@ -2,14 +2,14 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
-use chrono::{Duration, Utc};
+use chrono::{Datelike, Duration, Utc};
 use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::admin::billing::VerifiedBaseEthPayment;
-use crate::admin::models::{ApiKeyCreated, Plan, User};
+use crate::admin::models::{ApiKeyCreated, Plan, ReferralSummary, User};
 use crate::core::errors::{LedgerError, LedgerResult};
 
 #[derive(Clone)]
@@ -38,6 +38,8 @@ impl PostgresAdminStore {
               user_id uuid primary key,
               email text not null unique,
               password_hash text,
+              referral_code text unique,
+              referred_by_user_id uuid references indexer_users(user_id),
               email_verified boolean not null default false,
               created_at timestamptz not null default now(),
               updated_at timestamptz not null default now()
@@ -122,16 +124,32 @@ impl PostgresAdminStore {
               created_at timestamptz not null default now()
             )
             "#,
+            r#"
+            create table if not exists indexer_referral_rewards (
+              reward_id uuid primary key,
+              referrer_user_id uuid not null references indexer_users(user_id),
+              referred_user_id uuid not null references indexer_users(user_id),
+              reward_requests bigint not null,
+              reward_month date not null,
+              created_at timestamptz not null default now(),
+              unique (referrer_user_id, referred_user_id)
+            )
+            "#,
             "alter table indexer_users add column if not exists password_hash text",
+            "alter table indexer_users add column if not exists referral_code text unique",
+            "alter table indexer_users add column if not exists referred_by_user_id uuid references indexer_users(user_id)",
             "alter table indexer_email_otps add column if not exists purpose text not null default 'verify_email'",
             "create index if not exists indexer_email_otps_email_purpose_created_idx on indexer_email_otps (email, purpose, created_at desc)",
             "create index if not exists indexer_sessions_token_hash_idx on indexer_sessions (token_hash)",
+            "create index if not exists indexer_referral_rewards_month_idx on indexer_referral_rewards (referrer_user_id, reward_month)",
             r#"
             insert into indexer_plans (plan_id, name, monthly_price_wei, monthly_request_quota)
             values
-              ('developer', 'Developer', 10000000000000000, 1000000),
-              ('operator', 'Operator', 50000000000000000, 10000000)
-            on conflict (plan_id) do nothing
+              ('launch', 'Launch', 9000000000000000, 1000000)
+            on conflict (plan_id) do update set
+              name = excluded.name,
+              monthly_price_wei = excluded.monthly_price_wei,
+              monthly_request_quota = excluded.monthly_request_quota
             "#,
         ];
 
@@ -271,13 +289,41 @@ impl PostgresAdminStore {
     }
 
     pub async fn set_user_password(&self, email: &str, password: &str) -> LedgerResult<User> {
+        self.set_user_password_with_referral(email, password, None)
+            .await
+    }
+
+    pub async fn set_user_password_with_referral(
+        &self,
+        email: &str,
+        password: &str,
+        referral_code: Option<&str>,
+    ) -> LedgerResult<User> {
         let email = normalize_email(email)?;
         let password_hash = hash_password(password)?;
+        let referral_code = referral_code
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let referred_by_user_id = if let Some(referral_code) = referral_code.as_deref() {
+            sqlx::query("select user_id from indexer_users where referral_code = $1")
+                .bind(referral_code)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                .map(|row| row.try_get::<Uuid, _>("user_id"))
+                .transpose()
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+        } else {
+            None
+        };
         let row = sqlx::query(
             r#"
             update indexer_users
             set password_hash = $2,
                 email_verified = true,
+                referral_code = coalesce(referral_code, $3),
+                referred_by_user_id = coalesce(referred_by_user_id, $4),
                 updated_at = now()
             where email = $1
             returning user_id, email, email_verified, created_at
@@ -285,13 +331,22 @@ impl PostgresAdminStore {
         )
         .bind(&email)
         .bind(password_hash)
+        .bind(new_referral_code())
+        .bind(referred_by_user_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         let Some(row) = row else {
             return Err(LedgerError::Conflict("user not found".to_owned()));
         };
-        row_to_user(row)
+        let user = row_to_user(row)?;
+        if let Some(referrer_user_id) = referred_by_user_id {
+            if referrer_user_id != user.user_id {
+                self.record_referral_reward(referrer_user_id, user.user_id)
+                    .await?;
+            }
+        }
+        Ok(user)
     }
 
     pub async fn authenticate_password(&self, email: &str, password: &str) -> LedgerResult<User> {
@@ -430,12 +485,32 @@ impl PostgresAdminStore {
             r#"
             select
               k.key_id,
-              k.user_id
+              k.user_id,
+              s.monthly_request_quota,
+              coalesce((
+                select sum(reward_requests)
+                from indexer_referral_rewards r
+                where r.referrer_user_id = k.user_id
+                  and r.reward_month = date_trunc('month', current_date)::date
+              ), 0) as bonus_requests,
+              coalesce((
+                select sum(request_count)
+                from indexer_usage_daily u2
+                where u2.user_id = k.user_id
+                  and u2.usage_date >= date_trunc('month', current_date)::date
+                  and u2.usage_date < (date_trunc('month', current_date) + interval '1 month')::date
+              ), 0) as used_requests
             from indexer_api_keys k
             join indexer_users u on u.user_id = k.user_id
+            join indexer_subscriptions sub on sub.user_id = k.user_id
+            join indexer_plans s on s.plan_id = sub.plan_id
             where k.key_hash = $1
               and k.revoked_at is null
               and u.email_verified = true
+              and sub.status = 'active'
+              and sub.current_period_start <= now()
+              and sub.current_period_end > now()
+            order by sub.current_period_end desc
             limit 1
             "#,
         )
@@ -447,6 +522,15 @@ impl PostgresAdminStore {
         let Some(key_row) = key_row else {
             return Err(LedgerError::Unauthorized("invalid api key".to_owned()));
         };
+        let monthly_quota = key_row
+            .try_get::<i64, _>("monthly_request_quota")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let bonus_requests = key_row
+            .try_get::<i64, _>("bonus_requests")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let used_requests = key_row
+            .try_get::<i64, _>("used_requests")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         let auth = AuthenticatedApiKey {
             key_id: key_row
                 .try_get("key_id")
@@ -455,28 +539,9 @@ impl PostgresAdminStore {
                 .try_get("user_id")
                 .map_err(|err| LedgerError::Persistence(err.to_string()))?,
         };
-
-        let has_active_subscription = sqlx::query(
-            r#"
-            select 1
-            from indexer_subscriptions
-            where user_id = $1
-              and status = 'active'
-              and current_period_start <= now()
-              and current_period_end > now()
-            order by current_period_end desc
-            limit 1
-            "#,
-        )
-        .bind(auth.user_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| LedgerError::Persistence(err.to_string()))?
-        .is_some();
-
-        if !has_active_subscription {
+        if used_requests >= monthly_quota + bonus_requests {
             return Err(LedgerError::PaymentRequired(
-                "active subscription required".to_owned(),
+                "monthly request quota exhausted".to_owned(),
             ));
         }
 
@@ -510,7 +575,79 @@ impl PostgresAdminStore {
         Ok(())
     }
 
+    async fn ensure_referral_code(&self, user_id: Uuid) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            update indexer_users
+            set referral_code = coalesce(referral_code, $2),
+                updated_at = now()
+            where user_id = $1
+              and referral_code is null
+            "#,
+        )
+        .bind(user_id)
+        .bind(new_referral_code())
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn record_referral_reward(
+        &self,
+        referrer_user_id: Uuid,
+        referred_user_id: Uuid,
+    ) -> LedgerResult<()> {
+        let reward_month = Utc::now()
+            .date_naive()
+            .with_day(1)
+            .ok_or_else(|| LedgerError::Persistence("invalid reward month".to_owned()))?;
+        let current_bonus = sqlx::query(
+            r#"
+            select coalesce(sum(reward_requests), 0)::bigint as current_bonus
+            from indexer_referral_rewards
+            where referrer_user_id = $1
+              and reward_month = $2
+            "#,
+        )
+        .bind(referrer_user_id)
+        .bind(reward_month)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?
+        .try_get::<i64, _>("current_bonus")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let remaining = 250_000_i64.saturating_sub(current_bonus);
+        let reward = remaining.min(25_000);
+        if reward <= 0 {
+            return Ok(());
+        }
+        sqlx::query(
+            r#"
+            insert into indexer_referral_rewards (
+              reward_id, referrer_user_id, referred_user_id, reward_requests, reward_month
+            )
+            values ($1, $2, $3, $4, $5)
+            on conflict (referrer_user_id, referred_user_id) do nothing
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(referrer_user_id)
+        .bind(referred_user_id)
+        .bind(reward)
+        .bind(reward_month)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
     pub async fn get_plan_price_wei(&self, plan_id: &str) -> LedgerResult<u128> {
+        if plan_id != "launch" {
+            return Err(LedgerError::Conflict(
+                "only the launch plan is currently available".to_owned(),
+            ));
+        }
         let row = sqlx::query(
             "select monthly_price_wei::text as monthly_price_wei from indexer_plans where plan_id = $1",
         )
@@ -538,6 +675,7 @@ impl PostgresAdminStore {
               monthly_price_wei::text as monthly_price_wei,
               monthly_request_quota
             from indexer_plans
+            where plan_id = 'launch'
             order by monthly_price_wei asc
             "#,
         )
@@ -563,6 +701,48 @@ impl PostgresAdminStore {
                 })
             })
             .collect()
+    }
+
+    pub async fn get_referral_summary(&self, user_id: Uuid) -> LedgerResult<ReferralSummary> {
+        self.ensure_referral_code(user_id).await?;
+        let row = sqlx::query(
+            r#"
+            select
+              referral_code,
+              coalesce((
+                select count(*)
+                from indexer_referral_rewards r
+                where r.referrer_user_id = indexer_users.user_id
+                  and r.reward_month = date_trunc('month', current_date)::date
+              ), 0)::bigint as rewarded_referrals_this_month,
+              coalesce((
+                select sum(reward_requests)
+                from indexer_referral_rewards r
+                where r.referrer_user_id = indexer_users.user_id
+                  and r.reward_month = date_trunc('month', current_date)::date
+              ), 0)::bigint as bonus_requests_this_month
+            from indexer_users
+            where user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        Ok(ReferralSummary {
+            referral_code: row
+                .try_get("referral_code")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            reward_per_verified_referral: 25_000,
+            monthly_reward_cap: 250_000,
+            rewarded_referrals_this_month: row
+                .try_get("rewarded_referrals_this_month")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            bonus_requests_this_month: row
+                .try_get("bonus_requests_this_month")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        })
     }
 
     pub async fn record_submitted_payment(
@@ -707,6 +887,14 @@ fn normalize_email(email: &str) -> LedgerResult<String> {
         return Err(LedgerError::Conflict("invalid email".to_owned()));
     }
     Ok(email)
+}
+
+fn new_referral_code() -> String {
+    format!("lf{}", Uuid::new_v4().simple())
+        .chars()
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 fn ensure_valid_purpose(purpose: &str) -> LedgerResult<()> {

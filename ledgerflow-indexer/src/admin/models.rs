@@ -25,6 +25,15 @@ pub struct Plan {
     pub monthly_request_quota: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ReferralSummary {
+    pub referral_code: String,
+    pub reward_per_verified_referral: i64,
+    pub monthly_reward_cap: i64,
+    pub rewarded_referrals_this_month: i64,
+    pub bonus_requests_this_month: i64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct StartEmailRequest {
     pub email: String,
@@ -46,6 +55,7 @@ pub struct RegisterVerifyRequest {
     pub email: String,
     pub code: String,
     pub password: String,
+    pub referral_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
