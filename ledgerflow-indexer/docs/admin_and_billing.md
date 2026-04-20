@@ -27,14 +27,19 @@ Email verification uses Postmark when `LEDGERFLOW_POSTMARK_SERVER_TOKEN` is set.
 
 Flow:
 
-1. `POST /admin/auth/email/start`
+1. `POST /admin/auth/register/start`
 2. Generate a short-lived code.
 3. Store only the SHA-256 hash of the code.
 4. Send the code via Postmark.
-5. `POST /admin/auth/email/verify`
-6. Mark the user email verified.
+5. Reject repeat sends for the same email and purpose within 60 seconds.
+6. `POST /admin/auth/register/verify`
+7. Mark the user email verified.
+8. Store the password using Argon2 PHC format.
+9. Issue an HttpOnly `ledgerflow_session` cookie.
 
 The local scaffold returns `email_delivery: disabled` when Postmark is not configured.
+
+Password reset uses the same email-code mechanism through `/admin/auth/password-reset/start` and `/admin/auth/password-reset/verify`.
 
 ## Base ETH Subscription Payments
 

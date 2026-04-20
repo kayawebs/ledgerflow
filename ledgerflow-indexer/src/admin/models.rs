@@ -37,6 +37,36 @@ pub struct VerifyEmailRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct RegisterStartRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterVerifyRequest {
+    pub email: String,
+    pub code: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordLoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordResetStartRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PasswordResetVerifyRequest {
+    pub email: String,
+    pub code: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateApiKeyRequest {
     pub email: String,
     pub name: String,

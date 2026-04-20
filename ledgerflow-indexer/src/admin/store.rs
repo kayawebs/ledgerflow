@@ -1,4 +1,9 @@
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+};
 use chrono::{Duration, Utc};
+use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -32,6 +37,7 @@ impl PostgresAdminStore {
             create table if not exists indexer_users (
               user_id uuid primary key,
               email text not null unique,
+              password_hash text,
               email_verified boolean not null default false,
               created_at timestamptz not null default now(),
               updated_at timestamptz not null default now()
@@ -41,6 +47,7 @@ impl PostgresAdminStore {
             create table if not exists indexer_email_otps (
               otp_id uuid primary key,
               email text not null,
+              purpose text not null default 'verify_email',
               code_hash text not null,
               expires_at timestamptz not null,
               consumed_at timestamptz,
@@ -106,6 +113,20 @@ impl PostgresAdminStore {
             )
             "#,
             r#"
+            create table if not exists indexer_sessions (
+              session_id uuid primary key,
+              user_id uuid not null references indexer_users(user_id),
+              token_hash text not null unique,
+              expires_at timestamptz not null,
+              revoked_at timestamptz,
+              created_at timestamptz not null default now()
+            )
+            "#,
+            "alter table indexer_users add column if not exists password_hash text",
+            "alter table indexer_email_otps add column if not exists purpose text not null default 'verify_email'",
+            "create index if not exists indexer_email_otps_email_purpose_created_idx on indexer_email_otps (email, purpose, created_at desc)",
+            "create index if not exists indexer_sessions_token_hash_idx on indexer_sessions (token_hash)",
+            r#"
             insert into indexer_plans (plan_id, name, monthly_price_wei, monthly_request_quota)
             values
               ('developer', 'Developer', 10000000000000000, 1000000),
@@ -123,18 +144,47 @@ impl PostgresAdminStore {
         Ok(())
     }
 
-    pub async fn create_email_otp(&self, email: &str, code: &str) -> LedgerResult<()> {
+    pub async fn create_email_otp_for_purpose(
+        &self,
+        email: &str,
+        code: &str,
+        purpose: &str,
+    ) -> LedgerResult<()> {
         let email = normalize_email(email)?;
+        ensure_valid_purpose(purpose)?;
+        let recent = sqlx::query(
+            r#"
+            select created_at
+            from indexer_email_otps
+            where email = $1
+              and purpose = $2
+              and created_at > now() - interval '60 seconds'
+            order by created_at desc
+            limit 1
+            "#,
+        )
+        .bind(&email)
+        .bind(purpose)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        if recent.is_some() {
+            return Err(LedgerError::Conflict(
+                "verification code already sent; wait 60 seconds before retrying".to_owned(),
+            ));
+        }
+
         let code_hash = hash_secret(code);
         let expires_at = Utc::now() + Duration::minutes(10);
         sqlx::query(
             r#"
-            insert into indexer_email_otps (otp_id, email, code_hash, expires_at)
-            values ($1, $2, $3, $4)
+            insert into indexer_email_otps (otp_id, email, purpose, code_hash, expires_at)
+            values ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(Uuid::new_v4())
         .bind(email)
+        .bind(purpose)
         .bind(code_hash)
         .bind(expires_at)
         .execute(&self.pool)
@@ -144,7 +194,18 @@ impl PostgresAdminStore {
     }
 
     pub async fn verify_email_otp(&self, email: &str, code: &str) -> LedgerResult<User> {
+        self.verify_email_otp_for_purpose(email, code, "verify_email")
+            .await
+    }
+
+    pub async fn verify_email_otp_for_purpose(
+        &self,
+        email: &str,
+        code: &str,
+        purpose: &str,
+    ) -> LedgerResult<User> {
         let email = normalize_email(email)?;
+        ensure_valid_purpose(purpose)?;
         let code_hash = hash_secret(code);
         let mut tx = self
             .pool
@@ -157,7 +218,8 @@ impl PostgresAdminStore {
             select otp_id
             from indexer_email_otps
             where email = $1
-              and code_hash = $2
+              and purpose = $2
+              and code_hash = $3
               and consumed_at is null
               and expires_at > now()
             order by created_at desc
@@ -165,6 +227,7 @@ impl PostgresAdminStore {
             "#,
         )
         .bind(&email)
+        .bind(purpose)
         .bind(code_hash)
         .fetch_optional(&mut *tx)
         .await
@@ -205,6 +268,115 @@ impl PostgresAdminStore {
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;
 
         row_to_user(row)
+    }
+
+    pub async fn set_user_password(&self, email: &str, password: &str) -> LedgerResult<User> {
+        let email = normalize_email(email)?;
+        let password_hash = hash_password(password)?;
+        let row = sqlx::query(
+            r#"
+            update indexer_users
+            set password_hash = $2,
+                email_verified = true,
+                updated_at = now()
+            where email = $1
+            returning user_id, email, email_verified, created_at
+            "#,
+        )
+        .bind(&email)
+        .bind(password_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let Some(row) = row else {
+            return Err(LedgerError::Conflict("user not found".to_owned()));
+        };
+        row_to_user(row)
+    }
+
+    pub async fn authenticate_password(&self, email: &str, password: &str) -> LedgerResult<User> {
+        let email = normalize_email(email)?;
+        let row = sqlx::query(
+            r#"
+            select user_id, email, email_verified, created_at, password_hash
+            from indexer_users
+            where email = $1
+              and email_verified = true
+            "#,
+        )
+        .bind(&email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let Some(row) = row else {
+            return Err(LedgerError::Unauthorized(
+                "invalid email or password".to_owned(),
+            ));
+        };
+        let password_hash = row
+            .try_get::<Option<String>, _>("password_hash")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let Some(password_hash) = password_hash else {
+            return Err(LedgerError::Unauthorized(
+                "password login is not enabled for this account".to_owned(),
+            ));
+        };
+        if !verify_password(password, &password_hash)? {
+            return Err(LedgerError::Unauthorized(
+                "invalid email or password".to_owned(),
+            ));
+        }
+        row_to_user(row)
+    }
+
+    pub async fn create_session(&self, user_id: Uuid) -> LedgerResult<String> {
+        let token = format!("lfs_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_hash = hash_secret(&token);
+        let expires_at = Utc::now() + Duration::days(30);
+        sqlx::query(
+            r#"
+            insert into indexer_sessions (session_id, user_id, token_hash, expires_at)
+            values ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(token)
+    }
+
+    pub async fn get_user_by_session(&self, token: &str) -> LedgerResult<Option<User>> {
+        let token_hash = hash_secret(token);
+        let row = sqlx::query(
+            r#"
+            select u.user_id, u.email, u.email_verified, u.created_at
+            from indexer_sessions s
+            join indexer_users u on u.user_id = s.user_id
+            where s.token_hash = $1
+              and s.revoked_at is null
+              and s.expires_at > now()
+            limit 1
+            "#,
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        row.map(row_to_user).transpose()
+    }
+
+    pub async fn revoke_session(&self, token: &str) -> LedgerResult<()> {
+        let token_hash = hash_secret(token);
+        sqlx::query("update indexer_sessions set revoked_at = now() where token_hash = $1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
     }
 
     pub async fn create_api_key(&self, email: &str, name: &str) -> LedgerResult<ApiKeyCreated> {
@@ -535,6 +707,36 @@ fn normalize_email(email: &str) -> LedgerResult<String> {
         return Err(LedgerError::Conflict("invalid email".to_owned()));
     }
     Ok(email)
+}
+
+fn ensure_valid_purpose(purpose: &str) -> LedgerResult<()> {
+    match purpose {
+        "verify_email" | "password_reset" => Ok(()),
+        _ => Err(LedgerError::Conflict(format!(
+            "unsupported verification purpose: {purpose}"
+        ))),
+    }
+}
+
+fn hash_password(password: &str) -> LedgerResult<String> {
+    if password.len() < 8 {
+        return Err(LedgerError::Conflict(
+            "password must be at least 8 characters".to_owned(),
+        ));
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| LedgerError::Persistence(err.to_string()))
+}
+
+fn verify_password(password: &str, encoded: &str) -> LedgerResult<bool> {
+    let parsed =
+        PasswordHash::new(encoded).map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
 }
 
 fn hash_secret(secret: &str) -> String {

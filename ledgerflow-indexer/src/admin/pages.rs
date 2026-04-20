@@ -32,7 +32,8 @@ pub fn home() -> &'static str {
       display: flex; justify-content: space-between; align-items: center;
       padding: 24px clamp(20px, 5vw, 72px);
     }
-    .brand { font-size: 22px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .brand { font-size: 22px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; display:inline-flex; align-items:center; gap:10px; }
+    .brand svg { width:34px; height:34px; }
     .navlinks { display: flex; gap: 18px; align-items: center; font-family: ui-sans-serif, system-ui; }
     .pill {
       border: 1px solid var(--line); border-radius: 999px; padding: 10px 16px;
@@ -78,7 +79,7 @@ pub fn home() -> &'static str {
 </head>
 <body>
   <nav class="nav">
-    <a class="brand" href="/">LedgerFlow</a>
+    <a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a>
     <div class="navlinks">
       <a href="/docs">Docs</a>
       <a href="/login">Login</a>
@@ -130,32 +131,45 @@ pub fn login() -> &'static str {
     .shell { width:min(980px,100%); display:grid; grid-template-columns:.95fr 1.05fr; gap:18px; }
     .panel { border:1px solid var(--line); border-radius:30px; background:rgba(255,250,241,.82); padding:30px; }
     h1 { font-size: clamp(38px,6vw,72px); line-height:.92; letter-spacing:-.055em; margin:0 0 20px; }
-    p, label, button, input, .status, a { font-family:ui-sans-serif,system-ui; }
+    p, label, button, input, .status, a, select { font-family:ui-sans-serif,system-ui; }
     p { color:var(--muted); line-height:1.6; }
     label { display:block; font-size:12px; text-transform:uppercase; letter-spacing:.14em; color:var(--muted); margin:18px 0 8px; }
-    input { width:100%; border:1px solid var(--line); border-radius:16px; padding:14px 15px; background:#fffaf1; color:var(--ink); font-size:15px; }
+    input, select { width:100%; border:1px solid var(--line); border-radius:16px; padding:14px 15px; background:#fffaf1; color:var(--ink); font-size:15px; }
     button { width:100%; margin-top:16px; border:0; border-radius:999px; padding:14px 18px; background:var(--ink); color:var(--paper); font-weight:760; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
     button.secondary { background:transparent; color:var(--ink); border:1px solid var(--line); }
     .status { margin-top:16px; white-space:pre-wrap; color:var(--muted); line-height:1.5; }
     .nav { position:fixed; top:22px; left:24px; right:24px; display:flex; justify-content:space-between; font-family:ui-sans-serif,system-ui; }
     .nav a { color:var(--ink); text-decoration:none; }
+    .brand { display:inline-flex; align-items:center; gap:10px; font-weight:850; letter-spacing:.08em; text-transform:uppercase; }
+    .brand svg { width:32px; height:32px; }
     @media (max-width:820px) { .shell { grid-template-columns:1fr; padding-top:64px; } }
   </style>
 </head>
 <body>
-  <nav class="nav"><a href="/">LedgerFlow</a><a href="/docs">Docs</a></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><a href="/docs">Docs</a></nav>
   <main class="shell">
     <section class="panel">
-      <h1>Sign in with email verification.</h1>
-      <p>Use the same flow for login and registration. We send a short-lived code through Postmark. After verification, continue to the dashboard to create API keys and activate a subscription.</p>
+      <h1>Account access for the indexer API.</h1>
+      <p>Create an account with email verification and password, then use the dashboard to create API keys and activate a subscription. Verification codes can only be sent once per minute.</p>
     </section>
     <section class="panel">
+      <label for="mode">Flow</label>
+      <select id="mode">
+        <option value="login">Password login</option>
+        <option value="register">Register with email code</option>
+        <option value="reset">Forgot password</option>
+      </select>
       <label for="email">Email</label>
       <input id="email" type="email" placeholder="operator@example.com" autocomplete="email">
-      <button id="send">Send verification code</button>
-      <label for="code">Verification code</label>
-      <input id="code" placeholder="123456" inputmode="numeric">
-      <button id="verify">Verify and enter dashboard</button>
+      <label for="password">Password</label>
+      <input id="password" type="password" placeholder="at least 8 characters" autocomplete="current-password">
+      <div id="code-area" style="display:none">
+        <button id="send">Send verification code</button>
+        <label for="code">Verification code</label>
+        <input id="code" placeholder="123456" inputmode="numeric">
+      </div>
+      <button id="submit">Continue</button>
       <button class="secondary" onclick="location.href='/dashboard'">I already have access</button>
       <div id="status" class="status"></div>
     </section>
@@ -169,24 +183,57 @@ pub fn login() -> &'static str {
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       return data;
     }
+    const modeEl = document.getElementById("mode");
+    const sendBtn = document.getElementById("send");
+    const codeArea = document.getElementById("code-area");
+    let cooldownUntil = Number(localStorage.getItem("ledgerflow_code_cooldown_until") || 0);
+    function updateMode() {
+      const needsCode = modeEl.value !== "login";
+      codeArea.style.display = needsCode ? "block" : "none";
+      document.getElementById("password").autocomplete = modeEl.value === "login" ? "current-password" : "new-password";
+      document.getElementById("submit").textContent = modeEl.value === "login" ? "Login" : modeEl.value === "register" ? "Verify and create account" : "Reset password and login";
+    }
+    function updateCooldown() {
+      const remaining = Math.max(0, Math.ceil((cooldownUntil - Date.now()) / 1000));
+      if (remaining > 0) {
+        sendBtn.disabled = true;
+        sendBtn.textContent = `Code sent. Retry in ${remaining}s`;
+      } else {
+        sendBtn.disabled = false;
+        sendBtn.textContent = "Send verification code";
+      }
+    }
+    setInterval(updateCooldown, 500);
+    modeEl.onchange = updateMode;
     document.getElementById("send").onclick = async () => {
       try {
         const email = document.getElementById("email").value.trim();
         localStorage.setItem("ledgerflow_email", email);
-        const data = await post("/admin/auth/email/start", { email });
-        setStatus(data.dev_code_hint ? `Code sent. Dev code: ${data.dev_code_hint}` : "Code sent. Check your email.");
+        const endpoint = modeEl.value === "reset" ? "/admin/auth/password-reset/start" : "/admin/auth/register/start";
+        const data = await post(endpoint, { email });
+        cooldownUntil = Date.now() + Number(data.resend_after_seconds || 60) * 1000;
+        localStorage.setItem("ledgerflow_code_cooldown_until", String(cooldownUntil));
+        updateCooldown();
+        setStatus(data.dev_code_hint ? `Code sent. Dev code: ${data.dev_code_hint}` : "Code sent. Check your email. You can request another code in 60 seconds.");
       } catch (err) { setStatus(err.message); }
     };
-    document.getElementById("verify").onclick = async () => {
+    document.getElementById("submit").onclick = async () => {
       try {
         const email = document.getElementById("email").value.trim();
+        const password = document.getElementById("password").value;
         const code = document.getElementById("code").value.trim();
-        const data = await post("/admin/auth/email/verify", { email, code });
+        const data = modeEl.value === "login"
+          ? await post("/admin/auth/login", { email, password })
+          : modeEl.value === "register"
+            ? await post("/admin/auth/register/verify", { email, code, password })
+            : await post("/admin/auth/password-reset/verify", { email, code, new_password: password });
         localStorage.setItem("ledgerflow_email", data.user.email);
         location.href = "/dashboard";
       } catch (err) { setStatus(err.message); }
     };
     document.getElementById("email").value = localStorage.getItem("ledgerflow_email") || "";
+    updateMode();
+    updateCooldown();
   </script>
 </body>
 </html>"##
@@ -204,7 +251,8 @@ pub fn dashboard() -> &'static str {
     * { box-sizing:border-box; }
     body { margin:0; color:var(--ink); background:radial-gradient(circle at 10% 0%,rgba(184,93,36,.16),transparent 28rem),linear-gradient(135deg,#fbf7ef,#efe2cf); font-family:Georgia,"Times New Roman",serif; }
     .nav { display:flex; justify-content:space-between; align-items:center; padding:22px clamp(18px,4vw,54px); }
-    .brand { font-weight:900; letter-spacing:.08em; text-transform:uppercase; }
+    .brand { font-weight:900; letter-spacing:.08em; text-transform:uppercase; display:inline-flex; align-items:center; gap:10px; }
+    .brand svg { width:32px; height:32px; }
     .nav a, button, input, select, textarea, p, label, .mono, .status { font-family:ui-sans-serif,system-ui; }
     a { color:inherit; text-decoration:none; }
     .wrap { padding:12px clamp(18px,4vw,54px) 64px; }
@@ -229,11 +277,11 @@ pub fn dashboard() -> &'static str {
   </style>
 </head>
 <body>
-  <nav class="nav"><a class="brand" href="/">LedgerFlow</a><div><a href="/docs">Docs</a> &nbsp; <a href="/login">Login</a></div></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/docs">Docs</a> &nbsp; <a href="/login">Login</a></div></nav>
   <main class="wrap">
     <section class="hero">
       <div><h1>Indexer dashboard.</h1><p class="muted">Manage API keys, activate subscriptions, and test Base address queries from the same origin your customers will use.</p></div>
-      <button class="secondary" id="clear">Clear local session</button>
+      <button class="secondary" id="logout">Logout</button>
     </section>
     <section class="grid">
       <article class="card third"><h2>Account</h2><label>Email</label><input id="email" type="email" placeholder="operator@example.com"><button id="save-email">Save email</button><p class="muted">Email verification happens on the login page. This dashboard uses your verified email for key and payment operations.</p></article>
@@ -290,8 +338,18 @@ pub fn dashboard() -> &'static str {
     }
     const authHeaders = () => ({ Authorization: `Bearer ${$("api-key").value.trim()}` });
 
+    async function loadMe() {
+      const data = await getJson("/admin/auth/me");
+      $("email").value = data.user.email;
+      localStorage.setItem("ledgerflow_email", data.user.email);
+    }
     $("save-email").onclick = () => { localStorage.setItem("ledgerflow_email", $("email").value.trim()); };
-    $("clear").onclick = () => { localStorage.removeItem("ledgerflow_email"); localStorage.removeItem("ledgerflow_api_key"); location.href="/"; };
+    $("logout").onclick = async () => {
+      try { await postJson("/admin/auth/logout", {}); } catch (_) {}
+      localStorage.removeItem("ledgerflow_email");
+      localStorage.removeItem("ledgerflow_api_key");
+      location.href="/login";
+    };
 
     async function loadConfig() {
       const config = await getJson("/admin/config");
@@ -337,6 +395,7 @@ pub fn dashboard() -> &'static str {
       } catch (err) { $("query-result").textContent = err.message; }
     };
 
+    loadMe().catch(() => { location.href = "/login"; });
     loadConfig().catch((err) => { $("treasury").textContent = err.message; });
   </script>
 </body>
@@ -355,6 +414,8 @@ pub fn docs() -> &'static str {
     * { box-sizing:border-box; }
     body { margin:0; color:var(--ink); background:#fbf7ef; font-family:Georgia,"Times New Roman",serif; }
     .nav { display:flex; justify-content:space-between; padding:22px clamp(18px,4vw,54px); border-bottom:1px solid var(--line); background:#fffaf1; position:sticky; top:0; }
+    .brand { display:inline-flex; align-items:center; gap:10px; font-weight:850; letter-spacing:.08em; text-transform:uppercase; }
+    .brand svg { width:32px; height:32px; }
     .nav a, p, li, code, pre, th, td { font-family:ui-sans-serif,system-ui; }
     a { color:inherit; text-decoration:none; }
     main { width:min(1080px,100%); margin:0 auto; padding:42px 22px 80px; }
@@ -369,7 +430,7 @@ pub fn docs() -> &'static str {
   </style>
 </head>
 <body>
-  <nav class="nav"><a href="/">LedgerFlow</a><div><a href="/login">Login</a> &nbsp; <a href="/dashboard">Dashboard</a></div></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/login">Login</a> &nbsp; <a href="/dashboard">Dashboard</a></div></nav>
   <main>
     <h1>LedgerFlow Indexer API docs.</h1>
     <p>LedgerFlow Indexer is a Base top-level address reference API. It answers which transaction hashes touched an address as top-level <code>from</code> or <code>to</code>, and is designed as a fast discovery layer for bots, wallet operations, and transaction analysis systems.</p>

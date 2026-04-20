@@ -76,20 +76,39 @@ curl -s http://127.0.0.1:8090/v1/base/addresses/txs \
 
 ## Admin API Examples
 
-Start email verification:
+The customer dashboard is served from the same process:
+
+```text
+/               public landing page
+/login          register, login, password reset
+/dashboard      authenticated customer dashboard
+/docs           public API docs
+```
+
+`/dashboard` requires a valid `ledgerflow_session` cookie. The login page supports password login, email-code registration, and password reset.
+
+Start registration email verification:
 
 ```bash
-curl -s http://127.0.0.1:8090/admin/auth/email/start \
+curl -s http://127.0.0.1:8090/admin/auth/register/start \
   -H 'content-type: application/json' \
   -d '{"email":"operator@example.com"}' | jq
 ```
 
-Verify email:
+Complete registration and set a password:
 
 ```bash
-curl -s http://127.0.0.1:8090/admin/auth/email/verify \
+curl -i -s http://127.0.0.1:8090/admin/auth/register/verify \
   -H 'content-type: application/json' \
-  -d '{"email":"operator@example.com","code":"123456"}' | jq
+  -d '{"email":"operator@example.com","code":"123456","password":"replace-with-a-long-password"}'
+```
+
+Password login:
+
+```bash
+curl -i -s http://127.0.0.1:8090/admin/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email":"operator@example.com","password":"replace-with-a-long-password"}'
 ```
 
 Create an API key after verification:
