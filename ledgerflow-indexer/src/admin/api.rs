@@ -20,10 +20,12 @@ use crate::admin::models::{
 use crate::admin::pages;
 use crate::admin::store::PostgresAdminStore;
 use crate::core::errors::LedgerError;
+use crate::indexer::service::IndexerService;
 
 #[derive(Clone)]
 pub struct AdminState {
     pub store: Arc<PostgresAdminStore>,
+    pub indexer_service: Arc<IndexerService>,
     pub payment_verifier: Arc<BaseEthPaymentVerifier>,
     pub postmark_server_token: Option<String>,
     pub email_from: String,
@@ -36,12 +38,17 @@ pub fn router(state: AdminState) -> Router {
         .route("/", get(home_page))
         .route("/login", get(login_page))
         .route("/pricing", get(pricing_page))
+        .route("/subscribe", get(subscribe_page))
+        .route("/referrals", get(referrals_page))
         .route("/dashboard", get(dashboard_page))
         .route("/docs", get(docs_page))
         .route("/admin", get(dashboard_page))
         .route("/admin/health", get(admin_health))
         .route("/admin/config", get(admin_config))
+        .route("/admin/progress", get(admin_progress))
         .route("/admin/billing/plans", get(list_billing_plans))
+        .route("/admin/account/summary", get(account_summary))
+        .route("/admin/usage/summary", get(usage_summary))
         .route("/admin/referral", get(referral_summary))
         .route("/admin/auth/me", get(auth_me))
         .route("/admin/auth/register/start", post(register_start))
@@ -78,14 +85,32 @@ async fn pricing_page() -> Html<&'static str> {
     Html(pages::pricing())
 }
 
+async fn subscribe_page(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Response, AdminApiError> {
+    if current_user(&state, &headers).await?.is_some() {
+        return Ok(Html(pages::subscribe()).into_response());
+    }
+    Ok(Redirect::to("/login").into_response())
+}
+
+async fn referrals_page(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Response, AdminApiError> {
+    if current_user(&state, &headers).await?.is_some() {
+        return Ok(Html(pages::referrals()).into_response());
+    }
+    Ok(Redirect::to("/login").into_response())
+}
+
 async fn dashboard_page(
     State(state): State<AdminState>,
     headers: HeaderMap,
 ) -> Result<Response, AdminApiError> {
-    if let Some(token) = session_token(&headers) {
-        if state.store.get_user_by_session(token).await?.is_some() {
-            return Ok(Html(pages::dashboard()).into_response());
-        }
+    if current_user(&state, &headers).await?.is_some() {
+        return Ok(Html(pages::dashboard()).into_response());
     }
     Ok(Redirect::to("/login").into_response())
 }
@@ -114,16 +139,47 @@ async fn list_billing_plans(
     Ok(Json(json!({ "plans": plans })))
 }
 
+async fn admin_progress(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AdminApiError> {
+    require_user(&state, &headers).await?;
+    let progress = state.indexer_service.get_progress().await?;
+    Ok(Json(json!({
+        "chain": "base",
+        "chain_id": state.indexer_service.config.chain_id,
+        "worker_id": state.indexer_service.config.worker_id,
+        "last_indexed_block": progress
+    })))
+}
+
+async fn account_summary(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AdminApiError> {
+    let user = require_user(&state, &headers).await?;
+    let summary = state.store.get_account_usage_summary(user.user_id).await?;
+    Ok(Json(json!({ "summary": summary })))
+}
+
+async fn usage_summary(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AdminApiError> {
+    let user = require_user(&state, &headers).await?;
+    let stats = state.store.get_usage_endpoint_stats(user.user_id).await?;
+    let failures = state.store.get_recent_failures(user.user_id, 20).await?;
+    Ok(Json(json!({
+        "stats": stats,
+        "recent_failures": failures
+    })))
+}
+
 async fn auth_me(
     State(state): State<AdminState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AdminApiError> {
-    let Some(token) = session_token(&headers) else {
-        return Err(LedgerError::Unauthorized("not logged in".to_owned()).into());
-    };
-    let Some(user) = state.store.get_user_by_session(token).await? else {
-        return Err(LedgerError::Unauthorized("session expired".to_owned()).into());
-    };
+    let user = require_user(&state, &headers).await?;
     Ok(Json(json!({ "user": user })))
 }
 
@@ -131,12 +187,7 @@ async fn referral_summary(
     State(state): State<AdminState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AdminApiError> {
-    let Some(token) = session_token(&headers) else {
-        return Err(LedgerError::Unauthorized("not logged in".to_owned()).into());
-    };
-    let Some(user) = state.store.get_user_by_session(token).await? else {
-        return Err(LedgerError::Unauthorized("session expired".to_owned()).into());
-    };
+    let user = require_user(&state, &headers).await?;
     let referral = state.store.get_referral_summary(user.user_id).await?;
     Ok(Json(json!({ "referral": referral })))
 }
@@ -283,6 +334,29 @@ fn session_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+async fn current_user(
+    state: &AdminState,
+    headers: &HeaderMap,
+) -> Result<Option<crate::admin::models::User>, AdminApiError> {
+    let Some(token) = session_token(headers) else {
+        return Ok(None);
+    };
+    state
+        .store
+        .get_user_by_session(token)
+        .await
+        .map_err(AdminApiError::from)
+}
+
+async fn require_user(
+    state: &AdminState,
+    headers: &HeaderMap,
+) -> Result<crate::admin::models::User, AdminApiError> {
+    current_user(state, headers)
+        .await?
+        .ok_or_else(|| LedgerError::Unauthorized("not logged in".to_owned()).into())
+}
+
 fn session_cookie(token: &str) -> String {
     format!("ledgerflow_session={token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax")
 }
@@ -293,11 +367,13 @@ fn expired_session_cookie() -> String {
 
 async fn create_api_key(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(request): Json<CreateApiKeyRequest>,
 ) -> Result<Json<serde_json::Value>, AdminApiError> {
+    let user = require_user(&state, &headers).await?;
     let api_key = state
         .store
-        .create_api_key(&request.email, &request.name)
+        .create_api_key(&user.email, &request.name)
         .await?;
     Ok(Json(json!({
         "status": "created",
@@ -308,13 +384,15 @@ async fn create_api_key(
 
 async fn submit_base_eth_payment(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(request): Json<SubmitBaseEthPaymentRequest>,
 ) -> Result<Json<serde_json::Value>, AdminApiError> {
+    let user = require_user(&state, &headers).await?;
     let minimum_amount_wei = state.store.get_plan_price_wei(&request.plan_id).await?;
     let (payment_id, user_id) = state
         .store
         .record_submitted_payment(
-            &request.email,
+            &user.email,
             &request.plan_id,
             &request.tx_hash,
             request.from_address.as_deref(),

@@ -167,7 +167,7 @@ pub fn pricing() -> &'static str {
           <li>API key dashboard and usage metering</li>
           <li>Base ETH subscription payment</li>
         </ul>
-        <a class="button" href="/login">Start with launch discount</a>
+        <a class="button" href="/subscribe">Subscribe with launch discount</a>
       </div>
       <aside class="aside">
         <h2>Referral bonus</h2>
@@ -346,26 +346,29 @@ pub fn dashboard() -> &'static str {
     label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.14em; color:var(--muted); margin:14px 0 7px; }
     input, select, textarea { width:100%; border:1px solid var(--line); border-radius:14px; background:#fffaf1; color:var(--ink); padding:12px 13px; font-size:14px; }
     textarea { min-height:96px; resize:vertical; }
-    button { border:0; border-radius:999px; background:var(--ink); color:var(--paper); padding:12px 16px; font-weight:760; cursor:pointer; margin-top:14px; }
-    button.secondary { background:transparent; border:1px solid var(--line); color:var(--ink); }
-    .status, pre { white-space:pre-wrap; border-radius:18px; padding:14px; background:#18130f; color:#f7ead8; overflow:auto; }
+    button, .button { border:0; border-radius:999px; background:var(--ink); color:var(--paper); padding:12px 16px; font-weight:760; cursor:pointer; margin-top:14px; display:inline-flex; justify-content:center; }
+    button.secondary, .button.secondary { background:transparent; border:1px solid var(--line); color:var(--ink); }
+    .status, pre { white-space:pre-wrap; border-radius:18px; padding:14px; background:#18130f; color:#f7ead8; overflow:auto; margin-top:14px; }
     pre { min-height:120px; font-size:12px; line-height:1.6; }
     .metric { font-size:38px; font-weight:800; letter-spacing:-.05em; }
+    .metric.small { font-size:28px; }
     .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; word-break:break-all; }
+    .table { width:100%; border-collapse:collapse; font-family:ui-sans-serif,system-ui; }
+    .table td, .table th { text-align:left; border-bottom:1px solid var(--line); padding:9px 4px; font-size:13px; }
     @media (max-width:900px) { .card, .card.third { grid-column:span 12; } .hero { display:block; } }
   </style>
 </head>
 <body>
-  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/docs">Docs</a> &nbsp; <a href="/login">Login</a></div></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/subscribe">Subscribe</a> &nbsp; <a href="/referrals">Referrals</a> &nbsp; <a href="/docs">Docs</a> &nbsp; <a href="/login">Login</a></div></nav>
   <main class="wrap">
     <section class="hero">
-      <div><h1>Indexer dashboard.</h1><p class="muted">Manage API keys, activate subscriptions, and test Base address queries from the same origin your customers will use.</p></div>
+      <div><h1>Indexer dashboard.</h1><p class="muted">Manage API keys, subscription status, quota, usage, and referral credits.</p></div>
       <button class="secondary" id="logout">Logout</button>
     </section>
     <section class="grid">
       <article class="card third"><h2>Account</h2><label>Email</label><input id="email" type="email" placeholder="operator@example.com"><button id="save-email">Save email</button><p class="muted">Email verification happens on the login page. This dashboard uses your verified email for key and payment operations.</p></article>
-      <article class="card third"><h2>Indexer</h2><div class="metric" id="progress">—</div><p class="muted">Last indexed Base block. Requires a valid API key with an active subscription.</p><button id="load-progress">Load progress</button></article>
-      <article class="card third"><h2>Billing</h2><p class="muted">Treasury</p><div class="mono" id="treasury">loading...</div><p class="muted">Confirmations required: <span id="confirmations">—</span></p><button id="load-config">Reload billing config</button></article>
+      <article class="card third"><h2>Indexer</h2><div class="metric" id="progress">—</div><p class="muted">Last indexed Base block, loaded through your logged-in dashboard session.</p><button id="load-progress">Load progress</button></article>
+      <article class="card third"><h2>Quota</h2><div class="metric small" id="quota-remaining">—</div><p class="muted" id="quota-detail">Loading account quota...</p><a class="button" href="/subscribe">Subscribe / renew</a></article>
 
       <article class="card">
         <h2>Create API key</h2>
@@ -376,40 +379,26 @@ pub fn dashboard() -> &'static str {
       </article>
 
       <article class="card">
-        <h2>Activate subscription</h2>
-        <label>Plan</label><select id="plan"></select>
-        <label>Payment tx hash</label><input id="payment-tx" placeholder="0x...">
-        <label>From address (optional but recommended)</label><input id="payment-from" placeholder="0x...">
-        <button id="submit-payment">Verify payment</button>
-        <div class="status" id="payment-status">Submit a Base ETH transfer tx hash after sending payment.</div>
-      </article>
-
-      <article class="card">
         <h2>Referral bonus</h2>
         <p class="muted">Invite verified users. Each successful referral adds 25,000 bonus requests this month, capped at 250,000.</p>
         <label>Your referral code</label><input id="referral-code" readonly placeholder="loading...">
         <button id="copy-referral">Copy signup link</button>
+        <a class="button secondary" href="/referrals">Open referral page</a>
         <div class="status" id="referral-status">Referral stats will load after login.</div>
       </article>
 
       <article class="card wide">
-        <h2>Test address lookup</h2>
-        <div class="grid">
-          <div class="card third"><label>API key</label><input id="api-key" placeholder="lf_live_xxx"></div>
-          <div class="card third"><label>Address</label><input id="query-address" placeholder="0x..."></div>
-          <div class="card third"><label>Direction</label><select id="direction"><option value="">any</option><option value="from">from</option><option value="to">to</option></select></div>
-        </div>
-        <button id="query">Query latest txs</button>
-        <pre id="query-result">Waiting for query.</pre>
+        <h2>API usage this month</h2>
+        <p class="muted">Successful and failed authenticated public API calls are tracked separately. Recent failures show the latest error details for debugging.</p>
+        <div id="usage-summary">Loading usage...</div>
+        <pre id="failure-summary">Loading failures...</pre>
       </article>
     </section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
     const email = localStorage.getItem("ledgerflow_email") || "";
-    const apiKey = localStorage.getItem("ledgerflow_api_key") || "";
     $("email").value = email;
-    $("api-key").value = apiKey;
 
     async function getJson(url, headers = {}) {
       const res = await fetch(url, { headers });
@@ -423,8 +412,6 @@ pub fn dashboard() -> &'static str {
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       return data;
     }
-    const authHeaders = () => ({ Authorization: `Bearer ${$("api-key").value.trim()}` });
-
     async function loadMe() {
       const data = await getJson("/admin/auth/me");
       $("email").value = data.user.email;
@@ -440,12 +427,8 @@ pub fn dashboard() -> &'static str {
 
     async function loadConfig() {
       const config = await getJson("/admin/config");
-      $("treasury").textContent = config.billing.treasury_address;
-      $("confirmations").textContent = config.billing.required_confirmations;
-      const plans = await getJson("/admin/billing/plans");
-      $("plan").innerHTML = plans.plans.map((p) => `<option value="${p.plan_id}">${p.name} · ${Number(BigInt(p.monthly_price_wei)) / 1e18} ETH / ${p.monthly_request_quota.toLocaleString()} req</option>`).join("");
+      return config;
     }
-    $("load-config").onclick = () => loadConfig().catch((err) => alert(err.message));
     async function loadReferral() {
       const data = await getJson("/admin/referral");
       const r = data.referral;
@@ -461,42 +444,206 @@ pub fn dashboard() -> &'static str {
 
     $("create-key").onclick = async () => {
       try {
-        const data = await postJson("/admin/api-keys", { email: $("email").value.trim(), name: $("key-name").value.trim() || "production" });
+        const data = await postJson("/admin/api-keys", { name: $("key-name").value.trim() || "production" });
         const key = data.api_key.api_key;
         localStorage.setItem("ledgerflow_api_key", key);
-        $("api-key").value = key;
         $("key-status").textContent = JSON.stringify(data, null, 2);
       } catch (err) { $("key-status").textContent = err.message; }
     };
 
-    $("submit-payment").onclick = async () => {
-      try {
-        const payload = { email: $("email").value.trim(), plan_id: $("plan").value, tx_hash: $("payment-tx").value.trim(), from_address: $("payment-from").value.trim() || null };
-        const data = await postJson("/admin/billing/base-eth/payments", payload);
-        $("payment-status").textContent = JSON.stringify(data, null, 2);
-      } catch (err) { $("payment-status").textContent = err.message; }
-    };
-
     $("load-progress").onclick = async () => {
       try {
-        const data = await getJson("/v1/chains/base/progress", authHeaders());
+        const data = await getJson("/admin/progress");
         $("progress").textContent = data.last_indexed_block ?? "null";
       } catch (err) { $("progress").textContent = "blocked"; alert(err.message); }
     };
 
-    $("query").onclick = async () => {
-      try {
-        localStorage.setItem("ledgerflow_api_key", $("api-key").value.trim());
-        const params = new URLSearchParams({ limit: "25" });
-        if ($("direction").value) params.set("direction", $("direction").value);
-        const data = await getJson(`/v1/base/address/${$("query-address").value.trim()}/txs?${params}`, authHeaders());
-        $("query-result").textContent = JSON.stringify(data, null, 2);
-      } catch (err) { $("query-result").textContent = err.message; }
-    };
+    async function loadSummary() {
+      const data = await getJson("/admin/account/summary");
+      const s = data.summary;
+      const remaining = s.has_active_subscription ? s.subscription_remaining_this_month : s.bonus_remaining_this_month;
+      $("quota-remaining").textContent = remaining.toLocaleString();
+      $("quota-detail").textContent = s.has_active_subscription
+        ? `Active ${s.plan_id} subscription until ${new Date(s.current_period_end).toLocaleString()}. ${s.subscription_used_this_month.toLocaleString()} / ${s.subscription_quota.toLocaleString()} subscription requests used this month. Bonus credits are preserved for periods without subscription.`
+        : `No active subscription. Using bonus credits: ${s.bonus_used_this_month.toLocaleString()} used, ${s.bonus_remaining_this_month.toLocaleString()} remaining. Signup bonus: ${s.signup_bonus_requests.toLocaleString()}; referral bonus this month: ${s.referral_bonus_requests_this_month.toLocaleString()}.`;
+    }
+
+    async function loadUsage() {
+      const data = await getJson("/admin/usage/summary");
+      if (!data.stats.length) {
+        $("usage-summary").innerHTML = "<p class='muted'>No authenticated API usage yet.</p>";
+      } else {
+        $("usage-summary").innerHTML = `<table class="table"><tr><th>Endpoint</th><th>Source</th><th>Outcome</th><th>Count</th></tr>${data.stats.map((s) => `<tr><td>${s.endpoint}</td><td>${s.usage_source}</td><td>${s.outcome}</td><td>${Number(s.request_count).toLocaleString()}</td></tr>`).join("")}</table>`;
+      }
+      $("failure-summary").textContent = data.recent_failures.length ? JSON.stringify(data.recent_failures, null, 2) : "No recent API failures.";
+    }
 
     loadMe().catch(() => { location.href = "/login"; });
-    loadConfig().catch((err) => { $("treasury").textContent = err.message; });
+    $("load-progress").click();
+    loadSummary().catch((err) => { $("quota-detail").textContent = err.message; });
+    loadUsage().catch((err) => { $("failure-summary").textContent = err.message; });
     loadReferral().catch((err) => { $("referral-status").textContent = err.message; });
+  </script>
+</body>
+</html>"##
+}
+
+pub fn subscribe() -> &'static str {
+    r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Subscribe | LedgerFlow Indexer</title>
+  <style>
+    :root { --ink:#17130f; --paper:#fbf7ef; --line:#dacbb5; --muted:#6f675d; --accent:#b85d24; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:linear-gradient(135deg,#fbf7ef,#efe2cf); font-family:Georgia,"Times New Roman",serif; }
+    .nav { display:flex; justify-content:space-between; padding:22px clamp(18px,4vw,54px); font-family:ui-sans-serif,system-ui; }
+    .brand { display:inline-flex; align-items:center; gap:10px; font-weight:850; letter-spacing:.08em; text-transform:uppercase; }
+    .brand svg { width:32px; height:32px; }
+    a { color:inherit; text-decoration:none; }
+    main { width:min(1040px,100%); margin:0 auto; padding:38px 22px 80px; }
+    h1 { font-size:clamp(44px,7vw,88px); line-height:.9; letter-spacing:-.06em; margin:0 0 24px; }
+    h2 { margin:0 0 14px; font-size:28px; }
+    p, label, input, select, button, .status, li, .mono { font-family:ui-sans-serif,system-ui; }
+    p, li { color:var(--muted); line-height:1.65; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+    .card { border:1px solid var(--line); border-radius:28px; background:rgba(255,250,241,.9); padding:24px; }
+    label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.14em; color:var(--muted); margin:16px 0 7px; }
+    input, select { width:100%; border:1px solid var(--line); border-radius:14px; background:#fffaf1; color:var(--ink); padding:12px 13px; font-size:14px; }
+    button { border:0; border-radius:999px; background:var(--ink); color:var(--paper); padding:12px 16px; font-weight:760; cursor:pointer; margin-top:16px; }
+    .status { white-space:pre-wrap; border-radius:18px; padding:14px; background:#18130f; color:#f7ead8; overflow:auto; margin-top:16px; }
+    .price { font-size:64px; line-height:.9; letter-spacing:-.06em; margin:12px 0; }
+    .mono { word-break:break-all; font-size:13px; }
+    @media (max-width:850px) { .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/dashboard">Dashboard</a> &nbsp; <a href="/docs">Docs</a></div></nav>
+  <main>
+    <h1>Subscribe with Base ETH.</h1>
+    <section class="grid">
+      <article class="card">
+        <h2>Launch plan</h2>
+        <div class="price">0.009 ETH</div>
+        <p>30 days of access with 1,000,000 metered API requests. When a subscription is active, requests consume subscription quota first. Bonus credits are only used when no active subscription exists.</p>
+        <ol>
+          <li>Send exactly or at least the plan amount on Base to the treasury address.</li>
+          <li>Wait for the required confirmations.</li>
+          <li>Paste the Base transaction hash below and verify payment.</li>
+        </ol>
+      </article>
+      <article class="card">
+        <h2>Verify payment</h2>
+        <label>Email</label><input id="email" type="email" placeholder="operator@example.com">
+        <label>Plan</label><select id="plan"></select>
+        <label>Treasury address</label><div class="mono" id="treasury">loading...</div>
+        <p>Required confirmations: <span id="confirmations">—</span></p>
+        <label>Payment tx hash</label><input id="payment-tx" placeholder="0x...">
+        <label>From address (optional but recommended)</label><input id="payment-from" placeholder="0x...">
+        <button id="submit-payment">Verify payment</button>
+        <div class="status" id="payment-status">If payment verification fails unexpectedly, email peter@ledgerflow.top. We will handle it within 24 hours.</div>
+      </article>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    async function getJson(url) {
+      const res = await fetch(url);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    }
+    async function postJson(url, body) {
+      const res = await fetch(url, { method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    }
+    async function load() {
+      const me = await getJson("/admin/auth/me");
+      $("email").value = me.user.email;
+      const config = await getJson("/admin/config");
+      $("treasury").textContent = config.billing.treasury_address;
+      $("confirmations").textContent = config.billing.required_confirmations;
+      const plans = await getJson("/admin/billing/plans");
+      $("plan").innerHTML = plans.plans.map((p) => `<option value="${p.plan_id}">${p.name} · ${Number(BigInt(p.monthly_price_wei)) / 1e18} ETH / ${p.monthly_request_quota.toLocaleString()} req</option>`).join("");
+    }
+    $("submit-payment").onclick = async () => {
+      try {
+        const payload = { plan_id: $("plan").value, tx_hash: $("payment-tx").value.trim(), from_address: $("payment-from").value.trim() || null };
+        const data = await postJson("/admin/billing/base-eth/payments", payload);
+        $("payment-status").textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        $("payment-status").textContent = `${err.message}\n\nIf this looks wrong, email peter@ledgerflow.top. We will handle it within 24 hours.`;
+      }
+    };
+    load().catch(() => { location.href = "/login"; });
+  </script>
+</body>
+</html>"##
+}
+
+pub fn referrals() -> &'static str {
+    r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Referrals | LedgerFlow Indexer</title>
+  <style>
+    :root { --ink:#17130f; --paper:#fbf7ef; --line:#dacbb5; --muted:#6f675d; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:radial-gradient(circle at 80% 10%,rgba(97,119,81,.18),transparent 24rem),#fbf7ef; font-family:Georgia,"Times New Roman",serif; }
+    .nav { display:flex; justify-content:space-between; padding:22px clamp(18px,4vw,54px); font-family:ui-sans-serif,system-ui; }
+    .brand { display:inline-flex; align-items:center; gap:10px; font-weight:850; letter-spacing:.08em; text-transform:uppercase; }
+    .brand svg { width:32px; height:32px; }
+    a { color:inherit; text-decoration:none; }
+    main { width:min(920px,100%); margin:0 auto; padding:48px 22px 80px; }
+    h1 { font-size:clamp(44px,7vw,88px); line-height:.9; letter-spacing:-.06em; margin:0 0 24px; }
+    .card { border:1px solid var(--line); border-radius:28px; background:#fffaf1; padding:24px; }
+    p, label, input, button, .status { font-family:ui-sans-serif,system-ui; }
+    p { color:var(--muted); line-height:1.65; }
+    label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.14em; color:var(--muted); margin:16px 0 7px; }
+    input { width:100%; border:1px solid var(--line); border-radius:14px; background:#fbf7ef; color:var(--ink); padding:12px 13px; font-size:14px; }
+    button { border:0; border-radius:999px; background:var(--ink); color:var(--paper); padding:12px 16px; font-weight:760; cursor:pointer; margin-top:16px; }
+    .status { white-space:pre-wrap; border-radius:18px; padding:14px; background:#18130f; color:#f7ead8; overflow:auto; margin-top:16px; }
+  </style>
+</head>
+<body>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/dashboard">Dashboard</a> &nbsp; <a href="/subscribe">Subscribe</a></div></nav>
+  <main>
+    <h1>Referral credits.</h1>
+    <section class="card">
+      <p>Each verified referral grants 25,000 bonus requests this month, capped at 250,000. New accounts also receive 1,000 signup bonus requests. Bonus credits are consumed only when you do not have an active subscription.</p>
+      <label>Your referral code</label><input id="referral-code" readonly>
+      <label>Your signup link</label><input id="referral-link" readonly>
+      <button id="copy-referral">Copy signup link</button>
+      <div class="status" id="referral-status">Loading referral stats...</div>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    async function getJson(url) {
+      const res = await fetch(url);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    }
+    async function loadReferral() {
+      const data = await getJson("/admin/referral");
+      const r = data.referral;
+      const url = `${location.origin}/login?ref=${encodeURIComponent(r.referral_code)}`;
+      $("referral-code").value = r.referral_code;
+      $("referral-link").value = url;
+      $("referral-status").textContent = `${r.bonus_requests_this_month.toLocaleString()} bonus requests this month from ${r.rewarded_referrals_this_month} verified referrals. Monthly cap: ${r.monthly_reward_cap.toLocaleString()}.`;
+    }
+    $("copy-referral").onclick = async () => {
+      await navigator.clipboard.writeText($("referral-link").value);
+      $("referral-status").textContent += "\nCopied signup link.";
+    };
+    loadReferral().catch(() => { location.href = "/login"; });
   </script>
 </body>
 </html>"##
@@ -537,7 +684,7 @@ pub fn docs() -> &'static str {
 
     <h2>Authentication</h2>
     <pre>Authorization: Bearer lf_live_xxx</pre>
-    <p>Public <code>/v1</code> endpoints require an API key with an active subscription. Usage is metered daily per key and endpoint.</p>
+    <p>Public <code>/v1</code> endpoints require an API key. Requests use active subscription quota first; if there is no active subscription, signup/referral bonus credits are used.</p>
 
     <h2>Endpoints</h2>
     <table>
@@ -547,10 +694,14 @@ pub fn docs() -> &'static str {
       <tr><td>GET</td><td><code>/v1/base/address/{address}/txs</code></td><td>Full address transaction refs</td></tr>
       <tr><td>GET</td><td><code>/v1/base/address/{address}/tx-hashes</code></td><td>Deduplicated tx hashes</td></tr>
       <tr><td>POST</td><td><code>/v1/base/addresses/txs</code></td><td>Batch address lookup</td></tr>
+      <tr><td>GET</td><td><code>/v1/base/tx/{tx_hash}</code></td><td>Transaction details from the configured Base reth node</td></tr>
+      <tr><td>GET</td><td><code>/v1/base/tx/{tx_hash}/receipt</code></td><td>Transaction receipt from the configured Base reth node</td></tr>
+      <tr><td>GET</td><td><code>/v1/base/block/latest</code></td><td>Latest Base block number</td></tr>
+      <tr><td>GET</td><td><code>/v1/base/block/{block_number}</code></td><td>Block details with transactions</td></tr>
     </table>
 
     <h2>Address transaction refs</h2>
-    <pre>curl "https://indexer.ledgerflow.top/v1/base/address/0xabc.../txs?direction=from&limit=100" \
+    <pre>curl "https://indexer.ledgerflow.top/v1/base/address/0xabc.../txs?direction=from&limit=100&cursor=..." \
   -H "Authorization: Bearer lf_live_xxx"</pre>
 
     <h2>Batch lookup</h2>
@@ -570,6 +721,14 @@ pub fn docs() -> &'static str {
       <li><code>to_block</code>: inclusive upper block bound.</li>
       <li><code>direction</code>: <code>from</code>, <code>to</code>, or omitted/<code>any</code>.</li>
       <li><code>limit</code>: bounded by server-side max limit.</li>
+      <li><code>cursor</code>: pagination token returned as <code>next_cursor</code> by <code>/txs</code>.</li>
+    </ul>
+
+    <h2>Request limits</h2>
+    <ul>
+      <li>Batch lookup accepts at most 50 addresses per request.</li>
+      <li>Single address lookup is the correct interface for very high-volume addresses because it supports cursor pagination.</li>
+      <li>Successful and failed authenticated requests are both visible in the dashboard usage page.</li>
     </ul>
 
     <h2>What this is not</h2>

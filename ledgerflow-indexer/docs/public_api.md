@@ -1,9 +1,9 @@
 # Public API
 
-Base URL:
+Production base URL:
 
 ```text
-https://api.ledgerflow.dev
+https://indexer.ledgerflow.top
 ```
 
 Local development:
@@ -18,7 +18,14 @@ Authentication is required for `/v1/...` endpoints:
 Authorization: Bearer lf_live_xxx
 ```
 
-The service records daily usage per API key and requires an active subscription. `/health` and legacy internal endpoints are not part of the public metered API surface.
+The service records successful and failed authenticated usage per API key. `/health` and legacy internal endpoints are not part of the public metered API surface.
+
+Quota priority:
+
+1. If the user has an active subscription, requests consume subscription quota.
+2. If there is no active subscription, requests consume signup/referral bonus credits.
+3. Signup bonus is 1,000 requests.
+4. Referral bonus is 25,000 requests per verified referral, capped at 250,000 bonus requests per month.
 
 For public deployments, keep `LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false` so only `/v1/...`, `/admin/...`, and `/health` are mounted.
 
@@ -60,7 +67,7 @@ Query parameters:
 | `from_block` | Inclusive lower block bound |
 | `to_block` | Inclusive upper block bound |
 | `direction` | `from`, `to`, or omitted for both |
-| `limit` | Max hashes returned |
+| `limit` | Max hashes returned, clamped by server config |
 
 Response:
 
@@ -69,6 +76,7 @@ Response:
   "chain": "base",
   "chain_id": 8453,
   "address": "0x1111111111111111111111111111111111111111",
+  "limit": 100,
   "tx_hashes": ["0x..."]
 }
 ```
@@ -80,6 +88,16 @@ GET /v1/base/address/{address}/txs
 Authorization: Bearer lf_live_xxx
 ```
 
+Query parameters:
+
+| Name | Description |
+| --- | --- |
+| `from_block` | Inclusive lower block bound |
+| `to_block` | Inclusive upper block bound |
+| `direction` | `from`, `to`, or omitted for both |
+| `limit` | Max refs returned, clamped by server config |
+| `cursor` | Optional pagination cursor returned by the previous response |
+
 Response:
 
 ```json
@@ -87,6 +105,8 @@ Response:
   "chain": "base",
   "chain_id": 8453,
   "address": "0x1111111111111111111111111111111111111111",
+  "limit": 100,
+  "next_cursor": "31050099:14:1",
   "items": [
     {
       "chain_id": 8453,
@@ -99,6 +119,8 @@ Response:
   ]
 }
 ```
+
+Cursor format is intentionally opaque to clients even though v1 currently uses `block_number:tx_index:direction_rank`. Treat it as a token and pass it back unchanged.
 
 ## Batch Address Transaction References
 
@@ -119,6 +141,12 @@ Request:
 }
 ```
 
+Limits:
+
+- Maximum `50` addresses per batch request.
+- `limit` is per address and is clamped by server config.
+- Large addresses should use single-address pagination with `cursor`; batch lookup is for moderate cluster fan-out, not exporting an entire exchange wallet in one call.
+
 Response:
 
 ```json
@@ -136,6 +164,33 @@ Response:
   ]
 }
 ```
+
+## Base RPC Convenience Endpoints
+
+These endpoints proxy a narrow set of Base JSON-RPC reads through the configured reth node. They are metered like the indexer endpoints.
+
+```http
+GET /v1/base/block/latest
+GET /v1/base/block/{block_number}
+GET /v1/base/tx/{tx_hash}
+GET /v1/base/tx/{tx_hash}/receipt
+Authorization: Bearer lf_live_xxx
+```
+
+Use these to enrich indexed transaction refs without configuring a separate RPC provider.
+
+## Dashboard Admin Endpoints
+
+These are session-cookie endpoints for the LedgerFlow web dashboard, not public API-key endpoints:
+
+```http
+GET /admin/progress
+GET /admin/account/summary
+GET /admin/usage/summary
+GET /admin/referral
+```
+
+The dashboard intentionally does not call `/v1/chains/base/progress` because `/v1` is a customer API-key surface.
 
 ## Product Positioning
 

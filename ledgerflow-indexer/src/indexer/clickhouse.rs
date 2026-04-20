@@ -133,9 +133,11 @@ impl ClickHouseClient {
         from_block: Option<u32>,
         to_block: Option<u32>,
         direction: Option<AddressTxDirection>,
+        cursor: Option<&AddressTxCursor>,
     ) -> LedgerResult<Vec<AddressTxRef>> {
         let address = normalize_address(address)?;
-        let conditions = build_conditions(chain_id, &address, from_block, to_block, direction);
+        let conditions =
+            build_conditions(chain_id, &address, from_block, to_block, direction, cursor);
         let payload = self
             .query_json(&format!(
                 r#"
@@ -173,7 +175,8 @@ impl ClickHouseClient {
         direction: Option<AddressTxDirection>,
     ) -> LedgerResult<Vec<String>> {
         let address = normalize_address(address)?;
-        let conditions = build_conditions(chain_id, &address, from_block, to_block, direction);
+        let conditions =
+            build_conditions(chain_id, &address, from_block, to_block, direction, None);
         let payload = self
             .query_json(&format!(
                 r#"
@@ -261,6 +264,7 @@ fn build_conditions(
     from_block: Option<u32>,
     to_block: Option<u32>,
     direction: Option<AddressTxDirection>,
+    cursor: Option<&AddressTxCursor>,
 ) -> Vec<String> {
     let mut conditions = vec![
         format!("chain_id = {chain_id}"),
@@ -279,5 +283,23 @@ fn build_conditions(
         };
         conditions.push(format!("direction = '{direction}'"));
     }
+    if let Some(cursor) = cursor {
+        conditions.push(format!(
+            "(block_number < {} OR (block_number = {} AND tx_index < {}) OR (block_number = {} AND tx_index = {} AND toInt8(direction) > {}))",
+            cursor.block_number,
+            cursor.block_number,
+            cursor.tx_index,
+            cursor.block_number,
+            cursor.tx_index,
+            cursor.direction_rank
+        ));
+    }
     conditions
+}
+
+#[derive(Clone, Debug)]
+pub struct AddressTxCursor {
+    pub block_number: u32,
+    pub tx_index: u32,
+    pub direction_rank: u8,
 }

@@ -62,6 +62,7 @@ async fn query_address_txs(
             query.from_block,
             query.to_block,
             direction,
+            None,
         )
         .await
         .map_err(ApiError::from)?;

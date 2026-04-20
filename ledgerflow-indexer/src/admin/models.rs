@@ -26,6 +26,36 @@ pub struct Plan {
 }
 
 #[derive(Debug, Serialize)]
+pub struct AccountUsageSummary {
+    pub has_active_subscription: bool,
+    pub plan_id: Option<String>,
+    pub current_period_end: Option<DateTime<Utc>>,
+    pub subscription_quota: i64,
+    pub subscription_used_this_month: i64,
+    pub subscription_remaining_this_month: i64,
+    pub signup_bonus_requests: i64,
+    pub referral_bonus_requests_this_month: i64,
+    pub bonus_used_this_month: i64,
+    pub bonus_remaining_this_month: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageEndpointStat {
+    pub endpoint: String,
+    pub usage_source: String,
+    pub outcome: String,
+    pub request_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApiFailureDetail {
+    pub endpoint: String,
+    pub status_code: i32,
+    pub error: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ReferralSummary {
     pub referral_code: String,
     pub reward_per_verified_referral: i64,
@@ -78,13 +108,11 @@ pub struct PasswordResetVerifyRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateApiKeyRequest {
-    pub email: String,
     pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitBaseEthPaymentRequest {
-    pub email: String,
     pub plan_id: String,
     pub tx_hash: String,
     pub from_address: Option<String>,

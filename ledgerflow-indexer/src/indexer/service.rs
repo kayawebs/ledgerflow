@@ -5,7 +5,7 @@ use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
 use crate::core::errors::{LedgerError, LedgerResult};
-use crate::indexer::clickhouse::ClickHouseClient;
+use crate::indexer::clickhouse::{AddressTxCursor, ClickHouseClient};
 use crate::indexer::config::IndexerConfig;
 use crate::indexer::models::{
     AddressTxDirection, AddressTxHashesResponse, AddressTxQueryResponse, AddressTxRef,
@@ -64,6 +64,7 @@ impl IndexerService {
         from_block: Option<u32>,
         to_block: Option<u32>,
         direction: Option<AddressTxDirection>,
+        cursor: Option<AddressTxCursor>,
     ) -> LedgerResult<AddressTxQueryResponse> {
         let address = normalize_address(address)?;
         let limit = limit
@@ -78,6 +79,7 @@ impl IndexerService {
                 from_block,
                 to_block,
                 direction,
+                cursor.as_ref(),
             )
             .await?;
         Ok(AddressTxQueryResponse { address, refs })
@@ -107,6 +109,22 @@ impl IndexerService {
             )
             .await?;
         Ok(AddressTxHashesResponse { address, tx_hashes })
+    }
+
+    pub async fn get_latest_block_number(&self) -> LedgerResult<u64> {
+        self.rpc.get_latest_block_number().await
+    }
+
+    pub async fn get_block_by_number(&self, block_number: u64) -> LedgerResult<serde_json::Value> {
+        self.rpc.get_block_with_transactions(block_number).await
+    }
+
+    pub async fn get_transaction_by_hash(&self, tx_hash: &str) -> LedgerResult<serde_json::Value> {
+        self.rpc.get_transaction_by_hash(tx_hash).await
+    }
+
+    pub async fn get_transaction_receipt(&self, tx_hash: &str) -> LedgerResult<serde_json::Value> {
+        self.rpc.get_transaction_receipt(tx_hash).await
     }
 
     async fn run_worker_once(&self) -> LedgerResult<()> {

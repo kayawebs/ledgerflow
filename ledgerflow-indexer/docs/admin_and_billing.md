@@ -97,3 +97,15 @@ Public `/v1/...` endpoints require:
 - active subscription whose current period includes now
 
 Every successful public request increments `indexer_usage_daily` by `(date, user_id, api_key_id, endpoint)`.
+
+The newer dashboard counters use `indexer_usage_daily_by_source`, which separates:
+
+- `usage_source`: `subscription` or `bonus`
+- `outcome`: `success` or `error`
+
+Quota priority is:
+
+1. active subscription quota, when an active subscription exists
+2. signup/referral bonus quota only when no active subscription exists
+
+Each registered verified account gets `1,000` signup bonus requests. Authenticated public API failures are also written to `indexer_api_request_failures` so users can debug recent failed calls from the dashboard.

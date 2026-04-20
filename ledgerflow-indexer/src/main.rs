@@ -51,6 +51,7 @@ async fn main() {
 
     let admin_state = AdminState {
         store: admin_store.clone(),
+        indexer_service: service.clone(),
         payment_verifier,
         postmark_server_token: config.postmark_server_token.clone(),
         email_from: config.email_from.clone(),

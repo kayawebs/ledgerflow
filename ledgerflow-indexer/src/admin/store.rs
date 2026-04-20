@@ -9,8 +9,15 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::admin::billing::VerifiedBaseEthPayment;
-use crate::admin::models::{ApiKeyCreated, Plan, ReferralSummary, User};
+use crate::admin::models::{
+    AccountUsageSummary, ApiFailureDetail, ApiKeyCreated, Plan, ReferralSummary, UsageEndpointStat,
+    User,
+};
 use crate::core::errors::{LedgerError, LedgerResult};
+
+const SIGNUP_BONUS_REQUESTS: i64 = 1_000;
+const REFERRAL_REWARD_REQUESTS: i64 = 25_000;
+const REFERRAL_MONTHLY_CAP_REQUESTS: i64 = 250_000;
 
 #[derive(Clone)]
 pub struct PostgresAdminStore {
@@ -21,6 +28,22 @@ pub struct PostgresAdminStore {
 pub struct AuthenticatedApiKey {
     pub user_id: Uuid,
     pub key_id: Uuid,
+    pub quota_source: QuotaSource,
+}
+
+#[derive(Clone, Debug)]
+pub enum QuotaSource {
+    Subscription,
+    Bonus,
+}
+
+impl QuotaSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::Bonus => "bonus",
+        }
+    }
 }
 
 impl PostgresAdminStore {
@@ -115,6 +138,30 @@ impl PostgresAdminStore {
             )
             "#,
             r#"
+            create table if not exists indexer_usage_daily_by_source (
+              usage_date date not null,
+              user_id uuid not null references indexer_users(user_id),
+              api_key_id uuid references indexer_api_keys(key_id),
+              endpoint text not null,
+              usage_source text not null,
+              outcome text not null,
+              request_count bigint not null default 0,
+              primary key (usage_date, user_id, api_key_id, endpoint, usage_source, outcome)
+            )
+            "#,
+            r#"
+            create table if not exists indexer_api_request_failures (
+              failure_id uuid primary key,
+              user_id uuid references indexer_users(user_id),
+              api_key_id uuid references indexer_api_keys(key_id),
+              endpoint text not null,
+              usage_source text,
+              status_code integer not null,
+              error text not null,
+              created_at timestamptz not null default now()
+            )
+            "#,
+            r#"
             create table if not exists indexer_sessions (
               session_id uuid primary key,
               user_id uuid not null references indexer_users(user_id),
@@ -142,6 +189,8 @@ impl PostgresAdminStore {
             "create index if not exists indexer_email_otps_email_purpose_created_idx on indexer_email_otps (email, purpose, created_at desc)",
             "create index if not exists indexer_sessions_token_hash_idx on indexer_sessions (token_hash)",
             "create index if not exists indexer_referral_rewards_month_idx on indexer_referral_rewards (referrer_user_id, reward_month)",
+            "create index if not exists indexer_usage_daily_by_source_user_date_idx on indexer_usage_daily_by_source (user_id, usage_date desc)",
+            "create index if not exists indexer_api_request_failures_user_created_idx on indexer_api_request_failures (user_id, created_at desc)",
             r#"
             insert into indexer_plans (plan_id, name, monthly_price_wei, monthly_request_quota)
             values
@@ -486,31 +535,47 @@ impl PostgresAdminStore {
             select
               k.key_id,
               k.user_id,
-              s.monthly_request_quota,
+              active_sub.plan_id,
+              active_sub.current_period_end,
+              coalesce(active_sub.monthly_request_quota, 0)::bigint as monthly_request_quota,
               coalesce((
                 select sum(reward_requests)
                 from indexer_referral_rewards r
                 where r.referrer_user_id = k.user_id
                   and r.reward_month = date_trunc('month', current_date)::date
-              ), 0) as bonus_requests,
+              ), 0)::bigint as referral_bonus_requests,
               coalesce((
                 select sum(request_count)
-                from indexer_usage_daily u2
+                from indexer_usage_daily_by_source u2
                 where u2.user_id = k.user_id
+                  and u2.usage_source = 'subscription'
                   and u2.usage_date >= date_trunc('month', current_date)::date
                   and u2.usage_date < (date_trunc('month', current_date) + interval '1 month')::date
-              ), 0) as used_requests
+              ), 0)::bigint as subscription_used_requests,
+              coalesce((
+                select sum(request_count)
+                from indexer_usage_daily_by_source u3
+                where u3.user_id = k.user_id
+                  and u3.usage_source = 'bonus'
+                  and u3.usage_date >= date_trunc('month', current_date)::date
+                  and u3.usage_date < (date_trunc('month', current_date) + interval '1 month')::date
+              ), 0)::bigint as bonus_used_requests
             from indexer_api_keys k
             join indexer_users u on u.user_id = k.user_id
-            join indexer_subscriptions sub on sub.user_id = k.user_id
-            join indexer_plans s on s.plan_id = sub.plan_id
+            left join lateral (
+              select sub.plan_id, sub.current_period_end, p.monthly_request_quota
+              from indexer_subscriptions sub
+              join indexer_plans p on p.plan_id = sub.plan_id
+              where sub.user_id = k.user_id
+                and sub.status = 'active'
+                and sub.current_period_start <= now()
+                and sub.current_period_end > now()
+              order by sub.current_period_end desc
+              limit 1
+            ) active_sub on true
             where k.key_hash = $1
               and k.revoked_at is null
               and u.email_verified = true
-              and sub.status = 'active'
-              and sub.current_period_start <= now()
-              and sub.current_period_end > now()
-            order by sub.current_period_end desc
             limit 1
             "#,
         )
@@ -522,30 +587,50 @@ impl PostgresAdminStore {
         let Some(key_row) = key_row else {
             return Err(LedgerError::Unauthorized("invalid api key".to_owned()));
         };
+        let user_id = key_row
+            .try_get("user_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let key_id = key_row
+            .try_get("key_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         let monthly_quota = key_row
             .try_get::<i64, _>("monthly_request_quota")
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;
-        let bonus_requests = key_row
-            .try_get::<i64, _>("bonus_requests")
+        let referral_bonus_requests = key_row
+            .try_get::<i64, _>("referral_bonus_requests")
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;
-        let used_requests = key_row
-            .try_get::<i64, _>("used_requests")
+        let subscription_used_requests = key_row
+            .try_get::<i64, _>("subscription_used_requests")
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;
-        let auth = AuthenticatedApiKey {
-            key_id: key_row
-                .try_get("key_id")
-                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
-            user_id: key_row
-                .try_get("user_id")
-                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        let bonus_used_requests = key_row
+            .try_get::<i64, _>("bonus_used_requests")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let has_active_subscription = key_row
+            .try_get::<Option<String>, _>("plan_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            .is_some();
+        let quota_source = if has_active_subscription {
+            if subscription_used_requests >= monthly_quota {
+                return Err(LedgerError::PaymentRequired(
+                    "monthly subscription quota exhausted".to_owned(),
+                ));
+            }
+            QuotaSource::Subscription
+        } else {
+            let available_bonus = SIGNUP_BONUS_REQUESTS + referral_bonus_requests;
+            if bonus_used_requests >= available_bonus {
+                return Err(LedgerError::PaymentRequired(
+                    "no active subscription and bonus request quota exhausted".to_owned(),
+                ));
+            }
+            QuotaSource::Bonus
         };
-        if used_requests >= monthly_quota + bonus_requests {
-            return Err(LedgerError::PaymentRequired(
-                "monthly request quota exhausted".to_owned(),
-            ));
-        }
 
-        Ok(auth)
+        Ok(AuthenticatedApiKey {
+            user_id,
+            key_id,
+            quota_source,
+        })
     }
 
     pub async fn record_usage(
@@ -553,6 +638,8 @@ impl PostgresAdminStore {
         user_id: Uuid,
         api_key_id: Uuid,
         endpoint: &str,
+        quota_source: &str,
+        outcome: &str,
     ) -> LedgerResult<()> {
         let usage_date = Utc::now().date_naive();
         sqlx::query(
@@ -569,6 +656,55 @@ impl PostgresAdminStore {
         .bind(user_id)
         .bind(api_key_id)
         .bind(endpoint)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        sqlx::query(
+            r#"
+            insert into indexer_usage_daily_by_source (
+              usage_date, user_id, api_key_id, endpoint, usage_source, outcome, request_count
+            )
+            values ($1, $2, $3, $4, $5, $6, 1)
+            on conflict (usage_date, user_id, api_key_id, endpoint, usage_source, outcome)
+            do update set request_count = indexer_usage_daily_by_source.request_count + 1
+            "#,
+        )
+        .bind(usage_date)
+        .bind(user_id)
+        .bind(api_key_id)
+        .bind(endpoint)
+        .bind(quota_source)
+        .bind(outcome)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn record_request_failure(
+        &self,
+        user_id: Option<Uuid>,
+        api_key_id: Option<Uuid>,
+        endpoint: &str,
+        quota_source: Option<&str>,
+        status_code: i32,
+        error: &str,
+    ) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            insert into indexer_api_request_failures (
+              failure_id, user_id, api_key_id, endpoint, usage_source, status_code, error
+            )
+            values ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(user_id)
+        .bind(api_key_id)
+        .bind(endpoint)
+        .bind(quota_source)
+        .bind(status_code)
+        .bind(error.chars().take(1_000).collect::<String>())
         .execute(&self.pool)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
@@ -617,8 +753,8 @@ impl PostgresAdminStore {
         .map_err(|err| LedgerError::Persistence(err.to_string()))?
         .try_get::<i64, _>("current_bonus")
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
-        let remaining = 250_000_i64.saturating_sub(current_bonus);
-        let reward = remaining.min(25_000);
+        let remaining = REFERRAL_MONTHLY_CAP_REQUESTS.saturating_sub(current_bonus);
+        let reward = remaining.min(REFERRAL_REWARD_REQUESTS);
         if reward <= 0 {
             return Ok(());
         }
@@ -734,8 +870,8 @@ impl PostgresAdminStore {
             referral_code: row
                 .try_get("referral_code")
                 .map_err(|err| LedgerError::Persistence(err.to_string()))?,
-            reward_per_verified_referral: 25_000,
-            monthly_reward_cap: 250_000,
+            reward_per_verified_referral: REFERRAL_REWARD_REQUESTS,
+            monthly_reward_cap: REFERRAL_MONTHLY_CAP_REQUESTS,
             rewarded_referrals_this_month: row
                 .try_get("rewarded_referrals_this_month")
                 .map_err(|err| LedgerError::Persistence(err.to_string()))?,
@@ -743,6 +879,173 @@ impl PostgresAdminStore {
                 .try_get("bonus_requests_this_month")
                 .map_err(|err| LedgerError::Persistence(err.to_string()))?,
         })
+    }
+
+    pub async fn get_account_usage_summary(
+        &self,
+        user_id: Uuid,
+    ) -> LedgerResult<AccountUsageSummary> {
+        let row = sqlx::query(
+            r#"
+            select
+              active_sub.plan_id,
+              active_sub.current_period_end,
+              coalesce(active_sub.monthly_request_quota, 0)::bigint as monthly_request_quota,
+              coalesce((
+                select sum(reward_requests)
+                from indexer_referral_rewards r
+                where r.referrer_user_id = $1
+                  and r.reward_month = date_trunc('month', current_date)::date
+              ), 0)::bigint as referral_bonus_requests,
+              coalesce((
+                select sum(request_count)
+                from indexer_usage_daily_by_source u
+                where u.user_id = $1
+                  and u.usage_source = 'subscription'
+                  and u.usage_date >= date_trunc('month', current_date)::date
+                  and u.usage_date < (date_trunc('month', current_date) + interval '1 month')::date
+              ), 0)::bigint as subscription_used_requests,
+              coalesce((
+                select sum(request_count)
+                from indexer_usage_daily_by_source u
+                where u.user_id = $1
+                  and u.usage_source = 'bonus'
+                  and u.usage_date >= date_trunc('month', current_date)::date
+                  and u.usage_date < (date_trunc('month', current_date) + interval '1 month')::date
+              ), 0)::bigint as bonus_used_requests
+            from indexer_users users
+            left join lateral (
+              select sub.plan_id, sub.current_period_end, p.monthly_request_quota
+              from indexer_subscriptions sub
+              join indexer_plans p on p.plan_id = sub.plan_id
+              where sub.user_id = users.user_id
+                and sub.status = 'active'
+                and sub.current_period_start <= now()
+                and sub.current_period_end > now()
+              order by sub.current_period_end desc
+              limit 1
+            ) active_sub on true
+            where users.user_id = $1
+            "#,
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        let subscription_quota = row
+            .try_get::<i64, _>("monthly_request_quota")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let subscription_used_this_month = row
+            .try_get::<i64, _>("subscription_used_requests")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let referral_bonus_requests_this_month =
+            row.try_get::<i64, _>("referral_bonus_requests")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let bonus_used_this_month = row
+            .try_get::<i64, _>("bonus_used_requests")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let bonus_total = SIGNUP_BONUS_REQUESTS + referral_bonus_requests_this_month;
+        Ok(AccountUsageSummary {
+            has_active_subscription: row
+                .try_get::<Option<String>, _>("plan_id")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                .is_some(),
+            plan_id: row
+                .try_get("plan_id")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            current_period_end: row
+                .try_get("current_period_end")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            subscription_quota,
+            subscription_used_this_month,
+            subscription_remaining_this_month: subscription_quota
+                .saturating_sub(subscription_used_this_month),
+            signup_bonus_requests: SIGNUP_BONUS_REQUESTS,
+            referral_bonus_requests_this_month,
+            bonus_used_this_month,
+            bonus_remaining_this_month: bonus_total.saturating_sub(bonus_used_this_month),
+        })
+    }
+
+    pub async fn get_usage_endpoint_stats(
+        &self,
+        user_id: Uuid,
+    ) -> LedgerResult<Vec<UsageEndpointStat>> {
+        let rows = sqlx::query(
+            r#"
+            select endpoint, usage_source, outcome, sum(request_count)::bigint as request_count
+            from indexer_usage_daily_by_source
+            where user_id = $1
+              and usage_date >= date_trunc('month', current_date)::date
+              and usage_date < (date_trunc('month', current_date) + interval '1 month')::date
+            group by endpoint, usage_source, outcome
+            order by request_count desc, endpoint asc
+            "#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(UsageEndpointStat {
+                    endpoint: row
+                        .try_get("endpoint")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    usage_source: row
+                        .try_get("usage_source")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    outcome: row
+                        .try_get("outcome")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    request_count: row
+                        .try_get("request_count")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn get_recent_failures(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+    ) -> LedgerResult<Vec<ApiFailureDetail>> {
+        let rows = sqlx::query(
+            r#"
+            select endpoint, status_code, error, created_at
+            from indexer_api_request_failures
+            where user_id = $1
+            order by created_at desc
+            limit $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(ApiFailureDetail {
+                    endpoint: row
+                        .try_get("endpoint")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    status_code: row
+                        .try_get("status_code")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    error: row
+                        .try_get("error")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    created_at: row
+                        .try_get("created_at")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                })
+            })
+            .collect()
     }
 
     pub async fn record_submitted_payment(
