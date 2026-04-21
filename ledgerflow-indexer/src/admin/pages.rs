@@ -35,6 +35,7 @@ pub fn home() -> &'static str {
     .brand { font-size: 22px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; display:inline-flex; align-items:center; gap:10px; }
     .brand svg { width:34px; height:34px; }
     .navlinks { display: flex; gap: 18px; align-items: center; font-family: ui-sans-serif, system-ui; }
+    .navlinks button { border:0; background:transparent; color:inherit; cursor:pointer; font:inherit; padding:0; }
     .pill {
       border: 1px solid var(--line); border-radius: 999px; padding: 10px 16px;
       background: rgba(255, 250, 241, .72);
@@ -83,7 +84,7 @@ pub fn home() -> &'static str {
     <div class="navlinks">
       <a href="/docs">Docs</a>
       <a href="/pricing">Pricing</a>
-      <a href="/login">Login</a>
+      <a href="/login" data-auth-link>Login</a>
       <a class="pill" href="/dashboard">Dashboard</a>
     </div>
   </nav>
@@ -113,7 +114,25 @@ pub fn home() -> &'static str {
     <article class="card"><div class="eyebrow">Indexed primitive</div><h2>Top-level from/to</h2><p>Simple, fast, and predictable address reference lookup. No explorer label guessing, no ABI dependency, no semantic overclaiming.</p></article>
     <article class="card"><div class="eyebrow">Operator workflow</div><h2>Cluster-ready</h2><p>Use batch address queries to feed bot/EOA clusters into downstream spend analysis, backfills, and accounting jobs.</p></article>
     <article class="card"><div class="eyebrow">Product surface</div><h2>API keys and billing</h2><p>Email verification, metered API keys, and Base ETH subscription payments are built into the dashboard flow.</p></article>
-  </section>
+	  </section>
+  <script>
+    async function installAuthNav() {
+      const link = document.querySelector("[data-auth-link]");
+      if (!link) return;
+      const res = await fetch("/admin/auth/me");
+      if (!res.ok) return;
+      const button = document.createElement("button");
+      button.textContent = "Logout";
+      button.onclick = async () => {
+        await fetch("/admin/auth/logout", { method:"POST", headers:{"content-type":"application/json"}, body:"{}" }).catch(() => {});
+        localStorage.removeItem("ledgerflow_email");
+        localStorage.removeItem("ledgerflow_api_key");
+        location.href = "/login";
+      };
+      link.replaceWith(button);
+    }
+    installAuthNav().catch(() => {});
+  </script>
 </body>
 </html>"##
 }
@@ -136,6 +155,7 @@ pub fn pricing() -> &'static str {
     main { width:min(1120px,100%); margin:0 auto; padding:42px 22px 86px; }
     h1 { font-size:clamp(46px,8vw,96px); line-height:.9; letter-spacing:-.06em; margin:0; }
     p, li, button, .tag, .metric { font-family:ui-sans-serif,system-ui; }
+    .nav button { border:0; background:transparent; color:inherit; cursor:pointer; font:inherit; padding:0; }
     .lede { color:var(--muted); font-size:19px; line-height:1.65; max-width:760px; }
     .price-card { margin-top:34px; border:1px solid var(--line); border-radius:34px; background:rgba(255,250,241,.88); padding:30px; display:grid; grid-template-columns:1.05fr .95fr; gap:22px; box-shadow:0 28px 80px rgba(23,19,15,.08); }
     .tag { display:inline-flex; border:1px solid var(--line); border-radius:999px; padding:8px 12px; color:var(--accent); background:#fffaf1; font-weight:750; }
@@ -150,7 +170,7 @@ pub fn pricing() -> &'static str {
   </style>
 </head>
 <body>
-  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/docs">Docs</a> &nbsp; <a href="/pricing">Pricing</a> &nbsp; <a href="/login">Login</a></div></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/docs">Docs</a> &nbsp; <a href="/pricing">Pricing</a> &nbsp; <a href="/login" data-auth-link>Login</a></div></nav>
   <main>
     <span class="tag">Launch pricing · limited discount</span>
     <h1>One plan for Base builders.</h1>
@@ -178,7 +198,25 @@ pub fn pricing() -> &'static str {
         </div>
       </aside>
     </section>
-  </main>
+	  </main>
+  <script>
+    async function installAuthNav() {
+      const link = document.querySelector("[data-auth-link]");
+      if (!link) return;
+      const res = await fetch("/admin/auth/me");
+      if (!res.ok) return;
+      const button = document.createElement("button");
+      button.textContent = "Logout";
+      button.onclick = async () => {
+        await fetch("/admin/auth/logout", { method:"POST", headers:{"content-type":"application/json"}, body:"{}" }).catch(() => {});
+        localStorage.removeItem("ledgerflow_email");
+        localStorage.removeItem("ledgerflow_api_key");
+        location.href = "/login";
+      };
+      link.replaceWith(button);
+    }
+    installAuthNav().catch(() => {});
+  </script>
 </body>
 </html>"##
 }
@@ -333,6 +371,7 @@ pub fn dashboard() -> &'static str {
     .brand { font-weight:900; letter-spacing:.08em; text-transform:uppercase; display:inline-flex; align-items:center; gap:10px; }
     .brand svg { width:32px; height:32px; }
     .nav a, button, input, select, textarea, p, label, .mono, .status { font-family:ui-sans-serif,system-ui; }
+    .nav button { margin-top:0; padding:0; border:0; background:transparent; color:inherit; font:inherit; cursor:pointer; }
     a { color:inherit; text-decoration:none; }
     .wrap { padding:12px clamp(18px,4vw,54px) 64px; }
     .hero { display:flex; justify-content:space-between; gap:24px; align-items:end; margin-bottom:22px; }
@@ -359,11 +398,10 @@ pub fn dashboard() -> &'static str {
   </style>
 </head>
 <body>
-  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/subscribe">Subscribe</a> &nbsp; <a href="/referrals">Referrals</a> &nbsp; <a href="/docs">Docs</a> &nbsp; <a href="/login">Login</a></div></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/subscribe">Subscribe</a> &nbsp; <a href="/referrals">Referrals</a> &nbsp; <a href="/docs">Docs</a> &nbsp; <button id="logout">Logout</button></div></nav>
   <main class="wrap">
     <section class="hero">
       <div><h1>Indexer dashboard.</h1><p class="muted">Manage API keys, subscription status, quota, usage, and referral credits.</p></div>
-      <button class="secondary" id="logout">Logout</button>
     </section>
     <section class="grid">
       <article class="card third"><h2>Account</h2><label>Email</label><input id="email" type="email" placeholder="operator@example.com"><button id="save-email">Save email</button><p class="muted">Email verification happens on the login page. This dashboard uses your verified email for key and payment operations.</p></article>
@@ -507,6 +545,7 @@ pub fn subscribe() -> &'static str {
     h1 { font-size:clamp(44px,7vw,88px); line-height:.9; letter-spacing:-.06em; margin:0 0 24px; }
     h2 { margin:0 0 14px; font-size:28px; }
     p, label, input, select, button, .status, li, .mono { font-family:ui-sans-serif,system-ui; }
+    .nav button { border:0; background:transparent; color:inherit; cursor:pointer; font:inherit; padding:0; }
     p, li { color:var(--muted); line-height:1.65; }
     .grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
     .card { border:1px solid var(--line); border-radius:28px; background:rgba(255,250,241,.9); padding:24px; }
@@ -520,7 +559,7 @@ pub fn subscribe() -> &'static str {
   </style>
 </head>
 <body>
-  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/dashboard">Dashboard</a> &nbsp; <a href="/docs">Docs</a></div></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/dashboard">Dashboard</a> &nbsp; <a href="/docs">Docs</a> &nbsp; <button id="logout">Logout</button></div></nav>
   <main>
     <h1>Subscribe with Base ETH.</h1>
     <section class="grid">
@@ -561,6 +600,12 @@ pub fn subscribe() -> &'static str {
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       return data;
     }
+    $("logout").onclick = async () => {
+      try { await postJson("/admin/auth/logout", {}); } catch (_) {}
+      localStorage.removeItem("ledgerflow_email");
+      localStorage.removeItem("ledgerflow_api_key");
+      location.href = "/login";
+    };
     async function load() {
       const me = await getJson("/admin/auth/me");
       $("email").value = me.user.email;
@@ -604,6 +649,7 @@ pub fn referrals() -> &'static str {
     h1 { font-size:clamp(44px,7vw,88px); line-height:.9; letter-spacing:-.06em; margin:0 0 24px; }
     .card { border:1px solid var(--line); border-radius:28px; background:#fffaf1; padding:24px; }
     p, label, input, button, .status { font-family:ui-sans-serif,system-ui; }
+    .nav button { border:0; background:transparent; color:inherit; cursor:pointer; font:inherit; padding:0; }
     p { color:var(--muted); line-height:1.65; }
     label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.14em; color:var(--muted); margin:16px 0 7px; }
     input { width:100%; border:1px solid var(--line); border-radius:14px; background:#fbf7ef; color:var(--ink); padding:12px 13px; font-size:14px; }
@@ -612,7 +658,7 @@ pub fn referrals() -> &'static str {
   </style>
 </head>
 <body>
-  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/dashboard">Dashboard</a> &nbsp; <a href="/subscribe">Subscribe</a></div></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/dashboard">Dashboard</a> &nbsp; <a href="/subscribe">Subscribe</a> &nbsp; <button id="logout">Logout</button></div></nav>
   <main>
     <h1>Referral credits.</h1>
     <section class="card">
@@ -631,6 +677,18 @@ pub fn referrals() -> &'static str {
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       return data;
     }
+    async function postJson(url, body) {
+      const res = await fetch(url, { method:"POST", headers:{"content-type":"application/json"}, body:JSON.stringify(body) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    }
+    $("logout").onclick = async () => {
+      try { await postJson("/admin/auth/logout", {}); } catch (_) {}
+      localStorage.removeItem("ledgerflow_email");
+      localStorage.removeItem("ledgerflow_api_key");
+      location.href = "/login";
+    };
     async function loadReferral() {
       const data = await getJson("/admin/referral");
       const r = data.referral;
@@ -663,7 +721,8 @@ pub fn docs() -> &'static str {
     .nav { display:flex; justify-content:space-between; padding:22px clamp(18px,4vw,54px); border-bottom:1px solid var(--line); background:#fffaf1; position:sticky; top:0; }
     .brand { display:inline-flex; align-items:center; gap:10px; font-weight:850; letter-spacing:.08em; text-transform:uppercase; }
     .brand svg { width:32px; height:32px; }
-    .nav a, p, li, code, pre, th, td { font-family:ui-sans-serif,system-ui; }
+    .nav a, .nav button, p, li, code, pre, th, td { font-family:ui-sans-serif,system-ui; }
+    .nav button { border:0; background:transparent; color:inherit; cursor:pointer; padding:0; }
     a { color:inherit; text-decoration:none; }
     main { width:min(1080px,100%); margin:0 auto; padding:42px 22px 80px; }
     h1 { font-size:clamp(42px,7vw,82px); line-height:.9; letter-spacing:-.06em; margin:0 0 28px; }
@@ -677,7 +736,7 @@ pub fn docs() -> &'static str {
   </style>
 </head>
 <body>
-  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/login">Login</a> &nbsp; <a href="/dashboard">Dashboard</a></div></nav>
+  <nav class="nav"><a class="brand" href="/"><svg viewBox="0 0 64 64" aria-hidden="true"><rect x="7" y="7" width="50" height="50" rx="16" fill="#17130f"/><path d="M19 39V18h8v16h18v5H19Z" fill="#fbf7ef"/><path d="M28 46c10-1 17-7 19-18h-7c-2 6-6 10-12 12v6Z" fill="#c56a2d"/></svg><span>LedgerFlow</span></a><div><a href="/login" data-auth-link>Login</a> &nbsp; <a href="/dashboard">Dashboard</a></div></nav>
   <main>
     <h1>LedgerFlow Indexer API docs.</h1>
     <p>LedgerFlow Indexer is a Base top-level address reference API. It answers which transaction hashes touched an address as top-level <code>from</code> or <code>to</code>, and is designed as a fast discovery layer for bots, wallet operations, and transaction analysis systems.</p>
@@ -733,7 +792,25 @@ pub fn docs() -> &'static str {
 
     <h2>What this is not</h2>
     <p>This is not a full explorer clone and does not infer protocol semantics. Use it to discover transaction candidates, then run deeper evidence-first analysis elsewhere.</p>
-  </main>
+	  </main>
+  <script>
+    async function installAuthNav() {
+      const link = document.querySelector("[data-auth-link]");
+      if (!link) return;
+      const res = await fetch("/admin/auth/me");
+      if (!res.ok) return;
+      const button = document.createElement("button");
+      button.textContent = "Logout";
+      button.onclick = async () => {
+        await fetch("/admin/auth/logout", { method:"POST", headers:{"content-type":"application/json"}, body:"{}" }).catch(() => {});
+        localStorage.removeItem("ledgerflow_email");
+        localStorage.removeItem("ledgerflow_api_key");
+        location.href = "/login";
+      };
+      link.replaceWith(button);
+    }
+    installAuthNav().catch(() => {});
+  </script>
 </body>
 </html>"##
 }
