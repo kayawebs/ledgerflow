@@ -745,23 +745,60 @@ pub fn docs() -> &'static str {
     <pre>Authorization: Bearer lf_live_xxx</pre>
     <p>Public <code>/v1</code> endpoints require an API key. Requests use active subscription quota first; if there is no active subscription, signup/referral bonus credits are used.</p>
 
-    <h2>Endpoints</h2>
+    <h2>Common response and errors</h2>
+    <p>Address refs are normalized top-level <code>from</code>/<code>to</code> rows. Errors use a compact JSON shape:</p>
+    <pre>{
+  "error": "missing Authorization header"
+}</pre>
+    <p>Common status codes: <code>400</code> malformed input, <code>401</code> invalid auth, <code>402</code> quota or subscription required, <code>409</code> product rule conflict, <code>500</code> storage or upstream RPC failure.</p>
+
+    <h2>Endpoint summary</h2>
     <table>
-      <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
-      <tr><td>GET</td><td><code>/health</code></td><td>Service health</td></tr>
-      <tr><td>GET</td><td><code>/v1/chains/base/progress</code></td><td>Last indexed Base block</td></tr>
-      <tr><td>GET</td><td><code>/v1/base/address/{address}/txs</code></td><td>Full address transaction refs</td></tr>
-      <tr><td>GET</td><td><code>/v1/base/address/{address}/tx-hashes</code></td><td>Deduplicated tx hashes</td></tr>
-      <tr><td>POST</td><td><code>/v1/base/addresses/txs</code></td><td>Batch address lookup</td></tr>
-      <tr><td>GET</td><td><code>/v1/base/tx/{tx_hash}</code></td><td>Transaction details from the configured Base reth node</td></tr>
-      <tr><td>GET</td><td><code>/v1/base/tx/{tx_hash}/receipt</code></td><td>Transaction receipt from the configured Base reth node</td></tr>
-      <tr><td>GET</td><td><code>/v1/base/block/latest</code></td><td>Latest Base block number</td></tr>
-      <tr><td>GET</td><td><code>/v1/base/block/{block_number}</code></td><td>Block details with transactions</td></tr>
+      <tr><th>Method</th><th>Path</th><th>Params</th><th>Returns</th></tr>
+      <tr><td>GET</td><td><code>/health</code></td><td>none</td><td><code>{"status":"ok","service":"ledgerflow-indexer"}</code></td></tr>
+      <tr><td>GET</td><td><code>/v1/chains/base/progress</code></td><td>none</td><td><code>chain</code>, <code>chain_id</code>, <code>worker_id</code>, <code>last_indexed_block</code></td></tr>
+      <tr><td>GET</td><td><code>/v1/base/address/{address}/txs</code></td><td><code>address</code>, <code>from_block</code>, <code>to_block</code>, <code>direction</code>, <code>limit</code>, <code>cursor</code></td><td><code>items</code> as address refs plus <code>next_cursor</code></td></tr>
+      <tr><td>GET</td><td><code>/v1/base/address/{address}/tx-hashes</code></td><td><code>address</code>, <code>from_block</code>, <code>to_block</code>, <code>direction</code>, <code>limit</code></td><td>deduplicated <code>tx_hashes</code></td></tr>
+      <tr><td>POST</td><td><code>/v1/base/addresses/txs</code></td><td>JSON <code>addresses</code>, <code>from_block</code>, <code>to_block</code>, <code>direction</code>, <code>limit</code></td><td>combined <code>items</code> and <code>per_address_counts</code></td></tr>
+      <tr><td>GET</td><td><code>/v1/base/block/latest</code></td><td>none</td><td><code>block_number</code></td></tr>
+      <tr><td>GET</td><td><code>/v1/base/block/{block_number}</code></td><td>decimal <code>block_number</code></td><td>raw RPC <code>block</code> with full transactions</td></tr>
+      <tr><td>GET</td><td><code>/v1/base/tx/{tx_hash}</code></td><td><code>tx_hash</code></td><td>raw RPC <code>transaction</code></td></tr>
+      <tr><td>GET</td><td><code>/v1/base/tx/{tx_hash}/receipt</code></td><td><code>tx_hash</code></td><td>raw RPC <code>receipt</code></td></tr>
     </table>
 
     <h2>Address transaction refs</h2>
     <pre>curl "https://indexer.ledgerflow.top/v1/base/address/0xabc.../txs?direction=from&limit=100&cursor=..." \
   -H "Authorization: Bearer lf_live_xxx"</pre>
+    <p>Path parameter: <code>address</code> must be a 20-byte <code>0x</code> EVM address. Query parameters: <code>from_block</code> and <code>to_block</code> are inclusive bounds; <code>direction</code> is <code>from</code>, <code>to</code>, or omitted; <code>limit</code> is clamped by server config; <code>cursor</code> is the previous <code>next_cursor</code>.</p>
+    <pre>{
+  "chain": "base",
+  "chain_id": 8453,
+  "address": "0x1111111111111111111111111111111111111111",
+  "limit": 100,
+  "next_cursor": "31050099:14:1",
+  "items": [
+    {
+      "chain_id": 8453,
+      "address": "0x1111111111111111111111111111111111111111",
+      "tx_hash": "0x...",
+      "block_number": 31050099,
+      "tx_index": 14,
+      "direction": "from"
+    }
+  ]
+}</pre>
+
+    <h2>Address tx hashes</h2>
+    <pre>curl "https://indexer.ledgerflow.top/v1/base/address/0xabc.../tx-hashes?limit=1000" \
+  -H "Authorization: Bearer lf_live_xxx"</pre>
+    <p>Parameters match <code>/txs</code> except this endpoint does not take <code>cursor</code>. It returns deduplicated hashes only.</p>
+    <pre>{
+  "chain": "base",
+  "chain_id": 8453,
+  "address": "0x1111111111111111111111111111111111111111",
+  "limit": 1000,
+  "tx_hashes": ["0x..."]
+}</pre>
 
     <h2>Batch lookup</h2>
     <pre>curl "https://indexer.ledgerflow.top/v1/base/addresses/txs" \
@@ -773,14 +810,46 @@ pub fn docs() -> &'static str {
     "direction": "any",
     "limit": 1000
   }'</pre>
+    <p>Body field <code>addresses</code> is required and accepts at most 50 addresses. <code>limit</code> is per address, not total response size. Batch does not expose cursor pagination.</p>
+    <pre>{
+  "chain": "base",
+  "chain_id": 8453,
+  "items": [
+    {
+      "chain_id": 8453,
+      "address": "0x1111111111111111111111111111111111111111",
+      "tx_hash": "0x...",
+      "block_number": 31050099,
+      "tx_index": 14,
+      "direction": "from"
+    }
+  ],
+  "per_address_counts": {
+    "0x1111111111111111111111111111111111111111": 1
+  }
+}</pre>
 
-    <h2>Query parameters</h2>
+    <h2>Base RPC convenience endpoints</h2>
+    <pre>curl "https://indexer.ledgerflow.top/v1/base/block/latest" \
+  -H "Authorization: Bearer lf_live_xxx"
+
+curl "https://indexer.ledgerflow.top/v1/base/block/31050099" \
+  -H "Authorization: Bearer lf_live_xxx"
+
+curl "https://indexer.ledgerflow.top/v1/base/tx/0x..." \
+  -H "Authorization: Bearer lf_live_xxx"
+
+curl "https://indexer.ledgerflow.top/v1/base/tx/0x.../receipt" \
+  -H "Authorization: Bearer lf_live_xxx"</pre>
+    <p>These proxy narrow JSON-RPC reads from the configured Base reth node. The block endpoint returns raw <code>eth_getBlockByNumber(..., true)</code>; tx and receipt endpoints return raw <code>eth_getTransactionByHash</code> and <code>eth_getTransactionReceipt</code> results.</p>
+
+    <h2>Detailed parameter rules</h2>
     <ul>
       <li><code>from_block</code>: inclusive lower block bound.</li>
       <li><code>to_block</code>: inclusive upper block bound.</li>
       <li><code>direction</code>: <code>from</code>, <code>to</code>, or omitted/<code>any</code>.</li>
-      <li><code>limit</code>: bounded by server-side max limit.</li>
-      <li><code>cursor</code>: pagination token returned as <code>next_cursor</code> by <code>/txs</code>.</li>
+      <li><code>limit</code>: defaults to 1000 and is bounded by server-side max limit, currently 10000 by default config.</li>
+      <li><code>cursor</code>: pagination token returned as <code>next_cursor</code> by <code>/txs</code>; treat it as opaque.</li>
     </ul>
 
     <h2>Request limits</h2>
