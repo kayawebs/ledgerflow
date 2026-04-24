@@ -11,6 +11,13 @@ This project is extracted from the main LedgerFlow analysis platform. It focuses
 
 It does not attempt to replace the evidence-first transaction analysis engine. The analysis engine should call this service to discover candidate transaction hashes, then analyze those transactions separately.
 
+## Docs
+
+- [docs/public_api.md](docs/public_api.md): full public API reference
+- [docs/consumer_guide.md](docs/consumer_guide.md): how consumers should use the indexer as a discovery layer
+- [docs/admin_and_billing.md](docs/admin_and_billing.md): dashboard auth, billing, quota, and usage model
+- [docs/extraction.md](docs/extraction.md): extraction and storage notes
+
 ## Reusing Existing ClickHouse Data
 
 The current production-like data is in the parent LedgerFlow compose stack's ClickHouse volume. Do not create a new empty ClickHouse volume if you want to keep using already indexed blocks.
@@ -116,7 +123,8 @@ Create an API key after verification:
 ```bash
 curl -s http://127.0.0.1:8090/admin/api-keys \
   -H 'content-type: application/json' \
-  -d '{"email":"operator@example.com","name":"production"}' | jq
+  -H 'cookie: ledgerflow_session=YOUR_SESSION_COOKIE' \
+  -d '{"name":"production"}' | jq
 ```
 
 Submit and verify a Base ETH subscription payment:
@@ -124,9 +132,9 @@ Submit and verify a Base ETH subscription payment:
 ```bash
 curl -s http://127.0.0.1:8090/admin/billing/base-eth/payments \
   -H 'content-type: application/json' \
+  -H 'cookie: ledgerflow_session=YOUR_SESSION_COOKIE' \
   -d '{
-    "email": "operator@example.com",
-    "plan_id": "developer",
+    "plan_id": "launch",
     "tx_hash": "0xPAYMENT_TX_HASH",
     "from_address": "0xYOUR_PAYMENT_WALLET"
   }' | jq
