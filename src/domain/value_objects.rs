@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::enums::{AssetType, EvidenceKind, ValidationStatus};
+use crate::domain::enums::{AddressHitDirection, AssetType, EvidenceKind, ValidationStatus};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceRef {
@@ -50,4 +50,13 @@ pub struct ValidationMessage {
     pub details: Value,
     pub evidence_refs: Vec<EvidenceRef>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AddressTxRef {
+    pub address: String,
+    pub tx_hash: String,
+    pub block_number: u64,
+    pub tx_index: u32,
+    pub direction: AddressHitDirection,
 }

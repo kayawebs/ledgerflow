@@ -5,8 +5,14 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json};
 use uuid::Uuid;
 
 use crate::core::errors::{LedgerError, LedgerResult};
-use crate::domain::entities::{AddressCluster, ClusterAddress, EvidencePack, TransactionAnalysis};
-use crate::domain::interfaces::AnalysisRepository;
+use crate::domain::{
+    entities::{
+        AddressCluster, ClusterAddress, ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx,
+        EvidencePack, TransactionAnalysis,
+    },
+    enums::{ClusterBackfillStatus, ClusterTxStatus},
+    interfaces::AnalysisRepository,
+};
 use crate::ingestion::models::RawTransactionBundle;
 
 #[derive(Clone)]
@@ -475,6 +481,231 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             })
             .collect()
     }
+
+    async fn create_cluster_backfill_run(&self, run: &ClusterBackfillRun) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            insert into cluster_backfill_runs (
+              run_id, cluster_id, chain_id, start_block, end_block, status, requested_at,
+              started_at, finished_at, address_count, discovered_tx_count, analyzed_tx_count,
+              failed_tx_count, metadata
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            on conflict (run_id) do update set
+              cluster_id = excluded.cluster_id,
+              chain_id = excluded.chain_id,
+              start_block = excluded.start_block,
+              end_block = excluded.end_block,
+              status = excluded.status,
+              requested_at = excluded.requested_at,
+              started_at = excluded.started_at,
+              finished_at = excluded.finished_at,
+              address_count = excluded.address_count,
+              discovered_tx_count = excluded.discovered_tx_count,
+              analyzed_tx_count = excluded.analyzed_tx_count,
+              failed_tx_count = excluded.failed_tx_count,
+              metadata = excluded.metadata
+            "#,
+        )
+        .bind(run.run_id)
+        .bind(run.cluster_id)
+        .bind(run.chain_id as i64)
+        .bind(run.start_block.map(|value| value as i64))
+        .bind(run.end_block.map(|value| value as i64))
+        .bind(cluster_backfill_status_to_str(&run.status))
+        .bind(run.requested_at)
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .bind(run.address_count as i32)
+        .bind(run.discovered_tx_count as i32)
+        .bind(run.analyzed_tx_count as i32)
+        .bind(run.failed_tx_count as i32)
+        .bind(Json(run.metadata.clone()))
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn update_cluster_backfill_run(&self, run: &ClusterBackfillRun) -> LedgerResult<()> {
+        self.create_cluster_backfill_run(run).await
+    }
+
+    async fn list_cluster_backfill_runs(
+        &self,
+        cluster_id: Uuid,
+    ) -> LedgerResult<Vec<ClusterBackfillRun>> {
+        let rows = sqlx::query(
+            r#"
+            select run_id, cluster_id, chain_id, start_block, end_block, status, requested_at,
+                   started_at, finished_at, address_count, discovered_tx_count, analyzed_tx_count,
+                   failed_tx_count, metadata
+            from cluster_backfill_runs
+            where cluster_id = $1
+            order by requested_at desc
+            "#,
+        )
+        .bind(cluster_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter().map(row_to_backfill_run).collect()
+    }
+
+    async fn upsert_cluster_discovered_txs(&self, txs: &[ClusterDiscoveredTx]) -> LedgerResult<()> {
+        for tx in txs {
+            sqlx::query(
+                r#"
+                insert into cluster_discovered_txs (
+                  cluster_id, chain_id, tx_hash, block_number, processing_status, latest_run_id,
+                  first_seen_at, last_seen_at, analysis_attempted_at, analyzed_at, last_error, metadata
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                on conflict (cluster_id, tx_hash) do update set
+                  chain_id = excluded.chain_id,
+                  block_number = coalesce(excluded.block_number, cluster_discovered_txs.block_number),
+                  latest_run_id = excluded.latest_run_id,
+                  last_seen_at = excluded.last_seen_at,
+                  metadata = excluded.metadata
+                "#,
+            )
+            .bind(tx.cluster_id)
+            .bind(tx.chain_id as i64)
+            .bind(&tx.tx_hash)
+            .bind(tx.block_number.map(|value| value as i64))
+            .bind(cluster_tx_status_to_str(&tx.status))
+            .bind(tx.latest_run_id)
+            .bind(tx.first_seen_at)
+            .bind(tx.last_seen_at)
+            .bind(tx.analysis_attempted_at)
+            .bind(tx.analyzed_at)
+            .bind(&tx.last_error)
+            .bind(Json(tx.metadata.clone()))
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn update_cluster_discovered_tx_status(
+        &self,
+        cluster_id: Uuid,
+        tx_hash: &str,
+        status: ClusterTxStatus,
+        latest_run_id: Uuid,
+        error: Option<String>,
+        analyzed_at: Option<DateTime<Utc>>,
+    ) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            update cluster_discovered_txs
+            set processing_status = $3,
+                latest_run_id = $4,
+                last_error = $5,
+                analysis_attempted_at = now(),
+                analyzed_at = $6,
+                last_seen_at = now()
+            where cluster_id = $1 and tx_hash = $2
+            "#,
+        )
+        .bind(cluster_id)
+        .bind(tx_hash)
+        .bind(cluster_tx_status_to_str(&status))
+        .bind(latest_run_id)
+        .bind(error)
+        .bind(analyzed_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_cluster_coverage(
+        &self,
+        cluster_id: Uuid,
+    ) -> LedgerResult<Option<ClusterCoverage>> {
+        let cluster_row =
+            sqlx::query("select cluster_id, chain_id from address_clusters where cluster_id = $1")
+                .bind(cluster_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let Some(cluster_row) = cluster_row else {
+            return Ok(None);
+        };
+
+        let counts_row = sqlx::query(
+            r#"
+            select
+              count(*)::bigint as discovered_tx_count,
+              count(*) filter (where processing_status = '"analyzed"')::bigint as analyzed_tx_count,
+              count(*) filter (where processing_status = '"failed"')::bigint as failed_tx_count,
+              count(*) filter (where processing_status = '"pending"')::bigint as pending_tx_count
+            from cluster_discovered_txs
+            where cluster_id = $1
+            "#,
+        )
+        .bind(cluster_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        let latest_run = sqlx::query(
+            r#"
+            select run_id, status, started_at, finished_at
+            from cluster_backfill_runs
+            where cluster_id = $1
+            order by requested_at desc
+            limit 1
+            "#,
+        )
+        .bind(cluster_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        Ok(Some(ClusterCoverage {
+            cluster_id,
+            chain_id: cluster_row
+                .try_get::<i64, _>("chain_id")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                as u64,
+            discovered_tx_count: counts_row
+                .try_get::<i64, _>("discovered_tx_count")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                as u32,
+            analyzed_tx_count: counts_row
+                .try_get::<i64, _>("analyzed_tx_count")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                as u32,
+            failed_tx_count: counts_row
+                .try_get::<i64, _>("failed_tx_count")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                as u32,
+            pending_tx_count: counts_row
+                .try_get::<i64, _>("pending_tx_count")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                as u32,
+            latest_run_id: latest_run
+                .as_ref()
+                .and_then(|row| row.try_get("run_id").ok()),
+            latest_run_status: latest_run
+                .as_ref()
+                .and_then(|row| row.try_get::<String, _>("status").ok())
+                .map(|value| parse_cluster_backfill_status(&value))
+                .transpose()?,
+            latest_run_started_at: latest_run
+                .as_ref()
+                .and_then(|row| row.try_get("started_at").ok()),
+            latest_run_finished_at: latest_run
+                .as_ref()
+                .and_then(|row| row.try_get("finished_at").ok()),
+            metadata: serde_json::json!({
+                "coverage_mode": "cluster_discovered_txs"
+            }),
+        }))
+    }
 }
 
 fn row_to_pack(row: sqlx::postgres::PgRow) -> LedgerResult<EvidencePack> {
@@ -525,4 +756,90 @@ fn row_to_pack(row: sqlx::postgres::PgRow) -> LedgerResult<EvidencePack> {
         validation_results: validation_results.as_array().cloned().unwrap_or_default(),
         metadata,
     })
+}
+
+fn row_to_backfill_run(row: sqlx::postgres::PgRow) -> LedgerResult<ClusterBackfillRun> {
+    let Json(metadata): Json<Value> = row
+        .try_get("metadata")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    let status_raw = row
+        .try_get::<String, _>("status")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(ClusterBackfillRun {
+        run_id: row
+            .try_get("run_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        cluster_id: row
+            .try_get("cluster_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        chain_id: row
+            .try_get::<i64, _>("chain_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        start_block: row
+            .try_get::<Option<i64>, _>("start_block")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            .map(|value| value as u64),
+        end_block: row
+            .try_get::<Option<i64>, _>("end_block")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            .map(|value| value as u64),
+        status: parse_cluster_backfill_status(&status_raw)?,
+        requested_at: row
+            .try_get("requested_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        started_at: row
+            .try_get("started_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        finished_at: row
+            .try_get("finished_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        address_count: row
+            .try_get::<i32, _>("address_count")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            as u32,
+        discovered_tx_count: row
+            .try_get::<i32, _>("discovered_tx_count")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            as u32,
+        analyzed_tx_count: row
+            .try_get::<i32, _>("analyzed_tx_count")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            as u32,
+        failed_tx_count: row
+            .try_get::<i32, _>("failed_tx_count")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            as u32,
+        metadata,
+    })
+}
+
+fn parse_cluster_backfill_status(value: &str) -> LedgerResult<ClusterBackfillStatus> {
+    match value {
+        "pending" => Ok(ClusterBackfillStatus::Pending),
+        "running" => Ok(ClusterBackfillStatus::Running),
+        "completed" => Ok(ClusterBackfillStatus::Completed),
+        "partial" => Ok(ClusterBackfillStatus::Partial),
+        "failed" => Ok(ClusterBackfillStatus::Failed),
+        other => Err(LedgerError::Persistence(format!(
+            "unknown cluster backfill status: {other}"
+        ))),
+    }
+}
+
+fn cluster_backfill_status_to_str(value: &ClusterBackfillStatus) -> &'static str {
+    match value {
+        ClusterBackfillStatus::Pending => "pending",
+        ClusterBackfillStatus::Running => "running",
+        ClusterBackfillStatus::Completed => "completed",
+        ClusterBackfillStatus::Partial => "partial",
+        ClusterBackfillStatus::Failed => "failed",
+    }
+}
+
+fn cluster_tx_status_to_str(value: &ClusterTxStatus) -> &'static str {
+    match value {
+        ClusterTxStatus::Pending => "pending",
+        ClusterTxStatus::Analyzed => "analyzed",
+        ClusterTxStatus::Failed => "failed",
+    }
 }

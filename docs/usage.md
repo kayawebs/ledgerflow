@@ -223,6 +223,54 @@ curl -X POST http://localhost:8180/clusters \
 
 The response returns the `cluster_id`.
 
+## Backfill a cluster from the indexer
+
+After creating a cluster, trigger backfill so the analysis service can:
+
+- query the standalone indexer for address-related tx refs
+- deduplicate tx hashes across cluster addresses
+- analyze missing transactions
+- update cluster coverage
+
+```bash
+curl -X POST http://localhost:8180/clusters/YOUR_CLUSTER_ID/backfill \
+  -H 'content-type: application/json' \
+  -d '{
+    "start_block": 0,
+    "end_block": 45000000,
+    "force_reanalyze": false,
+    "query_limit": 10000
+  }' | jq
+```
+
+Useful notes:
+
+- `end_block` is optional. If omitted, the analysis service uses the indexer's latest indexed block.
+- `query_limit` is the per-request ceiling used when reading an address range from the indexer.
+- The analysis service recursively splits block ranges when the per-request limit is hit, so it can backfill large address histories without direct ClickHouse reads.
+
+## Check cluster coverage
+
+```bash
+curl http://localhost:8180/clusters/YOUR_CLUSTER_ID/coverage | jq
+```
+
+Important coverage fields:
+
+| Field | Meaning |
+| --- | --- |
+| `discovered_tx_count` | unique tx hashes discovered for the cluster |
+| `analyzed_tx_count` | txs already analyzed and persisted |
+| `failed_tx_count` | txs whose analysis failed during backfill |
+| `pending_tx_count` | discovered txs not yet analyzed |
+| `latest_run_status` | latest backfill status |
+
+## Inspect backfill runs
+
+```bash
+curl http://localhost:8180/clusters/YOUR_CLUSTER_ID/backfill-runs | jq
+```
+
 ## Request a cluster spend summary
 
 ```bash
@@ -251,8 +299,15 @@ This summary is computed from already analyzed transactions whose top-level `fro
 
 ### Important limitation
 
-This starter does not yet discover the full historical transaction set for a cluster automatically.
-You need the relevant transactions to have been analyzed and persisted first.
+Cluster spend summary still reads from persisted analyses only.
+
+That means:
+
+- create cluster
+- run cluster backfill
+- then read spend summary
+
+If coverage is partial, the spend summary metadata will reflect that partiality rather than pretending full completeness.
 
 ## Analyze a transaction
 

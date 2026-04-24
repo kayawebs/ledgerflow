@@ -81,6 +81,14 @@ pub struct ClusterSummaryQuery {
     pub end: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ClusterBackfillRequest {
+    pub start_block: Option<u64>,
+    pub end_block: Option<u64>,
+    pub force_reanalyze: Option<bool>,
+    pub query_limit: Option<u32>,
+}
+
 pub fn router(config: WebConfig) -> Router {
     let state = WebState {
         api_base_url: config.api_base_url,
@@ -101,6 +109,18 @@ pub fn router(config: WebConfig) -> Router {
         )
         .route("/api/replay/tx", post(proxy_replay_tx))
         .route("/api/clusters", post(proxy_create_cluster))
+        .route(
+            "/api/clusters/{cluster_id}/backfill",
+            post(proxy_backfill_cluster),
+        )
+        .route(
+            "/api/clusters/{cluster_id}/coverage",
+            get(proxy_get_cluster_coverage),
+        )
+        .route(
+            "/api/clusters/{cluster_id}/backfill-runs",
+            get(proxy_list_cluster_backfill_runs),
+        )
         .route(
             "/api/clusters/{cluster_id}/spend-summary",
             get(proxy_get_cluster_spend_summary),
@@ -193,6 +213,45 @@ async fn proxy_create_cluster(
             .post(format!("{}/clusters", state.api_base_url))
             .json(&request),
     )
+    .await
+}
+
+async fn proxy_backfill_cluster(
+    State(state): State<WebState>,
+    Path(cluster_id): Path<String>,
+    Json(request): Json<ClusterBackfillRequest>,
+) -> Result<Response<Body>, WebError> {
+    proxy_request(
+        state
+            .client
+            .post(format!(
+                "{}/clusters/{}/backfill",
+                state.api_base_url, cluster_id
+            ))
+            .json(&request),
+    )
+    .await
+}
+
+async fn proxy_get_cluster_coverage(
+    State(state): State<WebState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Response<Body>, WebError> {
+    proxy_request(state.client.get(format!(
+        "{}/clusters/{}/coverage",
+        state.api_base_url, cluster_id
+    )))
+    .await
+}
+
+async fn proxy_list_cluster_backfill_runs(
+    State(state): State<WebState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Response<Body>, WebError> {
+    proxy_request(state.client.get(format!(
+        "{}/clusters/{}/backfill-runs",
+        state.api_base_url, cluster_id
+    )))
     .await
 }
 

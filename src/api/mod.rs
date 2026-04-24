@@ -15,11 +15,16 @@ use crate::domain::entities::{AddressCluster, ClusterAddress, ClusterSpendSummar
 use crate::plugins::loader::PluginManifest;
 use crate::services::analysis::AnalysisService;
 use crate::services::cluster::ClusterService;
+use crate::services::cluster_backfill::{
+    ClusterBackfillRequest as ServiceClusterBackfillRequest, ClusterBackfillResult,
+    ClusterBackfillService,
+};
 
 #[derive(Clone)]
 pub struct ApiState {
     pub service: Arc<AnalysisService>,
     pub cluster_service: Arc<ClusterService>,
+    pub backfill_service: Arc<ClusterBackfillService>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +68,14 @@ pub struct ClusterSummaryQuery {
     pub end: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ClusterBackfillRequest {
+    pub start_block: Option<u64>,
+    pub end_block: Option<u64>,
+    pub force_reanalyze: Option<bool>,
+    pub query_limit: Option<u32>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AnalysisEnvelope {
     pub analysis: crate::domain::entities::TransactionAnalysis,
@@ -76,7 +89,10 @@ pub struct RecognizersResponse {
     pub plugins: Vec<PluginManifest>,
 }
 
-pub fn router(service: Arc<AnalysisService>) -> Router {
+pub fn router(
+    service: Arc<AnalysisService>,
+    backfill_service: Arc<ClusterBackfillService>,
+) -> Router {
     let cluster_service = Arc::new(ClusterService::new(service.repository.clone()));
     Router::new()
         .route("/health", get(health))
@@ -90,9 +106,16 @@ pub fn router(service: Arc<AnalysisService>) -> Router {
             "/clusters/{cluster_id}/spend-summary",
             get(get_cluster_spend_summary),
         )
+        .route("/clusters/{cluster_id}/backfill", post(backfill_cluster))
+        .route("/clusters/{cluster_id}/coverage", get(get_cluster_coverage))
+        .route(
+            "/clusters/{cluster_id}/backfill-runs",
+            get(list_cluster_backfill_runs),
+        )
         .with_state(ApiState {
             service,
             cluster_service,
+            backfill_service,
         })
 }
 
@@ -244,6 +267,57 @@ async fn get_cluster_spend_summary(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(summary))
+}
+
+async fn backfill_cluster(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+    Json(request): Json<ClusterBackfillRequest>,
+) -> Result<Json<ClusterBackfillResult>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let result = state
+        .backfill_service
+        .backfill_cluster(
+            cluster_id,
+            ServiceClusterBackfillRequest {
+                start_block: request.start_block,
+                end_block: request.end_block,
+                force_reanalyze: request.force_reanalyze.unwrap_or(false),
+                query_limit: request.query_limit,
+            },
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(result))
+}
+
+async fn get_cluster_coverage(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Json<crate::domain::entities::ClusterCoverage>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let coverage = state
+        .backfill_service
+        .get_cluster_coverage(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(coverage))
+}
+
+async fn list_cluster_backfill_runs(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Json<Vec<crate::domain::entities::ClusterBackfillRun>>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let runs = state
+        .backfill_service
+        .list_cluster_backfill_runs(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(runs))
 }
 
 fn parse_time(value: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {

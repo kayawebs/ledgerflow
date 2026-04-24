@@ -2,12 +2,19 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde_json::json;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::core::errors::LedgerResult;
-use crate::domain::entities::{AddressCluster, ClusterAddress, EvidencePack, TransactionAnalysis};
-use crate::domain::interfaces::AnalysisRepository;
+use crate::domain::{
+    entities::{
+        AddressCluster, ClusterAddress, ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx,
+        EvidencePack, TransactionAnalysis,
+    },
+    enums::ClusterTxStatus,
+    interfaces::AnalysisRepository,
+};
 use crate::ingestion::models::RawTransactionBundle;
 
 #[derive(Default)]
@@ -16,6 +23,8 @@ pub struct InMemoryAnalysisRepository {
     analyses: RwLock<HashMap<(u64, String), TransactionAnalysis>>,
     packs: RwLock<HashMap<String, EvidencePack>>,
     clusters: RwLock<HashMap<Uuid, AddressCluster>>,
+    cluster_backfill_runs: RwLock<HashMap<Uuid, Vec<ClusterBackfillRun>>>,
+    cluster_discovered_txs: RwLock<HashMap<(Uuid, String), ClusterDiscoveredTx>>,
 }
 
 #[async_trait]
@@ -127,6 +136,130 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
             .cloned()
             .collect::<Vec<_>>();
         Ok(analyses)
+    }
+
+    async fn create_cluster_backfill_run(&self, run: &ClusterBackfillRun) -> LedgerResult<()> {
+        let mut runs = self.cluster_backfill_runs.write().await;
+        runs.entry(run.cluster_id).or_default().push(run.clone());
+        Ok(())
+    }
+
+    async fn update_cluster_backfill_run(&self, run: &ClusterBackfillRun) -> LedgerResult<()> {
+        let mut runs = self.cluster_backfill_runs.write().await;
+        let entry = runs.entry(run.cluster_id).or_default();
+        if let Some(existing) = entry.iter_mut().find(|item| item.run_id == run.run_id) {
+            *existing = run.clone();
+        } else {
+            entry.push(run.clone());
+        }
+        entry.sort_by(|left, right| left.requested_at.cmp(&right.requested_at));
+        Ok(())
+    }
+
+    async fn list_cluster_backfill_runs(
+        &self,
+        cluster_id: Uuid,
+    ) -> LedgerResult<Vec<ClusterBackfillRun>> {
+        let mut runs = self
+            .cluster_backfill_runs
+            .read()
+            .await
+            .get(&cluster_id)
+            .cloned()
+            .unwrap_or_default();
+        runs.sort_by(|left, right| right.requested_at.cmp(&left.requested_at));
+        Ok(runs)
+    }
+
+    async fn upsert_cluster_discovered_txs(&self, txs: &[ClusterDiscoveredTx]) -> LedgerResult<()> {
+        let mut store = self.cluster_discovered_txs.write().await;
+        for tx in txs {
+            let key = (tx.cluster_id, tx.tx_hash.clone());
+            store
+                .entry(key)
+                .and_modify(|existing| {
+                    existing.last_seen_at = tx.last_seen_at;
+                    existing.block_number = tx.block_number.or(existing.block_number);
+                    existing.latest_run_id = tx.latest_run_id;
+                    existing.metadata = tx.metadata.clone();
+                })
+                .or_insert_with(|| tx.clone());
+        }
+        Ok(())
+    }
+
+    async fn update_cluster_discovered_tx_status(
+        &self,
+        cluster_id: Uuid,
+        tx_hash: &str,
+        status: ClusterTxStatus,
+        latest_run_id: Uuid,
+        error: Option<String>,
+        analyzed_at: Option<DateTime<Utc>>,
+    ) -> LedgerResult<()> {
+        let mut store = self.cluster_discovered_txs.write().await;
+        if let Some(existing) = store.get_mut(&(cluster_id, tx_hash.to_owned())) {
+            existing.status = status;
+            existing.latest_run_id = Some(latest_run_id);
+            existing.analysis_attempted_at = Some(Utc::now());
+            existing.analyzed_at = analyzed_at;
+            existing.last_error = error;
+            existing.last_seen_at = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn get_cluster_coverage(
+        &self,
+        cluster_id: Uuid,
+    ) -> LedgerResult<Option<ClusterCoverage>> {
+        let cluster = self.clusters.read().await.get(&cluster_id).cloned();
+        let Some(cluster) = cluster else {
+            return Ok(None);
+        };
+        let store = self.cluster_discovered_txs.read().await;
+        let relevant = store
+            .values()
+            .filter(|tx| tx.cluster_id == cluster_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let discovered_tx_count = relevant.len() as u32;
+        let analyzed_tx_count = relevant
+            .iter()
+            .filter(|tx| tx.status == ClusterTxStatus::Analyzed)
+            .count() as u32;
+        let failed_tx_count = relevant
+            .iter()
+            .filter(|tx| tx.status == ClusterTxStatus::Failed)
+            .count() as u32;
+        let pending_tx_count = relevant
+            .iter()
+            .filter(|tx| tx.status == ClusterTxStatus::Pending)
+            .count() as u32;
+
+        let latest_run = self
+            .cluster_backfill_runs
+            .read()
+            .await
+            .get(&cluster_id)
+            .and_then(|runs| runs.iter().max_by_key(|run| run.requested_at).cloned());
+
+        Ok(Some(ClusterCoverage {
+            cluster_id,
+            chain_id: cluster.chain_id,
+            discovered_tx_count,
+            analyzed_tx_count,
+            failed_tx_count,
+            pending_tx_count,
+            latest_run_id: latest_run.as_ref().map(|run| run.run_id),
+            latest_run_status: latest_run.as_ref().map(|run| run.status.clone()),
+            latest_run_started_at: latest_run.as_ref().and_then(|run| run.started_at),
+            latest_run_finished_at: latest_run.as_ref().and_then(|run| run.finished_at),
+            metadata: json!({
+                "coverage_mode": "cluster_discovered_txs",
+                "has_backfill_runs": latest_run.is_some(),
+            }),
+        }))
     }
 }
 

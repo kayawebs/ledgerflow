@@ -72,7 +72,8 @@ impl ClusterService {
             .repository
             .list_analyses_for_cluster(cluster.chain_id, &address_set, start, end)
             .await?;
-        Ok(self.summarize_cluster(&cluster, &analyses, start, end))
+        let coverage = self.repository.get_cluster_coverage(cluster_id).await?;
+        Ok(self.summarize_cluster(&cluster, &analyses, start, end, coverage))
     }
 
     fn summarize_cluster(
@@ -81,6 +82,7 @@ impl ClusterService {
         analyses: &[TransactionAnalysis],
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
+        coverage: Option<crate::domain::entities::ClusterCoverage>,
     ) -> ClusterSpendSummary {
         let cluster_set = cluster
             .addresses
@@ -239,6 +241,7 @@ impl ClusterService {
             metadata: json!({
                 "note": "summary derived from already analyzed transactions for the cluster address set",
                 "coverage_mode": "persisted_analyses_only",
+                "coverage": coverage,
             }),
         }
     }

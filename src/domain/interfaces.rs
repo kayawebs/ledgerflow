@@ -5,9 +5,10 @@ use chrono::{DateTime, Utc};
 
 use crate::core::errors::LedgerResult;
 use crate::domain::entities::{
-    AddressCluster, ClusterAddress, EvidencePack, RecognizerResult, TransactionAnalysis,
+    AddressCluster, ClusterAddress, ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx,
+    EvidencePack, RecognizerResult, TransactionAnalysis,
 };
-use crate::domain::value_objects::{AssetFlow, ValidationMessage};
+use crate::domain::value_objects::{AddressTxRef, AssetFlow, ValidationMessage};
 use crate::ingestion::models::RawTransactionBundle;
 
 #[async_trait]
@@ -40,6 +41,26 @@ pub trait AnalysisRepository: Send + Sync {
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
     ) -> LedgerResult<Vec<TransactionAnalysis>>;
+    async fn create_cluster_backfill_run(&self, run: &ClusterBackfillRun) -> LedgerResult<()>;
+    async fn update_cluster_backfill_run(&self, run: &ClusterBackfillRun) -> LedgerResult<()>;
+    async fn list_cluster_backfill_runs(
+        &self,
+        cluster_id: uuid::Uuid,
+    ) -> LedgerResult<Vec<ClusterBackfillRun>>;
+    async fn upsert_cluster_discovered_txs(&self, txs: &[ClusterDiscoveredTx]) -> LedgerResult<()>;
+    async fn update_cluster_discovered_tx_status(
+        &self,
+        cluster_id: uuid::Uuid,
+        tx_hash: &str,
+        status: crate::domain::enums::ClusterTxStatus,
+        latest_run_id: uuid::Uuid,
+        error: Option<String>,
+        analyzed_at: Option<DateTime<Utc>>,
+    ) -> LedgerResult<()>;
+    async fn get_cluster_coverage(
+        &self,
+        cluster_id: uuid::Uuid,
+    ) -> LedgerResult<Option<ClusterCoverage>>;
 }
 
 pub type DynRepository = Arc<dyn AnalysisRepository>;
@@ -67,4 +88,17 @@ pub trait Recognizer: Send + Sync {
     fn order(&self) -> u32;
     fn description(&self) -> &str;
     fn recognize(&self, analysis: &TransactionAnalysis) -> LedgerResult<Option<RecognizerResult>>;
+}
+
+#[async_trait]
+pub trait ClusterTxSource: Send + Sync {
+    async fn get_last_indexed_block(&self, chain_id: u64) -> LedgerResult<u64>;
+    async fn query_address_refs(
+        &self,
+        chain_id: u64,
+        address: &str,
+        limit: u32,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+    ) -> LedgerResult<Vec<AddressTxRef>>;
 }

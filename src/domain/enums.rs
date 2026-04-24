@@ -54,3 +54,28 @@ pub enum ValidationStatus {
     Warn,
     Fail,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterBackfillStatus {
+    Pending,
+    Running,
+    Completed,
+    Partial,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterTxStatus {
+    Pending,
+    Analyzed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressHitDirection {
+    From,
+    To,
+}

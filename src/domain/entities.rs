@@ -6,7 +6,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::core::versioning::VersionBundle;
-use crate::domain::enums::{AnalysisStatus, AssetType, SpendCategory, TransactionStatus};
+use crate::domain::enums::{
+    AnalysisStatus, AssetType, ClusterBackfillStatus, ClusterTxStatus, SpendCategory,
+    TransactionStatus,
+};
 use crate::domain::value_objects::{
     AssetFlow, CodeIdentitySummary, EvidenceRef, UnresolvedItem, ValidationMessage,
 };
@@ -164,5 +167,54 @@ pub struct ClusterSpendSummary {
     pub total_incoming_native_raw: String,
     pub breakdowns: Vec<ClusterSpendBreakdown>,
     pub transactions: Vec<ClusterTransactionSummary>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterBackfillRun {
+    pub run_id: Uuid,
+    pub cluster_id: Uuid,
+    pub chain_id: u64,
+    pub start_block: Option<u64>,
+    pub end_block: Option<u64>,
+    pub status: ClusterBackfillStatus,
+    pub requested_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub address_count: u32,
+    pub discovered_tx_count: u32,
+    pub analyzed_tx_count: u32,
+    pub failed_tx_count: u32,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterDiscoveredTx {
+    pub cluster_id: Uuid,
+    pub chain_id: u64,
+    pub tx_hash: String,
+    pub block_number: Option<u64>,
+    pub status: ClusterTxStatus,
+    pub latest_run_id: Option<Uuid>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub analysis_attempted_at: Option<DateTime<Utc>>,
+    pub analyzed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterCoverage {
+    pub cluster_id: Uuid,
+    pub chain_id: u64,
+    pub discovered_tx_count: u32,
+    pub analyzed_tx_count: u32,
+    pub failed_tx_count: u32,
+    pub pending_tx_count: u32,
+    pub latest_run_id: Option<Uuid>,
+    pub latest_run_status: Option<ClusterBackfillStatus>,
+    pub latest_run_started_at: Option<DateTime<Utc>>,
+    pub latest_run_finished_at: Option<DateTime<Utc>>,
     pub metadata: Value,
 }

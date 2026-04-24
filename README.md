@@ -20,6 +20,7 @@ For operators using a self-hosted Base node that is bound only to `127.0.0.1:854
 - Persists analysis artifacts in PostgreSQL via SQLx.
 - Exposes an Axum API for analysis, replay, evidence-pack fetch, recognizer listing, and health checks.
 - Computes address-cluster spend summaries over a time window, separating gas burn, external outflows, internal transfers, and incoming transfers.
+- Can backfill cluster transaction candidates from the standalone indexer, then analyze them into PostgreSQL-backed coverage and spend summaries.
 
 ## What v0 does not do
 
@@ -28,7 +29,7 @@ For operators using a self-hosted Base node that is bound only to `127.0.0.1:854
 - Opportunity-level P&L correctness.
 - ABI/source verification as ground truth.
 - Universal transaction understanding.
-- Automatic historical transaction discovery for every address in a cluster.
+- Fully automatic continuous cluster monitoring after onboarding.
 
 ## Quick start
 
@@ -101,6 +102,9 @@ For the full operational flow, read [docs/indexer.md](docs/indexer.md).
 - `GET /recognizers`
 - `POST /replay/tx`
 - `POST /clusters`
+- `POST /clusters/{cluster_id}/backfill`
+- `GET /clusters/{cluster_id}/coverage`
+- `GET /clusters/{cluster_id}/backfill-runs`
 - `GET /clusters/{cluster_id}/spend-summary?start=...&end=...`
 - `GET /health`
 - `GET /addresses/{address}/txs?limit=1000&from_block=&to_block=&direction=from|to`
