@@ -10,14 +10,23 @@ use crate::{
 #[derive(Clone)]
 pub struct IndexerHttpClient {
     base_url: String,
+    bearer_token: Option<String>,
     client: Client,
 }
 
 impl IndexerHttpClient {
-    pub fn new(base_url: String) -> Self {
+    pub fn new(base_url: String, bearer_token: Option<String>) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
+            bearer_token,
             client: Client::new(),
+        }
+    }
+
+    fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.bearer_token.as_deref() {
+            Some(token) if !token.is_empty() => request.bearer_auth(token),
+            _ => request,
         }
     }
 }
@@ -40,8 +49,7 @@ struct IndexerAddressRefsResponse {
 impl ClusterTxSource for IndexerHttpClient {
     async fn get_last_indexed_block(&self, _chain_id: u64) -> LedgerResult<u64> {
         let response = self
-            .client
-            .get(format!("{}/progress", self.base_url))
+            .apply_auth(self.client.get(format!("{}/progress", self.base_url)))
             .send()
             .await
             .map_err(|err| LedgerError::TransientIngestion(err.to_string()))?;
@@ -68,9 +76,10 @@ impl ClusterTxSource for IndexerHttpClient {
         from_block: Option<u64>,
         to_block: Option<u64>,
     ) -> LedgerResult<Vec<AddressTxRef>> {
-        let mut request = self
-            .client
-            .get(format!("{}/addresses/{}/txs", self.base_url, address));
+        let mut request = self.apply_auth(
+            self.client
+                .get(format!("{}/addresses/{}/txs", self.base_url, address)),
+        );
         request = request.query(&[("limit", limit)]);
         if let Some(from_block) = from_block {
             request = request.query(&[("from_block", from_block)]);

@@ -40,10 +40,12 @@ async fn main() {
         Arc::new(repository),
         config.enabled_recognizers.clone(),
     ));
-    let tx_source = config
-        .indexer_api_base_url
-        .clone()
-        .map(|url| Arc::new(IndexerHttpClient::new(url)) as Arc<dyn ClusterTxSource>);
+    let tx_source = config.indexer_api_base_url.clone().map(|url| {
+        Arc::new(IndexerHttpClient::new(
+            url,
+            config.indexer_api_bearer_token.clone(),
+        )) as Arc<dyn ClusterTxSource>
+    });
     let backfill_service = Arc::new(ClusterBackfillService::new(
         Arc::clone(&service),
         tx_source,

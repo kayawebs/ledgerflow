@@ -38,8 +38,11 @@ LedgerFlow reads configuration from environment variables.
 | `LEDGERFLOW_BIND_ADDR` | HTTP bind address for Axum | `0.0.0.0:8080` |
 | `LEDGERFLOW_DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@localhost:5432/ledgerflow` |
 | `LEDGERFLOW_RPC_URL` | Base RPC endpoint | `http://host.docker.internal:18545` in Docker via nginx proxy, `http://127.0.0.1:18545` for local runs on the host |
+| `LEDGERFLOW_INDEXER_API_BASE_URL` | Indexer API base URL used by analysis-side cluster backfill | `http://indexer:8090` |
+| `LEDGERFLOW_INDEXER_API_BEARER_TOKEN` | Optional Bearer token sent to the indexer API | unset |
 | `LEDGERFLOW_DEFAULT_CHAIN_ID` | Default chain for callers that omit it | `8453` |
 | `LEDGERFLOW_TRACE_ENABLED` | Enables trace fetch attempts | `false` |
+| `LEDGERFLOW_CLUSTER_BACKFILL_QUERY_LIMIT` | Per-request limit used when analysis reads tx refs from the indexer | `10000` |
 | `LEDGERFLOW_ENABLED_RECOGNIZERS` | Comma-separated recognizer ids to run by default | `selector_presence,erc20_transfer_flow,...` |
 | `LEDGERFLOW_PLUGINS` | Comma-separated plugin packs to load | `sample_builtin_pack` |
 | `LEDGERFLOW_WEB_BIND_ADDR` | Web process bind address | `0.0.0.0:3000` |
@@ -231,6 +234,8 @@ After creating a cluster, trigger backfill so the analysis service can:
 - deduplicate tx hashes across cluster addresses
 - analyze missing transactions
 - update cluster coverage
+
+If the indexer API requires auth, set `LEDGERFLOW_INDEXER_API_BEARER_TOKEN` in the analysis service environment. Backfill requests will then include `Authorization: Bearer <token>`.
 
 ```bash
 curl -X POST http://localhost:8180/clusters/YOUR_CLUSTER_ID/backfill \

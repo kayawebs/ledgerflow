@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub database_url: String,
     pub rpc_url: String,
     pub indexer_api_base_url: Option<String>,
+    pub indexer_api_bearer_token: Option<String>,
     pub default_chain_id: u64,
     pub trace_enabled: bool,
     pub cluster_backfill_query_limit: u32,
@@ -24,6 +25,7 @@ impl AppConfig {
             rpc_url: env::var("LEDGERFLOW_RPC_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8545".to_owned()),
             indexer_api_base_url: env::var("LEDGERFLOW_INDEXER_API_BASE_URL").ok(),
+            indexer_api_bearer_token: env::var("LEDGERFLOW_INDEXER_API_BEARER_TOKEN").ok(),
             default_chain_id: env::var("LEDGERFLOW_DEFAULT_CHAIN_ID")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
