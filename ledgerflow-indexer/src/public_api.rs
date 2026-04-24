@@ -68,6 +68,11 @@ pub struct BatchRefsResponse {
     pub per_address_counts: BTreeMap<String, usize>,
 }
 
+enum AuthContext {
+    Customer(AuthenticatedApiKey),
+    Internal,
+}
+
 pub fn router(service: Arc<IndexerService>, admin_store: Arc<PostgresAdminStore>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -344,23 +349,33 @@ async fn get_block(
     ))
 }
 
-async fn authorize(
-    state: &PublicApiState,
-    headers: &HeaderMap,
-) -> Result<AuthenticatedApiKey, ApiError> {
+async fn authorize(state: &PublicApiState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
     let api_key = bearer_token(headers).map_err(ApiError::from)?;
+    if state
+        .service
+        .config
+        .internal_api_token
+        .as_deref()
+        .is_some_and(|token| token == api_key)
+    {
+        return Ok(AuthContext::Internal);
+    }
     state
         .admin_store
         .authenticate_api_key(api_key)
         .await
+        .map(AuthContext::Customer)
         .map_err(ApiError::from)
 }
 
 async fn record_success(
     state: &PublicApiState,
-    auth: &AuthenticatedApiKey,
+    auth: &AuthContext,
     endpoint: &str,
 ) -> Result<(), ApiError> {
+    let AuthContext::Customer(auth) = auth else {
+        return Ok(());
+    };
     state
         .admin_store
         .record_usage(
@@ -377,10 +392,13 @@ async fn record_success(
 
 async fn record_failure(
     state: &PublicApiState,
-    auth: &AuthenticatedApiKey,
+    auth: &AuthContext,
     endpoint: &str,
     err: &LedgerError,
 ) {
+    let AuthContext::Customer(auth) = auth else {
+        return;
+    };
     let status = status_for_error(err).as_u16() as i32;
     let _ = state
         .admin_store

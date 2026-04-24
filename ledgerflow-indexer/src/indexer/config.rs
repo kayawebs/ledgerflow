@@ -28,6 +28,7 @@ pub struct IndexerConfig {
     pub worker_id: String,
     pub query_limit_default: u32,
     pub query_limit_max: u32,
+    pub internal_api_token: Option<String>,
 }
 
 impl IndexerConfig {
@@ -74,6 +75,9 @@ impl IndexerConfig {
             query_limit_default: parse_u32("LEDGERFLOW_INDEXER_QUERY_LIMIT_DEFAULT")
                 .unwrap_or(1_000),
             query_limit_max: parse_u32("LEDGERFLOW_INDEXER_QUERY_LIMIT_MAX").unwrap_or(10_000),
+            internal_api_token: env::var("LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
         }
     }
 }

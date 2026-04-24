@@ -26,6 +26,14 @@ Authorization: Bearer lf_live_xxx
 
 Dashboard `/admin/...` endpoints use the `ledgerflow_session` HttpOnly cookie set by the login/register flow. They do not accept public API keys.
 
+Optional internal bypass for trusted local consumers:
+
+```text
+LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN=some-long-random-secret
+```
+
+If this variable is set, the same bearer token can be used against `/v1/...` to bypass subscription and quota checks. This is intended for trusted internal analysis services, not public users.
+
 ## Metering And Quota
 
 The service records successful and failed authenticated `/v1` requests per API key, endpoint, usage source, and outcome.

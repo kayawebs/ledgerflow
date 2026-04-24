@@ -44,11 +44,14 @@ LEDGERFLOW_INDEXER_CLICKHOUSE_URL=http://127.0.0.1:8123
 LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE=ledgerflow_indexer
 LEDGERFLOW_INDEXER_WORKER_ID=base_mainnet_top_level
 LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false
+LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN=
 ```
 
 The table names remain `address_tx_refs` and `indexer_progress`, so the service can continue from the existing progress row.
 
 Keep `LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false` for public deployments. The legacy `/addresses/...` endpoints are intended only for internal compatibility.
+
+If you want your own local analysis service to bypass subscription/quota checks, set `LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN` and use it as a bearer token against `/v1/...`. Treat it as a privileged internal secret.
 
 ## Public API Examples
 

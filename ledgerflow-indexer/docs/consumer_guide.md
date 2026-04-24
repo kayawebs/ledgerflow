@@ -82,6 +82,31 @@ curl -s "https://indexer.ledgerflow.top/v1/chains/base/progress" \
   -H "Authorization: Bearer $LEDGERFLOW_API_KEY"
 ```
 
+### Internal Consumer Token
+
+If you control the deployment and want your own local analysis tool to bypass subscription and request quota, you can set:
+
+```text
+LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN=some-long-random-secret
+```
+
+Then your internal consumer can call the same `/v1/...` endpoints with:
+
+```http
+Authorization: Bearer some-long-random-secret
+```
+
+Behavior:
+
+- skips subscription checks
+- skips quota exhaustion checks
+- skips customer usage metering
+- still requires authentication via the token
+
+This is intended for trusted internal consumers only.
+
+Do not enable it on a public deployment unless you are sure the token is kept private and only reachable from trusted network paths.
+
 ## Core Consumer Flows
 
 ### 1. Single Address Backfill
