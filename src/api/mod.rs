@@ -8,7 +8,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::core::errors::LedgerError;
@@ -254,25 +253,19 @@ async fn create_cluster(
         .await
         .map_err(ApiError::from)?;
     if state.auto_backfill_on_cluster_create && state.backfill_service.is_configured() {
-        let backfill_service = Arc::clone(&state.backfill_service);
-        let cluster_id = cluster.cluster_id;
-        tokio::spawn(async move {
-            info!(%cluster_id, "starting background cluster backfill after create");
-            if let Err(err) = backfill_service
-                .backfill_cluster(
-                    cluster_id,
-                    ServiceClusterBackfillRequest {
-                        start_block: Some(0),
-                        end_block: None,
-                        force_reanalyze: false,
-                        query_limit: None,
-                    },
-                )
-                .await
-            {
-                error!(%cluster_id, error = %err, "background cluster backfill failed");
-            }
-        });
+        state
+            .backfill_service
+            .enqueue_cluster(
+                cluster.cluster_id,
+                ServiceClusterBackfillRequest {
+                    start_block: Some(0),
+                    end_block: None,
+                    force_reanalyze: false,
+                    query_limit: None,
+                },
+            )
+            .await
+            .map_err(ApiError::from)?;
     }
     Ok(Json(cluster))
 }
@@ -301,9 +294,9 @@ async fn backfill_cluster(
 ) -> Result<Json<ClusterBackfillResult>, ApiError> {
     let cluster_id = Uuid::parse_str(&cluster_id)
         .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
-    let result = state
+    let run = state
         .backfill_service
-        .backfill_cluster(
+        .enqueue_cluster(
             cluster_id,
             ServiceClusterBackfillRequest {
                 start_block: request.start_block,
@@ -314,7 +307,12 @@ async fn backfill_cluster(
         )
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(result))
+    let coverage = state
+        .backfill_service
+        .get_cluster_coverage(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ClusterBackfillResult { run, coverage }))
 }
 
 async fn get_cluster_coverage(

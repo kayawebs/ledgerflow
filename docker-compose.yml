@@ -33,10 +33,32 @@ services:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env
+    environment:
+      LEDGERFLOW_BIND_ADDR: 0.0.0.0:8080
+      LEDGERFLOW_DATABASE_URL: postgres://postgres:postgres@db:5432/ledgerflow
+      LEDGERFLOW_RPC_URL: http://host.docker.internal:18545
+      LEDGERFLOW_INDEXER_API_BASE_URL: http://indexer:8090
     depends_on:
       - db
     ports:
       - "127.0.0.1:8180:8080"
+
+  worker:
+    image: rust:1.92
+    working_dir: /app
+    command: sh -c "cargo run --bin ledgerflow_backfill_worker"
+    volumes:
+      - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      LEDGERFLOW_DATABASE_URL: postgres://postgres:postgres@db:5432/ledgerflow
+      LEDGERFLOW_RPC_URL: http://host.docker.internal:18545
+      LEDGERFLOW_INDEXER_API_BASE_URL: http://indexer:8090
+    depends_on:
+      - db
 
   web:
     image: rust:1.92

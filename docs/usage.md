@@ -35,19 +35,20 @@ LedgerFlow reads configuration from environment variables.
 
 | Variable | Purpose | Example |
 | --- | --- | --- |
-| `LEDGERFLOW_BIND_ADDR` | HTTP bind address for Axum | `0.0.0.0:8080` |
-| `LEDGERFLOW_DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@localhost:5432/ledgerflow` |
-| `LEDGERFLOW_RPC_URL` | Base RPC endpoint | `http://host.docker.internal:18545` in Docker via nginx proxy, `http://127.0.0.1:18545` for local runs on the host |
-| `LEDGERFLOW_INDEXER_API_BASE_URL` | Indexer API base URL used by analysis-side cluster backfill | `http://indexer:8090` |
+| `LEDGERFLOW_BIND_ADDR` | HTTP bind address for Axum | `127.0.0.1:3000` for host runs, `0.0.0.0:8080` in Docker |
+| `LEDGERFLOW_DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@127.0.0.1:5532/ledgerflow` for host runs |
+| `LEDGERFLOW_RPC_URL` | Base RPC endpoint | `http://127.0.0.1:8545` for host runs, `http://host.docker.internal:18545` in Docker via nginx proxy |
+| `LEDGERFLOW_INDEXER_API_BASE_URL` | Indexer API base URL used by analysis-side cluster backfill | `http://127.0.0.1:8090` for host runs, `http://indexer:8090` in Docker |
 | `LEDGERFLOW_INDEXER_API_BEARER_TOKEN` | Optional Bearer token sent to the indexer API | unset |
 | `LEDGERFLOW_DEFAULT_CHAIN_ID` | Default chain for callers that omit it | `8453` |
 | `LEDGERFLOW_TRACE_ENABLED` | Enables trace fetch attempts | `false` |
 | `LEDGERFLOW_CLUSTER_BACKFILL_QUERY_LIMIT` | Per-request limit used when analysis reads tx refs from the indexer | `10000` |
 | `LEDGERFLOW_CLUSTER_AUTO_BACKFILL_ON_CREATE` | Start a background historical backfill immediately after cluster creation | `true` |
+| `LEDGERFLOW_CLUSTER_BACKFILL_WORKER_POLL_INTERVAL_MS` | Poll interval for the standalone backfill worker | `5000` |
 | `LEDGERFLOW_ENABLED_RECOGNIZERS` | Comma-separated recognizer ids to run by default | `selector_presence,erc20_transfer_flow,...` |
 | `LEDGERFLOW_PLUGINS` | Comma-separated plugin packs to load | `sample_builtin_pack` |
-| `LEDGERFLOW_WEB_BIND_ADDR` | Web process bind address | `0.0.0.0:3000` |
-| `LEDGERFLOW_API_BASE_URL` | Upstream analysis API used by the web process | `http://app:8080` |
+| `LEDGERFLOW_WEB_BIND_ADDR` | Web process bind address | `127.0.0.1:3001` for host runs, `0.0.0.0:3000` in Docker |
+| `LEDGERFLOW_API_BASE_URL` | Upstream analysis API used by the web process | `http://127.0.0.1:3000` for host runs, `http://app:8080` in Docker |
 
 The checked-in `.env.example` is the easiest starting point. Copy it to `.env` before using Docker Compose, because the compose stack reads `.env` as the runtime config file.
 
@@ -82,14 +83,14 @@ This is the shortest path to a local instance.
 2. Start the stack:
 
 ```bash
-docker-compose up --build
+docker-compose up --build db app worker web
 ```
 
 The services will be available at:
 
-- API: `http://localhost:8180`
-- Web: `http://localhost:3000`
-- Indexer API: `http://localhost:8090`
+- API: `http://127.0.0.1:8180`
+- Web: `http://127.0.0.1:3000`
+- Indexer API: `http://127.0.0.1:8090`
 
 The API service runs migrations on startup. The web service is a separate process that proxies the API and exposes a minimal operator UI.
 
@@ -101,15 +102,17 @@ docker-compose up --build clickhouse indexer
 
 ## Run locally with Cargo
 
-If you already have PostgreSQL running locally:
+If you already have PostgreSQL and the indexer running in Docker already, this is the recommended way to run analysis on the host:
 
 1. Create a database named `ledgerflow`.
 2. Export environment variables:
 
 ```bash
-export LEDGERFLOW_DATABASE_URL=postgres://postgres:postgres@localhost:5432/ledgerflow
-export LEDGERFLOW_RPC_URL=http://127.0.0.1:18545
-export LEDGERFLOW_BIND_ADDR=0.0.0.0:8080
+export LEDGERFLOW_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5532/ledgerflow
+export LEDGERFLOW_RPC_URL=http://127.0.0.1:8545
+export LEDGERFLOW_INDEXER_API_BASE_URL=http://127.0.0.1:8090
+export LEDGERFLOW_INDEXER_API_BEARER_TOKEN=your-long-random-secret
+export LEDGERFLOW_BIND_ADDR=127.0.0.1:3000
 ```
 
 3. Run migrations:
@@ -121,17 +124,24 @@ make migrate
 4. Start the API server:
 
 ```bash
-make run
+cargo run --bin ledgerflow
 ```
 
-5. In another terminal, start the web server:
+5. In another terminal, start the backfill worker:
 
 ```bash
-export LEDGERFLOW_API_BASE_URL=http://127.0.0.1:8080
-make run-web
+cargo run --bin ledgerflow_backfill_worker
 ```
 
-When you run the API directly with Cargo, it still listens on `http://localhost:8080` unless you override `LEDGERFLOW_BIND_ADDR`.
+6. In another terminal, start the web server:
+
+```bash
+export LEDGERFLOW_API_BASE_URL=http://127.0.0.1:3000
+export LEDGERFLOW_WEB_BIND_ADDR=127.0.0.1:3001
+cargo run --bin web
+```
+
+When you run the API directly with Cargo, it listens on `http://127.0.0.1:3000` by default. The backfill worker is a separate process and must stay running if you want newly created clusters to keep making progress.
 
 To run only the standalone top-level indexer:
 
@@ -194,6 +204,7 @@ The web process is intentionally thin. It is not a second analysis engine. It do
 Current web console actions:
 
 - create an address cluster
+- inspect cluster coverage
 - load a cluster spend summary
 - analyze a transaction
 - load an already persisted analysis
@@ -227,11 +238,11 @@ curl -X POST http://localhost:8180/clusters \
 
 The response returns the `cluster_id`.
 
-If `LEDGERFLOW_CLUSTER_AUTO_BACKFILL_ON_CREATE=true`, cluster creation also starts a background historical backfill immediately. You can then poll `/clusters/{cluster_id}/coverage` or `/clusters/{cluster_id}/backfill-runs` to watch progress.
+If `LEDGERFLOW_CLUSTER_AUTO_BACKFILL_ON_CREATE=true`, cluster creation immediately enqueues a historical backfill job. The API request returns quickly; discovery and tx analysis happen later in the standalone backfill worker process.
 
-## Backfill a cluster from the indexer
+## Cluster backfill queue
 
-After creating a cluster, trigger backfill so the analysis service can:
+After creating a cluster, the worker will:
 
 - query the standalone indexer for address-related tx refs
 - deduplicate tx hashes across cluster addresses
@@ -239,6 +250,8 @@ After creating a cluster, trigger backfill so the analysis service can:
 - update cluster coverage
 
 If the indexer API requires auth, set `LEDGERFLOW_INDEXER_API_BEARER_TOKEN` in the analysis service environment. Backfill requests will then include `Authorization: Bearer <token>`.
+
+The normal path is automatic queueing on cluster creation. There is still an API endpoint for manually enqueueing another backfill run:
 
 ```bash
 curl -X POST http://localhost:8180/clusters/YOUR_CLUSTER_ID/backfill \
@@ -255,7 +268,8 @@ Useful notes:
 
 - `end_block` is optional. If omitted, the analysis service uses the indexer's latest indexed block.
 - `query_limit` is the per-request ceiling used when reading an address range from the indexer.
-- The analysis service recursively splits block ranges when the per-request limit is hit, so it can backfill large address histories without direct ClickHouse reads.
+- This endpoint now enqueues work. It does not synchronously analyze the whole cluster in the request path.
+- The worker recursively splits block ranges when the per-request limit is hit, so it can backfill large address histories without direct ClickHouse reads.
 
 ## Check cluster coverage
 
@@ -312,7 +326,8 @@ Cluster spend summary still reads from persisted analyses only.
 That means:
 
 - create cluster
-- run cluster backfill
+- keep the backfill worker running
+- wait for coverage to move
 - then read spend summary
 
 If coverage is partial, the spend summary metadata will reflect that partiality rather than pretending full completeness.

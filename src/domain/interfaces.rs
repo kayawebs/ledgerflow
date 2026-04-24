@@ -47,6 +47,9 @@ pub trait AnalysisRepository: Send + Sync {
         &self,
         cluster_id: uuid::Uuid,
     ) -> LedgerResult<Vec<ClusterBackfillRun>>;
+    async fn claim_next_pending_cluster_backfill_run(
+        &self,
+    ) -> LedgerResult<Option<ClusterBackfillRun>>;
     async fn upsert_cluster_discovered_txs(&self, txs: &[ClusterDiscoveredTx]) -> LedgerResult<()>;
     async fn update_cluster_discovered_tx_status(
         &self,

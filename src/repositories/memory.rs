@@ -12,7 +12,7 @@ use crate::domain::{
         AddressCluster, ClusterAddress, ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx,
         EvidencePack, TransactionAnalysis,
     },
-    enums::ClusterTxStatus,
+    enums::{ClusterBackfillStatus, ClusterTxStatus},
     interfaces::AnalysisRepository,
 };
 use crate::ingestion::models::RawTransactionBundle;
@@ -169,6 +169,41 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
             .unwrap_or_default();
         runs.sort_by(|left, right| right.requested_at.cmp(&left.requested_at));
         Ok(runs)
+    }
+
+    async fn claim_next_pending_cluster_backfill_run(
+        &self,
+    ) -> LedgerResult<Option<ClusterBackfillRun>> {
+        let mut runs = self.cluster_backfill_runs.write().await;
+        let mut selected: Option<(Uuid, usize, chrono::DateTime<Utc>)> = None;
+
+        for (cluster_id, cluster_runs) in runs.iter() {
+            for (index, run) in cluster_runs.iter().enumerate() {
+                if run.status != ClusterBackfillStatus::Pending {
+                    continue;
+                }
+                match selected {
+                    Some((_, _, requested_at)) if run.requested_at >= requested_at => {}
+                    _ => selected = Some((*cluster_id, index, run.requested_at)),
+                }
+            }
+        }
+
+        let Some((cluster_id, index, _)) = selected else {
+            return Ok(None);
+        };
+
+        let run = runs
+            .get_mut(&cluster_id)
+            .and_then(|cluster_runs| cluster_runs.get_mut(index))
+            .map(|run| {
+                run.status = ClusterBackfillStatus::Running;
+                if run.started_at.is_none() {
+                    run.started_at = Some(Utc::now());
+                }
+                run.clone()
+            });
+        Ok(run)
     }
 
     async fn upsert_cluster_discovered_txs(&self, txs: &[ClusterDiscoveredTx]) -> LedgerResult<()> {

@@ -29,9 +29,9 @@ impl WebConfig {
     pub fn from_env() -> Self {
         Self {
             bind_addr: std::env::var("LEDGERFLOW_WEB_BIND_ADDR")
-                .unwrap_or_else(|_| "0.0.0.0:3000".to_owned()),
+                .unwrap_or_else(|_| "127.0.0.1:3001".to_owned()),
             api_base_url: std::env::var("LEDGERFLOW_API_BASE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned()),
+                .unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
             default_chain_id: std::env::var("LEDGERFLOW_DEFAULT_CHAIN_ID")
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
@@ -81,14 +81,6 @@ pub struct ClusterSummaryQuery {
     pub end: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ClusterBackfillRequest {
-    pub start_block: Option<u64>,
-    pub end_block: Option<u64>,
-    pub force_reanalyze: Option<bool>,
-    pub query_limit: Option<u32>,
-}
-
 pub fn router(config: WebConfig) -> Router {
     let state = WebState {
         api_base_url: config.api_base_url,
@@ -109,10 +101,6 @@ pub fn router(config: WebConfig) -> Router {
         )
         .route("/api/replay/tx", post(proxy_replay_tx))
         .route("/api/clusters", post(proxy_create_cluster))
-        .route(
-            "/api/clusters/{cluster_id}/backfill",
-            post(proxy_backfill_cluster),
-        )
         .route(
             "/api/clusters/{cluster_id}/coverage",
             get(proxy_get_cluster_coverage),
@@ -211,23 +199,6 @@ async fn proxy_create_cluster(
         state
             .client
             .post(format!("{}/clusters", state.api_base_url))
-            .json(&request),
-    )
-    .await
-}
-
-async fn proxy_backfill_cluster(
-    State(state): State<WebState>,
-    Path(cluster_id): Path<String>,
-    Json(request): Json<ClusterBackfillRequest>,
-) -> Result<Response<Body>, WebError> {
-    proxy_request(
-        state
-            .client
-            .post(format!(
-                "{}/clusters/{}/backfill",
-                state.api_base_url, cluster_id
-            ))
             .json(&request),
     )
     .await
@@ -468,45 +439,12 @@ fn render_index_html(state: &WebState) -> String {
 
           <section class="panel">
             <div class="panel-head">
-              <h2>Cluster Backfill</h2>
-              <span class="pill">Discover first</span>
-            </div>
-            <div class="panel-body">
-              <div class="panel-copy">Creating a cluster does not analyze its history. Run backfill first so the analysis service can pull tx refs from the indexer, deduplicate them, and analyze missing transactions.</div>
-              <div class="panel-copy">New clusters now also trigger background historical backfill automatically. Use this panel when you want to force a manual run or inspect coverage immediately.</div>
-              <form id="cluster-backfill-form">
-                <label>
-                  Cluster ID
-                  <input id="cluster-id" placeholder="uuid">
-                </label>
-                <label>
-                  Start Block
-                  <input id="cluster-backfill-start-block" placeholder="0" inputmode="numeric">
-                </label>
-                <label>
-                  End Block
-                  <input id="cluster-backfill-end-block" placeholder="optional latest indexed block" inputmode="numeric">
-                </label>
-                <label>
-                  Query Limit
-                  <input id="cluster-backfill-query-limit" placeholder="10000" inputmode="numeric">
-                </label>
-                <div class="actions">
-                  <button class="primary" type="submit">Backfill Cluster</button>
-                  <button class="secondary" type="button" id="load-cluster-coverage">Load Coverage</button>
-                </div>
-              </form>
-            </div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-head">
               <h2>Cluster Summary</h2>
               <span class="pill">Spend window</span>
             </div>
             <div class="panel-body">
-              <div class="panel-copy">Spend summary only aggregates already analyzed transactions. If this is a new cluster, backfill it first. Empty txs here usually means no discovered transactions were analyzed yet.</div>
-              <div class="panel-copy">After cluster creation, wait for background backfill to progress, or check coverage first.</div>
+              <div class="panel-copy">Spend summary only aggregates already analyzed transactions. New clusters are queued for historical backfill immediately after creation, then a separate worker process analyzes them in the background.</div>
+              <div class="panel-copy">If txs are still empty, load coverage first. That tells you whether discovery has started, how many txs were found, and whether the worker is still catching up.</div>
               <form id="cluster-summary-form">
                 <label>
                   Cluster ID
@@ -521,6 +459,7 @@ fn render_index_html(state: &WebState) -> String {
                   <input id="cluster-end" placeholder="2026-04-30T23:59:59Z">
                 </label>
                 <div class="actions">
+                  <button class="secondary" type="button" id="load-cluster-coverage">Load Coverage</button>
                   <button class="primary" type="submit">Load Spend Summary</button>
                 </div>
               </form>
@@ -668,35 +607,10 @@ fn render_index_html(state: &WebState) -> String {
         labelsEl.innerHTML = "";
       }};
 
-      const renderClusterBackfill = (payload) => {{
-        const run = payload.run || {{}};
-        const coverage = payload.coverage || {{}};
-        const cards = [
-          ["run status", run.status || "-"],
-          ["discovered", String(run.discovered_tx_count || 0)],
-          ["analyzed", String(run.analyzed_tx_count || 0)],
-          ["failed", String(run.failed_tx_count || 0)],
-          ["coverage discovered", String(coverage.discovered_tx_count || 0)],
-          ["coverage pending", String(coverage.pending_tx_count || 0)],
-        ];
-        summaryEl.innerHTML = cards.map(([label, value]) => `
-          <div class="stat">
-            <span class="stat-label">${{label}}</span>
-            <span class="stat-value">${{value}}</span>
-          </div>
-        `).join("");
-        labelsEl.innerHTML = (run.metadata?.warnings || [])
-          .slice(0, 12)
-          .map((item) => `<div class="chip">${{item.type || "warning"}}</div>`)
-          .join("");
-      }};
-
       const renderJson = (payload, mode) => {{
         outputEl.textContent = JSON.stringify(payload, null, 2);
         if (mode === "cluster-coverage") {{
           renderClusterCoverage(payload);
-        }} else if (mode === "cluster-backfill") {{
-          renderClusterBackfill(payload);
         }} else if (mode.startsWith("cluster")) {{
           renderClusterSummary(payload);
         }} else {{
@@ -750,32 +664,13 @@ fn render_index_html(state: &WebState) -> String {
           body: JSON.stringify(payload),
         }}, "cluster-create");
         if (result?.cluster_id) {{
-          document.getElementById("cluster-id").value = result.cluster_id;
           document.getElementById("cluster-summary-id").value = result.cluster_id;
-          setStatus("Cluster created. Background historical backfill has been started; use Load Coverage to watch progress.");
+          setStatus("Cluster created. Historical backfill has been queued; keep the worker process running and use Load Coverage to watch progress.");
         }}
       }});
 
-      document.getElementById("cluster-backfill-form").addEventListener("submit", async (event) => {{
-        event.preventDefault();
-        const clusterId = document.getElementById("cluster-id").value.trim();
-        const startBlock = document.getElementById("cluster-backfill-start-block").value.trim();
-        const endBlock = document.getElementById("cluster-backfill-end-block").value.trim();
-        const queryLimit = document.getElementById("cluster-backfill-query-limit").value.trim();
-        await request(`/api/clusters/${{clusterId}}/backfill`, {{
-          method: "POST",
-          headers: {{ "content-type": "application/json" }},
-          body: JSON.stringify({{
-            start_block: startBlock ? Number(startBlock) : null,
-            end_block: endBlock ? Number(endBlock) : null,
-            force_reanalyze: false,
-            query_limit: queryLimit ? Number(queryLimit) : null,
-          }}),
-        }}, "cluster-backfill");
-      }});
-
       document.getElementById("load-cluster-coverage").addEventListener("click", async () => {{
-        const clusterId = document.getElementById("cluster-id").value.trim();
+        const clusterId = document.getElementById("cluster-summary-id").value.trim();
         await request(`/api/clusters/${{clusterId}}/coverage`, {{}}, "cluster-coverage");
       }});
 

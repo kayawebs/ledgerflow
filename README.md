@@ -22,8 +22,8 @@ For operators using a self-hosted Base node that is bound only to `127.0.0.1:854
 - Persists analysis artifacts in PostgreSQL via SQLx.
 - Exposes an Axum API for analysis, replay, evidence-pack fetch, recognizer listing, and health checks.
 - Computes address-cluster spend summaries over a time window, separating gas burn, external outflows, internal transfers, and incoming transfers.
-- Can backfill cluster transaction candidates from the standalone indexer, then analyze them into PostgreSQL-backed coverage and spend summaries.
-- Automatically starts a background historical backfill when a new cluster is created, as long as the analysis service can reach the indexer API.
+- Can queue cluster transaction discovery jobs from the standalone indexer, then analyze them into PostgreSQL-backed coverage and spend summaries.
+- Automatically enqueues a historical backfill when a new cluster is created. A separate worker process drains that queue without blocking the API.
 
 ## What v0 does not do
 
@@ -37,10 +37,10 @@ For operators using a self-hosted Base node that is bound only to `127.0.0.1:854
 ## Quick start
 
 1. Copy `.env.example` to `.env`. Docker Compose now reads `.env` as the runtime config file.
-2. Start Postgres and the app:
+2. Start Postgres, the API, the backfill worker, and the web process:
 
 ```bash
-docker-compose up --build
+docker-compose up --build db app worker web
 ```
 
 3. Run checks locally:
@@ -54,8 +54,8 @@ For a practical operator walkthrough, read [docs/usage.md](docs/usage.md).
 
 Default local endpoints:
 
-- API: `http://localhost:8180`
-- Web: `http://localhost:3000`
+- API: `http://127.0.0.1:3000` when run directly on the host, `http://127.0.0.1:8180` in Docker
+- Web: `http://127.0.0.1:3001` when run directly on the host, `http://127.0.0.1:3000` in Docker
 - Indexer API: `http://localhost:8090`
 
 ## Standalone indexer
@@ -110,8 +110,6 @@ For the full operational flow, read [docs/indexer.md](docs/indexer.md).
 - `GET /clusters/{cluster_id}/backfill-runs`
 - `GET /clusters/{cluster_id}/spend-summary?start=...&end=...`
 - `GET /health`
-- `GET /addresses/{address}/txs?limit=1000&from_block=&to_block=&direction=from|to`
-- `GET /addresses/{address}/tx-hashes?limit=1000&from_block=&to_block=&direction=from|to`
 
 Example:
 

@@ -10,7 +10,9 @@ use common::MockRpcClient;
 use ledgerflow::{
     core::errors::LedgerResult,
     domain::{
-        entities::ClusterAddress, enums::AddressHitDirection, interfaces::ClusterTxSource,
+        entities::ClusterAddress,
+        enums::{AddressHitDirection, ClusterBackfillStatus},
+        interfaces::ClusterTxSource,
         value_objects::AddressTxRef,
     },
     ingestion::fetchers::TransactionBundleFetcher,
@@ -237,4 +239,77 @@ async fn cluster_coverage_is_zero_before_any_backfill() {
             .unwrap_or(false)
     );
     assert!(now <= Utc::now());
+}
+
+#[tokio::test]
+async fn queued_cluster_backfill_is_processed_by_worker_path() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository.clone(),
+        vec!["selector_presence".to_owned(), "native_transfer".to_owned()],
+    ));
+    let backfill_service = ClusterBackfillService::new(
+        Arc::clone(&analysis_service),
+        Some(Arc::new(MockClusterTxSource {
+            last_indexed_block: 42,
+            refs_by_address: HashMap::from([(
+                "0x1111111111111111111111111111111111111111".to_owned(),
+                vec![AddressTxRef {
+                    address: "0x1111111111111111111111111111111111111111".to_owned(),
+                    tx_hash: "0xqueued-a".to_owned(),
+                    block_number: 9,
+                    tx_index: 0,
+                    direction: AddressHitDirection::From,
+                }],
+            )]),
+        })),
+        100,
+    );
+    let cluster_service = ClusterService::new(repository.clone());
+
+    let cluster = cluster_service
+        .create_cluster(
+            8453,
+            "ops_team",
+            "queued_cluster",
+            None,
+            vec![ClusterAddress {
+                address: "0x1111111111111111111111111111111111111111".to_owned(),
+                label: Some("bot".to_owned()),
+                role: Some("bot".to_owned()),
+                metadata: json!({}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let queued = backfill_service
+        .enqueue_cluster(
+            cluster.cluster_id,
+            ClusterBackfillRequest {
+                start_block: Some(0),
+                end_block: None,
+                force_reanalyze: false,
+                query_limit: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.status, ClusterBackfillStatus::Pending);
+
+    let result = backfill_service
+        .process_next_pending_run()
+        .await
+        .unwrap()
+        .expect("pending run should be claimed");
+    assert_eq!(result.run.run_id, queued.run_id);
+    assert_eq!(result.run.status, ClusterBackfillStatus::Completed);
+    assert_eq!(result.coverage.discovered_tx_count, 1);
+    assert_eq!(result.coverage.analyzed_tx_count, 1);
 }

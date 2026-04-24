@@ -552,6 +552,47 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         rows.into_iter().map(row_to_backfill_run).collect()
     }
 
+    async fn claim_next_pending_cluster_backfill_run(
+        &self,
+    ) -> LedgerResult<Option<ClusterBackfillRun>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        let row = sqlx::query(
+            r#"
+            with candidate as (
+              select run_id
+              from cluster_backfill_runs
+              where status = 'pending'
+              order by requested_at asc
+              limit 1
+              for update skip locked
+            )
+            update cluster_backfill_runs runs
+            set status = 'running',
+                started_at = coalesce(runs.started_at, now())
+            from candidate
+            where runs.run_id = candidate.run_id
+            returning runs.run_id, runs.cluster_id, runs.chain_id, runs.start_block, runs.end_block,
+                      runs.status, runs.requested_at, runs.started_at, runs.finished_at,
+                      runs.address_count, runs.discovered_tx_count, runs.analyzed_tx_count,
+                      runs.failed_tx_count, runs.metadata
+            "#,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        row.map(row_to_backfill_run).transpose()
+    }
+
     async fn upsert_cluster_discovered_txs(&self, txs: &[ClusterDiscoveredTx]) -> LedgerResult<()> {
         for tx in txs {
             sqlx::query(
