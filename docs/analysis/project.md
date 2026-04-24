@@ -96,3 +96,21 @@ Partial coverage is acceptable if the response makes coverage explicit.
 4. Expose backfill trigger and status endpoints.
 5. Update the web UI to show coverage: discovered, analyzed, failed, pending.
 6. Keep spend summaries based on persisted analysis outputs only.
+
+## Current Product Gaps
+
+The current cluster flow is structurally incomplete, not just cosmetically weak.
+
+- Cluster creation only persists cluster metadata and addresses.
+- Cluster spend summary only aggregates already-persisted analyses.
+- There is no analysis-side transaction discovery or backfill job yet.
+- There is no coverage model showing discovered vs analyzed vs failed txs.
+- There is no operator-visible backlog or retry surface for cluster analysis.
+
+This is why a newly created cluster can appear to have "wrong" or empty spend output even when the addresses are valid: the summary is currently correct only for the subset of transactions that were already analyzed before the summary request.
+
+## Current Priority
+
+Use the indexer as a producer and finish the consumer side in the analysis tool before adding more UI polish.
+
+The next implementation work should follow the roadmap in `docs/analysis/roadmap.md`.
