@@ -69,8 +69,10 @@ services:
     env_file:
       - .env
     environment:
+      LEDGERFLOW_DATABASE_URL: postgres://postgres:postgres@db:5432/ledgerflow
       LEDGERFLOW_API_BASE_URL: http://app:8080
       LEDGERFLOW_WEB_BIND_ADDR: 0.0.0.0:3000
+      LEDGERFLOW_WEB_BASE_URL: http://127.0.0.1:3000
     depends_on:
       - app
     ports:

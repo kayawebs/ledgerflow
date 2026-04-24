@@ -6,9 +6,11 @@ If you only want the standalone top-level address indexer, read [docs/indexer.md
 
 The main operator workflow is now:
 
-1. analyze transactions into the local store
-2. create an address cluster for your bot and EOA set
-3. request a spend summary for that cluster over a time window
+1. open the web product shell
+2. register or sign in by email verification code
+3. create an address cluster for your bot and EOA set
+4. let the worker backfill and analyze history
+5. review cluster coverage, spend summary, and single-tx detail from the dashboard
 
 ## What this starter is for
 
@@ -48,7 +50,13 @@ LedgerFlow reads configuration from environment variables.
 | `LEDGERFLOW_ENABLED_RECOGNIZERS` | Comma-separated recognizer ids to run by default | `selector_presence,erc20_transfer_flow,...` |
 | `LEDGERFLOW_PLUGINS` | Comma-separated plugin packs to load | `sample_builtin_pack` |
 | `LEDGERFLOW_WEB_BIND_ADDR` | Web process bind address | `127.0.0.1:3001` for host runs, `0.0.0.0:3000` in Docker |
+| `LEDGERFLOW_WEB_BASE_URL` | Public base URL used in verification email links | `http://127.0.0.1:3001` for host runs |
 | `LEDGERFLOW_API_BASE_URL` | Upstream analysis API used by the web process | `http://127.0.0.1:3000` for host runs, `http://app:8080` in Docker |
+| `LEDGERFLOW_SESSION_COOKIE_NAME` | Session cookie name for the web product | `ledgerflow_session` |
+| `LEDGERFLOW_EMAIL_FROM` | Sender address when using real email delivery | `noreply@yourdomain.xyz` |
+| `LEDGERFLOW_RESEND_API_KEY` | Optional Resend API key for verification emails | unset |
+| `LEDGERFLOW_VERIFICATION_TTL_MINUTES` | Verification code lifetime | `15` |
+| `LEDGERFLOW_SESSION_TTL_DAYS` | Passwordless session lifetime | `30` |
 
 The checked-in `.env.example` is the easiest starting point. Copy it to `.env` before using Docker Compose, because the compose stack reads `.env` as the runtime config file.
 
@@ -195,21 +203,37 @@ Open:
 http://localhost:3000
 ```
 
-The web process is intentionally thin. It is not a second analysis engine. It does three things:
+The web process is intentionally product-first. It is not a second analysis engine. It does four things:
 
-- gives you a basic external-facing query surface
-- proxies browser requests to the analysis API
-- makes it easier to evolve toward a real product frontend later
+- gives you a homepage and pricing surface
+- owns registration, login, and sessions
+- renders the operator dashboard
+- calls the internal analysis API on behalf of authenticated users
 
 Current web console actions:
 
+- homepage
+- pricing page
+- email-code register/login
 - create an address cluster
 - inspect cluster coverage
 - load a cluster spend summary
 - analyze a transaction
 - load an already persisted analysis
 - replay with a recognizer subset
-- inspect installed recognizers
+
+## Email verification delivery
+
+By default, the verification sender falls back to structured logs. That is enough for local development.
+
+If you want real email delivery, set:
+
+```bash
+export LEDGERFLOW_EMAIL_FROM=noreply@yourdomain.xyz
+export LEDGERFLOW_RESEND_API_KEY=re_xxx
+```
+
+Then the web process will send verification emails through Resend.
 
 ## Create an address cluster
 

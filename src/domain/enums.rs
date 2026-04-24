@@ -79,3 +79,10 @@ pub enum AddressHitDirection {
     From,
     To,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationPurpose {
+    Signup,
+    Login,
+}

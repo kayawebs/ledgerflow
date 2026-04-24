@@ -2,7 +2,7 @@
 
 LedgerFlow is a Rust backend starter for evidence-first EVM transaction analysis, initially focused on Base (`chain_id=8453`). It is intentionally narrow in semantic coverage for v0, but the architecture is built so recognizers, protocol adapters, validators, and accounting policies can expand steadily without breaking the stable core schema.
 
-It now ships with a separate `web` process that fronts the API with a lightweight operator UI, so the stack can be presented as an external-facing product shape without entangling web delivery concerns with the analysis service.
+It now ships with a separate `web` process that fronts the API with a product-shaped operator UI: homepage, pricing page, passwordless email auth, and a dashboard split across cluster management, cluster analysis, and single-tx analysis.
 
 The current product surface is cluster-first: define an address cluster for a person, bot fleet, or wallet family, then compute spend summaries over the already analyzed transactions that touch that cluster.
 
@@ -20,10 +20,12 @@ For operators using a self-hosted Base node that is bound only to `127.0.0.1:854
 - Runs versioned recognizers over normalized facts instead of raw RPC payloads.
 - Builds deterministic Evidence Packs with input digests and validation results.
 - Persists analysis artifacts in PostgreSQL via SQLx.
-- Exposes an Axum API for analysis, replay, evidence-pack fetch, recognizer listing, and health checks.
+- Exposes an internal Axum API for analysis, replay, evidence-pack fetch, recognizer listing, and health checks.
 - Computes address-cluster spend summaries over a time window, separating gas burn, external outflows, internal transfers, and incoming transfers.
 - Can queue cluster transaction discovery jobs from the standalone indexer, then analyze them into PostgreSQL-backed coverage and spend summaries.
 - Automatically enqueues a historical backfill when a new cluster is created. A separate worker process drains that queue without blocking the API.
+- Provides email-code registration and login in the web process, with pluggable verification delivery.
+- Includes a pricing surface set to `0.5 ETH / month`, while the current private beta remains free.
 
 ## What v0 does not do
 
@@ -57,6 +59,8 @@ Default local endpoints:
 - API: `http://127.0.0.1:3000` when run directly on the host, `http://127.0.0.1:8180` in Docker
 - Web: `http://127.0.0.1:3001` when run directly on the host, `http://127.0.0.1:3000` in Docker
 - Indexer API: `http://localhost:8090`
+
+The intended exposure model is: web public, analysis API private. In local/dev this means the API stays on localhost or container-internal networking while operators use the web process.
 
 ## Standalone indexer
 
