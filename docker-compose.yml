@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5532:5432"
+      - "127.0.0.1:5532:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
@@ -18,8 +18,8 @@ services:
       CLICKHOUSE_PASSWORD: ledgerflow
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      - "8123:8123"
-      - "9002:9000"
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9002:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
 
@@ -36,7 +36,7 @@ services:
     depends_on:
       - db
     ports:
-      - "8180:8080"
+      - "127.0.0.1:8180:8080"
 
   web:
     image: rust:1.92
@@ -52,7 +52,7 @@ services:
     depends_on:
       - app
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
 
   indexer:
     image: rust:1.92
@@ -73,7 +73,7 @@ services:
     depends_on:
       - clickhouse
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
 
 volumes:
   postgres_data:

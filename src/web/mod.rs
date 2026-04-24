@@ -468,15 +468,47 @@ fn render_index_html(state: &WebState) -> String {
 
           <section class="panel">
             <div class="panel-head">
+              <h2>Cluster Backfill</h2>
+              <span class="pill">Discover first</span>
+            </div>
+            <div class="panel-body">
+              <div class="panel-copy">Creating a cluster does not analyze its history. Run backfill first so the analysis service can pull tx refs from the indexer, deduplicate them, and analyze missing transactions.</div>
+              <form id="cluster-backfill-form">
+                <label>
+                  Cluster ID
+                  <input id="cluster-id" placeholder="uuid">
+                </label>
+                <label>
+                  Start Block
+                  <input id="cluster-backfill-start-block" placeholder="0" inputmode="numeric">
+                </label>
+                <label>
+                  End Block
+                  <input id="cluster-backfill-end-block" placeholder="optional latest indexed block" inputmode="numeric">
+                </label>
+                <label>
+                  Query Limit
+                  <input id="cluster-backfill-query-limit" placeholder="10000" inputmode="numeric">
+                </label>
+                <div class="actions">
+                  <button class="primary" type="submit">Backfill Cluster</button>
+                  <button class="secondary" type="button" id="load-cluster-coverage">Load Coverage</button>
+                </div>
+              </form>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
               <h2>Cluster Summary</h2>
               <span class="pill">Spend window</span>
             </div>
             <div class="panel-body">
-              <div class="panel-copy">Load spend summary for an existing cluster from already analyzed transactions. This starter does not auto-discover all historical txs for the addresses yet.</div>
+              <div class="panel-copy">Spend summary only aggregates already analyzed transactions. If this is a new cluster, backfill it first. Empty txs here usually means no discovered transactions were analyzed yet.</div>
               <form id="cluster-summary-form">
                 <label>
                   Cluster ID
-                  <input id="cluster-id" placeholder="uuid">
+                  <input id="cluster-summary-id" placeholder="uuid">
                 </label>
                 <label>
                   Start Time (RFC3339)
@@ -588,6 +620,7 @@ fn render_index_html(state: &WebState) -> String {
 
       const renderClusterSummary = (payload) => {{
         const breakdowns = payload.breakdowns || [];
+        const coverage = payload.metadata?.coverage || null;
         const cards = [
           ["cluster", payload.cluster_name],
           ["owner", payload.owner_label],
@@ -598,6 +631,11 @@ fn render_index_html(state: &WebState) -> String {
           ["internal", String(payload.total_internal_native_transfer_raw || "0")],
           ["incoming", String(payload.total_incoming_native_raw || "0")],
         ];
+        if (coverage) {{
+          cards.push(["discovered", String(coverage.discovered_tx_count || 0)]);
+          cards.push(["failed", String(coverage.failed_tx_count || 0)]);
+          cards.push(["pending", String(coverage.pending_tx_count || 0)]);
+        }}
         summaryEl.innerHTML = cards.map(([label, value]) => `
           <div class="stat">
             <span class="stat-label">${{label}}</span>
@@ -610,9 +648,54 @@ fn render_index_html(state: &WebState) -> String {
           .join("");
       }};
 
+      const renderClusterCoverage = (payload) => {{
+        const cards = [
+          ["cluster", payload.cluster_id || "-"],
+          ["discovered", String(payload.discovered_tx_count || 0)],
+          ["analyzed", String(payload.analyzed_tx_count || 0)],
+          ["failed", String(payload.failed_tx_count || 0)],
+          ["pending", String(payload.pending_tx_count || 0)],
+          ["latest run", payload.latest_run_status || "-"],
+        ];
+        summaryEl.innerHTML = cards.map(([label, value]) => `
+          <div class="stat">
+            <span class="stat-label">${{label}}</span>
+            <span class="stat-value">${{value}}</span>
+          </div>
+        `).join("");
+        labelsEl.innerHTML = "";
+      }};
+
+      const renderClusterBackfill = (payload) => {{
+        const run = payload.run || {{}};
+        const coverage = payload.coverage || {{}};
+        const cards = [
+          ["run status", run.status || "-"],
+          ["discovered", String(run.discovered_tx_count || 0)],
+          ["analyzed", String(run.analyzed_tx_count || 0)],
+          ["failed", String(run.failed_tx_count || 0)],
+          ["coverage discovered", String(coverage.discovered_tx_count || 0)],
+          ["coverage pending", String(coverage.pending_tx_count || 0)],
+        ];
+        summaryEl.innerHTML = cards.map(([label, value]) => `
+          <div class="stat">
+            <span class="stat-label">${{label}}</span>
+            <span class="stat-value">${{value}}</span>
+          </div>
+        `).join("");
+        labelsEl.innerHTML = (run.metadata?.warnings || [])
+          .slice(0, 12)
+          .map((item) => `<div class="chip">${{item.type || "warning"}}</div>`)
+          .join("");
+      }};
+
       const renderJson = (payload, mode) => {{
         outputEl.textContent = JSON.stringify(payload, null, 2);
-        if (mode.startsWith("cluster")) {{
+        if (mode === "cluster-coverage") {{
+          renderClusterCoverage(payload);
+        }} else if (mode === "cluster-backfill") {{
+          renderClusterBackfill(payload);
+        }} else if (mode.startsWith("cluster")) {{
           renderClusterSummary(payload);
         }} else {{
           renderTransactionSummary(payload);
@@ -666,12 +749,36 @@ fn render_index_html(state: &WebState) -> String {
         }}, "cluster-create");
         if (result?.cluster_id) {{
           document.getElementById("cluster-id").value = result.cluster_id;
+          document.getElementById("cluster-summary-id").value = result.cluster_id;
         }}
+      }});
+
+      document.getElementById("cluster-backfill-form").addEventListener("submit", async (event) => {{
+        event.preventDefault();
+        const clusterId = document.getElementById("cluster-id").value.trim();
+        const startBlock = document.getElementById("cluster-backfill-start-block").value.trim();
+        const endBlock = document.getElementById("cluster-backfill-end-block").value.trim();
+        const queryLimit = document.getElementById("cluster-backfill-query-limit").value.trim();
+        await request(`/api/clusters/${{clusterId}}/backfill`, {{
+          method: "POST",
+          headers: {{ "content-type": "application/json" }},
+          body: JSON.stringify({{
+            start_block: startBlock ? Number(startBlock) : null,
+            end_block: endBlock ? Number(endBlock) : null,
+            force_reanalyze: false,
+            query_limit: queryLimit ? Number(queryLimit) : null,
+          }}),
+        }}, "cluster-backfill");
+      }});
+
+      document.getElementById("load-cluster-coverage").addEventListener("click", async () => {{
+        const clusterId = document.getElementById("cluster-id").value.trim();
+        await request(`/api/clusters/${{clusterId}}/coverage`, {{}}, "cluster-coverage");
       }});
 
       document.getElementById("cluster-summary-form").addEventListener("submit", async (event) => {{
         event.preventDefault();
-        const clusterId = document.getElementById("cluster-id").value.trim();
+        const clusterId = document.getElementById("cluster-summary-id").value.trim();
         const start = document.getElementById("cluster-start").value.trim();
         const end = document.getElementById("cluster-end").value.trim();
         const params = new URLSearchParams();
