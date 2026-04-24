@@ -43,6 +43,7 @@ LedgerFlow reads configuration from environment variables.
 | `LEDGERFLOW_DEFAULT_CHAIN_ID` | Default chain for callers that omit it | `8453` |
 | `LEDGERFLOW_TRACE_ENABLED` | Enables trace fetch attempts | `false` |
 | `LEDGERFLOW_CLUSTER_BACKFILL_QUERY_LIMIT` | Per-request limit used when analysis reads tx refs from the indexer | `10000` |
+| `LEDGERFLOW_CLUSTER_AUTO_BACKFILL_ON_CREATE` | Start a background historical backfill immediately after cluster creation | `true` |
 | `LEDGERFLOW_ENABLED_RECOGNIZERS` | Comma-separated recognizer ids to run by default | `selector_presence,erc20_transfer_flow,...` |
 | `LEDGERFLOW_PLUGINS` | Comma-separated plugin packs to load | `sample_builtin_pack` |
 | `LEDGERFLOW_WEB_BIND_ADDR` | Web process bind address | `0.0.0.0:3000` |
@@ -225,6 +226,8 @@ curl -X POST http://localhost:8180/clusters \
 ```
 
 The response returns the `cluster_id`.
+
+If `LEDGERFLOW_CLUSTER_AUTO_BACKFILL_ON_CREATE=true`, cluster creation also starts a background historical backfill immediately. You can then poll `/clusters/{cluster_id}/coverage` or `/clusters/{cluster_id}/backfill-runs` to watch progress.
 
 ## Backfill a cluster from the indexer
 

@@ -11,6 +11,7 @@ pub struct AppConfig {
     pub default_chain_id: u64,
     pub trace_enabled: bool,
     pub cluster_backfill_query_limit: u32,
+    pub cluster_auto_backfill_on_create: bool,
     pub enabled_recognizers: Vec<String>,
     pub plugins: Vec<String>,
 }
@@ -37,6 +38,9 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(10_000),
+            cluster_auto_backfill_on_create: env::var("LEDGERFLOW_CLUSTER_AUTO_BACKFILL_ON_CREATE")
+                .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+                .unwrap_or(true),
             enabled_recognizers: parse_list(
                 &env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").unwrap_or_else(|_| {
                     "selector_presence,erc20_transfer_flow,native_transfer,batch_router_heuristic,approval_swap_scenario"

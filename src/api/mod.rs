@@ -8,6 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::core::errors::LedgerError;
@@ -25,6 +26,7 @@ pub struct ApiState {
     pub service: Arc<AnalysisService>,
     pub cluster_service: Arc<ClusterService>,
     pub backfill_service: Arc<ClusterBackfillService>,
+    pub auto_backfill_on_cluster_create: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +94,7 @@ pub struct RecognizersResponse {
 pub fn router(
     service: Arc<AnalysisService>,
     backfill_service: Arc<ClusterBackfillService>,
+    auto_backfill_on_cluster_create: bool,
 ) -> Router {
     let cluster_service = Arc::new(ClusterService::new(service.repository.clone()));
     Router::new()
@@ -116,6 +119,7 @@ pub fn router(
             service,
             cluster_service,
             backfill_service,
+            auto_backfill_on_cluster_create,
         })
 }
 
@@ -249,6 +253,27 @@ async fn create_cluster(
         )
         .await
         .map_err(ApiError::from)?;
+    if state.auto_backfill_on_cluster_create && state.backfill_service.is_configured() {
+        let backfill_service = Arc::clone(&state.backfill_service);
+        let cluster_id = cluster.cluster_id;
+        tokio::spawn(async move {
+            info!(%cluster_id, "starting background cluster backfill after create");
+            if let Err(err) = backfill_service
+                .backfill_cluster(
+                    cluster_id,
+                    ServiceClusterBackfillRequest {
+                        start_block: Some(0),
+                        end_block: None,
+                        force_reanalyze: false,
+                        query_limit: None,
+                    },
+                )
+                .await
+            {
+                error!(%cluster_id, error = %err, "background cluster backfill failed");
+            }
+        });
+    }
     Ok(Json(cluster))
 }
 

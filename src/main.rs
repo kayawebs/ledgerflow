@@ -55,7 +55,14 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .expect("bind should succeed");
-    axum::serve(listener, api::router(service, backfill_service))
-        .await
-        .expect("server should run");
+    axum::serve(
+        listener,
+        api::router(
+            service,
+            backfill_service,
+            config.cluster_auto_backfill_on_create,
+        ),
+    )
+    .await
+    .expect("server should run");
 }

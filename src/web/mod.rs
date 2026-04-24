@@ -473,6 +473,7 @@ fn render_index_html(state: &WebState) -> String {
             </div>
             <div class="panel-body">
               <div class="panel-copy">Creating a cluster does not analyze its history. Run backfill first so the analysis service can pull tx refs from the indexer, deduplicate them, and analyze missing transactions.</div>
+              <div class="panel-copy">New clusters now also trigger background historical backfill automatically. Use this panel when you want to force a manual run or inspect coverage immediately.</div>
               <form id="cluster-backfill-form">
                 <label>
                   Cluster ID
@@ -505,6 +506,7 @@ fn render_index_html(state: &WebState) -> String {
             </div>
             <div class="panel-body">
               <div class="panel-copy">Spend summary only aggregates already analyzed transactions. If this is a new cluster, backfill it first. Empty txs here usually means no discovered transactions were analyzed yet.</div>
+              <div class="panel-copy">After cluster creation, wait for background backfill to progress, or check coverage first.</div>
               <form id="cluster-summary-form">
                 <label>
                   Cluster ID
@@ -750,6 +752,7 @@ fn render_index_html(state: &WebState) -> String {
         if (result?.cluster_id) {{
           document.getElementById("cluster-id").value = result.cluster_id;
           document.getElementById("cluster-summary-id").value = result.cluster_id;
+          setStatus("Cluster created. Background historical backfill has been started; use Load Coverage to watch progress.");
         }}
       }});
 

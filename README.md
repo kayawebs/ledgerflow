@@ -23,6 +23,7 @@ For operators using a self-hosted Base node that is bound only to `127.0.0.1:854
 - Exposes an Axum API for analysis, replay, evidence-pack fetch, recognizer listing, and health checks.
 - Computes address-cluster spend summaries over a time window, separating gas burn, external outflows, internal transfers, and incoming transfers.
 - Can backfill cluster transaction candidates from the standalone indexer, then analyze them into PostgreSQL-backed coverage and spend summaries.
+- Automatically starts a background historical backfill when a new cluster is created, as long as the analysis service can reach the indexer API.
 
 ## What v0 does not do
 

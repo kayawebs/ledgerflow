@@ -278,6 +278,10 @@ impl ClusterBackfillService {
         repository.list_cluster_backfill_runs(cluster_id).await
     }
 
+    pub fn is_configured(&self) -> bool {
+        self.tx_source.is_some()
+    }
+
     async fn collect_refs_for_range(
         &self,
         tx_source: &dyn ClusterTxSource,
