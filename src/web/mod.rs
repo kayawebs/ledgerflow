@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Form, Router,
+    Form, Json, Router,
     extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
@@ -19,7 +19,7 @@ use crate::{
             AddressCluster, AppUser, ClusterBackfillRun, ClusterCoverage, ClusterSpendSummary,
             EvidencePack, TransactionAnalysis,
         },
-        enums::VerificationPurpose,
+        enums::{ClusterBackfillStatus, VerificationPurpose},
     },
     services::{
         auth::{
@@ -178,6 +178,15 @@ struct AnalysisEnvelope {
     evidence_pack: EvidencePack,
 }
 
+#[derive(Debug, Serialize)]
+struct ClusterLiveResponse {
+    status_label: String,
+    status_tone: String,
+    coverage: Option<ClusterCoverage>,
+    runs: Vec<ClusterBackfillRun>,
+    spend_summary: Option<ClusterSpendSummary>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashboardTab {
     Clusters,
@@ -239,6 +248,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/auth/verify", post(verify_code))
         .route("/auth/logout", post(logout))
         .route("/dashboard", get(dashboard))
+        .route("/dashboard/cluster-status", get(cluster_status))
         .route("/dashboard/clusters/create", post(create_cluster))
         .route("/dashboard/tx/run", post(run_tx_analysis))
         .route("/health", get(health))
@@ -394,6 +404,38 @@ async fn dashboard(
     render_dashboard_response(&state, user, query, None, None).await
 }
 
+async fn cluster_status(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<DashboardQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let clusters = state
+        .portal_service
+        .list_clusters_for_user(user.user_id)
+        .await?;
+    let Some(cluster_id_raw) = query.cluster_id.as_deref() else {
+        return Err(WebError::bad_request("cluster_id is required".to_owned()));
+    };
+    let cluster_id = Uuid::parse_str(cluster_id_raw)
+        .map_err(|err| WebError::bad_request(format!("invalid cluster id: {err}")))?;
+    if !clusters.iter().any(|cluster| cluster.cluster_id == cluster_id) {
+        return Err(WebError::bad_request(
+            "cluster is not available for the current user".to_owned(),
+        ));
+    }
+    let payload = load_cluster_live_response(
+        &state,
+        cluster_id,
+        query.start.as_deref(),
+        query.end.as_deref(),
+    )
+    .await?;
+    Ok(Json(payload).into_response())
+}
+
 async fn create_cluster(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -512,45 +554,32 @@ async fn render_dashboard_response(
         .and_then(|cluster_id| clusters.iter().find(|item| item.cluster_id == cluster_id).cloned())
         .or_else(|| clusters.first().cloned());
 
-    let (coverage, runs, spend_summary, cluster_error) = if tab == DashboardTab::ClusterAnalysis {
-        if let Some(cluster) = selected_cluster.as_ref() {
-            let coverage = api_get_json::<ClusterCoverage>(
-                state,
-                &format!("/clusters/{}/coverage", cluster.cluster_id),
-            )
-            .await
-            .ok();
-            let runs = api_get_json::<Vec<ClusterBackfillRun>>(
-                state,
-                &format!("/clusters/{}/backfill-runs", cluster.cluster_id),
-            )
-            .await
-            .unwrap_or_default();
-            let summary_path = match (&query.start, &query.end) {
-                (None, None) => format!("/clusters/{}/spend-summary", cluster.cluster_id),
-                _ => {
-                    let mut params = Vec::new();
-                    if let Some(start) = query.start.as_ref() {
-                        params.push(format!("start={}", urlencoding::encode(start)));
-                    }
-                    if let Some(end) = query.end.as_ref() {
-                        params.push(format!("end={}", urlencoding::encode(end)));
-                    }
-                    format!(
-                        "/clusters/{}/spend-summary?{}",
-                        cluster.cluster_id,
-                        params.join("&")
-                    )
+    let (coverage, runs, spend_summary, cluster_status, cluster_error) =
+        if tab == DashboardTab::ClusterAnalysis {
+            if let Some(cluster) = selected_cluster.as_ref() {
+                match load_cluster_live_response(
+                    state,
+                    cluster.cluster_id,
+                    query.start.as_deref(),
+                    query.end.as_deref(),
+                )
+                .await
+                {
+                    Ok(payload) => (
+                        payload.coverage,
+                        payload.runs,
+                        payload.spend_summary,
+                        Some((payload.status_label, payload.status_tone)),
+                        None::<String>,
+                    ),
+                    Err(err) => (None, Vec::new(), None, None, Some(err.to_string())),
                 }
-            };
-            let summary = api_get_json::<ClusterSpendSummary>(state, &summary_path).await.ok();
-            (coverage, runs, summary, None::<String>)
+            } else {
+                (None, Vec::new(), None, None, None)
+            }
         } else {
-            (None, Vec::new(), None, None)
-        }
-    } else {
-        (None, Vec::new(), None, None)
-    };
+            (None, Vec::new(), None, None, None)
+        };
 
     let notice = query.notice.as_deref().and_then(render_notice_message);
     Ok(Html(render_dashboard_page(
@@ -564,11 +593,51 @@ async fn render_dashboard_response(
         coverage.as_ref(),
         &runs,
         spend_summary.as_ref(),
+        cluster_status.as_ref(),
         tx_result.as_ref(),
         query.start.as_deref(),
         query.end.as_deref(),
     ))
     .into_response())
+}
+
+async fn load_cluster_live_response(
+    state: &WebState,
+    cluster_id: Uuid,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<ClusterLiveResponse, WebError> {
+    let coverage = api_get_json::<ClusterCoverage>(state, &format!("/clusters/{}/coverage", cluster_id))
+        .await
+        .ok();
+    let runs = api_get_json::<Vec<ClusterBackfillRun>>(
+        state,
+        &format!("/clusters/{}/backfill-runs", cluster_id),
+    )
+    .await
+    .unwrap_or_default();
+    let summary_path = match (start, end) {
+        (None, None) => format!("/clusters/{}/spend-summary", cluster_id),
+        _ => {
+            let mut params = Vec::new();
+            if let Some(start) = start {
+                params.push(format!("start={}", urlencoding::encode(start)));
+            }
+            if let Some(end) = end {
+                params.push(format!("end={}", urlencoding::encode(end)));
+            }
+            format!("/clusters/{}/spend-summary?{}", cluster_id, params.join("&"))
+        }
+    };
+    let spend_summary = api_get_json::<ClusterSpendSummary>(state, &summary_path).await.ok();
+    let (status_label, status_tone) = derive_cluster_status(coverage.as_ref(), &runs);
+    Ok(ClusterLiveResponse {
+        status_label,
+        status_tone,
+        coverage,
+        runs,
+        spend_summary,
+    })
 }
 
 async fn current_user(state: &WebState, headers: &HeaderMap) -> Result<Option<AppUser>, WebError> {
@@ -910,6 +979,7 @@ fn render_dashboard_page(
     coverage: Option<&ClusterCoverage>,
     runs: &[ClusterBackfillRun],
     spend_summary: Option<&ClusterSpendSummary>,
+    cluster_status: Option<&(String, String)>,
     tx_result: Option<&serde_json::Value>,
     start: Option<&str>,
     end: Option<&str>,
@@ -955,86 +1025,12 @@ fn render_dashboard_page(
     };
 
     let cluster_analysis_panel = if let Some(cluster) = selected_cluster {
-        let coverage_cards = if let Some(coverage) = coverage {
-            format!(
-                r#"<div class="stats-grid">
-  <div class="stat"><span>Discovered</span><strong>{}</strong></div>
-  <div class="stat"><span>Analyzed</span><strong>{}</strong></div>
-  <div class="stat"><span>Failed</span><strong>{}</strong></div>
-  <div class="stat"><span>Pending</span><strong>{}</strong></div>
-  <div class="stat"><span>Latest run</span><strong>{}</strong></div>
-</div>"#,
-                coverage.discovered_tx_count,
-                coverage.analyzed_tx_count,
-                coverage.failed_tx_count,
-                coverage.pending_tx_count,
-                coverage
-                    .latest_run_status
-                    .as_ref()
-                    .map(|value| format!("{value:?}"))
-                    .unwrap_or_else(|| "-".to_owned())
-            )
-        } else {
-            "<div class=\"empty-state\">Coverage not available yet.</div>".to_owned()
-        };
-        let summary_panel = if let Some(summary) = spend_summary {
-            format!(
-                r#"<div class="stats-grid">
-  <div class="stat"><span>Analyzed tx</span><strong>{}</strong></div>
-  <div class="stat"><span>Gas</span><strong>{}</strong></div>
-  <div class="stat"><span>External native</span><strong>{}</strong></div>
-  <div class="stat"><span>Internal native</span><strong>{}</strong></div>
-  <div class="stat"><span>Incoming native</span><strong>{}</strong></div>
-</div>
-<div class="table-shell">
-  <table>
-    <thead><tr><th>Tx</th><th>Recognizers</th><th>Gas</th><th>External outflow</th></tr></thead>
-    <tbody>{}</tbody>
-  </table>
-</div>"#,
-                summary.analyzed_tx_count,
-                escape_html(&summary.total_gas_cost_raw),
-                escape_html(&summary.total_external_native_outflow_raw),
-                escape_html(&summary.total_internal_native_transfer_raw),
-                escape_html(&summary.total_incoming_native_raw),
-                summary
-                    .transactions
-                    .iter()
-                    .take(12)
-                    .map(|tx| {
-                        format!(
-                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                            escape_html(&truncate_middle(&tx.tx_hash, 14)),
-                            escape_html(&tx.recognizer_labels.join(", ")),
-                            escape_html(&tx.gas_cost_raw),
-                            escape_html(&tx.external_native_outflow_raw)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("")
-            )
-        } else {
-            "<div class=\"empty-state\">Spend summary is empty or unavailable. Wait for coverage to move above zero.</div>".to_owned()
-        };
-        let runs_table = if runs.is_empty() {
-            "<div class=\"empty-state\">No backfill runs recorded yet.</div>".to_owned()
-        } else {
-            format!(
-                "<div class=\"table-shell\"><table><thead><tr><th>Status</th><th>Discovered</th><th>Analyzed</th><th>Failed</th></tr></thead><tbody>{}</tbody></table></div>",
-                runs
-                    .iter()
-                    .take(8)
-                    .map(|run| format!(
-                        "<tr><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                        run.status,
-                        run.discovered_tx_count,
-                        run.analyzed_tx_count,
-                        run.failed_tx_count
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("")
-            )
-        };
+        let status_label = cluster_status
+            .map(|item| item.0.as_str())
+            .unwrap_or("Waiting for backfill");
+        let status_tone = cluster_status
+            .map(|item| item.1.as_str())
+            .unwrap_or("info");
         format!(
             r#"
 <section class="panel">
@@ -1047,12 +1043,14 @@ fn render_dashboard_page(
       <label>End<input type="text" name="end" value="{}" placeholder="2026-04-30T23:59:59Z"></label>
       <button class="cta secondary" type="submit">Refresh analysis</button>
     </form>
+    <div id="cluster-live-root" data-cluster-id="{}" data-start="{}" data-end="{}"></div>
+    <div id="cluster-live-status" class="notice {}">{}</div>
     <h3>Coverage</h3>
-    {}
+    <div id="cluster-live-coverage">{}</div>
     <h3>Spend summary</h3>
-    {}
+    <div id="cluster-live-summary">{}</div>
     <h3>Recent backfill runs</h3>
-    {}
+    <div id="cluster-live-runs">{}</div>
   </div>
 </section>
 "#,
@@ -1060,9 +1058,14 @@ fn render_dashboard_page(
             cluster_options,
             escape_html(start.unwrap_or_default()),
             escape_html(end.unwrap_or_default()),
-            coverage_cards,
-            summary_panel,
-            runs_table
+            cluster.cluster_id,
+            escape_html(start.unwrap_or_default()),
+            escape_html(end.unwrap_or_default()),
+            escape_html(status_tone),
+            escape_html(status_label),
+            render_cluster_coverage_cards(coverage),
+            render_cluster_summary_panel(spend_summary),
+            render_cluster_runs_table(runs)
         )
     } else {
         "<section class=\"panel\"><div class=\"panel-body\"><div class=\"empty-state\">Select or create a cluster to view analysis.</div></div></section>".to_owned()
@@ -1158,6 +1161,7 @@ fn render_dashboard_page(
         </section>
       </main>
     </div>
+    {}
   </body>
 </html>"#,
         shared_styles(),
@@ -1178,7 +1182,8 @@ fn render_dashboard_page(
         },
         clusters.len(),
         cluster_cards,
-        DEFAULT_PRICE_ETH
+        DEFAULT_PRICE_ETH,
+        render_cluster_autorefresh_script(selected_cluster, start, end)
     )
 }
 
@@ -1201,6 +1206,337 @@ fn render_cluster_management_panel(default_chain_id: u64) -> String {
 </section>
 "#,
         default_chain_id
+    )
+}
+
+fn derive_cluster_status(
+    coverage: Option<&ClusterCoverage>,
+    runs: &[ClusterBackfillRun],
+) -> (String, String) {
+    if let Some(coverage) = coverage {
+        if coverage.pending_tx_count > 0 {
+            return ("Backfill in progress".to_owned(), "info".to_owned());
+        }
+        if coverage.failed_tx_count > 0 {
+            return (
+                "Analysis completed with failures".to_owned(),
+                "warning".to_owned(),
+            );
+        }
+        if coverage.discovered_tx_count > 0
+            && coverage.analyzed_tx_count >= coverage.discovered_tx_count
+        {
+            return ("History fully analyzed".to_owned(), "success".to_owned());
+        }
+        if matches!(
+            coverage.latest_run_status,
+            Some(ClusterBackfillStatus::Pending | ClusterBackfillStatus::Running)
+        ) {
+            return ("Backfill queued".to_owned(), "info".to_owned());
+        }
+    }
+
+    if let Some(run) = runs.first() {
+        return match run.status {
+            ClusterBackfillStatus::Pending | ClusterBackfillStatus::Running => {
+                ("Backfill queued".to_owned(), "info".to_owned())
+            }
+            ClusterBackfillStatus::Partial => (
+                "Analysis completed with failures".to_owned(),
+                "warning".to_owned(),
+            ),
+            ClusterBackfillStatus::Completed => {
+                ("History fully analyzed".to_owned(), "success".to_owned())
+            }
+            ClusterBackfillStatus::Failed => ("Backfill failed".to_owned(), "error".to_owned()),
+        };
+    }
+
+    ("Waiting for discovery".to_owned(), "info".to_owned())
+}
+
+fn render_cluster_coverage_cards(coverage: Option<&ClusterCoverage>) -> String {
+    coverage
+        .map(|coverage| {
+            format!(
+                r#"<div class="stats-grid">
+  <div class="stat"><span>Discovered</span><strong>{}</strong></div>
+  <div class="stat"><span>Analyzed</span><strong>{}</strong></div>
+  <div class="stat"><span>Failed</span><strong>{}</strong></div>
+  <div class="stat"><span>Pending</span><strong>{}</strong></div>
+</div>"#,
+                coverage.discovered_tx_count,
+                coverage.analyzed_tx_count,
+                coverage.failed_tx_count,
+                coverage.pending_tx_count
+            )
+        })
+        .unwrap_or_else(|| {
+            "<div class=\"empty-state\">Coverage is not available yet. The worker may still be discovering transactions.</div>".to_owned()
+        })
+}
+
+fn render_cluster_summary_panel(spend_summary: Option<&ClusterSpendSummary>) -> String {
+    spend_summary
+        .map(|summary| {
+            format!(
+                r#"<div class="stats-grid">
+  <div class="stat"><span>Analyzed txs</span><strong>{}</strong></div>
+  <div class="stat"><span>Gas spent</span><strong>{}</strong></div>
+  <div class="stat"><span>Native outflow</span><strong>{}</strong></div>
+  <div class="stat"><span>Incoming native</span><strong>{}</strong></div>
+</div>
+<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Tx</th>
+        <th>Block time</th>
+        <th>Status</th>
+        <th>Recognizers</th>
+        <th>Gas</th>
+        <th>Native outflow</th>
+      </tr>
+    </thead>
+    <tbody>
+      {}
+    </tbody>
+  </table>
+</div>"#,
+                summary.analyzed_tx_count,
+                escape_html(&summary.total_gas_cost_raw),
+                escape_html(&summary.total_external_native_outflow_raw),
+                escape_html(&summary.total_incoming_native_raw),
+                if summary.transactions.is_empty() {
+                    "<tr><td colspan=\"6\">No analyzed transactions in this window yet.</td></tr>"
+                        .to_owned()
+                } else {
+                    summary
+                        .transactions
+                        .iter()
+                        .take(12)
+                        .map(|tx| {
+                            format!(
+                                "<tr><td><code>{}</code></td><td>{}</td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                                escape_html(&truncate_middle(&tx.tx_hash, 8)),
+                                tx.block_timestamp
+                                    .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                                    .unwrap_or_else(|| "n/a".to_owned()),
+                                tx.status,
+                                escape_html(&tx.recognizer_labels.join(", ")),
+                                escape_html(&tx.gas_cost_raw),
+                                escape_html(&tx.external_native_outflow_raw)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("")
+                }
+            )
+        })
+        .unwrap_or_else(|| {
+            "<div class=\"empty-state\">Spend summary will appear once some discovered transactions have been analyzed.</div>".to_owned()
+        })
+}
+
+fn render_cluster_runs_table(runs: &[ClusterBackfillRun]) -> String {
+    if runs.is_empty() {
+        return "<div class=\"empty-state\">No backfill runs recorded yet.</div>".to_owned();
+    }
+
+    format!(
+        r#"<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Requested</th>
+        <th>Status</th>
+        <th>Range</th>
+        <th>Discovered</th>
+        <th>Analyzed</th>
+        <th>Failed</th>
+      </tr>
+    </thead>
+    <tbody>
+      {}
+    </tbody>
+  </table>
+</div>"#,
+        runs.iter()
+            .take(10)
+            .map(|run| {
+                format!(
+                    "<tr><td>{}</td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    run.requested_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                    run.status,
+                    match (run.start_block, run.end_block) {
+                        (Some(start), Some(end)) => format!("{start} - {end}"),
+                        (Some(start), None) => format!("{start} - latest"),
+                        (None, Some(end)) => format!("0 - {end}"),
+                        (None, None) => "full history".to_owned(),
+                    },
+                    run.discovered_tx_count,
+                    run.analyzed_tx_count,
+                    run.failed_tx_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    )
+}
+
+fn render_cluster_autorefresh_script(
+    selected_cluster: Option<&DashboardClusterRecord>,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> String {
+    let Some(cluster) = selected_cluster else {
+        return String::new();
+    };
+
+    format!(
+        r#"<script>
+(() => {{
+  const clusterId = {cluster_id:?};
+  const start = {start:?};
+  const end = {end:?};
+  const statusNode = document.getElementById("cluster-live-status");
+  const coverageNode = document.getElementById("cluster-live-coverage");
+  const summaryNode = document.getElementById("cluster-live-summary");
+  const runsNode = document.getElementById("cluster-live-runs");
+  if (!clusterId || !statusNode || !coverageNode || !summaryNode || !runsNode) return;
+
+  const escapeHtml = (value) => String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+
+  const truncate = (value) => {{
+    const text = String(value ?? "");
+    return text.length > 16 ? `${{text.slice(0, 8)}}...${{text.slice(-8)}}` : text;
+  }};
+
+  const renderCoverage = (coverage) => {{
+    if (!coverage) {{
+      return '<div class="empty-state">Coverage is not available yet. The worker may still be discovering transactions.</div>';
+    }}
+    return `
+      <div class="stats-grid">
+        <div class="stat"><span>Discovered</span><strong>${{coverage.discovered_tx_count}}</strong></div>
+        <div class="stat"><span>Analyzed</span><strong>${{coverage.analyzed_tx_count}}</strong></div>
+        <div class="stat"><span>Failed</span><strong>${{coverage.failed_tx_count}}</strong></div>
+        <div class="stat"><span>Pending</span><strong>${{coverage.pending_tx_count}}</strong></div>
+      </div>
+    `;
+  }};
+
+  const renderSummary = (summary) => {{
+    if (!summary) {{
+      return '<div class="empty-state">Spend summary will appear once some discovered transactions have been analyzed.</div>';
+    }}
+    const rows = (summary.transactions || []).slice(0, 12).map((tx) => `
+      <tr>
+        <td><code>${{escapeHtml(truncate(tx.tx_hash))}}</code></td>
+        <td>${{escapeHtml(tx.block_timestamp ? String(tx.block_timestamp).replace("T", " ").replace("Z", " UTC") : "n/a")}}</td>
+        <td>${{escapeHtml(tx.status)}}</td>
+        <td>${{escapeHtml((tx.recognizer_labels || []).join(", "))}}</td>
+        <td>${{escapeHtml(tx.gas_cost_raw)}}</td>
+        <td>${{escapeHtml(tx.external_native_outflow_raw)}}</td>
+      </tr>
+    `).join("") || '<tr><td colspan="6">No analyzed transactions in this window yet.</td></tr>';
+    return `
+      <div class="stats-grid">
+        <div class="stat"><span>Analyzed txs</span><strong>${{summary.analyzed_tx_count}}</strong></div>
+        <div class="stat"><span>Gas spent</span><strong>${{escapeHtml(summary.total_gas_cost_raw)}}</strong></div>
+        <div class="stat"><span>Native outflow</span><strong>${{escapeHtml(summary.total_external_native_outflow_raw)}}</strong></div>
+        <div class="stat"><span>Incoming native</span><strong>${{escapeHtml(summary.total_incoming_native_raw)}}</strong></div>
+      </div>
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th>Tx</th>
+              <th>Block time</th>
+              <th>Status</th>
+              <th>Recognizers</th>
+              <th>Gas</th>
+              <th>Native outflow</th>
+            </tr>
+          </thead>
+          <tbody>${{rows}}</tbody>
+        </table>
+      </div>
+    `;
+  }};
+
+  const renderRuns = (runs) => {{
+    if (!runs || runs.length === 0) {{
+      return '<div class="empty-state">No backfill runs recorded yet.</div>';
+    }}
+    const rows = runs.slice(0, 10).map((run) => {{
+      let range = "full history";
+      if (run.start_block != null && run.end_block != null) range = `${{run.start_block}} - ${{run.end_block}}`;
+      else if (run.start_block != null) range = `${{run.start_block}} - latest`;
+      else if (run.end_block != null) range = `0 - ${{run.end_block}}`;
+      const requestedAt = escapeHtml(String(run.requested_at || "").replace("T", " ").replace("Z", " UTC"));
+      return `
+        <tr>
+          <td>${{requestedAt}}</td>
+          <td>${{escapeHtml(run.status)}}</td>
+          <td>${{escapeHtml(range)}}</td>
+          <td>${{run.discovered_tx_count}}</td>
+          <td>${{run.analyzed_tx_count}}</td>
+          <td>${{run.failed_tx_count}}</td>
+        </tr>
+      `;
+    }}).join("");
+    return `
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th>Requested</th>
+              <th>Status</th>
+              <th>Range</th>
+              <th>Discovered</th>
+              <th>Analyzed</th>
+              <th>Failed</th>
+            </tr>
+          </thead>
+          <tbody>${{rows}}</tbody>
+        </table>
+      </div>
+    `;
+  }};
+
+  const renderState = (payload) => {{
+    statusNode.className = `notice ${{payload.status_tone || "info"}}`;
+    statusNode.textContent = payload.status_label || "Waiting for discovery";
+    coverageNode.innerHTML = renderCoverage(payload.coverage);
+    summaryNode.innerHTML = renderSummary(payload.spend_summary);
+    runsNode.innerHTML = renderRuns(payload.runs || []);
+  }};
+
+  const fetchState = async () => {{
+    const url = new URL("/dashboard/cluster-status", window.location.origin);
+    url.searchParams.set("cluster_id", clusterId);
+    if (start) url.searchParams.set("start", start);
+    if (end) url.searchParams.set("end", end);
+    const response = await fetch(url, {{ credentials: "same-origin" }});
+    if (!response.ok) throw new Error(`status ${{response.status}}`);
+    renderState(await response.json());
+  }};
+
+  fetchState().catch(() => {{}});
+  window.setInterval(() => {{
+    fetchState().catch(() => {{}});
+  }}, 5000);
+}})();
+</script>"#,
+        cluster_id = cluster.cluster_id.to_string(),
+        start = start.unwrap_or_default(),
+        end = end.unwrap_or_default()
     )
 }
 
@@ -1277,7 +1613,9 @@ a { color: inherit; text-decoration: none; }
 .mode-hint, .price-note { margin-top: 16px; color: var(--muted); }
 .flat-list { padding-left: 18px; color: var(--muted); line-height: 1.7; }
 .notice { margin: 12px 0; padding: 12px 14px; border-radius: 14px; font-size: .95rem; }
+.notice.info { background: rgba(13,110,99,.08); color: var(--accent); }
 .notice.success { background: rgba(13,110,99,.1); color: var(--accent); }
+.notice.warning { background: rgba(197,95,12,.12); color: var(--accent-2); }
 .notice.error { background: rgba(197,95,12,.1); color: var(--accent-2); }
 label { display: grid; gap: 8px; font-size: .95rem; }
 input, textarea, select { width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); font: inherit; }
