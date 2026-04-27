@@ -19,7 +19,7 @@ use crate::{
             AddressCluster, AppUser, ClusterBackfillRun, ClusterCoverage, ClusterSpendSummary,
             EvidencePack, TransactionAnalysis,
         },
-        enums::{ClusterBackfillStatus, VerificationPurpose},
+        enums::{AddressHitDirection, ClusterBackfillStatus, VerificationPurpose},
     },
     services::{
         auth::{
@@ -35,6 +35,8 @@ const DEFAULT_PRICE_ETH: &str = "0.5";
 #[derive(Clone)]
 pub struct WebState {
     pub api_base_url: String,
+    pub indexer_api_base_url: Option<String>,
+    pub indexer_api_bearer_token: Option<String>,
     pub bind_addr: String,
     pub default_chain_id: u64,
     pub web_base_url: String,
@@ -48,6 +50,8 @@ pub struct WebState {
 pub struct WebConfig {
     pub bind_addr: String,
     pub api_base_url: String,
+    pub indexer_api_base_url: Option<String>,
+    pub indexer_api_bearer_token: Option<String>,
     pub database_url: String,
     pub default_chain_id: u64,
     pub web_base_url: String,
@@ -65,6 +69,8 @@ impl WebConfig {
                 .unwrap_or_else(|_| "127.0.0.1:3001".to_owned()),
             api_base_url: std::env::var("LEDGERFLOW_API_BASE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
+            indexer_api_base_url: std::env::var("LEDGERFLOW_INDEXER_API_BASE_URL").ok(),
+            indexer_api_bearer_token: std::env::var("LEDGERFLOW_INDEXER_API_BEARER_TOKEN").ok(),
             database_url: std::env::var("LEDGERFLOW_DATABASE_URL").unwrap_or_else(|_| {
                 "postgres://postgres:postgres@127.0.0.1:5532/ledgerflow".to_owned()
             }),
@@ -109,6 +115,16 @@ struct DashboardQuery {
     cluster_id: Option<String>,
     start: Option<String>,
     end: Option<String>,
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct IndexerLookupQuery {
+    address: Option<String>,
+    limit: Option<u32>,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    direction: Option<String>,
     notice: Option<String>,
 }
 
@@ -190,6 +206,28 @@ struct AnalysisEnvelope {
     evidence_pack: EvidencePack,
 }
 
+#[derive(Debug, Deserialize)]
+struct IndexerProgressPayload {
+    chain_id: u64,
+    worker_id: String,
+    last_indexed_block: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexerAddressRefsPayload {
+    address: String,
+    refs: Vec<IndexerAddressRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexerAddressRef {
+    chain_id: u64,
+    tx_hash: String,
+    block_number: u64,
+    tx_index: u32,
+    direction: AddressHitDirection,
+}
+
 #[derive(Debug, Serialize)]
 struct ClusterLiveResponse {
     status_label: String,
@@ -205,6 +243,8 @@ enum DashboardTab {
     ClusterAnalysis,
     TxAnalysis,
     ClusterGraph,
+    IndexerProgress,
+    IndexerLookup,
 }
 
 fn section_title(tab: &DashboardTab) -> &'static str {
@@ -213,6 +253,8 @@ fn section_title(tab: &DashboardTab) -> &'static str {
         DashboardTab::ClusterAnalysis => "Cluster analysis",
         DashboardTab::TxAnalysis => "Single tx analysis",
         DashboardTab::ClusterGraph => "Cluster graph",
+        DashboardTab::IndexerProgress => "Indexer progress",
+        DashboardTab::IndexerLookup => "Indexer address lookup",
     }
 }
 
@@ -222,6 +264,8 @@ impl DashboardTab {
             Some("cluster-analysis") => Self::ClusterAnalysis,
             Some("tx-analysis") => Self::TxAnalysis,
             Some("cluster-graph") => Self::ClusterGraph,
+            Some("indexer-progress") => Self::IndexerProgress,
+            Some("indexer-lookup") => Self::IndexerLookup,
             _ => Self::Clusters,
         }
     }
@@ -247,6 +291,8 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
 
     let state = WebState {
         api_base_url: config.api_base_url.clone(),
+        indexer_api_base_url: config.indexer_api_base_url.clone(),
+        indexer_api_bearer_token: config.indexer_api_bearer_token.clone(),
         bind_addr: config.bind_addr.clone(),
         default_chain_id: config.default_chain_id,
         web_base_url: config.web_base_url.clone(),
@@ -278,6 +324,8 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/tx-analysis", get(tx_analysis_page))
         .route("/app/tx-analysis/run", post(run_tx_analysis))
         .route("/app/cluster-graph", get(cluster_graph_page))
+        .route("/app/indexer/progress", get(indexer_progress_page))
+        .route("/app/indexer/address-lookup", get(indexer_lookup_page))
         .route("/dashboard", get(dashboard))
         .route("/dashboard/cluster-status", get(cluster_status))
         .route("/dashboard/clusters/create", post(create_cluster))
@@ -452,6 +500,8 @@ async fn dashboard(
         }
         DashboardTab::TxAnalysis => "/app/tx-analysis".to_owned(),
         DashboardTab::ClusterGraph => "/app/cluster-graph".to_owned(),
+        DashboardTab::IndexerProgress => "/app/indexer/progress".to_owned(),
+        DashboardTab::IndexerLookup => "/app/indexer/address-lookup".to_owned(),
     };
     Ok(Redirect::to(&location).into_response())
 }
@@ -480,6 +530,8 @@ async fn clusters_page(
         },
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -503,6 +555,8 @@ async fn cluster_analysis_page(
             end: query.end,
             notice: query.notice,
         },
+        None,
+        None,
         None,
         None,
     )
@@ -529,6 +583,8 @@ async fn tx_analysis_page(
         },
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -553,6 +609,69 @@ async fn cluster_graph_page(
         },
         None,
         None,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn indexer_progress_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<PageNoticeQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    render_dashboard_response(
+        &state,
+        user,
+        DashboardQuery {
+            tab: Some("indexer-progress".to_owned()),
+            cluster_id: None,
+            start: None,
+            end: None,
+            notice: query.notice,
+        },
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn indexer_lookup_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<IndexerLookupQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let path = build_indexer_lookup_path(&query)?;
+    let (payload, error) = if let Some(path) = path.as_deref() {
+        match indexer_get_json::<IndexerAddressRefsPayload>(&state, path).await {
+            Ok(payload) => (Some(payload), None),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    render_dashboard_response(
+        &state,
+        user,
+        DashboardQuery {
+            tab: Some("indexer-lookup".to_owned()),
+            cluster_id: None,
+            start: None,
+            end: None,
+            notice: query.notice.clone(),
+        },
+        None,
+        error,
+        payload,
+        Some(query),
     )
     .await
 }
@@ -624,7 +743,8 @@ async fn create_cluster(
                 end: None,
                 notice: None,
             };
-            render_dashboard_response(&state, user, query, None, Some(err.to_string())).await
+            render_dashboard_response(&state, user, query, None, Some(err.to_string()), None, None)
+                .await
         }
     }
 }
@@ -683,8 +803,13 @@ async fn run_tx_analysis(
         notice: None,
     };
     match result {
-        Ok(payload) => render_dashboard_response(&state, user, query, Some(payload), None).await,
-        Err(err) => render_dashboard_response(&state, user, query, None, Some(err.to_string())).await,
+        Ok(payload) => {
+            render_dashboard_response(&state, user, query, Some(payload), None, None, None).await
+        }
+        Err(err) => {
+            render_dashboard_response(&state, user, query, None, Some(err.to_string()), None, None)
+                .await
+        }
     }
 }
 
@@ -694,6 +819,8 @@ async fn render_dashboard_response(
     query: DashboardQuery,
     tx_result: Option<serde_json::Value>,
     error: Option<String>,
+    indexer_lookup: Option<IndexerAddressRefsPayload>,
+    indexer_query: Option<IndexerLookupQuery>,
 ) -> Result<Response, WebError> {
     let tab = DashboardTab::from_query(query.tab.as_deref());
     let clusters = state
@@ -734,13 +861,21 @@ async fn render_dashboard_response(
             (None, Vec::new(), None, None, None)
         };
 
+    let (indexer_progress, indexer_error) = if tab == DashboardTab::IndexerProgress {
+        match indexer_get_json::<IndexerProgressPayload>(state, "/progress").await {
+            Ok(payload) => (Some(payload), None),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+
     let notice = query.notice.as_deref().and_then(render_notice_message);
     Ok(Html(render_dashboard_page(
         state,
         &user,
         &tab,
         notice,
-        error.as_deref().or(cluster_error.as_deref()),
         &clusters,
         selected_cluster.as_ref(),
         coverage.as_ref(),
@@ -748,8 +883,15 @@ async fn render_dashboard_response(
         spend_summary.as_ref(),
         cluster_status.as_ref(),
         tx_result.as_ref(),
+        indexer_progress.as_ref(),
+        indexer_lookup.as_ref(),
+        indexer_query.as_ref(),
         query.start.as_deref(),
         query.end.as_deref(),
+        error
+            .as_deref()
+            .or(cluster_error.as_deref())
+            .or(indexer_error.as_deref()),
     ))
     .into_response())
 }
@@ -858,6 +1000,22 @@ async fn api_get_json<T: DeserializeOwned>(state: &WebState, path: &str) -> Resu
     parse_api_response(response).await
 }
 
+async fn indexer_get_json<T: DeserializeOwned>(state: &WebState, path: &str) -> Result<T, WebError> {
+    let Some(base_url) = state.indexer_api_base_url.as_deref() else {
+        return Err(WebError::bad_gateway(
+            "indexer api is not configured for the web portal".to_owned(),
+        ));
+    };
+    let mut request = state
+        .client
+        .get(format!("{}{}", base_url.trim_end_matches('/'), path));
+    if let Some(token) = state.indexer_api_bearer_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(WebError::upstream)?;
+    parse_indexer_response(response).await
+}
+
 async fn api_post_json<Req: Serialize, Res: DeserializeOwned>(
     state: &WebState,
     path: &str,
@@ -884,6 +1042,58 @@ async fn parse_api_response<T: DeserializeOwned>(response: reqwest::Response) ->
         )));
     }
     serde_json::from_str(&body).map_err(|err| WebError::internal(err.to_string()))
+}
+
+async fn parse_indexer_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, WebError> {
+    let status = response.status();
+    let body = response.text().await.map_err(WebError::upstream)?;
+    if !status.is_success() {
+        return Err(WebError::bad_gateway(format!(
+            "indexer api returned {}: {}",
+            status,
+            body
+        )));
+    }
+    serde_json::from_str(&body).map_err(|err| WebError::internal(err.to_string()))
+}
+
+fn build_indexer_lookup_path(query: &IndexerLookupQuery) -> Result<Option<String>, WebError> {
+    let Some(address) = query.address.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let mut params = Vec::new();
+    if let Some(limit) = query.limit {
+        params.push(format!("limit={limit}"));
+    }
+    if let Some(from_block) = query.from_block {
+        params.push(format!("from_block={from_block}"));
+    }
+    if let Some(to_block) = query.to_block {
+        params.push(format!("to_block={to_block}"));
+    }
+    if let Some(direction) = query
+        .direction
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match direction {
+            "from" | "to" => params.push(format!("direction={direction}")),
+            _ => {
+                return Err(WebError::bad_request(
+                    "direction must be either from or to".to_owned(),
+                ));
+            }
+        }
+    }
+    let base = format!("/addresses/{}/txs", urlencoding::encode(address));
+    if params.is_empty() {
+        Ok(Some(base))
+    } else {
+        Ok(Some(format!("{base}?{}", params.join("&"))))
+    }
 }
 
 fn user_agent(headers: &HeaderMap) -> Option<String> {
@@ -1126,7 +1336,6 @@ fn render_dashboard_page(
     user: &AppUser,
     tab: &DashboardTab,
     notice: Option<&str>,
-    error: Option<&str>,
     clusters: &[DashboardClusterRecord],
     selected_cluster: Option<&DashboardClusterRecord>,
     coverage: Option<&ClusterCoverage>,
@@ -1134,8 +1343,12 @@ fn render_dashboard_page(
     spend_summary: Option<&ClusterSpendSummary>,
     cluster_status: Option<&(String, String)>,
     tx_result: Option<&serde_json::Value>,
+    indexer_progress: Option<&IndexerProgressPayload>,
+    indexer_lookup: Option<&IndexerAddressRefsPayload>,
+    indexer_query: Option<&IndexerLookupQuery>,
     start: Option<&str>,
     end: Option<&str>,
+    error: Option<&str>,
 ) -> String {
     let cluster_cards = if clusters.is_empty() {
         "<div class=\"empty-state\">No clusters yet. Create one in the Cluster Management tab.</div>".to_owned()
@@ -1172,7 +1385,7 @@ fn render_dashboard_page(
 <section class="panel">
   <div class="panel-head"><h2>{}</h2><span class="badge">cluster analysis</span></div>
   <div class="panel-body">
-    <form class="inline-form" method="get" action="/dashboard">
+    <form class="inline-form" method="get" action="/app/clusters/{}">
       <div class="stat"><span>Cluster</span><strong>{}</strong></div>
       <label>Start<input type="text" name="start" value="{}" placeholder="2026-04-01T00:00:00Z"></label>
       <label>End<input type="text" name="end" value="{}" placeholder="2026-04-30T23:59:59Z"></label>
@@ -1190,6 +1403,7 @@ fn render_dashboard_page(
 </section>
 "#,
             escape_html(&cluster.name),
+            cluster.cluster_id,
             escape_html(&format!("{} · {}", cluster.name, cluster.owner_label)),
             escape_html(start.unwrap_or_default()),
             escape_html(end.unwrap_or_default()),
@@ -1204,15 +1418,6 @@ fn render_dashboard_page(
         )
     } else {
         "<section class=\"panel\"><div class=\"panel-body\"><div class=\"empty-state\">Select or create a cluster to view analysis.</div></div></section>".to_owned()
-    };
-
-    let cluster_analysis_panel = if let Some(cluster) = selected_cluster {
-        cluster_analysis_panel.replace(
-            "action=\"/dashboard\"",
-            &format!("action=\"/app/clusters/{}\"", cluster.cluster_id),
-        )
-    } else {
-        cluster_analysis_panel
     };
 
     let tx_panel = format!(
@@ -1248,6 +1453,8 @@ fn render_dashboard_page(
     );
 
     let graph_panel = render_cluster_graph_panel(clusters);
+    let indexer_progress_panel = render_indexer_progress_panel(indexer_progress);
+    let indexer_lookup_panel = render_indexer_lookup_panel(indexer_lookup, indexer_query);
 
     format!(
         r#"<!doctype html>
@@ -1272,6 +1479,8 @@ fn render_dashboard_page(
           <a class="{}" href="{}">Cluster analysis</a>
           <a class="{}" href="/app/cluster-graph">Cluster graph</a>
           <a class="{}" href="/app/tx-analysis">Single tx analysis</a>
+          <a class="{}" href="/app/indexer/progress">Indexer progress</a>
+          <a class="{}" href="/app/indexer/address-lookup">Indexer address lookup</a>
           <a class="" href="/pricing">Pricing</a>
         </nav>
         <form method="post" action="/auth/logout">
@@ -1282,7 +1491,7 @@ fn render_dashboard_page(
         <section class="dashboard-hero">
           <span class="eyebrow">Application</span>
           <h1>{}</h1>
-          <p>Create clusters, let the worker backfill historical txs in the background, inspect cluster spend, plan graph views, and keep single-tx analysis in its own dedicated workflow.</p>
+          <p>Use one signed-in portal for both layers: the Base indexer discovery surface and the analysis workflows built on top of it. Keep address lookup lightweight, then move into cluster backfill, spend attribution, graph planning, and dedicated single-tx debugging.</p>
           {}
           {}
         </section>
@@ -1321,6 +1530,8 @@ fn render_dashboard_page(
             .unwrap_or_else(|| "/app/clusters".to_owned()),
         active_class(tab, DashboardTab::ClusterGraph),
         active_class(tab, DashboardTab::TxAnalysis),
+        active_class(tab, DashboardTab::IndexerProgress),
+        active_class(tab, DashboardTab::IndexerLookup),
         escape_html(section_title(tab)),
         render_notice_block(notice),
         render_error_block(error),
@@ -1329,6 +1540,8 @@ fn render_dashboard_page(
             DashboardTab::ClusterAnalysis => cluster_analysis_panel,
             DashboardTab::TxAnalysis => tx_panel,
             DashboardTab::ClusterGraph => graph_panel,
+            DashboardTab::IndexerProgress => indexer_progress_panel,
+            DashboardTab::IndexerLookup => indexer_lookup_panel,
         },
         clusters.len(),
         cluster_cards,
@@ -1404,6 +1617,153 @@ fn render_cluster_graph_panel(clusters: &[DashboardClusterRecord]) -> String {
 </section>
 "#,
         cluster_links
+    )
+}
+
+fn render_indexer_progress_panel(progress: Option<&IndexerProgressPayload>) -> String {
+    let body = progress
+        .map(|progress| {
+            format!(
+                r#"<div class="stats-grid">
+  <div class="stat"><span>Chain ID</span><strong>{}</strong></div>
+  <div class="stat"><span>Worker ID</span><strong>{}</strong></div>
+  <div class="stat"><span>Last indexed block</span><strong>{}</strong></div>
+</div>
+<div class="panel-copy">This portal keeps indexer and analysis separate. The indexer discovers address-level transaction references; the analysis stack consumes those references for cluster backfill, tx interpretation, and spend attribution.</div>
+<div class="button-row">
+  <a class="cta secondary" href="/app/indexer/address-lookup">Open address lookup</a>
+  <a class="cta ghost" href="/app/clusters">Open clusters</a>
+</div>"#,
+                progress.chain_id,
+                escape_html(&progress.worker_id),
+                progress.last_indexed_block
+            )
+        })
+        .unwrap_or_else(|| {
+            "<div class=\"empty-state\">Indexer progress is unavailable right now. Check `LEDGERFLOW_INDEXER_API_BASE_URL` and the bearer token configuration.</div>".to_owned()
+        });
+
+    format!(
+        r#"<section class="panel">
+  <div class="panel-head"><h2>Indexer progress</h2><span class="badge">discovery layer</span></div>
+  <div class="panel-body">{}</div>
+</section>"#,
+        body
+    )
+}
+
+fn render_indexer_lookup_panel(
+    lookup: Option<&IndexerAddressRefsPayload>,
+    query: Option<&IndexerLookupQuery>,
+) -> String {
+    let address = query
+        .and_then(|value| value.address.as_deref())
+        .unwrap_or_default();
+    let direction = query
+        .and_then(|value| value.direction.as_deref())
+        .unwrap_or_default();
+    let limit = query
+        .and_then(|value| value.limit)
+        .unwrap_or(100);
+    let from_block = query
+        .and_then(|value| value.from_block)
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let to_block = query
+        .and_then(|value| value.to_block)
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let results = lookup
+        .map(|payload| {
+            if payload.refs.is_empty() {
+                return "<div class=\"empty-state\">No top-level transaction references matched this query.</div>"
+                    .to_owned();
+            }
+            format!(
+                r#"<div class="stats-grid">
+  <div class="stat"><span>Address</span><strong><code>{}</code></strong></div>
+  <div class="stat"><span>Hits returned</span><strong>{}</strong></div>
+</div>
+<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Tx hash</th>
+        <th>Block</th>
+        <th>Index</th>
+        <th>Direction</th>
+        <th>Chain</th>
+      </tr>
+    </thead>
+    <tbody>
+      {}
+    </tbody>
+  </table>
+</div>"#,
+                escape_html(&payload.address),
+                payload.refs.len(),
+                payload
+                    .refs
+                    .iter()
+                    .take(200)
+                    .map(|reference| {
+                        format!(
+                            "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            escape_html(&truncate_middle(&reference.tx_hash, 8)),
+                            reference.block_number,
+                            reference.tx_index,
+                            match reference.direction {
+                                AddressHitDirection::From => "from",
+                                AddressHitDirection::To => "to",
+                            },
+                            reference.chain_id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            )
+        })
+        .unwrap_or_else(|| {
+            "<div class=\"empty-state\">Query an address to inspect the raw discovery layer before you attach it to a cluster.</div>".to_owned()
+        });
+
+    format!(
+        r#"<section class="panel">
+  <div class="panel-head"><h2>Indexer address lookup</h2><span class="badge">producer view</span></div>
+  <div class="panel-body">
+    <p class="panel-copy">This page talks to the indexer directly under the same login session. Use it to verify address discovery, block windows, and sender/receiver direction before or after cluster onboarding.</p>
+    <form class="stack-form" method="get" action="/app/indexer/address-lookup">
+      <label>Address<input type="text" name="address" value="{}" placeholder="0x..." required></label>
+      <div class="split-fields">
+        <label>Limit<input type="number" name="limit" value="{}" min="1" max="10000"></label>
+        <label>Direction
+          <select name="direction">
+            <option value="" {}>all</option>
+            <option value="from" {}>from</option>
+            <option value="to" {}>to</option>
+          </select>
+        </label>
+      </div>
+      <div class="split-fields">
+        <label>From block<input type="number" name="from_block" value="{}" min="0"></label>
+        <label>To block<input type="number" name="to_block" value="{}" min="0"></label>
+      </div>
+      <div class="button-row">
+        <button class="cta secondary" type="submit">Query address refs</button>
+        <a class="cta ghost" href="/app/indexer/progress">View indexer progress</a>
+      </div>
+    </form>
+    {}
+  </div>
+</section>"#,
+        escape_html(address),
+        limit,
+        if direction.is_empty() { "selected" } else { "" },
+        if direction == "from" { "selected" } else { "" },
+        if direction == "to" { "selected" } else { "" },
+        escape_html(&from_block),
+        escape_html(&to_block),
+        results
     )
 }
 
@@ -1717,7 +2077,7 @@ fn render_cluster_autorefresh_script(
   }};
 
   const fetchState = async () => {{
-    const url = new URL("/dashboard/cluster-status", window.location.origin);
+    const url = new URL("/app/clusters/status", window.location.origin);
     url.searchParams.set("cluster_id", clusterId);
     if (start) url.searchParams.set("start", start);
     if (end) url.searchParams.set("end", end);
@@ -1837,6 +2197,7 @@ textarea { min-height: 140px; resize: vertical; }
 .stat span { display: block; color: var(--muted); font-size: .82rem; text-transform: uppercase; letter-spacing: .08em; }
 .stat strong { display: block; margin-top: 8px; font-size: 1.1rem; }
 .stack-form, .inline-form { display: grid; gap: 12px; }
+.split-fields { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
 .inline-form { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); align-items: end; margin-bottom: 12px; }
 .cluster-list { display: grid; gap: 12px; }
 .cluster-card { display: grid; gap: 6px; padding: 16px; }
