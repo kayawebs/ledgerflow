@@ -34,16 +34,13 @@ LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN=some-long-random-secret
 
 If this variable is set, the same bearer token can be used against `/v1/...` to bypass subscription and quota checks. This is intended for trusted internal analysis services, not public users.
 
-Optional public demo token for low-risk trials:
+Built-in public demo token for low-risk trials:
 
 ```text
-LEDGERFLOW_INDEXER_TEST_API_TOKEN=lf_test_ledgerflow_public_demo
-LEDGERFLOW_INDEXER_TEST_API_RPS=1
-LEDGERFLOW_INDEXER_TEST_API_BURST=3
-LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT=50
+lf_test_ledgerflow_public_demo
 ```
 
-If this variable is set, the same bearer token can be used against a narrow public demo subset:
+This token works without additional setup and can be used against a narrow public demo subset:
 
 - `GET /v1/chains/base/progress`
 - `GET /v1/base/address/{address}/txs`
@@ -55,6 +52,15 @@ The public demo token is:
 - capped to a lower `limit` than paid users
 - blocked from batch lookup and RPC convenience endpoints
 - meant for quick evaluation, not production use
+
+Operator overrides still exist if you want to change the built-in behavior:
+
+```text
+LEDGERFLOW_INDEXER_TEST_API_TOKEN=
+LEDGERFLOW_INDEXER_TEST_API_RPS=1
+LEDGERFLOW_INDEXER_TEST_API_BURST=3
+LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT=50
+```
 
 ## Metering And Quota
 

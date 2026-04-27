@@ -45,10 +45,6 @@ LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE=ledgerflow_indexer
 LEDGERFLOW_INDEXER_WORKER_ID=base_mainnet_top_level
 LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false
 LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN=
-LEDGERFLOW_INDEXER_TEST_API_TOKEN=lf_test_ledgerflow_public_demo
-LEDGERFLOW_INDEXER_TEST_API_RPS=1
-LEDGERFLOW_INDEXER_TEST_API_BURST=3
-LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT=50
 ```
 
 The table names remain `address_tx_refs` and `indexer_progress`, so the service can continue from the existing progress row.
@@ -57,9 +53,24 @@ Keep `LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false` for public deployments. The le
 
 If you want your own local analysis service to bypass subscription/quota checks, set `LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN` and use it as a bearer token against `/v1/...`. Treat it as a privileged internal secret.
 
-If you want to expose a public demo credential, set `LEDGERFLOW_INDEXER_TEST_API_TOKEN`. This token is intended for low-risk trial traffic only: it is rate-limited per IP, clamped to a much smaller `limit`, and only works on `GET /v1/chains/base/progress`, `GET /v1/base/address/{address}/txs`, and `GET /v1/base/address/{address}/tx-hashes`.
+The service now ships with a built-in public demo credential:
+
+```text
+lf_test_ledgerflow_public_demo
+```
+
+This token is intended for low-risk trial traffic only: it is rate-limited per IP, clamped to a much smaller `limit`, and only works on `GET /v1/chains/base/progress`, `GET /v1/base/address/{address}/txs`, and `GET /v1/base/address/{address}/tx-hashes`.
 
 If you run behind Nginx or Cloudflare, make sure the proxy forwards `X-Forwarded-For` or `X-Real-IP`, otherwise all demo traffic may collapse into the same limiter bucket.
+
+If you really need to change the built-in behavior, optional overrides still exist:
+
+```text
+LEDGERFLOW_INDEXER_TEST_API_TOKEN=
+LEDGERFLOW_INDEXER_TEST_API_RPS=1
+LEDGERFLOW_INDEXER_TEST_API_BURST=3
+LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT=50
+```
 
 ## Public API Examples
 

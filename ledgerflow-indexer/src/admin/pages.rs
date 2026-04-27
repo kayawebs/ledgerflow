@@ -745,6 +745,10 @@ pub fn docs() -> &'static str {
     <pre>Authorization: Bearer lf_live_xxx</pre>
     <p>Public <code>/v1</code> endpoints require an API key. Requests use active subscription quota first; if there is no active subscription, signup/referral bonus credits are used.</p>
 
+    <h2>Free demo token</h2>
+    <pre>Authorization: Bearer lf_test_ledgerflow_public_demo</pre>
+    <p>A built-in demo credential is available for quick trials. It is rate-limited per IP, capped to a smaller <code>limit</code>, and only works on <code>/v1/chains/base/progress</code>, <code>/v1/base/address/{address}/txs</code>, and <code>/v1/base/address/{address}/tx-hashes</code>. Expect <code>429</code> if the same IP sends too many demo requests.</p>
+
     <h2>Common response and errors</h2>
     <p>Address refs are normalized top-level <code>from</code>/<code>to</code> rows. Errors use a compact JSON shape:</p>
     <pre>{
@@ -769,6 +773,8 @@ pub fn docs() -> &'static str {
     <h2>Address transaction refs</h2>
     <pre>curl "https://indexer.ledgerflow.top/v1/base/address/0xabc.../txs?direction=from&limit=100&cursor=..." \
   -H "Authorization: Bearer lf_live_xxx"</pre>
+    <pre>curl "https://indexer.ledgerflow.top/v1/base/address/0xabc.../txs?limit=20" \
+  -H "Authorization: Bearer lf_test_ledgerflow_public_demo"</pre>
     <p>Path parameter: <code>address</code> must be a 20-byte <code>0x</code> EVM address. Query parameters: <code>from_block</code> and <code>to_block</code> are inclusive bounds; <code>direction</code> is <code>from</code>, <code>to</code>, or omitted; <code>limit</code> is clamped by server config; <code>cursor</code> is the previous <code>next_cursor</code>.</p>
     <pre>{
   "chain": "base",
@@ -791,6 +797,8 @@ pub fn docs() -> &'static str {
     <h2>Address tx hashes</h2>
     <pre>curl "https://indexer.ledgerflow.top/v1/base/address/0xabc.../tx-hashes?limit=1000" \
   -H "Authorization: Bearer lf_live_xxx"</pre>
+    <pre>curl "https://indexer.ledgerflow.top/v1/base/address/0xabc.../tx-hashes?limit=20" \
+  -H "Authorization: Bearer lf_test_ledgerflow_public_demo"</pre>
     <p>Parameters match <code>/txs</code> except this endpoint does not take <code>cursor</code>. It returns deduplicated hashes only.</p>
     <pre>{
   "chain": "base",
@@ -857,6 +865,7 @@ curl "https://indexer.ledgerflow.top/v1/base/tx/0x.../receipt" \
       <li>Batch lookup accepts at most 50 addresses per request.</li>
       <li>Single address lookup is the correct interface for very high-volume addresses because it supports cursor pagination.</li>
       <li>Successful and failed authenticated requests are both visible in the dashboard usage page.</li>
+      <li>The built-in demo token is IP-rate-limited and returns <code>429</code> on bursts.</li>
     </ul>
 
     <h2>What this is not</h2>

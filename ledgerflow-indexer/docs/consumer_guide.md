@@ -84,7 +84,7 @@ curl -s "https://indexer.ledgerflow.top/v1/chains/base/progress" \
 
 ### Public Demo Token
 
-If the operator enables a public test credential, you can use:
+The public trial credential is built in, so you can use:
 
 ```http
 Authorization: Bearer lf_test_ledgerflow_public_demo

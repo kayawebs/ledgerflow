@@ -1,5 +1,7 @@
 use std::env;
 
+pub const DEFAULT_PUBLIC_TEST_TOKEN: &str = "lf_test_ledgerflow_public_demo";
+
 #[derive(Clone, Debug)]
 pub struct IndexerConfig {
     pub bind_addr: String,
@@ -82,9 +84,12 @@ impl IndexerConfig {
             internal_api_token: env::var("LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
-            test_api_token: env::var("LEDGERFLOW_INDEXER_TEST_API_TOKEN")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
+            test_api_token: Some(
+                env::var("LEDGERFLOW_INDEXER_TEST_API_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_PUBLIC_TEST_TOKEN.to_owned()),
+            ),
             test_api_rps: parse_u32("LEDGERFLOW_INDEXER_TEST_API_RPS").unwrap_or(1),
             test_api_burst: parse_u32("LEDGERFLOW_INDEXER_TEST_API_BURST").unwrap_or(3),
             test_api_max_limit: parse_u32("LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT").unwrap_or(50),
