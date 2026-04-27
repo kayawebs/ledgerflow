@@ -733,6 +733,21 @@ pub fn docs() -> &'static str {
     table { width:100%; border-collapse:collapse; background:#fffaf1; border:1px solid var(--line); border-radius:18px; overflow:hidden; }
     th, td { text-align:left; padding:12px; border-bottom:1px solid var(--line); }
     th { color:var(--accent); text-transform:uppercase; letter-spacing:.12em; font-size:12px; }
+    .demo-card { border:1px solid var(--line); border-radius:24px; background:#fffaf1; padding:20px; margin-top:18px; }
+    .demo-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+    .demo-grid label, .demo-actions button { font-family:ui-sans-serif,system-ui; }
+    .demo-grid label { display:block; font-size:12px; text-transform:uppercase; letter-spacing:.12em; color:var(--muted); margin-bottom:6px; }
+    .demo-grid input, .demo-grid select { width:100%; border:1px solid var(--line); border-radius:14px; padding:12px 13px; background:#fbf7ef; color:var(--ink); font-family:ui-sans-serif,system-ui; }
+    .demo-grid .span-2 { grid-column:span 2; }
+    .demo-actions { display:flex; gap:12px; margin-top:16px; flex-wrap:wrap; }
+    .demo-actions button { border:0; border-radius:999px; background:#17130f; color:#fbf7ef; padding:12px 16px; cursor:pointer; font-weight:700; }
+    .demo-actions button.secondary { background:transparent; color:var(--ink); border:1px solid var(--line); }
+    .demo-note { font-size:13px; color:var(--muted); margin-top:12px; }
+    #demo-status { font-family:ui-sans-serif,system-ui; color:var(--muted); margin-top:12px; }
+    @media (max-width: 760px) {
+      .demo-grid { grid-template-columns:1fr; }
+      .demo-grid .span-2 { grid-column:span 1; }
+    }
   </style>
 </head>
 <body>
@@ -748,6 +763,45 @@ pub fn docs() -> &'static str {
     <h2>Free demo token</h2>
     <pre>Authorization: Bearer lf_test_ledgerflow_public_demo</pre>
     <p>A built-in demo credential is available for quick trials. It is rate-limited per IP, works across the public <code>/v1</code> API surface, and still uses a smaller demo <code>limit</code>. Expect <code>429</code> if the same IP sends too many demo requests.</p>
+    <div class="demo-card">
+      <div class="demo-grid">
+        <div>
+          <label for="demo-endpoint">Demo endpoint</label>
+          <select id="demo-endpoint">
+            <option value="progress">Base progress</option>
+            <option value="latest_block">Latest block</option>
+            <option value="address_hashes">Address tx hashes</option>
+            <option value="address_txs">Address tx refs</option>
+            <option value="tx">Transaction by hash</option>
+            <option value="receipt">Transaction receipt</option>
+            <option value="block">Block by number</option>
+          </select>
+        </div>
+        <div>
+          <label for="demo-limit">Limit</label>
+          <input id="demo-limit" type="number" min="1" max="50" value="20">
+        </div>
+        <div class="span-2">
+          <label for="demo-address">Address</label>
+          <input id="demo-address" value="0x4200000000000000000000000000000000000006" placeholder="0x...">
+        </div>
+        <div class="span-2">
+          <label for="demo-tx-hash">Tx hash</label>
+          <input id="demo-tx-hash" placeholder="0x...">
+        </div>
+        <div class="span-2">
+          <label for="demo-block-number">Block number</label>
+          <input id="demo-block-number" type="number" min="0" placeholder="31050099">
+        </div>
+      </div>
+      <div class="demo-actions">
+        <button id="run-demo">Run demo request</button>
+        <button id="copy-demo-curl" class="secondary">Copy demo curl</button>
+      </div>
+      <p class="demo-note">The browser calls this site directly with the public demo token. For tx hash and block endpoints, paste a real tx hash or block number first.</p>
+      <div id="demo-status">Ready to run a demo request.</div>
+      <pre id="demo-output">Select an endpoint and click "Run demo request".</pre>
+    </div>
 
     <h2>Common response and errors</h2>
     <p>Address refs are normalized top-level <code>from</code>/<code>to</code> rows. Errors use a compact JSON shape:</p>
@@ -887,6 +941,77 @@ curl "https://indexer.ledgerflow.top/v1/base/tx/0x.../receipt" \
       };
       link.replaceWith(button);
     }
+    function demoRequestSpec() {
+      const endpoint = document.getElementById("demo-endpoint").value;
+      const limit = Math.max(1, Math.min(50, Number(document.getElementById("demo-limit").value || 20)));
+      const address = document.getElementById("demo-address").value.trim();
+      const txHash = document.getElementById("demo-tx-hash").value.trim();
+      const blockNumber = document.getElementById("demo-block-number").value.trim();
+      switch (endpoint) {
+        case "progress":
+          return { path: "/v1/chains/base/progress", curl: "curl -s https://indexer.ledgerflow.top/v1/chains/base/progress \\\n  -H 'Authorization: Bearer lf_test_ledgerflow_public_demo'" };
+        case "latest_block":
+          return { path: "/v1/base/block/latest", curl: "curl -s https://indexer.ledgerflow.top/v1/base/block/latest \\\n  -H 'Authorization: Bearer lf_test_ledgerflow_public_demo'" };
+        case "address_hashes":
+          return { path: `/v1/base/address/${encodeURIComponent(address)}/tx-hashes?limit=${limit}`, curl: `curl -s "https://indexer.ledgerflow.top/v1/base/address/${address}/tx-hashes?limit=${limit}" \\\n  -H 'Authorization: Bearer lf_test_ledgerflow_public_demo'` };
+        case "address_txs":
+          return { path: `/v1/base/address/${encodeURIComponent(address)}/txs?limit=${limit}`, curl: `curl -s "https://indexer.ledgerflow.top/v1/base/address/${address}/txs?limit=${limit}" \\\n  -H 'Authorization: Bearer lf_test_ledgerflow_public_demo'` };
+        case "tx":
+          return { path: `/v1/base/tx/${encodeURIComponent(txHash)}`, curl: `curl -s "https://indexer.ledgerflow.top/v1/base/tx/${txHash}" \\\n  -H 'Authorization: Bearer lf_test_ledgerflow_public_demo'` };
+        case "receipt":
+          return { path: `/v1/base/tx/${encodeURIComponent(txHash)}/receipt`, curl: `curl -s "https://indexer.ledgerflow.top/v1/base/tx/${txHash}/receipt" \\\n  -H 'Authorization: Bearer lf_test_ledgerflow_public_demo'` };
+        case "block":
+          return { path: `/v1/base/block/${encodeURIComponent(blockNumber)}`, curl: `curl -s "https://indexer.ledgerflow.top/v1/base/block/${blockNumber}" \\\n  -H 'Authorization: Bearer lf_test_ledgerflow_public_demo'` };
+        default:
+          return { path: "/v1/chains/base/progress", curl: "curl -s https://indexer.ledgerflow.top/v1/chains/base/progress \\\n  -H 'Authorization: Bearer lf_test_ledgerflow_public_demo'" };
+      }
+    }
+    function validateDemoInputs() {
+      const endpoint = document.getElementById("demo-endpoint").value;
+      const address = document.getElementById("demo-address").value.trim();
+      const txHash = document.getElementById("demo-tx-hash").value.trim();
+      const blockNumber = document.getElementById("demo-block-number").value.trim();
+      if ((endpoint === "address_hashes" || endpoint === "address_txs") && !address) {
+        throw new Error("Address is required for address lookup endpoints.");
+      }
+      if ((endpoint === "tx" || endpoint === "receipt") && !txHash) {
+        throw new Error("Tx hash is required for transaction endpoints.");
+      }
+      if (endpoint === "block" && !blockNumber) {
+        throw new Error("Block number is required for block lookup.");
+      }
+    }
+    document.getElementById("run-demo").onclick = async () => {
+      const status = document.getElementById("demo-status");
+      const output = document.getElementById("demo-output");
+      try {
+        validateDemoInputs();
+        const spec = demoRequestSpec();
+        status.textContent = `Running ${spec.path}`;
+        const res = await fetch(spec.path, {
+          headers: {
+            "Authorization": "Bearer lf_test_ledgerflow_public_demo"
+          }
+        });
+        const text = await res.text();
+        let parsed = text;
+        try { parsed = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
+        output.textContent = parsed;
+        status.textContent = res.ok ? `HTTP ${res.status}` : `HTTP ${res.status} demo request failed`;
+      } catch (err) {
+        status.textContent = err.message;
+      }
+    };
+    document.getElementById("copy-demo-curl").onclick = async () => {
+      try {
+        validateDemoInputs();
+        const spec = demoRequestSpec();
+        await navigator.clipboard.writeText(spec.curl);
+        document.getElementById("demo-status").textContent = "Demo curl copied.";
+      } catch (err) {
+        document.getElementById("demo-status").textContent = err.message;
+      }
+    };
     installAuthNav().catch(() => {});
   </script>
 </body>
