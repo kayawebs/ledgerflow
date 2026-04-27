@@ -59,7 +59,7 @@ The service now ships with a built-in public demo credential:
 lf_test_ledgerflow_public_demo
 ```
 
-This token is intended for low-risk trial traffic only: it is rate-limited per IP, clamped to a much smaller `limit`, and only works on `GET /v1/chains/base/progress`, `GET /v1/base/address/{address}/txs`, and `GET /v1/base/address/{address}/tx-hashes`.
+This token is intended for low-risk trial traffic only: it is rate-limited per IP, can be used across the public `/v1/...` API surface, and still clamps query `limit` down to a much smaller demo maximum.
 
 If you run behind Nginx or Cloudflare, make sure the proxy forwards `X-Forwarded-For` or `X-Real-IP`, otherwise all demo traffic may collapse into the same limiter bucket.
 
@@ -97,7 +97,7 @@ curl -s "http://127.0.0.1:8090/v1/base/address/0x1111111111111111111111111111111
   -H "Authorization: Bearer $LEDGERFLOW_TEST_TOKEN" | jq
 ```
 
-Use the demo token only for simple trials. It is intentionally too constrained for production integrations.
+Use the demo token only for simple trials. It is intentionally rate-limited and lower-quota than a real customer API key.
 
 Batch lookup:
 

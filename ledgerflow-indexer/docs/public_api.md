@@ -40,17 +40,12 @@ Built-in public demo token for low-risk trials:
 lf_test_ledgerflow_public_demo
 ```
 
-This token works without additional setup and can be used against a narrow public demo subset:
-
-- `GET /v1/chains/base/progress`
-- `GET /v1/base/address/{address}/txs`
-- `GET /v1/base/address/{address}/tx-hashes`
+This token works without additional setup and can be used across the public `/v1/...` API surface.
 
 The public demo token is:
 
 - rate-limited per client IP
 - capped to a lower `limit` than paid users
-- blocked from batch lookup and RPC convenience endpoints
 - meant for quick evaluation, not production use
 
 Operator overrides still exist if you want to change the built-in behavior:
@@ -160,7 +155,7 @@ Common status codes:
 | `GET` | `/v1/base/tx/{tx_hash}` | API key | yes | Transaction object from RPC. |
 | `GET` | `/v1/base/tx/{tx_hash}/receipt` | API key | yes | Transaction receipt from RPC. |
 
-Public demo token access is intentionally limited to `progress`, single-address `txs`, and single-address `tx-hashes`.
+Public demo token access is available across the public `/v1/...` API surface, but it is still rate-limited per client IP and uses a smaller maximum `limit`.
 
 ## GET /health
 

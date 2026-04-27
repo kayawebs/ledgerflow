@@ -92,9 +92,7 @@ Authorization: Bearer lf_test_ledgerflow_public_demo
 
 This is intentionally constrained:
 
-- only `GET /v1/chains/base/progress`
-- only `GET /v1/base/address/{address}/txs`
-- only `GET /v1/base/address/{address}/tx-hashes`
+- works across the public `/v1/...` API surface
 - per-IP rate-limited
 - lower maximum `limit`
 

@@ -395,7 +395,7 @@ async fn get_block(
 async fn authorize(
     state: &PublicApiState,
     headers: &HeaderMap,
-    endpoint: &str,
+    _endpoint: &str,
 ) -> Result<AuthContext, ApiError> {
     let api_key = bearer_token(headers).map_err(ApiError::from)?;
     if state
@@ -414,7 +414,6 @@ async fn authorize(
         .as_deref()
         .is_some_and(|token| token == api_key)
     {
-        ensure_test_endpoint_allowed(endpoint)?;
         let client_key = format!("test:{}", client_ip_key(headers));
         let allowed = state
             .test_rate_limiter
@@ -521,18 +520,6 @@ fn effective_limit(
     }
 }
 
-fn ensure_test_endpoint_allowed(endpoint: &str) -> Result<(), ApiError> {
-    match endpoint {
-        "GET /v1/chains/base/progress"
-        | "GET /v1/base/address/{address}/txs"
-        | "GET /v1/base/address/{address}/tx-hashes" => Ok(()),
-        _ => Err(ApiError::conflict(
-            "public test token only supports progress and single-address lookup endpoints"
-                .to_owned(),
-        )),
-    }
-}
-
 fn client_ip_key(headers: &HeaderMap) -> String {
     headers
         .get("x-forwarded-for")
@@ -616,11 +603,10 @@ mod tests {
         assert_eq!(client_ip_key(&headers), "203.0.113.8");
     }
 
-    #[test]
-    fn test_demo_endpoints_are_restricted() {
-        assert!(ensure_test_endpoint_allowed("GET /v1/chains/base/progress").is_ok());
-        assert!(ensure_test_endpoint_allowed("GET /v1/base/address/{address}/txs").is_ok());
-        assert!(ensure_test_endpoint_allowed("GET /v1/base/tx/{tx_hash}").is_err());
-        assert!(ensure_test_endpoint_allowed("POST /v1/base/addresses/txs").is_err());
+    #[tokio::test]
+    async fn test_demo_rate_limiter_blocks_excess_burst() {
+        let limiter = TestTokenRateLimiter::new();
+        assert!(limiter.allow("demo:203.0.113.8", 1, 1).await);
+        assert!(!limiter.allow("demo:203.0.113.8", 1, 1).await);
     }
 }

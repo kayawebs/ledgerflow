@@ -747,7 +747,7 @@ pub fn docs() -> &'static str {
 
     <h2>Free demo token</h2>
     <pre>Authorization: Bearer lf_test_ledgerflow_public_demo</pre>
-    <p>A built-in demo credential is available for quick trials. It is rate-limited per IP, capped to a smaller <code>limit</code>, and only works on <code>/v1/chains/base/progress</code>, <code>/v1/base/address/{address}/txs</code>, and <code>/v1/base/address/{address}/tx-hashes</code>. Expect <code>429</code> if the same IP sends too many demo requests.</p>
+    <p>A built-in demo credential is available for quick trials. It is rate-limited per IP, works across the public <code>/v1</code> API surface, and still uses a smaller demo <code>limit</code>. Expect <code>429</code> if the same IP sends too many demo requests.</p>
 
     <h2>Common response and errors</h2>
     <p>Address refs are normalized top-level <code>from</code>/<code>to</code> rows. Errors use a compact JSON shape:</p>
