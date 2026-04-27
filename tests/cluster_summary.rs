@@ -32,8 +32,10 @@ async fn cluster_summary_rolls_up_gas_and_external_flows() {
         repository.clone(),
         vec![
             "selector_presence".to_owned(),
+            "erc20_approval".to_owned(),
             "erc20_transfer_flow".to_owned(),
             "native_transfer".to_owned(),
+            "swap_flow".to_owned(),
         ],
     );
     let cluster_service = ClusterService::new(repository);
@@ -76,6 +78,9 @@ async fn cluster_summary_rolls_up_gas_and_external_flows() {
     assert_eq!(summary.total_gas_cost_raw, "21000000000000");
     assert_eq!(summary.total_external_native_outflow_raw, "1000");
     assert_eq!(summary.total_incoming_native_raw, "0");
+    assert_eq!(summary.transactions[0].analysis_status, analysis.analysis_status);
+    assert!(summary.transactions[0].trace_available);
+    assert!(!summary.transactions[0].counterparties.is_empty());
     assert!(summary.breakdowns.iter().any(|item| {
         item.category == SpendCategory::GasBurn
             && item.asset_type == AssetType::Native
@@ -86,6 +91,7 @@ async fn cluster_summary_rolls_up_gas_and_external_flows() {
             && item.asset_type == AssetType::Erc20
             && item.amount_raw == "100"
     }));
+    assert!(summary.metadata["warnings"].is_array());
 }
 
 #[tokio::test]

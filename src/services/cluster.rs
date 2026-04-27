@@ -94,6 +94,8 @@ impl ClusterService {
         let mut total_external_native_outflow = 0u128;
         let mut total_internal_native_transfer = 0u128;
         let mut total_incoming_native = 0u128;
+        let mut unresolved_tx_count = 0u32;
+        let mut trace_missing_tx_count = 0u32;
         let mut breakdown_map = BTreeMap::<
             (SpendCategory, AssetType, Option<String>, Option<String>),
             (u128, BTreeSet<String>, u32),
@@ -124,6 +126,7 @@ impl ClusterService {
             let mut tx_external_native = 0u128;
             let mut tx_external_token_count = 0u32;
             let mut tx_internal_transfer_count = 0u32;
+            let mut counterparties = BTreeSet::new();
 
             for flow in &analysis.derived_flows {
                 let from_in_cluster = cluster_set.contains(&flow.from_address.to_lowercase());
@@ -135,6 +138,7 @@ impl ClusterService {
                         total_internal_native_transfer += amount;
                     }
                     tx_internal_transfer_count += 1;
+                    counterparties.insert(flow.to_address.clone());
                     increment_breakdown(
                         &mut breakdown_map,
                         SpendCategory::InternalTransfer,
@@ -154,6 +158,7 @@ impl ClusterService {
                     } else {
                         tx_external_token_count += 1;
                     }
+                    counterparties.insert(flow.to_address.clone());
                     increment_breakdown(
                         &mut breakdown_map,
                         SpendCategory::ExternalOutflow,
@@ -170,6 +175,7 @@ impl ClusterService {
                     if flow.asset_type == AssetType::Native {
                         total_incoming_native += amount;
                     }
+                    counterparties.insert(flow.from_address.clone());
                     increment_breakdown(
                         &mut breakdown_map,
                         SpendCategory::IncomingTransfer,
@@ -182,12 +188,27 @@ impl ClusterService {
                 }
             }
 
+            let unresolved_count = analysis.unresolved_items.len() as u32;
+            if unresolved_count > 0 {
+                unresolved_tx_count += 1;
+            }
+            let trace_available = analysis
+                .normalized_execution_facts
+                .derived_facts
+                .get("trace_available")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if !trace_available {
+                trace_missing_tx_count += 1;
+            }
+
             tx_summaries.push(ClusterTransactionSummary {
                 tx_hash: analysis.tx_hash.clone(),
                 block_timestamp: analysis.block_timestamp,
                 from_address: analysis.from_address.clone(),
                 to_address: analysis.to_address.clone(),
                 status: analysis.status.clone(),
+                analysis_status: analysis.analysis_status.clone(),
                 recognizer_labels: analysis
                     .recognizer_results
                     .iter()
@@ -197,6 +218,9 @@ impl ClusterService {
                 external_native_outflow_raw: tx_external_native.to_string(),
                 external_token_outflow_count: tx_external_token_count,
                 internal_transfer_count: tx_internal_transfer_count,
+                unresolved_count,
+                trace_available,
+                counterparties: counterparties.into_iter().collect(),
             });
         }
 
@@ -222,6 +246,37 @@ impl ClusterService {
             )
             .collect::<Vec<_>>();
 
+        let mut warnings = Vec::new();
+        if let Some(coverage) = coverage.as_ref() {
+            if coverage.pending_tx_count > 0 {
+                warnings.push(format!(
+                    "coverage is partial: {} discovered txs are still pending analysis",
+                    coverage.pending_tx_count
+                ));
+            }
+            if coverage.failed_tx_count > 0 {
+                warnings.push(format!(
+                    "{} discovered txs failed analysis and may affect totals",
+                    coverage.failed_tx_count
+                ));
+            }
+            if coverage.discovered_tx_count > coverage.analyzed_tx_count {
+                warnings.push("summary only reflects analyzed transactions, not all discovered transactions".to_owned());
+            }
+        }
+        if trace_missing_tx_count > 0 {
+            warnings.push(format!(
+                "{} analyzed txs were processed without trace data",
+                trace_missing_tx_count
+            ));
+        }
+        if unresolved_tx_count > 0 {
+            warnings.push(format!(
+                "{} analyzed txs still contain unresolved items",
+                unresolved_tx_count
+            ));
+        }
+
         ClusterSpendSummary {
             cluster_id: cluster.cluster_id,
             chain_id: cluster.chain_id,
@@ -242,6 +297,9 @@ impl ClusterService {
                 "note": "summary derived from already analyzed transactions for the cluster address set",
                 "coverage_mode": "persisted_analyses_only",
                 "coverage": coverage,
+                "warnings": warnings,
+                "unresolved_tx_count": unresolved_tx_count,
+                "trace_missing_tx_count": trace_missing_tx_count,
             }),
         }
     }

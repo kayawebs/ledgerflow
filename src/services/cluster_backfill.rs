@@ -35,6 +35,7 @@ pub struct ClusterBackfillService {
     analysis_service: Arc<AnalysisService>,
     tx_source: Option<Arc<dyn ClusterTxSource>>,
     default_query_limit: u32,
+    continuous_watch_lookback_blocks: u64,
 }
 
 impl ClusterBackfillService {
@@ -42,11 +43,13 @@ impl ClusterBackfillService {
         analysis_service: Arc<AnalysisService>,
         tx_source: Option<Arc<dyn ClusterTxSource>>,
         default_query_limit: u32,
+        continuous_watch_lookback_blocks: u64,
     ) -> Self {
         Self {
             analysis_service,
             tx_source,
             default_query_limit,
+            continuous_watch_lookback_blocks,
         }
     }
 
@@ -184,6 +187,72 @@ impl ClusterBackfillService {
 
     pub fn is_configured(&self) -> bool {
         self.tx_source.is_some()
+    }
+
+    pub async fn enqueue_incremental_runs(&self) -> LedgerResult<u32> {
+        let tx_source = self.tx_source.as_ref().ok_or_else(|| {
+            LedgerError::AnalysisInvariant("indexer tx source is not configured".to_owned())
+        })?;
+        let repository = &self.analysis_service.repository;
+        let clusters = repository.list_clusters().await?;
+        let mut enqueued = 0u32;
+
+        for cluster in clusters {
+            let runs = repository
+                .list_cluster_backfill_runs(cluster.cluster_id)
+                .await
+                .unwrap_or_default();
+            if runs.iter().any(|run| {
+                matches!(
+                    run.status,
+                    ClusterBackfillStatus::Pending | ClusterBackfillStatus::Running
+                )
+            }) {
+                continue;
+            }
+
+            let last_indexed_block = tx_source.get_last_indexed_block(cluster.chain_id).await?;
+            let latest_completed_end = runs
+                .iter()
+                .filter(|run| {
+                    matches!(
+                        run.status,
+                        ClusterBackfillStatus::Completed
+                            | ClusterBackfillStatus::Partial
+                            | ClusterBackfillStatus::Failed
+                    )
+                })
+                .filter_map(|run| run.end_block)
+                .max();
+
+            let start_block = latest_completed_end
+                .map(|value| {
+                    value
+                        .saturating_add(1)
+                        .saturating_sub(self.continuous_watch_lookback_blocks)
+                })
+                .unwrap_or(0);
+
+            if let Some(last_end) = latest_completed_end
+                && last_end >= last_indexed_block
+            {
+                continue;
+            }
+
+            self.enqueue_cluster(
+                cluster.cluster_id,
+                ClusterBackfillRequest {
+                    start_block: Some(start_block),
+                    end_block: Some(last_indexed_block),
+                    force_reanalyze: false,
+                    query_limit: Some(self.default_query_limit),
+                },
+            )
+            .await?;
+            enqueued += 1;
+        }
+
+        Ok(enqueued)
     }
 
     async fn execute_run(

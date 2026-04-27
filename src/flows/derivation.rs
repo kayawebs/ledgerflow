@@ -18,17 +18,28 @@ fn hex_amount_to_decimal(value: &str) -> String {
         .to_string()
 }
 
-fn trace_native_flows(tx_hash: &str, frame: Option<&RawTraceFrame>) -> Vec<AssetFlow> {
+fn trace_native_flows(
+    tx_hash: &str,
+    frame: Option<&RawTraceFrame>,
+    parent_trace_address: &[u64],
+) -> Vec<AssetFlow> {
     let Some(frame) = frame else {
         return Vec::new();
     };
     let mut flows = Vec::new();
     for (index, child) in frame.children.iter().enumerate() {
+        let mut trace_address = parent_trace_address.to_vec();
+        trace_address.push(index as u64);
         if child.to_address.is_some()
             && u128::from_str_radix(child.value.trim_start_matches("0x"), 16).unwrap_or(0) > 0
         {
+            let trace_address_label = trace_address
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(".");
             flows.push(AssetFlow {
-                flow_id: format!("{tx_hash}:native:{index}"),
+                flow_id: format!("{tx_hash}:native:{trace_address_label}"),
                 asset_type: AssetType::Native,
                 token_address: None,
                 from_address: child.from_address.to_lowercase(),
@@ -37,16 +48,20 @@ fn trace_native_flows(tx_hash: &str, frame: Option<&RawTraceFrame>) -> Vec<Asset
                 direction_hint: None,
                 evidence_refs: vec![EvidenceRef {
                     kind: EvidenceKind::CallFrame,
-                    reference: format!("{tx_hash}:trace:{index}"),
+                    reference: format!("{tx_hash}:trace:{trace_address_label}"),
                     tx_hash: Some(tx_hash.to_owned()),
                     metadata: json!({}),
                 }],
                 derivation_method: "trace_native_transfer".to_owned(),
                 confidence: 0.95,
-                metadata: json!({}),
+                metadata: json!({
+                    "scope": "internal",
+                    "trace_address": trace_address,
+                    "call_type": child.call_type,
+                }),
             });
         }
-        flows.extend(trace_native_flows(tx_hash, Some(child)));
+        flows.extend(trace_native_flows(tx_hash, Some(child), &trace_address));
     }
     flows
 }
@@ -86,10 +101,10 @@ impl FlowDeriver for BasicFlowDeriver {
                 }],
                 derivation_method: "tx_value".to_owned(),
                 confidence: 1.0,
-                metadata: json!({}),
+                metadata: json!({ "scope": "top_level" }),
             });
         }
-        flows.extend(trace_native_flows(tx_hash, bundle.trace.as_ref()));
+        flows.extend(trace_native_flows(tx_hash, bundle.trace.as_ref(), &[]));
 
         for log in &bundle.receipt.logs {
             if log.topics.len() < 3 || !log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC) {
@@ -111,7 +126,7 @@ impl FlowDeriver for BasicFlowDeriver {
                 }],
                 derivation_method: "erc20_transfer_log".to_owned(),
                 confidence: 0.98,
-                metadata: json!({}),
+                metadata: json!({ "scope": "event_log" }),
             });
         }
 

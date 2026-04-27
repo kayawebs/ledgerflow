@@ -49,6 +49,7 @@ async fn main() {
         Arc::clone(&service),
         tx_source,
         config.cluster_backfill_query_limit,
+        config.cluster_continuous_watch_lookback_blocks,
     );
     let poll_interval =
         Duration::from_millis(config.cluster_backfill_worker_poll_interval_ms.max(250));
@@ -72,6 +73,18 @@ async fn main() {
                 );
             }
             Ok(None) => {
+                if config.cluster_continuous_watch_enabled {
+                    match backfill_service.enqueue_incremental_runs().await {
+                        Ok(enqueued) if enqueued > 0 => {
+                            info!(enqueued, "enqueued incremental cluster backfill runs");
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!(error = %err, "cluster watch enqueue iteration failed");
+                        }
+                    }
+                }
                 tokio::time::sleep(poll_interval).await;
             }
             Err(err) => {

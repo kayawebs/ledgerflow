@@ -21,10 +21,15 @@ async fn end_to_end_analysis_happy_path() {
         Arc::new(InMemoryAnalysisRepository::default()),
         vec![
             "selector_presence".to_owned(),
+            "failed_execution_classifier".to_owned(),
             "erc20_transfer_flow".to_owned(),
+            "erc20_approval".to_owned(),
             "native_transfer".to_owned(),
             "batch_router_heuristic".to_owned(),
+            "swap_flow".to_owned(),
             "approval_swap_scenario".to_owned(),
+            "bridge_like_transfer".to_owned(),
+            "deposit_withdraw_pattern".to_owned(),
         ],
     );
 
@@ -37,10 +42,14 @@ async fn end_to_end_analysis_happy_path() {
     assert!(!analysis.input_digest.is_empty());
     assert!(labels.contains(&"selector_present".to_owned()));
     assert!(labels.contains(&"erc20_transfer_activity".to_owned()));
+    assert!(labels.contains(&"erc20_approval_activity".to_owned()));
+    assert!(labels.contains(&"swap_like_activity".to_owned()));
     assert_eq!(
         pack.metadata["analysis_status"],
         serde_json::json!(analysis.analysis_status)
     );
+    assert!(analysis.normalized_execution_facts.derived_facts["trace_selectors"].is_array());
+    assert!(analysis.normalized_execution_facts.derived_facts["token_net_deltas"].is_array());
 }
 
 #[tokio::test]
@@ -85,4 +94,31 @@ async fn graceful_handling_of_unsupported_trace() {
             .any(|item| item.validator_id == "trace_availability"
                 && item.status == ledgerflow::domain::enums::ValidationStatus::Warn)
     );
+}
+
+#[tokio::test]
+async fn failed_execution_is_classified_without_crashing_other_recognizers() {
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let service = AnalysisService::new(
+        TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true),
+        registry,
+        plugin_context,
+        Arc::new(InMemoryAnalysisRepository::default()),
+        vec![
+            "selector_presence".to_owned(),
+            "failed_execution_classifier".to_owned(),
+        ],
+    );
+
+    let (analysis, _) = service
+        .analyze_transaction(8453, "0xfail-case")
+        .await
+        .unwrap();
+    let labels = analysis
+        .recognizer_results
+        .iter()
+        .map(|item| item.label.clone())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"failed_execution".to_owned()));
 }

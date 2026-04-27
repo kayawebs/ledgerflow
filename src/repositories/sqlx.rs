@@ -446,6 +446,70 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         }))
     }
 
+    async fn list_clusters(&self) -> LedgerResult<Vec<AddressCluster>> {
+        let rows = sqlx::query(
+            r#"
+            select
+              c.cluster_id,
+              c.chain_id,
+              c.owner_label,
+              c.name,
+              c.description,
+              c.metadata,
+              coalesce(
+                json_agg(
+                  json_build_object(
+                    'address', a.address,
+                    'label', a.label,
+                    'role', a.role,
+                    'metadata', a.metadata
+                  )
+                  order by a.address asc
+                ) filter (where a.address is not null),
+                '[]'::json
+              ) as addresses
+            from address_clusters c
+            left join cluster_addresses a on a.cluster_id = c.cluster_id
+            group by c.cluster_id, c.chain_id, c.owner_label, c.name, c.description, c.metadata
+            order by c.created_at asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                let Json(metadata): Json<Value> = row
+                    .try_get("metadata")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+                let Json(addresses): Json<Vec<ClusterAddress>> = row
+                    .try_get("addresses")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+                Ok(AddressCluster {
+                    cluster_id: row
+                        .try_get("cluster_id")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    chain_id: row
+                        .try_get::<i64, _>("chain_id")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                        as u64,
+                    owner_label: row
+                        .try_get("owner_label")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    name: row
+                        .try_get("name")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    description: row
+                        .try_get("description")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    addresses,
+                    metadata,
+                })
+            })
+            .collect()
+    }
+
     async fn list_analyses_for_cluster(
         &self,
         chain_id: u64,

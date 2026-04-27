@@ -50,6 +50,7 @@ async fn main() {
         Arc::clone(&service),
         tx_source,
         config.cluster_backfill_query_limit,
+        config.cluster_continuous_watch_lookback_blocks,
     ));
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)

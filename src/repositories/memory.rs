@@ -107,6 +107,10 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
         Ok(self.clusters.read().await.get(&cluster_id).cloned())
     }
 
+    async fn list_clusters(&self) -> LedgerResult<Vec<AddressCluster>> {
+        Ok(self.clusters.read().await.values().cloned().collect())
+    }
+
     async fn list_analyses_for_cluster(
         &self,
         chain_id: u64,

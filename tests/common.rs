@@ -37,21 +37,29 @@ impl Default for MockRpcClient {
 #[async_trait]
 impl RpcClient for MockRpcClient {
     async fn get_transaction(&self, chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
+        let input = if tx_hash.contains("approve") {
+            format!("{}{}", "0x095ea7b3", "00".repeat(32))
+        } else if tx_hash.contains("transfer") {
+            format!("{}{}", "0xa9059cbb", "00".repeat(32))
+        } else {
+            format!("{}{}", "0x38ed1739", "00".repeat(32))
+        };
         Ok(json!({
             "hash": tx_hash,
             "blockNumber": format!("0x{:x}", 123456u64),
             "from": "0x1111111111111111111111111111111111111111",
             "to": "0x2222222222222222222222222222222222222222",
             "value": format!("0x{:x}", 1000u64),
-            "input": format!("{}{}", "0x38ed1739", "00".repeat(32)),
+            "input": input,
             "nonce": "0x7",
             "chainId": chain_id,
         }))
     }
 
-    async fn get_receipt(&self, _chain_id: u64, _tx_hash: &str) -> LedgerResult<Value> {
+    async fn get_receipt(&self, _chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
+        let status = if tx_hash.contains("fail") { "0x0" } else { "0x1" };
         Ok(json!({
-            "status": "0x1",
+            "status": status,
             "gasUsed": format!("0x{:x}", 21000u64),
             "effectiveGasPrice": format!("0x{:x}", 1_000_000_000u64),
             "logs": [

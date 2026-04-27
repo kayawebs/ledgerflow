@@ -161,11 +161,15 @@ pub struct ClusterTransactionSummary {
     pub from_address: String,
     pub to_address: Option<String>,
     pub status: TransactionStatus,
+    pub analysis_status: AnalysisStatus,
     pub recognizer_labels: Vec<String>,
     pub gas_cost_raw: String,
     pub external_native_outflow_raw: String,
     pub external_token_outflow_count: u32,
     pub internal_transfer_count: u32,
+    pub unresolved_count: u32,
+    pub trace_available: bool,
+    pub counterparties: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

@@ -13,6 +13,8 @@ pub struct AppConfig {
     pub cluster_backfill_query_limit: u32,
     pub cluster_auto_backfill_on_create: bool,
     pub cluster_backfill_worker_poll_interval_ms: u64,
+    pub cluster_continuous_watch_enabled: bool,
+    pub cluster_continuous_watch_lookback_blocks: u64,
     pub enabled_recognizers: Vec<String>,
     pub plugins: Vec<String>,
 }
@@ -51,9 +53,20 @@ impl AppConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5_000),
+            cluster_continuous_watch_enabled: env::var(
+                "LEDGERFLOW_CLUSTER_CONTINUOUS_WATCH_ENABLED",
+            )
+            .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+            .unwrap_or(true),
+            cluster_continuous_watch_lookback_blocks: env::var(
+                "LEDGERFLOW_CLUSTER_CONTINUOUS_WATCH_LOOKBACK_BLOCKS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8),
             enabled_recognizers: parse_list(
                 &env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").unwrap_or_else(|_| {
-                    "selector_presence,erc20_transfer_flow,native_transfer,batch_router_heuristic,approval_swap_scenario"
+                    "selector_presence,failed_execution_classifier,erc20_transfer_flow,erc20_approval,native_transfer,batch_router_heuristic,swap_flow,approval_swap_scenario,bridge_like_transfer,deposit_withdraw_pattern"
                         .to_owned()
                 }),
             ),

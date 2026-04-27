@@ -1,4 +1,5 @@
 use chrono::Utc;
+use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -34,6 +35,42 @@ fn hex_to_u128(value: Option<&str>) -> u128 {
     u128::from_str_radix(value.unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or_default()
 }
 
+fn topic_to_address(topic: &str) -> String {
+    let trimmed = topic.trim_start_matches("0x");
+    format!("0x{}", &trimmed[trimmed.len().saturating_sub(40)..]).to_lowercase()
+}
+
+fn collect_trace_details(
+    frame: Option<&RawTraceFrame>,
+    touched_contracts: &mut BTreeSet<String>,
+    call_type_counts: &mut BTreeMap<String, u32>,
+    nonzero_native_call_count: &mut u32,
+    selector_set: &mut BTreeSet<String>,
+) {
+    let Some(frame) = frame else {
+        return;
+    };
+    *call_type_counts.entry(frame.call_type.to_lowercase()).or_default() += 1;
+    if let Some(to_address) = frame.to_address.as_ref() {
+        touched_contracts.insert(to_address.to_lowercase());
+    }
+    if hex_to_u128(Some(&frame.value)) > 0 {
+        *nonzero_native_call_count += 1;
+    }
+    if frame.input_data.len() >= 10 {
+        selector_set.insert(frame.input_data[..10].to_lowercase());
+    }
+    for child in &frame.children {
+        collect_trace_details(
+            Some(child),
+            touched_contracts,
+            call_type_counts,
+            nonzero_native_call_count,
+            selector_set,
+        );
+    }
+}
+
 #[derive(Default)]
 pub struct EvidenceNormalizer;
 
@@ -49,7 +86,16 @@ impl EvidenceNormalizer {
         if let Some(target) = bundle.tx.to_address.as_ref() {
             participants.push(target.to_lowercase());
         }
+        let mut touched_contracts = BTreeSet::new();
+        if let Some(target) = bundle.tx.to_address.as_ref() {
+            touched_contracts.insert(target.to_lowercase());
+        }
+        let mut call_type_counts = BTreeMap::<String, u32>::new();
+        let mut nonzero_native_call_count = 0u32;
+        let mut trace_selectors = BTreeSet::new();
         let mut log_summaries = Vec::new();
+        let mut token_net_deltas = BTreeMap::<(String, String), i128>::new();
+        let mut approval_edges = BTreeSet::<(String, String, String)>::new();
         let mut evidence_refs = vec![
             EvidenceRef {
                 kind: EvidenceKind::Tx,
@@ -66,6 +112,7 @@ impl EvidenceNormalizer {
         ];
         for log in &bundle.receipt.logs {
             participants.push(log.address.to_lowercase());
+            touched_contracts.insert(log.address.to_lowercase());
             evidence_refs.push(EvidenceRef {
                 kind: EvidenceKind::Log,
                 reference: format!("{}:log:{}", bundle.tx.tx_hash, log.log_index),
@@ -80,6 +127,25 @@ impl EvidenceNormalizer {
                 "is_transfer": log.topics.first().map(|v| v.eq_ignore_ascii_case(TRANSFER_TOPIC)).unwrap_or(false),
                 "is_approval": log.topics.first().map(|v| v.eq_ignore_ascii_case(APPROVAL_TOPIC)).unwrap_or(false),
             }));
+
+            if log.topics.len() >= 3 && log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC) {
+                let token = log.address.to_lowercase();
+                let from_address = topic_to_address(&log.topics[1]);
+                let to_address = topic_to_address(&log.topics[2]);
+                let amount = i128::try_from(hex_to_u128(Some(&log.data))).unwrap_or_default();
+                *token_net_deltas
+                    .entry((from_address.clone(), token.clone()))
+                    .or_default() -= amount;
+                *token_net_deltas.entry((to_address, token)).or_default() += amount;
+            }
+
+            if log.topics.len() >= 3 && log.topics[0].eq_ignore_ascii_case(APPROVAL_TOPIC) {
+                approval_edges.insert((
+                    topic_to_address(&log.topics[1]),
+                    topic_to_address(&log.topics[2]),
+                    log.address.to_lowercase(),
+                ));
+            }
         }
         participants.sort();
         participants.dedup();
@@ -92,6 +158,13 @@ impl EvidenceNormalizer {
                 metadata: json!({}),
             });
         }
+        collect_trace_details(
+            bundle.trace.as_ref(),
+            &mut touched_contracts,
+            &mut call_type_counts,
+            &mut nonzero_native_call_count,
+            &mut trace_selectors,
+        );
 
         let code_identity_summary = bundle.target_code.as_ref().map(|code| {
             let mut hasher = Sha256::new();
@@ -117,6 +190,20 @@ impl EvidenceNormalizer {
                 "trace_available": bundle.trace.is_some(),
                 "has_token_transfer_logs": bundle.receipt.logs.iter().any(|log| log.topics.first().map(|v| v.eq_ignore_ascii_case(TRANSFER_TOPIC)).unwrap_or(false)),
                 "has_approval_logs": bundle.receipt.logs.iter().any(|log| log.topics.first().map(|v| v.eq_ignore_ascii_case(APPROVAL_TOPIC)).unwrap_or(false)),
+                "touched_contracts": touched_contracts.into_iter().collect::<Vec<_>>(),
+                "call_type_counts": call_type_counts,
+                "nonzero_native_call_count": nonzero_native_call_count,
+                "trace_selectors": trace_selectors.into_iter().collect::<Vec<_>>(),
+                "token_net_deltas": token_net_deltas.into_iter().map(|((address, token_address), delta_raw)| json!({
+                    "address": address,
+                    "token_address": token_address,
+                    "delta_raw": delta_raw.to_string(),
+                })).collect::<Vec<_>>(),
+                "approval_edges": approval_edges.into_iter().map(|(owner, spender, token_address)| json!({
+                    "owner": owner,
+                    "spender": spender,
+                    "token_address": token_address,
+                })).collect::<Vec<_>>(),
                 "gas_cost_raw": (
                     hex_to_u128(bundle.receipt.gas_used.as_deref())
                         * hex_to_u128(bundle.receipt.effective_gas_price.as_deref())
