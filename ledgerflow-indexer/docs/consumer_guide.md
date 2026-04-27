@@ -82,6 +82,24 @@ curl -s "https://indexer.ledgerflow.top/v1/chains/base/progress" \
   -H "Authorization: Bearer $LEDGERFLOW_API_KEY"
 ```
 
+### Public Demo Token
+
+If the operator enables a public test credential, you can use:
+
+```http
+Authorization: Bearer lf_test_ledgerflow_public_demo
+```
+
+This is intentionally constrained:
+
+- only `GET /v1/chains/base/progress`
+- only `GET /v1/base/address/{address}/txs`
+- only `GET /v1/base/address/{address}/tx-hashes`
+- per-IP rate-limited
+- lower maximum `limit`
+
+Treat it as a try-before-you-buy credential, not something to embed into a production integration.
+
 ### Internal Consumer Token
 
 If you control the deployment and want your own local analysis tool to bypass subscription and request quota, you can set:

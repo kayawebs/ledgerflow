@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -9,6 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 
 use crate::admin::{AuthenticatedApiKey, PostgresAdminStore};
 use crate::core::errors::{LedgerError, LedgerResult};
@@ -19,8 +21,9 @@ use crate::indexer::service::IndexerService;
 
 #[derive(Clone)]
 pub struct PublicApiState {
-    pub service: Arc<IndexerService>,
-    pub admin_store: Arc<PostgresAdminStore>,
+    service: Arc<IndexerService>,
+    admin_store: Arc<PostgresAdminStore>,
+    test_rate_limiter: Arc<TestTokenRateLimiter>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +74,34 @@ pub struct BatchRefsResponse {
 enum AuthContext {
     Customer(AuthenticatedApiKey),
     Internal,
+    PublicTest,
+}
+
+struct TestTokenRateLimiter {
+    requests: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl TestTokenRateLimiter {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn allow(&self, key: &str, per_second: u32, burst: u32) -> bool {
+        let max_in_window = per_second.max(burst).max(1) as usize;
+        let cutoff = Instant::now() - Duration::from_secs(1);
+        let mut requests = self.requests.lock().await;
+        let bucket = requests.entry(key.to_owned()).or_default();
+        while bucket.front().is_some_and(|instant| *instant < cutoff) {
+            bucket.pop_front();
+        }
+        if bucket.len() >= max_in_window {
+            return false;
+        }
+        bucket.push_back(Instant::now());
+        true
+    }
 }
 
 pub fn router(service: Arc<IndexerService>, admin_store: Arc<PostgresAdminStore>) -> Router {
@@ -93,6 +124,7 @@ pub fn router(service: Arc<IndexerService>, admin_store: Arc<PostgresAdminStore>
         .with_state(PublicApiState {
             service,
             admin_store,
+            test_rate_limiter: Arc::new(TestTokenRateLimiter::new()),
         })
 }
 
@@ -104,8 +136,8 @@ async fn progress(
     State(state): State<PublicApiState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = authorize(&state, &headers).await?;
     let endpoint = "GET /v1/chains/base/progress";
+    let auth = authorize(&state, &headers, endpoint).await?;
     let progress = match state.service.get_progress().await {
         Ok(progress) => progress,
         Err(err) => {
@@ -128,11 +160,13 @@ async fn query_address_txs(
     Query(query): Query<AddressTxQuery>,
     headers: HeaderMap,
 ) -> Result<Json<PublicRefsResponse>, ApiError> {
-    let auth = authorize(&state, &headers).await?;
     let endpoint = "GET /v1/base/address/{address}/txs";
+    let auth = authorize(&state, &headers, endpoint).await?;
     let direction = parse_direction(query.direction.as_deref())?;
     let cursor = parse_cursor(query.cursor.as_deref()).map_err(ApiError::from)?;
     let limit = effective_limit(
+        &state,
+        &auth,
         query.limit,
         state.service.config.query_limit_default,
         state.service.config.query_limit_max,
@@ -179,10 +213,12 @@ async fn query_address_tx_hashes(
     Query(query): Query<AddressTxQuery>,
     headers: HeaderMap,
 ) -> Result<Json<PublicHashesResponse>, ApiError> {
-    let auth = authorize(&state, &headers).await?;
     let endpoint = "GET /v1/base/address/{address}/tx-hashes";
+    let auth = authorize(&state, &headers, endpoint).await?;
     let direction = parse_direction(query.direction.as_deref())?;
     let limit = effective_limit(
+        &state,
+        &auth,
         query.limit,
         state.service.config.query_limit_default,
         state.service.config.query_limit_max,
@@ -219,14 +255,21 @@ async fn batch_query_address_txs(
     headers: HeaderMap,
     Json(request): Json<BatchAddressTxRequest>,
 ) -> Result<Json<BatchRefsResponse>, ApiError> {
-    let auth = authorize(&state, &headers).await?;
     let endpoint = "POST /v1/base/addresses/txs";
+    let auth = authorize(&state, &headers, endpoint).await?;
     if request.addresses.len() > 50 {
         return Err(ApiError::conflict(
             "batch address lookup accepts at most 50 addresses".to_owned(),
         ));
     }
     let direction = parse_direction(request.direction.as_deref())?;
+    let limit = effective_limit(
+        &state,
+        &auth,
+        request.limit,
+        state.service.config.query_limit_default,
+        state.service.config.query_limit_max,
+    );
     let mut items = Vec::new();
     let mut per_address_counts = BTreeMap::new();
 
@@ -235,7 +278,7 @@ async fn batch_query_address_txs(
             .service
             .query_address(
                 &address,
-                request.limit,
+                Some(limit),
                 request.from_block,
                 request.to_block,
                 direction.clone(),
@@ -275,8 +318,8 @@ async fn get_transaction(
     Path(tx_hash): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let auth = authorize(&state, &headers).await?;
     let endpoint = "GET /v1/base/tx/{tx_hash}";
+    let auth = authorize(&state, &headers, endpoint).await?;
     let value = match state.service.get_transaction_by_hash(&tx_hash).await {
         Ok(value) => value,
         Err(err) => {
@@ -295,8 +338,8 @@ async fn get_transaction_receipt(
     Path(tx_hash): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let auth = authorize(&state, &headers).await?;
     let endpoint = "GET /v1/base/tx/{tx_hash}/receipt";
+    let auth = authorize(&state, &headers, endpoint).await?;
     let value = match state.service.get_transaction_receipt(&tx_hash).await {
         Ok(value) => value,
         Err(err) => {
@@ -314,8 +357,8 @@ async fn get_latest_block(
     State(state): State<PublicApiState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let auth = authorize(&state, &headers).await?;
     let endpoint = "GET /v1/base/block/latest";
+    let auth = authorize(&state, &headers, endpoint).await?;
     let block_number = match state.service.get_latest_block_number().await {
         Ok(block_number) => block_number,
         Err(err) => {
@@ -334,8 +377,8 @@ async fn get_block(
     Path(block_number): Path<u64>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let auth = authorize(&state, &headers).await?;
     let endpoint = "GET /v1/base/block/{block_number}";
+    let auth = authorize(&state, &headers, endpoint).await?;
     let value = match state.service.get_block_by_number(block_number).await {
         Ok(value) => value,
         Err(err) => {
@@ -349,7 +392,11 @@ async fn get_block(
     ))
 }
 
-async fn authorize(state: &PublicApiState, headers: &HeaderMap) -> Result<AuthContext, ApiError> {
+async fn authorize(
+    state: &PublicApiState,
+    headers: &HeaderMap,
+    endpoint: &str,
+) -> Result<AuthContext, ApiError> {
     let api_key = bearer_token(headers).map_err(ApiError::from)?;
     if state
         .service
@@ -359,6 +406,30 @@ async fn authorize(state: &PublicApiState, headers: &HeaderMap) -> Result<AuthCo
         .is_some_and(|token| token == api_key)
     {
         return Ok(AuthContext::Internal);
+    }
+    if state
+        .service
+        .config
+        .test_api_token
+        .as_deref()
+        .is_some_and(|token| token == api_key)
+    {
+        ensure_test_endpoint_allowed(endpoint)?;
+        let client_key = format!("test:{}", client_ip_key(headers));
+        let allowed = state
+            .test_rate_limiter
+            .allow(
+                &client_key,
+                state.service.config.test_api_rps,
+                state.service.config.test_api_burst,
+            )
+            .await;
+        if !allowed {
+            return Err(ApiError::too_many_requests(
+                "public test token rate limit exceeded for this IP".to_owned(),
+            ));
+        }
+        return Ok(AuthContext::PublicTest);
     }
     state
         .admin_store
@@ -436,8 +507,46 @@ fn bearer_token(headers: &HeaderMap) -> LedgerResult<&str> {
         .ok_or_else(|| LedgerError::Unauthorized("expected Bearer api key".to_owned()))
 }
 
-fn effective_limit(limit: Option<u32>, default: u32, max: u32) -> u32 {
-    limit.unwrap_or(default).max(1).min(max)
+fn effective_limit(
+    state: &PublicApiState,
+    auth: &AuthContext,
+    limit: Option<u32>,
+    default: u32,
+    max: u32,
+) -> u32 {
+    let limit = limit.unwrap_or(default).max(1).min(max);
+    match auth {
+        AuthContext::PublicTest => limit.min(state.service.config.test_api_max_limit.max(1)),
+        AuthContext::Customer(_) | AuthContext::Internal => limit,
+    }
+}
+
+fn ensure_test_endpoint_allowed(endpoint: &str) -> Result<(), ApiError> {
+    match endpoint {
+        "GET /v1/chains/base/progress"
+        | "GET /v1/base/address/{address}/txs"
+        | "GET /v1/base/address/{address}/tx-hashes" => Ok(()),
+        _ => Err(ApiError::conflict(
+            "public test token only supports progress and single-address lookup endpoints"
+                .to_owned(),
+        )),
+    }
+}
+
+fn client_ip_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 fn parse_cursor(cursor: Option<&str>) -> LedgerResult<Option<AddressTxCursor>> {
@@ -488,5 +597,30 @@ fn status_for_error(err: &LedgerError) -> StatusCode {
         LedgerError::TransientIngestion(_) | LedgerError::Persistence(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn test_client_ip_key_prefers_forwarded_ip() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.8, 10.0.0.2"),
+        );
+        headers.insert("x-real-ip", HeaderValue::from_static("127.0.0.1"));
+        assert_eq!(client_ip_key(&headers), "203.0.113.8");
+    }
+
+    #[test]
+    fn test_demo_endpoints_are_restricted() {
+        assert!(ensure_test_endpoint_allowed("GET /v1/chains/base/progress").is_ok());
+        assert!(ensure_test_endpoint_allowed("GET /v1/base/address/{address}/txs").is_ok());
+        assert!(ensure_test_endpoint_allowed("GET /v1/base/tx/{tx_hash}").is_err());
+        assert!(ensure_test_endpoint_allowed("POST /v1/base/addresses/txs").is_err());
     }
 }

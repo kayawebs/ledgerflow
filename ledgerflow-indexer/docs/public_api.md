@@ -34,6 +34,28 @@ LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN=some-long-random-secret
 
 If this variable is set, the same bearer token can be used against `/v1/...` to bypass subscription and quota checks. This is intended for trusted internal analysis services, not public users.
 
+Optional public demo token for low-risk trials:
+
+```text
+LEDGERFLOW_INDEXER_TEST_API_TOKEN=lf_test_ledgerflow_public_demo
+LEDGERFLOW_INDEXER_TEST_API_RPS=1
+LEDGERFLOW_INDEXER_TEST_API_BURST=3
+LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT=50
+```
+
+If this variable is set, the same bearer token can be used against a narrow public demo subset:
+
+- `GET /v1/chains/base/progress`
+- `GET /v1/base/address/{address}/txs`
+- `GET /v1/base/address/{address}/tx-hashes`
+
+The public demo token is:
+
+- rate-limited per client IP
+- capped to a lower `limit` than paid users
+- blocked from batch lookup and RPC convenience endpoints
+- meant for quick evaluation, not production use
+
 ## Metering And Quota
 
 The service records successful and failed authenticated `/v1` requests per API key, endpoint, usage source, and outcome.
@@ -58,6 +80,12 @@ LEDGERFLOW_INDEXER_QUERY_LIMIT_MAX=10000
 ```
 
 The server clamps user-supplied `limit` to `[1, LEDGERFLOW_INDEXER_QUERY_LIMIT_MAX]`.
+
+For the public demo token, `limit` is clamped a second time to:
+
+```text
+LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT
+```
 
 For public deployments, keep:
 
@@ -108,6 +136,7 @@ Common status codes:
 | `400` | Malformed address, cursor, block number, tx hash, or RPC evidence. |
 | `401` | Missing, malformed, invalid, or expired authentication. |
 | `402` | Subscription required, subscription quota exhausted, or bonus quota exhausted. |
+| `429` | Public demo token rate limit exceeded for this client IP. |
 | `409` | Request conflicts with product rules, for example too many batch addresses. |
 | `500` | ClickHouse, Postgres, or upstream RPC failure. |
 
@@ -124,6 +153,8 @@ Common status codes:
 | `GET` | `/v1/base/block/{block_number}` | API key | yes | Block with full transaction objects from RPC. |
 | `GET` | `/v1/base/tx/{tx_hash}` | API key | yes | Transaction object from RPC. |
 | `GET` | `/v1/base/tx/{tx_hash}/receipt` | API key | yes | Transaction receipt from RPC. |
+
+Public demo token access is intentionally limited to `progress`, single-address `txs`, and single-address `tx-hashes`.
 
 ## GET /health
 
@@ -170,6 +201,13 @@ Request:
 ```http
 GET /v1/chains/base/progress
 Authorization: Bearer lf_live_xxx
+```
+
+Demo token request:
+
+```http
+GET /v1/chains/base/progress
+Authorization: Bearer lf_test_ledgerflow_public_demo
 ```
 
 Path parameters:
@@ -224,6 +262,13 @@ GET /v1/base/address/{address}/txs?from_block=30000000&to_block=32000000&directi
 Authorization: Bearer lf_live_xxx
 ```
 
+Demo token request:
+
+```http
+GET /v1/base/address/{address}/txs?limit=20
+Authorization: Bearer lf_test_ledgerflow_public_demo
+```
+
 Path parameters:
 
 | Name | Type | Required | Description |
@@ -245,6 +290,12 @@ Ordering:
 ```text
 block_number desc, tx_index desc, direction asc
 ```
+
+Demo token notes:
+
+- requests are rate-limited per client IP
+- `limit` is additionally capped by `LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT`
+- use this path for manual testing or a lightweight product demo only
 
 Response `200`:
 
@@ -318,6 +369,13 @@ GET /v1/base/address/{address}/tx-hashes?from_block=30000000&to_block=32000000&d
 Authorization: Bearer lf_live_xxx
 ```
 
+Demo token request:
+
+```http
+GET /v1/base/address/{address}/tx-hashes?limit=20
+Authorization: Bearer lf_test_ledgerflow_public_demo
+```
+
 Path parameters:
 
 | Name | Type | Required | Description |
@@ -332,6 +390,11 @@ Query parameters:
 | `to_block` | integer | no | none | Inclusive upper block bound. |
 | `direction` | string | no | any | `from`, `to`, `any`, or omitted. |
 | `limit` | integer | no | `LEDGERFLOW_INDEXER_QUERY_LIMIT_DEFAULT` | Max hashes returned. Clamped to server max. |
+
+Demo token notes:
+
+- requests are rate-limited per client IP
+- `limit` is additionally capped by `LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT`
 
 Ordering:
 

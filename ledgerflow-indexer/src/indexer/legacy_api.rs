@@ -112,6 +112,13 @@ impl ApiError {
             message,
         }
     }
+
+    pub fn too_many_requests(message: String) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message,
+        }
+    }
 }
 
 impl From<LedgerError> for ApiError {

@@ -45,6 +45,10 @@ LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE=ledgerflow_indexer
 LEDGERFLOW_INDEXER_WORKER_ID=base_mainnet_top_level
 LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false
 LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN=
+LEDGERFLOW_INDEXER_TEST_API_TOKEN=lf_test_ledgerflow_public_demo
+LEDGERFLOW_INDEXER_TEST_API_RPS=1
+LEDGERFLOW_INDEXER_TEST_API_BURST=3
+LEDGERFLOW_INDEXER_TEST_API_MAX_LIMIT=50
 ```
 
 The table names remain `address_tx_refs` and `indexer_progress`, so the service can continue from the existing progress row.
@@ -52,6 +56,10 @@ The table names remain `address_tx_refs` and `indexer_progress`, so the service 
 Keep `LEDGERFLOW_INDEXER_ENABLE_LEGACY_API=false` for public deployments. The legacy `/addresses/...` endpoints are intended only for internal compatibility.
 
 If you want your own local analysis service to bypass subscription/quota checks, set `LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN` and use it as a bearer token against `/v1/...`. Treat it as a privileged internal secret.
+
+If you want to expose a public demo credential, set `LEDGERFLOW_INDEXER_TEST_API_TOKEN`. This token is intended for low-risk trial traffic only: it is rate-limited per IP, clamped to a much smaller `limit`, and only works on `GET /v1/chains/base/progress`, `GET /v1/base/address/{address}/txs`, and `GET /v1/base/address/{address}/tx-hashes`.
+
+If you run behind Nginx or Cloudflare, make sure the proxy forwards `X-Forwarded-For` or `X-Real-IP`, otherwise all demo traffic may collapse into the same limiter bucket.
 
 ## Public API Examples
 
@@ -67,6 +75,18 @@ curl -s "http://127.0.0.1:8090/v1/base/address/0x1111111111111111111111111111111
 curl -s "http://127.0.0.1:8090/v1/base/address/0x1111111111111111111111111111111111111111/txs?direction=from&limit=20" \
   -H "Authorization: Bearer $LEDGERFLOW_API_KEY" | jq
 ```
+
+Public demo token example:
+
+```bash
+export LEDGERFLOW_TEST_TOKEN=lf_test_ledgerflow_public_demo
+curl -s "http://127.0.0.1:8090/v1/chains/base/progress" \
+  -H "Authorization: Bearer $LEDGERFLOW_TEST_TOKEN" | jq
+curl -s "http://127.0.0.1:8090/v1/base/address/0x1111111111111111111111111111111111111111/tx-hashes?limit=20" \
+  -H "Authorization: Bearer $LEDGERFLOW_TEST_TOKEN" | jq
+```
+
+Use the demo token only for simple trials. It is intentionally too constrained for production integrations.
 
 Batch lookup:
 
