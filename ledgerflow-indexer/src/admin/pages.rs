@@ -739,6 +739,7 @@ pub fn docs() -> &'static str {
     .demo-grid label { display:block; font-size:12px; text-transform:uppercase; letter-spacing:.12em; color:var(--muted); margin-bottom:6px; }
     .demo-grid input, .demo-grid select { width:100%; border:1px solid var(--line); border-radius:14px; padding:12px 13px; background:#fbf7ef; color:var(--ink); font-family:ui-sans-serif,system-ui; }
     .demo-grid .span-2 { grid-column:span 2; }
+    .demo-field.hidden { display:none; }
     .demo-actions { display:flex; gap:12px; margin-top:16px; flex-wrap:wrap; }
     .demo-actions button { border:0; border-radius:999px; background:#17130f; color:#fbf7ef; padding:12px 16px; cursor:pointer; font-weight:700; }
     .demo-actions button.secondary { background:transparent; color:var(--ink); border:1px solid var(--line); }
@@ -765,7 +766,7 @@ pub fn docs() -> &'static str {
     <p>A built-in demo credential is available for quick trials. It is rate-limited per IP, works across the public <code>/v1</code> API surface, and still uses a smaller demo <code>limit</code>. Expect <code>429</code> if the same IP sends too many demo requests.</p>
     <div class="demo-card">
       <div class="demo-grid">
-        <div>
+        <div class="demo-field" id="demo-endpoint-field">
           <label for="demo-endpoint">Demo endpoint</label>
           <select id="demo-endpoint">
             <option value="progress">Base progress</option>
@@ -777,19 +778,19 @@ pub fn docs() -> &'static str {
             <option value="block">Block by number</option>
           </select>
         </div>
-        <div>
+        <div class="demo-field" id="demo-limit-field">
           <label for="demo-limit">Limit</label>
           <input id="demo-limit" type="number" min="1" max="50" value="20">
         </div>
-        <div class="span-2">
+        <div class="demo-field span-2" id="demo-address-field">
           <label for="demo-address">Address</label>
           <input id="demo-address" value="0x4200000000000000000000000000000000000006" placeholder="0x...">
         </div>
-        <div class="span-2">
+        <div class="demo-field span-2 hidden" id="demo-tx-hash-field">
           <label for="demo-tx-hash">Tx hash</label>
           <input id="demo-tx-hash" placeholder="0x...">
         </div>
-        <div class="span-2">
+        <div class="demo-field span-2 hidden" id="demo-block-number-field">
           <label for="demo-block-number">Block number</label>
           <input id="demo-block-number" type="number" min="0" placeholder="31050099">
         </div>
@@ -798,7 +799,7 @@ pub fn docs() -> &'static str {
         <button id="run-demo">Run demo request</button>
         <button id="copy-demo-curl" class="secondary">Copy demo curl</button>
       </div>
-      <p class="demo-note">The browser calls this site directly with the public demo token. For tx hash and block endpoints, paste a real tx hash or block number first.</p>
+      <p class="demo-note" id="demo-note">The browser calls this site directly with the public demo token. Address lookup endpoints use the address and limit fields.</p>
       <div id="demo-status">Ready to run a demo request.</div>
       <pre id="demo-output">Select an endpoint and click "Run demo request".</pre>
     </div>
@@ -941,6 +942,51 @@ curl "https://indexer.ledgerflow.top/v1/base/tx/0x.../receipt" \
       };
       link.replaceWith(button);
     }
+    const demoConfigs = {
+      progress: {
+        fields: [],
+        note: "The browser calls this site directly with the public demo token. Progress does not require any extra input."
+      },
+      latest_block: {
+        fields: [],
+        note: "Latest block queries the connected Base node directly and does not require any extra input."
+      },
+      address_hashes: {
+        fields: ["address", "limit"],
+        note: "Address tx hashes needs an address. The demo limit is capped to 50 even if you enter a larger number."
+      },
+      address_txs: {
+        fields: ["address", "limit"],
+        note: "Address tx refs needs an address. The demo limit is capped to 50 even if you enter a larger number."
+      },
+      tx: {
+        fields: ["tx-hash"],
+        note: "Paste a real Base tx hash to fetch the raw transaction object."
+      },
+      receipt: {
+        fields: ["tx-hash"],
+        note: "Paste a real Base tx hash to fetch the transaction receipt."
+      },
+      block: {
+        fields: ["block-number"],
+        note: "Enter a decimal Base block number to fetch the full block payload."
+      }
+    };
+    function setDemoFieldVisibility(fieldName, visible) {
+      const field = document.getElementById(`demo-${fieldName}-field`);
+      if (!field) return;
+      field.classList.toggle("hidden", !visible);
+    }
+    function updateDemoForm() {
+      const endpoint = document.getElementById("demo-endpoint").value;
+      const config = demoConfigs[endpoint] || demoConfigs.progress;
+      setDemoFieldVisibility("limit", config.fields.includes("limit"));
+      setDemoFieldVisibility("address", config.fields.includes("address"));
+      setDemoFieldVisibility("tx-hash", config.fields.includes("tx-hash"));
+      setDemoFieldVisibility("block-number", config.fields.includes("block-number"));
+      document.getElementById("demo-note").textContent = config.note;
+      document.getElementById("demo-status").textContent = `Ready to run ${endpoint}.`;
+    }
     function demoRequestSpec() {
       const endpoint = document.getElementById("demo-endpoint").value;
       const limit = Math.max(1, Math.min(50, Number(document.getElementById("demo-limit").value || 20)));
@@ -1012,6 +1058,8 @@ curl "https://indexer.ledgerflow.top/v1/base/tx/0x.../receipt" \
         document.getElementById("demo-status").textContent = err.message;
       }
     };
+    document.getElementById("demo-endpoint").onchange = updateDemoForm;
+    updateDemoForm();
     installAuthNav().catch(() => {});
   </script>
 </body>
