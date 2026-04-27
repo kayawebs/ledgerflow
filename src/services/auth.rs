@@ -360,6 +360,7 @@ impl VerificationSender for LogVerificationSender {
             code = %code,
             purpose = %verification_purpose_to_str(&purpose),
             verify_url = %verify_url,
+            delivery_mode = "log",
             "verification email logged"
         );
         Ok(())
@@ -422,6 +423,12 @@ impl VerificationSender for ResendVerificationSender {
                 subject, body
             )));
         }
+        info!(
+            email = %email,
+            purpose = %verification_purpose_to_str(&purpose),
+            delivery_mode = "resend",
+            "verification email sent"
+        );
         Ok(())
     }
 }

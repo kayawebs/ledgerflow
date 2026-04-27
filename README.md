@@ -4,6 +4,8 @@ LedgerFlow is a Rust backend starter for evidence-first EVM transaction analysis
 
 It now ships with a separate `web` process that fronts the API with a product-shaped operator UI: homepage, pricing page, passwordless email auth, and a dashboard split across cluster management, cluster analysis, and single-tx analysis.
 
+Passwordless auth supports real email delivery through Resend. If the web process starts without email credentials, it now stays in explicit log-only mode instead of silently pretending mail is enabled; the auth page and `/health` surface that status.
+
 The current product surface is cluster-first: define an address cluster for a person, bot fleet, or wallet family, then compute spend summaries over the already analyzed transactions that touch that cluster.
 
 The repository also ships a standalone `ledgerflow indexer` binary for top-level Base address indexing. It scans blocks, writes `from` / `to` address references into ClickHouse, and exposes an address-to-tx query API without depending on the analysis API.

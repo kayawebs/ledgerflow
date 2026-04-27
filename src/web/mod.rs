@@ -10,6 +10,7 @@ use axum::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::postgres::PgPoolOptions;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
@@ -44,6 +45,15 @@ pub struct WebState {
     pub client: Client,
     pub auth_service: Arc<AuthService>,
     pub portal_service: Arc<PortalService>,
+    pub email_delivery_mode: &'static str,
+    pub email_delivery_ready: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailDeliveryMode {
+    Auto,
+    Log,
+    Resend,
 }
 
 #[derive(Debug, Clone)]
@@ -58,12 +68,15 @@ pub struct WebConfig {
     pub session_cookie_name: String,
     pub resend_api_key: Option<String>,
     pub email_from: Option<String>,
+    pub email_delivery_mode: EmailDeliveryMode,
     pub verification_ttl_minutes: i64,
     pub session_ttl_days: i64,
 }
 
 impl WebConfig {
     pub fn from_env() -> Self {
+        let resend_api_key = first_env(&["LEDGERFLOW_RESEND_API_KEY", "RESEND_API_KEY"]);
+        let email_from = first_env(&["LEDGERFLOW_EMAIL_FROM", "EMAIL_FROM"]);
         Self {
             bind_addr: std::env::var("LEDGERFLOW_WEB_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:3001".to_owned()),
@@ -82,8 +95,9 @@ impl WebConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned()),
             session_cookie_name: std::env::var("LEDGERFLOW_SESSION_COOKIE_NAME")
                 .unwrap_or_else(|_| "ledgerflow_session".to_owned()),
-            resend_api_key: std::env::var("LEDGERFLOW_RESEND_API_KEY").ok(),
-            email_from: std::env::var("LEDGERFLOW_EMAIL_FROM").ok(),
+            resend_api_key,
+            email_from,
+            email_delivery_mode: EmailDeliveryMode::from_env(),
             verification_ttl_minutes: std::env::var("LEDGERFLOW_VERIFICATION_TTL_MINUTES")
                 .ok()
                 .and_then(|value| value.parse::<i64>().ok())
@@ -94,6 +108,38 @@ impl WebConfig {
                 .unwrap_or(30),
         }
     }
+}
+
+impl EmailDeliveryMode {
+    fn from_env() -> Self {
+        match std::env::var("LEDGERFLOW_EMAIL_DELIVERY_MODE")
+            .unwrap_or_else(|_| "auto".to_owned())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "log" => Self::Log,
+            "resend" => Self::Resend,
+            _ => Self::Auto,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Log => "log",
+            Self::Resend => "resend",
+        }
+    }
+}
+
+fn first_env(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -282,12 +328,49 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
 
-    let sender: Arc<dyn VerificationSender> =
-        if let (Some(api_key), Some(from_email)) = (config.resend_api_key.clone(), config.email_from.clone()) {
-            Arc::new(ResendVerificationSender::new(api_key, from_email))
-        } else {
-            Arc::new(LogVerificationSender)
-        };
+    let (sender, email_delivery_mode, email_delivery_ready): (
+        Arc<dyn VerificationSender>,
+        &'static str,
+        bool,
+    ) = match config.email_delivery_mode {
+        EmailDeliveryMode::Log => (Arc::new(LogVerificationSender), "log", false),
+        EmailDeliveryMode::Resend => {
+            let Some(api_key) = config.resend_api_key.clone() else {
+                return Err(LedgerError::AnalysisInvariant(
+                    "email delivery mode is resend but RESEND API key is missing".to_owned(),
+                ));
+            };
+            let Some(from_email) = config.email_from.clone() else {
+                return Err(LedgerError::AnalysisInvariant(
+                    "email delivery mode is resend but sender email is missing".to_owned(),
+                ));
+            };
+            (
+                Arc::new(ResendVerificationSender::new(api_key, from_email)),
+                "resend",
+                true,
+            )
+        }
+        EmailDeliveryMode::Auto => {
+            if let (Some(api_key), Some(from_email)) =
+                (config.resend_api_key.clone(), config.email_from.clone())
+            {
+                (
+                    Arc::new(ResendVerificationSender::new(api_key, from_email)),
+                    "resend",
+                    true,
+                )
+            } else {
+                (Arc::new(LogVerificationSender), "log", false)
+            }
+        }
+    };
+    info!(
+        requested_mode = %config.email_delivery_mode.label(),
+        active_mode = %email_delivery_mode,
+        ready = email_delivery_ready,
+        "web email delivery configured"
+    );
 
     let state = WebState {
         api_base_url: config.api_base_url.clone(),
@@ -306,6 +389,8 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
             config.verification_ttl_minutes,
         )),
         portal_service: Arc::new(PortalService::new(pool)),
+        email_delivery_mode,
+        email_delivery_ready,
     };
 
     Ok(Router::new()
@@ -336,8 +421,11 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
 
 async fn health(State(state): State<WebState>) -> Html<String> {
     Html(format!(
-        "{{\"status\":\"ok\",\"web_bind_addr\":\"{}\",\"api_base_url\":\"{}\"}}",
-        state.bind_addr, state.api_base_url
+        "{{\"status\":\"ok\",\"web_bind_addr\":\"{}\",\"api_base_url\":\"{}\",\"email_delivery_mode\":\"{}\",\"email_delivery_ready\":{}}}",
+        state.bind_addr,
+        state.api_base_url,
+        state.email_delivery_mode,
+        state.email_delivery_ready
     ))
 }
 
@@ -372,7 +460,13 @@ async fn auth_page(
     Ok(Html(render_marketing_page(
         "Sign in",
         None,
-        render_auth_content(notice, None, mode),
+        render_auth_content(
+            notice,
+            None,
+            mode,
+            state.email_delivery_mode,
+            state.email_delivery_ready,
+        ),
     ))
     .into_response())
 }
@@ -397,7 +491,13 @@ async fn request_code(
         Err(err) => Ok(Html(render_marketing_page(
             "Sign in",
             None,
-            render_auth_content(None, Some(err.to_string()), verification_purpose_to_str(&purpose)),
+            render_auth_content(
+                None,
+                Some(err.to_string()),
+                verification_purpose_to_str(&purpose),
+                state.email_delivery_mode,
+                state.email_delivery_ready,
+            ),
         ))
         .into_response()),
     }
@@ -1258,7 +1358,13 @@ fn render_pricing_content() -> String {
     )
 }
 
-fn render_auth_content(notice: Option<&str>, error: Option<String>, mode: &str) -> String {
+fn render_auth_content(
+    notice: Option<&str>,
+    error: Option<String>,
+    mode: &str,
+    email_delivery_mode: &str,
+    email_delivery_ready: bool,
+) -> String {
     format!(
         r#"
 <section class="auth-shell">
@@ -1266,6 +1372,7 @@ fn render_auth_content(notice: Option<&str>, error: Option<String>, mode: &str) 
     <span class="eyebrow">Access</span>
     <h1>Login or register with a one-time email code.</h1>
     <p>No password setup yet. Request a code, verify it, and you land in the dashboard.</p>
+    {}
     {}
     {}
   </div>
@@ -1290,6 +1397,7 @@ fn render_auth_content(notice: Option<&str>, error: Option<String>, mode: &str) 
   <div class="mode-hint">Current mode: <strong>{}</strong></div>
 </section>
 "#,
+        render_email_delivery_notice(email_delivery_mode, email_delivery_ready),
         render_notice_block(notice),
         render_error_block(error.as_deref()),
         escape_html(mode)
@@ -1327,6 +1435,19 @@ fn render_verify_content(
         render_error_block(error.as_deref()),
         escape_html(email),
         escape_html(purpose)
+    )
+}
+
+fn render_email_delivery_notice(email_delivery_mode: &str, email_delivery_ready: bool) -> String {
+    if email_delivery_ready {
+        return format!(
+            "<div class=\"notice success\">Verification emails are being delivered through <strong>{}</strong>.</div>",
+            escape_html(email_delivery_mode)
+        );
+    }
+    format!(
+        "<div class=\"notice warning\">Verification email delivery is in <strong>{}</strong> mode. Codes will be written to server logs unless you configure `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_RESEND_API_KEY` or force `LEDGERFLOW_EMAIL_DELIVERY_MODE=resend`.</div>",
+        escape_html(email_delivery_mode)
     )
 }
 
