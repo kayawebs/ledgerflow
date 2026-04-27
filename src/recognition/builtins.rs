@@ -550,6 +550,126 @@ impl Recognizer for DepositWithdrawPatternRecognizer {
     }
 }
 
+pub struct ArbitrageLikeScenarioRecognizer;
+
+impl Recognizer for ArbitrageLikeScenarioRecognizer {
+    fn recognizer_id(&self) -> &str {
+        "arbitrage_like_scenario"
+    }
+    fn version(&self) -> &str {
+        "1.0.0"
+    }
+    fn order(&self) -> u32 {
+        65
+    }
+    fn description(&self) -> &str {
+        "Recognizes simple arbitrage-like multi-leg token cycling patterns."
+    }
+
+    fn recognize(&self, analysis: &TransactionAnalysis) -> LedgerResult<Option<RecognizerResult>> {
+        let sender = analysis.from_address.to_lowercase();
+        let deltas = token_net_delta_entries(analysis)
+            .into_iter()
+            .filter(|(address, _, _)| address == &sender)
+            .collect::<Vec<_>>();
+        let outgoing_count = deltas.iter().filter(|(_, _, delta)| *delta < 0).count();
+        let incoming_count = deltas.iter().filter(|(_, _, delta)| *delta > 0).count();
+        let touched_tokens = deltas
+            .iter()
+            .map(|(_, token, _)| token.clone())
+            .collect::<BTreeSet<_>>();
+        if analysis.normalized_execution_facts.internal_call_count < 2
+            || outgoing_count == 0
+            || incoming_count == 0
+            || touched_tokens.len() < 2
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(RecognizerResult {
+            recognizer_id: self.recognizer_id().to_owned(),
+            recognizer_version: self.version().to_owned(),
+            label: "arbitrage_like_activity".to_owned(),
+            confidence: 0.67,
+            evidence_refs: analysis.raw_evidence_refs.clone(),
+            attributes: json!({
+                "sender": sender,
+                "token_touch_count": touched_tokens.len(),
+                "internal_call_count": analysis.normalized_execution_facts.internal_call_count,
+            }),
+            unresolved_points: vec![UnresolvedItem {
+                code: "profitability_unresolved".to_owned(),
+                message: "Arbitrage-like flow pattern detected, but realized profitability and venue classification are unresolved."
+                    .to_owned(),
+                evidence_refs: Vec::new(),
+            }],
+            warnings: vec!["heuristic_only".to_owned()],
+        }))
+    }
+}
+
+pub struct LiquidationLikeScenarioRecognizer;
+
+impl Recognizer for LiquidationLikeScenarioRecognizer {
+    fn recognizer_id(&self) -> &str {
+        "liquidation_like_scenario"
+    }
+    fn version(&self) -> &str {
+        "1.0.0"
+    }
+    fn order(&self) -> u32 {
+        70
+    }
+    fn description(&self) -> &str {
+        "Recognizes narrow liquidation-like repay-and-seize token patterns."
+    }
+
+    fn recognize(&self, analysis: &TransactionAnalysis) -> LedgerResult<Option<RecognizerResult>> {
+        let sender = analysis.from_address.to_lowercase();
+        let approvals = approval_edge_entries(analysis);
+        let deltas = token_net_delta_entries(analysis)
+            .into_iter()
+            .filter(|(address, _, _)| address == &sender)
+            .collect::<Vec<_>>();
+        let outgoing = deltas
+            .iter()
+            .filter(|(_, _, delta)| *delta < 0)
+            .collect::<Vec<_>>();
+        let incoming = deltas
+            .iter()
+            .filter(|(_, _, delta)| *delta > 0)
+            .collect::<Vec<_>>();
+        if analysis.normalized_execution_facts.internal_call_count < 2
+            || outgoing.is_empty()
+            || incoming.is_empty()
+            || !approvals.is_empty()
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(RecognizerResult {
+            recognizer_id: self.recognizer_id().to_owned(),
+            recognizer_version: self.version().to_owned(),
+            label: "liquidation_like_activity".to_owned(),
+            confidence: 0.61,
+            evidence_refs: analysis.raw_evidence_refs.clone(),
+            attributes: json!({
+                "sender": sender,
+                "repay_asset_count": outgoing.len(),
+                "seized_asset_count": incoming.len(),
+                "internal_call_count": analysis.normalized_execution_facts.internal_call_count,
+            }),
+            unresolved_points: vec![UnresolvedItem {
+                code: "liquidation_roles_unresolved".to_owned(),
+                message: "Repay-and-seize-like pattern detected, but protocol roles and position health are unresolved."
+                    .to_owned(),
+                evidence_refs: Vec::new(),
+            }],
+            warnings: vec!["heuristic_only".to_owned()],
+        }))
+    }
+}
+
 pub struct FailedExecutionClassifier;
 
 impl Recognizer for FailedExecutionClassifier {
@@ -626,5 +746,7 @@ pub fn builtin_recognizers() -> Vec<Arc<dyn Recognizer>> {
         Arc::new(SampleScenarioRecognizer),
         Arc::new(BridgeLikeTransferRecognizer),
         Arc::new(DepositWithdrawPatternRecognizer),
+        Arc::new(ArbitrageLikeScenarioRecognizer),
+        Arc::new(LiquidationLikeScenarioRecognizer),
     ]
 }

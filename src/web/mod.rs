@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Form, Json, Router,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -112,6 +112,18 @@ struct DashboardQuery {
     notice: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct PageNoticeQuery {
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct ClusterDetailQuery {
+    start: Option<String>,
+    end: Option<String>,
+    notice: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RequestCodeForm {
     email: String,
@@ -192,6 +204,16 @@ enum DashboardTab {
     Clusters,
     ClusterAnalysis,
     TxAnalysis,
+    ClusterGraph,
+}
+
+fn section_title(tab: &DashboardTab) -> &'static str {
+    match tab {
+        DashboardTab::Clusters => "Cluster management",
+        DashboardTab::ClusterAnalysis => "Cluster analysis",
+        DashboardTab::TxAnalysis => "Single tx analysis",
+        DashboardTab::ClusterGraph => "Cluster graph",
+    }
 }
 
 impl DashboardTab {
@@ -199,6 +221,7 @@ impl DashboardTab {
         match value {
             Some("cluster-analysis") => Self::ClusterAnalysis,
             Some("tx-analysis") => Self::TxAnalysis,
+            Some("cluster-graph") => Self::ClusterGraph,
             _ => Self::Clusters,
         }
     }
@@ -247,6 +270,14 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/verify", get(verify_page))
         .route("/auth/verify", post(verify_code))
         .route("/auth/logout", post(logout))
+        .route("/app", get(app_home))
+        .route("/app/clusters", get(clusters_page))
+        .route("/app/clusters/status", get(cluster_status))
+        .route("/app/clusters/{cluster_id}", get(cluster_analysis_page))
+        .route("/app/clusters/create", post(create_cluster))
+        .route("/app/tx-analysis", get(tx_analysis_page))
+        .route("/app/tx-analysis/run", post(run_tx_analysis))
+        .route("/app/cluster-graph", get(cluster_graph_page))
         .route("/dashboard", get(dashboard))
         .route("/dashboard/cluster-status", get(cluster_status))
         .route("/dashboard/clusters/create", post(create_cluster))
@@ -286,7 +317,7 @@ async fn auth_page(
     Query(query): Query<AuthPageQuery>,
 ) -> Result<Response, WebError> {
     if current_user(&state, &headers).await?.is_some() {
-        return Ok(Redirect::to("/dashboard").into_response());
+        return Ok(Redirect::to("/app/clusters").into_response());
     }
     let notice = query.notice.as_deref().and_then(render_notice_message);
     let mode = query.mode.as_deref().unwrap_or("signup");
@@ -330,7 +361,7 @@ async fn verify_page(
     Query(query): Query<VerifyPageQuery>,
 ) -> Result<Response, WebError> {
     if current_user(&state, &headers).await?.is_some() {
-        return Ok(Redirect::to("/dashboard").into_response());
+        return Ok(Redirect::to("/app/clusters").into_response());
     }
     let notice = query.notice.as_deref().and_then(render_notice_message);
     Ok(Html(render_marketing_page(
@@ -359,7 +390,7 @@ async fn verify_code(
         .await
     {
         Ok((_user, session_token)) => {
-            let mut response = Redirect::to("/dashboard?notice=signed-in").into_response();
+            let mut response = Redirect::to("/app/clusters?notice=signed-in").into_response();
             response.headers_mut().insert(
                 header::SET_COOKIE,
                 HeaderValue::from_str(&session_cookie(
@@ -394,14 +425,136 @@ async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Result<Res
 }
 
 async fn dashboard(
+    Query(query): Query<DashboardQuery>,
+) -> Result<Response, WebError> {
+    let location = match DashboardTab::from_query(query.tab.as_deref()) {
+        DashboardTab::Clusters => "/app/clusters".to_owned(),
+        DashboardTab::ClusterAnalysis => {
+            if let Some(cluster_id) = query.cluster_id.as_deref() {
+                let mut params = Vec::new();
+                if let Some(start) = query.start.as_deref() {
+                    params.push(format!("start={}", urlencoding::encode(start)));
+                }
+                if let Some(end) = query.end.as_deref() {
+                    params.push(format!("end={}", urlencoding::encode(end)));
+                }
+                if let Some(notice) = query.notice.as_deref() {
+                    params.push(format!("notice={}", urlencoding::encode(notice)));
+                }
+                if params.is_empty() {
+                    format!("/app/clusters/{cluster_id}")
+                } else {
+                    format!("/app/clusters/{cluster_id}?{}", params.join("&"))
+                }
+            } else {
+                "/app/clusters".to_owned()
+            }
+        }
+        DashboardTab::TxAnalysis => "/app/tx-analysis".to_owned(),
+        DashboardTab::ClusterGraph => "/app/cluster-graph".to_owned(),
+    };
+    Ok(Redirect::to(&location).into_response())
+}
+
+async fn app_home() -> Response {
+    Redirect::to("/app/clusters").into_response()
+}
+
+async fn clusters_page(
     State(state): State<WebState>,
     headers: HeaderMap,
-    Query(query): Query<DashboardQuery>,
+    Query(query): Query<PageNoticeQuery>,
 ) -> Result<Response, WebError> {
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
-    render_dashboard_response(&state, user, query, None, None).await
+    render_dashboard_response(
+        &state,
+        user,
+        DashboardQuery {
+            tab: Some("clusters".to_owned()),
+            cluster_id: None,
+            start: None,
+            end: None,
+            notice: query.notice,
+        },
+        None,
+        None,
+    )
+    .await
+}
+
+async fn cluster_analysis_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(cluster_id): Path<String>,
+    Query(query): Query<ClusterDetailQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    render_dashboard_response(
+        &state,
+        user,
+        DashboardQuery {
+            tab: Some("cluster-analysis".to_owned()),
+            cluster_id: Some(cluster_id),
+            start: query.start,
+            end: query.end,
+            notice: query.notice,
+        },
+        None,
+        None,
+    )
+    .await
+}
+
+async fn tx_analysis_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<PageNoticeQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    render_dashboard_response(
+        &state,
+        user,
+        DashboardQuery {
+            tab: Some("tx-analysis".to_owned()),
+            cluster_id: None,
+            start: None,
+            end: None,
+            notice: query.notice,
+        },
+        None,
+        None,
+    )
+    .await
+}
+
+async fn cluster_graph_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<PageNoticeQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    render_dashboard_response(
+        &state,
+        user,
+        DashboardQuery {
+            tab: Some("cluster-graph".to_owned()),
+            cluster_id: None,
+            start: None,
+            end: None,
+            notice: query.notice,
+        },
+        None,
+        None,
+    )
+    .await
 }
 
 async fn cluster_status(
@@ -459,7 +612,7 @@ async fn create_cluster(
                 .attach_cluster_to_user(user.user_id, cluster.cluster_id)
                 .await?;
             Ok(redirect_response(&format!(
-                "/dashboard?tab=cluster-analysis&cluster_id={}&notice=cluster-created",
+                "/app/clusters/{}?notice=cluster-created",
                 cluster.cluster_id
             )))
         }
@@ -812,7 +965,7 @@ fn render_marketing_page(title: &str, user: Option<&AppUser>, content: String) -
         escape_html(title),
         shared_styles(),
         if user.is_some() {
-            "<a class=\"cta ghost\" href=\"/dashboard\">Dashboard</a>".to_owned()
+            "<a class=\"cta ghost\" href=\"/app/clusters\">Dashboard</a>".to_owned()
         } else {
             "<a class=\"cta ghost\" href=\"/auth\">Login / Register</a>".to_owned()
         },
@@ -862,7 +1015,7 @@ fn render_homepage_content(user: Option<&AppUser>) -> String {
   <a class="cta secondary" href="/pricing">Open pricing</a>
 </section>
 "#,
-        if user.is_some() { "/dashboard" } else { "/auth" },
+        if user.is_some() { "/app/clusters" } else { "/auth" },
         if user.is_some() { "Open dashboard" } else { "Request access" }
     )
 }
@@ -984,23 +1137,6 @@ fn render_dashboard_page(
     start: Option<&str>,
     end: Option<&str>,
 ) -> String {
-    let cluster_options = clusters
-        .iter()
-        .map(|cluster| {
-            format!(
-                "<option value=\"{}\" {}>{}</option>",
-                cluster.cluster_id,
-                if selected_cluster.map(|item| item.cluster_id) == Some(cluster.cluster_id) {
-                    "selected"
-                } else {
-                    ""
-                },
-                escape_html(&format!("{} · {}", cluster.name, cluster.owner_label))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-
     let cluster_cards = if clusters.is_empty() {
         "<div class=\"empty-state\">No clusters yet. Create one in the Cluster Management tab.</div>".to_owned()
     } else {
@@ -1008,7 +1144,7 @@ fn render_dashboard_page(
             .iter()
             .map(|cluster| {
                 format!(
-                    r#"<a class="cluster-card" href="/dashboard?tab=cluster-analysis&cluster_id={}">
+                    r#"<a class="cluster-card" href="/app/clusters/{}">
 <strong>{}</strong>
 <span>{}</span>
 <small>{} addresses · chain {}</small>
@@ -1037,8 +1173,7 @@ fn render_dashboard_page(
   <div class="panel-head"><h2>{}</h2><span class="badge">cluster analysis</span></div>
   <div class="panel-body">
     <form class="inline-form" method="get" action="/dashboard">
-      <input type="hidden" name="tab" value="cluster-analysis">
-      <label>Cluster<select name="cluster_id">{}</select></label>
+      <div class="stat"><span>Cluster</span><strong>{}</strong></div>
       <label>Start<input type="text" name="start" value="{}" placeholder="2026-04-01T00:00:00Z"></label>
       <label>End<input type="text" name="end" value="{}" placeholder="2026-04-30T23:59:59Z"></label>
       <button class="cta secondary" type="submit">Refresh analysis</button>
@@ -1055,7 +1190,7 @@ fn render_dashboard_page(
 </section>
 "#,
             escape_html(&cluster.name),
-            cluster_options,
+            escape_html(&format!("{} · {}", cluster.name, cluster.owner_label)),
             escape_html(start.unwrap_or_default()),
             escape_html(end.unwrap_or_default()),
             cluster.cluster_id,
@@ -1071,12 +1206,21 @@ fn render_dashboard_page(
         "<section class=\"panel\"><div class=\"panel-body\"><div class=\"empty-state\">Select or create a cluster to view analysis.</div></div></section>".to_owned()
     };
 
+    let cluster_analysis_panel = if let Some(cluster) = selected_cluster {
+        cluster_analysis_panel.replace(
+            "action=\"/dashboard\"",
+            &format!("action=\"/app/clusters/{}\"", cluster.cluster_id),
+        )
+    } else {
+        cluster_analysis_panel
+    };
+
     let tx_panel = format!(
         r#"
 <section class="panel">
   <div class="panel-head"><h2>Single transaction analysis</h2><span class="badge">debug layer</span></div>
   <div class="panel-body">
-    <form class="stack-form" method="post" action="/dashboard/tx/run">
+    <form class="stack-form" method="post" action="/app/tx-analysis/run">
       <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
       <label>Transaction hash<input type="text" name="tx_hash" placeholder="0x..." required></label>
       <label>Recognizer overrides<input type="text" name="recognizer_ids" placeholder="selector_presence,native_transfer"></label>
@@ -1103,6 +1247,8 @@ fn render_dashboard_page(
             })
     );
 
+    let graph_panel = render_cluster_graph_panel(clusters);
+
     format!(
         r#"<!doctype html>
 <html lang="en">
@@ -1122,9 +1268,10 @@ fn render_dashboard_page(
           <small>Private beta pricing: {} ETH / month, currently free.</small>
         </div>
         <nav class="side-nav">
-          <a class="{}" href="/dashboard?tab=clusters">Cluster management</a>
-          <a class="{}" href="/dashboard?tab=cluster-analysis{}">Cluster analysis</a>
-          <a class="{}" href="/dashboard?tab=tx-analysis">Single tx analysis</a>
+          <a class="{}" href="/app/clusters">Cluster management</a>
+          <a class="{}" href="{}">Cluster analysis</a>
+          <a class="{}" href="/app/cluster-graph">Cluster graph</a>
+          <a class="{}" href="/app/tx-analysis">Single tx analysis</a>
           <a class="" href="/pricing">Pricing</a>
         </nav>
         <form method="post" action="/auth/logout">
@@ -1133,9 +1280,9 @@ fn render_dashboard_page(
       </aside>
       <main class="dashboard-main">
         <section class="dashboard-hero">
-          <span class="eyebrow">Dashboard</span>
-          <h1>Address-cluster operations workspace</h1>
-          <p>Create clusters, let the worker backfill historical txs in the background, then review coverage and spend outputs without exposing the raw analysis API publicly.</p>
+          <span class="eyebrow">Application</span>
+          <h1>{}</h1>
+          <p>Create clusters, let the worker backfill historical txs in the background, inspect cluster spend, plan graph views, and keep single-tx analysis in its own dedicated workflow.</p>
           {}
           {}
         </section>
@@ -1170,15 +1317,18 @@ fn render_dashboard_page(
         active_class(tab, DashboardTab::Clusters),
         active_class(tab, DashboardTab::ClusterAnalysis),
         selected_cluster
-            .map(|cluster| format!("&cluster_id={}", cluster.cluster_id))
-            .unwrap_or_default(),
+            .map(|cluster| format!("/app/clusters/{}", cluster.cluster_id))
+            .unwrap_or_else(|| "/app/clusters".to_owned()),
+        active_class(tab, DashboardTab::ClusterGraph),
         active_class(tab, DashboardTab::TxAnalysis),
+        escape_html(section_title(tab)),
         render_notice_block(notice),
         render_error_block(error),
         match tab {
             DashboardTab::Clusters => render_cluster_management_panel(state.default_chain_id),
             DashboardTab::ClusterAnalysis => cluster_analysis_panel,
             DashboardTab::TxAnalysis => tx_panel,
+            DashboardTab::ClusterGraph => graph_panel,
         },
         clusters.len(),
         cluster_cards,
@@ -1194,7 +1344,7 @@ fn render_cluster_management_panel(default_chain_id: u64) -> String {
   <div class="panel-head"><h2>Create cluster</h2><span class="badge">management</span></div>
   <div class="panel-body">
     <p class="panel-copy">Create a cluster for one operator, wallet family, or bot set. As soon as creation succeeds, LedgerFlow queues a historical backfill job for the separate worker process.</p>
-    <form class="stack-form" method="post" action="/dashboard/clusters/create">
+    <form class="stack-form" method="post" action="/app/clusters/create">
       <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
       <label>Owner label<input type="text" name="owner_label" placeholder="ops_team" required></label>
       <label>Cluster name<input type="text" name="name" placeholder="primary_searcher" required></label>
@@ -1206,6 +1356,54 @@ fn render_cluster_management_panel(default_chain_id: u64) -> String {
 </section>
 "#,
         default_chain_id
+    )
+}
+
+fn render_cluster_graph_panel(clusters: &[DashboardClusterRecord]) -> String {
+    let cluster_links = if clusters.is_empty() {
+        "<div class=\"empty-state\">No clusters yet. Create a cluster first so graph planning has a subject.</div>"
+            .to_owned()
+    } else {
+        clusters
+            .iter()
+            .map(|cluster| {
+                format!(
+                    "<a class=\"cluster-card\" href=\"/app/clusters/{}\"><strong>{}</strong><span>{} addresses</span><small>graph work will begin from historical cluster transactions</small></a>",
+                    cluster.cluster_id,
+                    escape_html(&cluster.name),
+                    cluster.address_count
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    format!(
+        r#"
+<section class="panel">
+  <div class="panel-head"><h2>Cluster relationship graph</h2><span class="badge">planned</span></div>
+  <div class="panel-body">
+    <p class="panel-copy">This page will evolve into the dedicated graph workspace: cluster-level relationship inference, historical flow clustering, and eventually a high-performance 3D view. The first milestone is not rendering. It is building stable graph data extraction and storage.</p>
+    <div class="feature-grid">
+      <article class="feature-card">
+        <h2>Phase 1</h2>
+        <p>Build graph-ready exports from analyzed cluster history: counterparties, internal transfers, repeated router/protocol touchpoints, and address co-occurrence motifs.</p>
+      </article>
+      <article class="feature-card">
+        <h2>Phase 2</h2>
+        <p>Add server-side graph aggregation, edge scoring, and time-window filtering so graph queries stay fast before any 3D rendering work starts.</p>
+      </article>
+      <article class="feature-card">
+        <h2>Phase 3</h2>
+        <p>Ship a 2D operator graph first, then move to a GPU-backed 3D scene only after the graph data model and interaction patterns are stable.</p>
+      </article>
+    </div>
+    <div class="panel-copy">Current cluster entry points for that roadmap:</div>
+    <div class="cluster-list">{}</div>
+  </div>
+</section>
+"#,
+        cluster_links
     )
 }
 

@@ -66,7 +66,7 @@ impl AppConfig {
             .unwrap_or(8),
             enabled_recognizers: parse_list(
                 &env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").unwrap_or_else(|_| {
-                    "selector_presence,failed_execution_classifier,erc20_transfer_flow,erc20_approval,native_transfer,batch_router_heuristic,swap_flow,approval_swap_scenario,bridge_like_transfer,deposit_withdraw_pattern"
+                    "selector_presence,failed_execution_classifier,erc20_transfer_flow,erc20_approval,native_transfer,batch_router_heuristic,swap_flow,approval_swap_scenario,bridge_like_transfer,deposit_withdraw_pattern,arbitrage_like_scenario,liquidation_like_scenario"
                         .to_owned()
                 }),
             ),
