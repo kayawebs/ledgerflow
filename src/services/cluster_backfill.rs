@@ -8,8 +8,11 @@ use uuid::Uuid;
 use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{
-        entities::{ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx},
-        enums::{ClusterBackfillStatus, ClusterTxStatus},
+        entities::{
+            ClassifiedTransaction, ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx,
+            ClusterTrackingState,
+        },
+        enums::{BehaviorTag, ClusterBackfillStatus, ClusterTrackingStatus, ClusterTxStatus},
         interfaces::ClusterTxSource,
         value_objects::AddressTxRef,
     },
@@ -194,10 +197,13 @@ impl ClusterBackfillService {
             LedgerError::AnalysisInvariant("indexer tx source is not configured".to_owned())
         })?;
         let repository = &self.analysis_service.repository;
-        let clusters = repository.list_clusters().await?;
+        let tracking_states = repository.list_active_cluster_tracking_states().await?;
         let mut enqueued = 0u32;
 
-        for cluster in clusters {
+        for tracking in tracking_states {
+            let Some(cluster) = repository.get_cluster(tracking.cluster_id).await? else {
+                continue;
+            };
             let runs = repository
                 .list_cluster_backfill_runs(cluster.cluster_id)
                 .await
@@ -212,18 +218,21 @@ impl ClusterBackfillService {
             }
 
             let last_indexed_block = tx_source.get_last_indexed_block(cluster.chain_id).await?;
-            let latest_completed_end = runs
-                .iter()
-                .filter(|run| {
-                    matches!(
-                        run.status,
-                        ClusterBackfillStatus::Completed
-                            | ClusterBackfillStatus::Partial
-                            | ClusterBackfillStatus::Failed
-                    )
-                })
-                .filter_map(|run| run.end_block)
-                .max();
+            let latest_completed_end = tracking
+                .last_processed_block
+                .or_else(|| {
+                    runs.iter()
+                        .filter(|run| {
+                            matches!(
+                                run.status,
+                                ClusterBackfillStatus::Completed
+                                    | ClusterBackfillStatus::Partial
+                                    | ClusterBackfillStatus::Failed
+                            )
+                        })
+                        .filter_map(|run| run.end_block)
+                        .max()
+                });
 
             let start_block = latest_completed_end
                 .map(|value| {
@@ -255,6 +264,117 @@ impl ClusterBackfillService {
         Ok(enqueued)
     }
 
+    async fn sync_tracking_state_success(
+        &self,
+        run: &ClusterBackfillRun,
+        cluster: &crate::domain::entities::AddressCluster,
+    ) -> LedgerResult<()> {
+        let repository = &self.analysis_service.repository;
+        let now = Utc::now();
+        let existing = repository.get_cluster_tracking_state(run.cluster_id).await?;
+        let state = ClusterTrackingState {
+            cluster_id: run.cluster_id,
+            chain_id: cluster.chain_id,
+            status: existing
+                .as_ref()
+                .map(|item| item.status.clone())
+                .unwrap_or(ClusterTrackingStatus::Paused),
+            last_processed_block: run.end_block,
+            last_processed_at: Some(now),
+            last_updated_at: Some(now),
+            error_message: None,
+            tracked_address_count: cluster.addresses.len() as u32,
+            created_at: existing.as_ref().map(|item| item.created_at).unwrap_or(now),
+            updated_at: now,
+            metadata: json!({
+                "source": "cluster_backfill_worker",
+                "run_id": run.run_id,
+            }),
+        };
+        repository.upsert_cluster_tracking_state(&state).await
+    }
+
+    async fn sync_tracking_state_failure(
+        &self,
+        run: &ClusterBackfillRun,
+        error: &LedgerError,
+    ) -> LedgerResult<()> {
+        let repository = &self.analysis_service.repository;
+        let Some(existing) = repository.get_cluster_tracking_state(run.cluster_id).await? else {
+            return Ok(());
+        };
+        let now = Utc::now();
+        let state = ClusterTrackingState {
+            status: ClusterTrackingStatus::Error,
+            error_message: Some(error.to_string()),
+            last_updated_at: Some(now),
+            updated_at: now,
+            metadata: json!({
+                "source": "cluster_backfill_worker",
+                "last_failed_run_id": run.run_id,
+            }),
+            ..existing
+        };
+        repository.upsert_cluster_tracking_state(&state).await
+    }
+
+    fn classify_unknown_transaction(
+        &self,
+        cluster_id: Uuid,
+        chain_id: u64,
+        address: String,
+        analysis: &crate::domain::entities::TransactionAnalysis,
+    ) -> ClassifiedTransaction {
+        let protocol = analysis
+            .to_address
+            .clone()
+            .or_else(|| analysis.recognizer_results.first().map(|item| item.label.clone()));
+        ClassifiedTransaction {
+            cluster_id,
+            chain_id,
+            tx_hash: analysis.tx_hash.clone(),
+            address,
+            block_number: analysis.block_number.unwrap_or_default(),
+            timestamp: analysis.block_timestamp,
+            behavior_tag: BehaviorTag::Unknown,
+            protocol,
+            token_in: None,
+            token_out: None,
+            amount_in: None,
+            amount_out: None,
+            value_usd: None,
+            gas_cost_usd: None,
+            estimated_pnl_usd: None,
+            raw_json: json!({
+                "analysis_status": analysis.analysis_status,
+                "recognizer_labels": analysis.recognizer_results.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
+                "from_address": analysis.from_address,
+                "to_address": analysis.to_address,
+            }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn tx_address_for_cluster(
+        &self,
+        tx_ref: &AddressTxRef,
+        cluster: &crate::domain::entities::AddressCluster,
+    ) -> String {
+        if cluster
+            .addresses
+            .iter()
+            .any(|item| item.address.eq_ignore_ascii_case(&tx_ref.address))
+        {
+            return tx_ref.address.clone();
+        }
+        cluster
+            .addresses
+            .first()
+            .map(|item| item.address.clone())
+            .unwrap_or_else(|| tx_ref.address.clone())
+    }
+
     async fn execute_run(
         &self,
         mut run: ClusterBackfillRun,
@@ -279,6 +399,7 @@ impl ClusterBackfillService {
                 .repository
                 .update_cluster_backfill_run(&run)
                 .await?;
+            self.sync_tracking_state_failure(&run, &err).await?;
             return Err(err);
         }
         result
@@ -360,6 +481,7 @@ impl ClusterBackfillService {
 
         let mut analyzed_count = 0u32;
         let mut failed_count = 0u32;
+        let mut classified = Vec::new();
         let mut txs = tx_map.into_values().collect::<Vec<_>>();
         txs.sort_by(|left, right| {
             (left.block_number, left.tx_index, left.tx_hash.as_str()).cmp(&(
@@ -373,6 +495,16 @@ impl ClusterBackfillService {
             if !request.force_reanalyze
                 && repository.get_analysis(chain_id, &tx_ref.tx_hash).await?.is_some()
             {
+                if let Some(existing_analysis) =
+                    repository.get_analysis(chain_id, &tx_ref.tx_hash).await?
+                {
+                    classified.push(self.classify_unknown_transaction(
+                        run.cluster_id,
+                        chain_id,
+                        self.tx_address_for_cluster(tx_ref, &cluster),
+                        &existing_analysis,
+                    ));
+                }
                 repository
                     .update_cluster_discovered_tx_status(
                         run.cluster_id,
@@ -392,7 +524,13 @@ impl ClusterBackfillService {
                 .analyze_transaction(chain_id, &tx_ref.tx_hash)
                 .await
             {
-                Ok(_) => {
+                Ok((analysis, _)) => {
+                    classified.push(self.classify_unknown_transaction(
+                        run.cluster_id,
+                        chain_id,
+                        self.tx_address_for_cluster(tx_ref, &cluster),
+                        &analysis,
+                    ));
                     repository
                         .update_cluster_discovered_tx_status(
                             run.cluster_id,
@@ -421,6 +559,10 @@ impl ClusterBackfillService {
             }
         }
 
+        if !classified.is_empty() {
+            repository.upsert_classified_transactions(&classified).await?;
+        }
+
         run.discovered_tx_count = txs.len() as u32;
         run.analyzed_tx_count = analyzed_count;
         run.failed_tx_count = failed_count;
@@ -442,6 +584,7 @@ impl ClusterBackfillService {
             }),
         );
         repository.update_cluster_backfill_run(run).await?;
+        self.sync_tracking_state_success(run, &cluster).await?;
 
         let coverage = repository
             .get_cluster_coverage(run.cluster_id)

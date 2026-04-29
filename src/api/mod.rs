@@ -11,7 +11,10 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::core::errors::LedgerError;
-use crate::domain::entities::{AddressCluster, ClusterAddress, ClusterSpendSummary};
+use crate::domain::entities::{
+    AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterSpendSummary,
+    ClusterTrackingState,
+};
 use crate::plugins::loader::PluginManifest;
 use crate::services::analysis::AnalysisService;
 use crate::services::cluster::ClusterService;
@@ -19,12 +22,14 @@ use crate::services::cluster_backfill::{
     ClusterBackfillRequest as ServiceClusterBackfillRequest, ClusterBackfillResult,
     ClusterBackfillService,
 };
+use crate::services::cluster_tracking::ClusterTrackingService;
 
 #[derive(Clone)]
 pub struct ApiState {
     pub service: Arc<AnalysisService>,
     pub cluster_service: Arc<ClusterService>,
     pub backfill_service: Arc<ClusterBackfillService>,
+    pub tracking_service: Arc<ClusterTrackingService>,
     pub auto_backfill_on_cluster_create: bool,
 }
 
@@ -96,6 +101,7 @@ pub fn router(
     auto_backfill_on_cluster_create: bool,
 ) -> Router {
     let cluster_service = Arc::new(ClusterService::new(service.repository.clone()));
+    let tracking_service = Arc::new(ClusterTrackingService::new(service.repository.clone()));
     Router::new()
         .route("/health", get(health))
         .route("/analyses/tx", post(analyze_tx))
@@ -114,10 +120,24 @@ pub fn router(
             "/clusters/{cluster_id}/backfill-runs",
             get(list_cluster_backfill_runs),
         )
+        .route("/clusters/{cluster_id}/tracking", get(get_cluster_tracking))
+        .route(
+            "/clusters/{cluster_id}/tracking/enable",
+            post(enable_cluster_tracking),
+        )
+        .route(
+            "/clusters/{cluster_id}/tracking/pause",
+            post(pause_cluster_tracking),
+        )
+        .route(
+            "/clusters/{cluster_id}/classified-transactions",
+            get(list_classified_transactions),
+        )
         .with_state(ApiState {
             service,
             cluster_service,
             backfill_service,
+            tracking_service,
             auto_backfill_on_cluster_create,
         })
 }
@@ -341,6 +361,68 @@ async fn list_cluster_backfill_runs(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(runs))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ClassifiedTransactionsQuery {
+    pub limit: Option<u32>,
+}
+
+async fn get_cluster_tracking(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Json<ClusterTrackingState>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let tracking = state
+        .tracking_service
+        .get_tracking_state(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(tracking))
+}
+
+async fn enable_cluster_tracking(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Json<ClusterTrackingState>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let tracking = state
+        .tracking_service
+        .enable_tracking(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(tracking))
+}
+
+async fn pause_cluster_tracking(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Json<ClusterTrackingState>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let tracking = state
+        .tracking_service
+        .pause_tracking(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(tracking))
+}
+
+async fn list_classified_transactions(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+    Query(query): Query<ClassifiedTransactionsQuery>,
+) -> Result<Json<Vec<ClassifiedTransaction>>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let txs = state
+        .tracking_service
+        .list_recent_classified_transactions(cluster_id, query.limit.unwrap_or(20))
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(txs))
 }
 
 fn parse_time(value: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {

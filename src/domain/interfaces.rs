@@ -5,7 +5,8 @@ use chrono::{DateTime, Utc};
 
 use crate::core::errors::LedgerResult;
 use crate::domain::entities::{
-    AddressCluster, ClusterAddress, ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx,
+    AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun,
+    ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState,
     EvidencePack, RecognizerResult, TransactionAnalysis,
 };
 use crate::domain::value_objects::{AddressTxRef, AssetFlow, ValidationMessage};
@@ -65,6 +66,45 @@ pub trait AnalysisRepository: Send + Sync {
         &self,
         cluster_id: uuid::Uuid,
     ) -> LedgerResult<Option<ClusterCoverage>>;
+    async fn upsert_cluster_tracking_state(
+        &self,
+        state: &ClusterTrackingState,
+    ) -> LedgerResult<()>;
+    async fn get_cluster_tracking_state(
+        &self,
+        cluster_id: uuid::Uuid,
+    ) -> LedgerResult<Option<ClusterTrackingState>>;
+    async fn list_active_cluster_tracking_states(&self) -> LedgerResult<Vec<ClusterTrackingState>>;
+    async fn upsert_classified_transactions(
+        &self,
+        txs: &[ClassifiedTransaction],
+    ) -> LedgerResult<()>;
+    async fn list_recent_classified_transactions(
+        &self,
+        cluster_id: uuid::Uuid,
+        limit: u32,
+    ) -> LedgerResult<Vec<ClassifiedTransaction>>;
+    async fn replace_cluster_metrics_snapshots(
+        &self,
+        cluster_id: uuid::Uuid,
+        snapshots: &[ClusterMetricsSnapshot],
+    ) -> LedgerResult<()>;
+    async fn list_cluster_metrics_snapshots(
+        &self,
+        cluster_id: uuid::Uuid,
+    ) -> LedgerResult<Vec<ClusterMetricsSnapshot>>;
+    async fn insert_cluster_alerts(&self, alerts: &[ClusterAlert]) -> LedgerResult<()>;
+    async fn list_cluster_alerts(
+        &self,
+        cluster_id: uuid::Uuid,
+        include_read: bool,
+        limit: u32,
+    ) -> LedgerResult<Vec<ClusterAlert>>;
+    async fn mark_cluster_alert_read(
+        &self,
+        cluster_id: uuid::Uuid,
+        alert_id: uuid::Uuid,
+    ) -> LedgerResult<Option<ClusterAlert>>;
 }
 
 pub type DynRepository = Arc<dyn AnalysisRepository>;

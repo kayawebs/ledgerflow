@@ -9,6 +9,7 @@ use axum::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use tracing::info;
 use uuid::Uuid;
@@ -17,8 +18,8 @@ use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{
         entities::{
-            AddressCluster, AppUser, ClusterBackfillRun, ClusterCoverage, ClusterSpendSummary,
-            EvidencePack, TransactionAnalysis,
+            AddressCluster, AppUser, ClassifiedTransaction, ClusterBackfillRun, ClusterCoverage,
+            ClusterSpendSummary, ClusterTrackingState, EvidencePack, TransactionAnalysis,
         },
         enums::{AddressHitDirection, ClusterBackfillStatus, VerificationPurpose},
     },
@@ -278,9 +279,11 @@ struct IndexerAddressRef {
 struct ClusterLiveResponse {
     status_label: String,
     status_tone: String,
+    tracking: Option<ClusterTrackingState>,
     coverage: Option<ClusterCoverage>,
     runs: Vec<ClusterBackfillRun>,
     spend_summary: Option<ClusterSpendSummary>,
+    classified_transactions: Vec<ClassifiedTransaction>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -406,6 +409,14 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/clusters/status", get(cluster_status))
         .route("/app/clusters/{cluster_id}", get(cluster_analysis_page))
         .route("/app/clusters/create", post(create_cluster))
+        .route(
+            "/app/clusters/{cluster_id}/tracking/enable",
+            post(enable_cluster_tracking),
+        )
+        .route(
+            "/app/clusters/{cluster_id}/tracking/pause",
+            post(pause_cluster_tracking),
+        )
         .route("/app/tx-analysis", get(tx_analysis_page))
         .route("/app/tx-analysis/run", post(run_tx_analysis))
         .route("/app/cluster-graph", get(cluster_graph_page))
@@ -849,6 +860,56 @@ async fn create_cluster(
     }
 }
 
+async fn enable_cluster_tracking(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(cluster_id): Path<String>,
+) -> Result<Response, WebError> {
+    let Some(_user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    match api_post_json::<_, ClusterTrackingState>(
+        &state,
+        &format!("/clusters/{cluster_id}/tracking/enable"),
+        &json!({}),
+    )
+    .await
+    {
+        Ok(_) => Ok(redirect_response(&format!(
+            "/app/clusters/{cluster_id}?notice=tracking-enabled"
+        ))),
+        Err(err) => Ok(redirect_response(&format!(
+            "/app/clusters/{cluster_id}?notice=tracking-error&error={}",
+            urlencoding::encode(&err.to_string())
+        ))),
+    }
+}
+
+async fn pause_cluster_tracking(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(cluster_id): Path<String>,
+) -> Result<Response, WebError> {
+    let Some(_user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    match api_post_json::<_, ClusterTrackingState>(
+        &state,
+        &format!("/clusters/{cluster_id}/tracking/pause"),
+        &json!({}),
+    )
+    .await
+    {
+        Ok(_) => Ok(redirect_response(&format!(
+            "/app/clusters/{cluster_id}?notice=tracking-paused"
+        ))),
+        Err(err) => Ok(redirect_response(&format!(
+            "/app/clusters/{cluster_id}?notice=tracking-error&error={}",
+            urlencoding::encode(&err.to_string())
+        ))),
+    }
+}
+
 async fn run_tx_analysis(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -934,7 +995,7 @@ async fn render_dashboard_response(
         .and_then(|cluster_id| clusters.iter().find(|item| item.cluster_id == cluster_id).cloned())
         .or_else(|| clusters.first().cloned());
 
-    let (coverage, runs, spend_summary, cluster_status, cluster_error) =
+    let (tracking, coverage, runs, spend_summary, classified_transactions, cluster_status, cluster_error) =
         if tab == DashboardTab::ClusterAnalysis {
             if let Some(cluster) = selected_cluster.as_ref() {
                 match load_cluster_live_response(
@@ -946,19 +1007,21 @@ async fn render_dashboard_response(
                 .await
                 {
                     Ok(payload) => (
+                        payload.tracking,
                         payload.coverage,
                         payload.runs,
                         payload.spend_summary,
+                        payload.classified_transactions,
                         Some((payload.status_label, payload.status_tone)),
                         None::<String>,
                     ),
-                    Err(err) => (None, Vec::new(), None, None, Some(err.to_string())),
+                    Err(err) => (None, None, Vec::new(), None, Vec::new(), None, Some(err.to_string())),
                 }
             } else {
-                (None, Vec::new(), None, None, None)
+                (None, None, Vec::new(), None, Vec::new(), None, None)
             }
         } else {
-            (None, Vec::new(), None, None, None)
+            (None, None, Vec::new(), None, Vec::new(), None, None)
         };
 
     let (indexer_progress, indexer_error) = if tab == DashboardTab::IndexerProgress {
@@ -978,9 +1041,11 @@ async fn render_dashboard_response(
         notice,
         &clusters,
         selected_cluster.as_ref(),
+        tracking.as_ref(),
         coverage.as_ref(),
         &runs,
         spend_summary.as_ref(),
+        &classified_transactions,
         cluster_status.as_ref(),
         tx_result.as_ref(),
         indexer_progress.as_ref(),
@@ -1002,6 +1067,9 @@ async fn load_cluster_live_response(
     start: Option<&str>,
     end: Option<&str>,
 ) -> Result<ClusterLiveResponse, WebError> {
+    let tracking = api_get_json::<ClusterTrackingState>(state, &format!("/clusters/{}/tracking", cluster_id))
+        .await
+        .ok();
     let coverage = api_get_json::<ClusterCoverage>(state, &format!("/clusters/{}/coverage", cluster_id))
         .await
         .ok();
@@ -1025,13 +1093,21 @@ async fn load_cluster_live_response(
         }
     };
     let spend_summary = api_get_json::<ClusterSpendSummary>(state, &summary_path).await.ok();
+    let classified_transactions = api_get_json::<Vec<ClassifiedTransaction>>(
+        state,
+        &format!("/clusters/{}/classified-transactions?limit=12", cluster_id),
+    )
+    .await
+    .unwrap_or_default();
     let (status_label, status_tone) = derive_cluster_status(coverage.as_ref(), &runs);
     Ok(ClusterLiveResponse {
         status_label,
         status_tone,
+        tracking,
         coverage,
         runs,
         spend_summary,
+        classified_transactions,
     })
 }
 
@@ -1243,6 +1319,9 @@ fn render_notice_message(code: &str) -> Option<&'static str> {
         "signed-in" => Some("Signed in."),
         "logged-out" => Some("Signed out."),
         "cluster-created" => Some("Cluster created and queued for historical backfill."),
+        "tracking-enabled" => Some("Cluster tracking enabled."),
+        "tracking-paused" => Some("Cluster tracking paused."),
+        "tracking-error" => Some("Tracking action failed. Inspect the latest cluster state or server logs."),
         "auth-required" => Some("Sign in to continue."),
         _ => None,
     }
@@ -1459,9 +1538,11 @@ fn render_dashboard_page(
     notice: Option<&str>,
     clusters: &[DashboardClusterRecord],
     selected_cluster: Option<&DashboardClusterRecord>,
+    tracking: Option<&ClusterTrackingState>,
     coverage: Option<&ClusterCoverage>,
     runs: &[ClusterBackfillRun],
     spend_summary: Option<&ClusterSpendSummary>,
+    classified_transactions: &[ClassifiedTransaction],
     cluster_status: Option<&(String, String)>,
     tx_result: Option<&serde_json::Value>,
     indexer_progress: Option<&IndexerProgressPayload>,
@@ -1514,12 +1595,16 @@ fn render_dashboard_page(
     </form>
     <div id="cluster-live-root" data-cluster-id="{}" data-start="{}" data-end="{}"></div>
     <div id="cluster-live-status" class="notice {}">{}</div>
+    <h3>Tracking</h3>
+    <div id="cluster-live-tracking">{}</div>
     <h3>Coverage</h3>
     <div id="cluster-live-coverage">{}</div>
     <h3>Spend summary</h3>
     <div id="cluster-live-summary">{}</div>
     <h3>Recent backfill runs</h3>
     <div id="cluster-live-runs">{}</div>
+    <h3>Recent classified transactions</h3>
+    <div id="cluster-live-classified">{}</div>
   </div>
 </section>
 "#,
@@ -1533,9 +1618,11 @@ fn render_dashboard_page(
             escape_html(end.unwrap_or_default()),
             escape_html(status_tone),
             escape_html(status_label),
+            render_tracking_status_panel(cluster, tracking),
             render_cluster_coverage_cards(coverage),
             render_cluster_summary_panel(spend_summary),
-            render_cluster_runs_table(runs)
+            render_cluster_runs_table(runs),
+            render_recent_classified_transactions_panel(classified_transactions),
         )
     } else {
         "<section class=\"panel\"><div class=\"panel-body\"><div class=\"empty-state\">Select or create a cluster to view analysis.</div></div></section>".to_owned()
@@ -1738,6 +1825,101 @@ fn render_cluster_graph_panel(clusters: &[DashboardClusterRecord]) -> String {
 </section>
 "#,
         cluster_links
+    )
+}
+
+fn render_tracking_status_panel(
+    cluster: &DashboardClusterRecord,
+    tracking: Option<&ClusterTrackingState>,
+) -> String {
+    let Some(tracking) = tracking else {
+        return "<div class=\"empty-state\">Tracking state has not been initialized yet.</div>"
+            .to_owned();
+    };
+    let action_path = match tracking.status {
+        crate::domain::enums::ClusterTrackingStatus::Active => {
+            format!("/app/clusters/{}/tracking/pause", cluster.cluster_id)
+        }
+        _ => format!("/app/clusters/{}/tracking/enable", cluster.cluster_id),
+    };
+    let action_label = match tracking.status {
+        crate::domain::enums::ClusterTrackingStatus::Active => "Pause tracking",
+        _ => "Start tracking",
+    };
+    format!(
+        r#"<div class="stats-grid">
+  <div class="stat"><span>Status</span><strong>{:?}</strong></div>
+  <div class="stat"><span>Last processed block</span><strong>{}</strong></div>
+  <div class="stat"><span>Last updated</span><strong>{}</strong></div>
+  <div class="stat"><span>Tracked addresses</span><strong>{}</strong></div>
+</div>
+{}
+<form method="post" action="{}">
+  <button class="cta secondary" type="submit">{}</button>
+</form>"#,
+        tracking.status,
+        tracking
+            .last_processed_block
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned()),
+        tracking
+            .last_updated_at
+            .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "n/a".to_owned()),
+        tracking.tracked_address_count,
+        tracking
+            .error_message
+            .as_deref()
+            .map(|message| format!("<div class=\"notice error\">{}</div>", escape_html(message)))
+            .unwrap_or_default(),
+        action_path,
+        action_label
+    )
+}
+
+fn render_recent_classified_transactions_panel(txs: &[ClassifiedTransaction]) -> String {
+    if txs.is_empty() {
+        return "<div class=\"empty-state\">No classified transactions yet. Once tracking or backfill analyzes transactions, they will appear here.</div>".to_owned();
+    }
+    format!(
+        r#"<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Tx</th>
+        <th>Time</th>
+        <th>Behavior</th>
+        <th>Protocol</th>
+        <th>Gas USD</th>
+        <th>Estimated PnL USD</th>
+      </tr>
+    </thead>
+    <tbody>
+      {}
+    </tbody>
+  </table>
+</div>"#,
+        txs
+            .iter()
+            .map(|tx| {
+                format!(
+                    "<tr><td><code>{}</code></td><td>{}</td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape_html(&truncate_middle(&tx.tx_hash, 8)),
+                    tx.timestamp
+                        .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| "n/a".to_owned()),
+                    tx.behavior_tag,
+                    escape_html(tx.protocol.as_deref().unwrap_or("n/a")),
+                    tx.gas_cost_usd
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "n/a".to_owned()),
+                    tx.estimated_pnl_usd
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "n/a".to_owned())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
     )
 }
 
@@ -2079,10 +2261,12 @@ fn render_cluster_autorefresh_script(
   const start = {start:?};
   const end = {end:?};
   const statusNode = document.getElementById("cluster-live-status");
+  const trackingNode = document.getElementById("cluster-live-tracking");
   const coverageNode = document.getElementById("cluster-live-coverage");
   const summaryNode = document.getElementById("cluster-live-summary");
   const runsNode = document.getElementById("cluster-live-runs");
-  if (!clusterId || !statusNode || !coverageNode || !summaryNode || !runsNode) return;
+  const classifiedNode = document.getElementById("cluster-live-classified");
+  if (!clusterId || !statusNode || !trackingNode || !coverageNode || !summaryNode || !runsNode || !classifiedNode) return;
 
   const escapeHtml = (value) => String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -2107,6 +2291,31 @@ fn render_cluster_autorefresh_script(
         <div class="stat"><span>Failed</span><strong>${{coverage.failed_tx_count}}</strong></div>
         <div class="stat"><span>Pending</span><strong>${{coverage.pending_tx_count}}</strong></div>
       </div>
+    `;
+  }};
+
+  const renderTracking = (tracking) => {{
+    if (!tracking) {{
+      return '<div class="empty-state">Tracking state has not been initialized yet.</div>';
+    }}
+    const lastProcessedBlock = tracking.last_processed_block ?? "n/a";
+    const lastUpdated = tracking.last_updated_at ? String(tracking.last_updated_at).replace("T", " ").replace("Z", " UTC") : "n/a";
+    const error = tracking.error_message ? `<div class="notice error">${{escapeHtml(tracking.error_message)}}</div>` : "";
+    const actionPath = tracking.status === "active"
+      ? `/app/clusters/${{clusterId}}/tracking/pause`
+      : `/app/clusters/${{clusterId}}/tracking/enable`;
+    const actionLabel = tracking.status === "active" ? "Pause tracking" : "Start tracking";
+    return `
+      <div class="stats-grid">
+        <div class="stat"><span>Status</span><strong>${{escapeHtml(tracking.status)}}</strong></div>
+        <div class="stat"><span>Last processed block</span><strong>${{escapeHtml(lastProcessedBlock)}}</strong></div>
+        <div class="stat"><span>Last updated</span><strong>${{escapeHtml(lastUpdated)}}</strong></div>
+        <div class="stat"><span>Tracked addresses</span><strong>${{tracking.tracked_address_count ?? 0}}</strong></div>
+      </div>
+      ${{error}}
+      <form method="post" action="${{actionPath}}">
+        <button class="cta secondary" type="submit">${{actionLabel}}</button>
+      </form>
     `;
   }};
 
@@ -2189,12 +2398,47 @@ fn render_cluster_autorefresh_script(
     `;
   }};
 
+  const renderClassified = (txs) => {{
+    if (!txs || txs.length === 0) {{
+      return '<div class="empty-state">No classified transactions yet. Once tracking or backfill analyzes transactions, they will appear here.</div>';
+    }}
+    const rows = txs.map((tx) => `
+      <tr>
+        <td><code>${{escapeHtml(truncate(tx.tx_hash))}}</code></td>
+        <td>${{escapeHtml(tx.timestamp ? String(tx.timestamp).replace("T", " ").replace("Z", " UTC") : "n/a")}}</td>
+        <td>${{escapeHtml(tx.behavior_tag)}}</td>
+        <td>${{escapeHtml(tx.protocol || "n/a")}}</td>
+        <td>${{escapeHtml(tx.gas_cost_usd != null ? Number(tx.gas_cost_usd).toFixed(2) : "n/a")}}</td>
+        <td>${{escapeHtml(tx.estimated_pnl_usd != null ? Number(tx.estimated_pnl_usd).toFixed(2) : "n/a")}}</td>
+      </tr>
+    `).join("");
+    return `
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th>Tx</th>
+              <th>Time</th>
+              <th>Behavior</th>
+              <th>Protocol</th>
+              <th>Gas USD</th>
+              <th>Estimated PnL USD</th>
+            </tr>
+          </thead>
+          <tbody>${{rows}}</tbody>
+        </table>
+      </div>
+    `;
+  }};
+
   const renderState = (payload) => {{
     statusNode.className = `notice ${{payload.status_tone || "info"}}`;
     statusNode.textContent = payload.status_label || "Waiting for discovery";
+    trackingNode.innerHTML = renderTracking(payload.tracking);
     coverageNode.innerHTML = renderCoverage(payload.coverage);
     summaryNode.innerHTML = renderSummary(payload.spend_summary);
     runsNode.innerHTML = renderRuns(payload.runs || []);
+    classifiedNode.innerHTML = renderClassified(payload.classified_transactions || []);
   }};
 
   const fetchState = async () => {{

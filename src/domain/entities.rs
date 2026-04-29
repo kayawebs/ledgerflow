@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::core::versioning::VersionBundle;
 use crate::domain::enums::{
-    AnalysisStatus, AssetType, ClusterBackfillStatus, ClusterTxStatus, SpendCategory,
-    TransactionStatus,
+    AlertSeverity, AlertType, AnalysisStatus, AssetType, BehaviorTag, ClusterBackfillStatus,
+    ClusterTrackingStatus, ClusterTxStatus, MetricsWindow, SpendCategory, TransactionStatus,
 };
 use crate::domain::value_objects::{
     AssetFlow, CodeIdentitySummary, EvidenceRef, UnresolvedItem, ValidationMessage,
@@ -238,5 +238,75 @@ pub struct ClusterCoverage {
     pub latest_run_status: Option<ClusterBackfillStatus>,
     pub latest_run_started_at: Option<DateTime<Utc>>,
     pub latest_run_finished_at: Option<DateTime<Utc>>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterTrackingState {
+    pub cluster_id: Uuid,
+    pub chain_id: u64,
+    pub status: ClusterTrackingStatus,
+    pub last_processed_block: Option<u64>,
+    pub last_processed_at: Option<DateTime<Utc>>,
+    pub last_updated_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+    pub tracked_address_count: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterMetricsSnapshot {
+    pub snapshot_id: Uuid,
+    pub cluster_id: Uuid,
+    pub chain_id: u64,
+    pub window: MetricsWindow,
+    pub timestamp: DateTime<Utc>,
+    pub tx_count: u32,
+    pub volume_usd: Option<f64>,
+    pub gas_cost_usd: Option<f64>,
+    pub realized_pnl_usd: Option<f64>,
+    pub roi: Option<f64>,
+    pub active_addresses_count: u32,
+    pub behavior_breakdown: Value,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClassifiedTransaction {
+    pub cluster_id: Uuid,
+    pub chain_id: u64,
+    pub tx_hash: String,
+    pub address: String,
+    pub block_number: u64,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub behavior_tag: BehaviorTag,
+    pub protocol: Option<String>,
+    pub token_in: Option<String>,
+    pub token_out: Option<String>,
+    pub amount_in: Option<String>,
+    pub amount_out: Option<String>,
+    pub value_usd: Option<f64>,
+    pub gas_cost_usd: Option<f64>,
+    pub estimated_pnl_usd: Option<f64>,
+    pub raw_json: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterAlert {
+    pub alert_id: Uuid,
+    pub cluster_id: Uuid,
+    pub chain_id: u64,
+    pub alert_type: AlertType,
+    pub severity: AlertSeverity,
+    pub title: String,
+    pub message: String,
+    pub related_metric: Value,
+    pub triggered_at: DateTime<Utc>,
+    pub is_read: bool,
+    pub read_at: Option<DateTime<Utc>>,
     pub metadata: Value,
 }

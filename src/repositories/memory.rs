@@ -9,10 +9,11 @@ use uuid::Uuid;
 use crate::core::errors::LedgerResult;
 use crate::domain::{
     entities::{
-        AddressCluster, ClusterAddress, ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx,
+        AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun,
+        ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState,
         EvidencePack, TransactionAnalysis,
     },
-    enums::{ClusterBackfillStatus, ClusterTxStatus},
+    enums::{ClusterBackfillStatus, ClusterTrackingStatus, ClusterTxStatus},
     interfaces::AnalysisRepository,
 };
 use crate::ingestion::models::RawTransactionBundle;
@@ -25,6 +26,10 @@ pub struct InMemoryAnalysisRepository {
     clusters: RwLock<HashMap<Uuid, AddressCluster>>,
     cluster_backfill_runs: RwLock<HashMap<Uuid, Vec<ClusterBackfillRun>>>,
     cluster_discovered_txs: RwLock<HashMap<(Uuid, String), ClusterDiscoveredTx>>,
+    cluster_tracking_states: RwLock<HashMap<Uuid, ClusterTrackingState>>,
+    classified_transactions: RwLock<HashMap<(Uuid, String), ClassifiedTransaction>>,
+    cluster_metrics_snapshots: RwLock<HashMap<Uuid, Vec<ClusterMetricsSnapshot>>>,
+    cluster_alerts: RwLock<HashMap<Uuid, Vec<ClusterAlert>>>,
 }
 
 #[async_trait]
@@ -299,6 +304,148 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
                 "has_backfill_runs": latest_run.is_some(),
             }),
         }))
+    }
+
+    async fn upsert_cluster_tracking_state(
+        &self,
+        state: &ClusterTrackingState,
+    ) -> LedgerResult<()> {
+        self.cluster_tracking_states
+            .write()
+            .await
+            .insert(state.cluster_id, state.clone());
+        Ok(())
+    }
+
+    async fn get_cluster_tracking_state(
+        &self,
+        cluster_id: Uuid,
+    ) -> LedgerResult<Option<ClusterTrackingState>> {
+        Ok(self
+            .cluster_tracking_states
+            .read()
+            .await
+            .get(&cluster_id)
+            .cloned())
+    }
+
+    async fn list_active_cluster_tracking_states(&self) -> LedgerResult<Vec<ClusterTrackingState>> {
+        Ok(self
+            .cluster_tracking_states
+            .read()
+            .await
+            .values()
+            .filter(|state| state.status == ClusterTrackingStatus::Active)
+            .cloned()
+            .collect())
+    }
+
+    async fn upsert_classified_transactions(
+        &self,
+        txs: &[ClassifiedTransaction],
+    ) -> LedgerResult<()> {
+        let mut store = self.classified_transactions.write().await;
+        for tx in txs {
+            store.insert((tx.cluster_id, tx.tx_hash.clone()), tx.clone());
+        }
+        Ok(())
+    }
+
+    async fn list_recent_classified_transactions(
+        &self,
+        cluster_id: Uuid,
+        limit: u32,
+    ) -> LedgerResult<Vec<ClassifiedTransaction>> {
+        let mut items = self
+            .classified_transactions
+            .read()
+            .await
+            .values()
+            .filter(|item| item.cluster_id == cluster_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| right.block_number.cmp(&left.block_number))
+        });
+        items.truncate(limit as usize);
+        Ok(items)
+    }
+
+    async fn replace_cluster_metrics_snapshots(
+        &self,
+        cluster_id: Uuid,
+        snapshots: &[ClusterMetricsSnapshot],
+    ) -> LedgerResult<()> {
+        self.cluster_metrics_snapshots
+            .write()
+            .await
+            .insert(cluster_id, snapshots.to_vec());
+        Ok(())
+    }
+
+    async fn list_cluster_metrics_snapshots(
+        &self,
+        cluster_id: Uuid,
+    ) -> LedgerResult<Vec<ClusterMetricsSnapshot>> {
+        Ok(self
+            .cluster_metrics_snapshots
+            .read()
+            .await
+            .get(&cluster_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn insert_cluster_alerts(&self, alerts: &[ClusterAlert]) -> LedgerResult<()> {
+        let mut store = self.cluster_alerts.write().await;
+        for alert in alerts {
+            let entry = store.entry(alert.cluster_id).or_default();
+            if let Some(existing) = entry.iter_mut().find(|item| item.alert_id == alert.alert_id) {
+                *existing = alert.clone();
+            } else {
+                entry.push(alert.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_cluster_alerts(
+        &self,
+        cluster_id: Uuid,
+        include_read: bool,
+        limit: u32,
+    ) -> LedgerResult<Vec<ClusterAlert>> {
+        let mut alerts = self
+            .cluster_alerts
+            .read()
+            .await
+            .get(&cluster_id)
+            .cloned()
+            .unwrap_or_default();
+        alerts.retain(|alert| include_read || !alert.is_read);
+        alerts.sort_by(|left, right| right.triggered_at.cmp(&left.triggered_at));
+        alerts.truncate(limit as usize);
+        Ok(alerts)
+    }
+
+    async fn mark_cluster_alert_read(
+        &self,
+        cluster_id: Uuid,
+        alert_id: Uuid,
+    ) -> LedgerResult<Option<ClusterAlert>> {
+        let mut store = self.cluster_alerts.write().await;
+        let Some(alerts) = store.get_mut(&cluster_id) else {
+            return Ok(None);
+        };
+        let Some(alert) = alerts.iter_mut().find(|item| item.alert_id == alert_id) else {
+            return Ok(None);
+        };
+        alert.is_read = true;
+        alert.read_at = Some(Utc::now());
+        Ok(Some(alert.clone()))
     }
 }
 

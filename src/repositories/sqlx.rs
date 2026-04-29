@@ -7,10 +7,14 @@ use uuid::Uuid;
 use crate::core::errors::{LedgerError, LedgerResult};
 use crate::domain::{
     entities::{
-        AddressCluster, ClusterAddress, ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx,
+        AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun,
+        ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState,
         EvidencePack, TransactionAnalysis,
     },
-    enums::{ClusterBackfillStatus, ClusterTxStatus},
+    enums::{
+        AlertSeverity, AlertType, BehaviorTag, ClusterBackfillStatus, ClusterTrackingStatus,
+        ClusterTxStatus, MetricsWindow,
+    },
     interfaces::AnalysisRepository,
 };
 use crate::ingestion::models::RawTransactionBundle;
@@ -811,6 +815,279 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             }),
         }))
     }
+
+    async fn upsert_cluster_tracking_state(
+        &self,
+        state: &ClusterTrackingState,
+    ) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            insert into cluster_tracking_state (
+              cluster_id, chain_id, tracking_status, last_processed_block, last_processed_at,
+              last_updated_at, error_message, tracked_address_count, metadata, created_at, updated_at
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            on conflict (cluster_id) do update set
+              chain_id = excluded.chain_id,
+              tracking_status = excluded.tracking_status,
+              last_processed_block = excluded.last_processed_block,
+              last_processed_at = excluded.last_processed_at,
+              last_updated_at = excluded.last_updated_at,
+              error_message = excluded.error_message,
+              tracked_address_count = excluded.tracked_address_count,
+              metadata = excluded.metadata,
+              updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(state.cluster_id)
+        .bind(state.chain_id as i64)
+        .bind(cluster_tracking_status_to_str(&state.status))
+        .bind(state.last_processed_block.map(|value| value as i64))
+        .bind(state.last_processed_at)
+        .bind(state.last_updated_at)
+        .bind(&state.error_message)
+        .bind(state.tracked_address_count as i32)
+        .bind(Json(state.metadata.clone()))
+        .bind(state.created_at)
+        .bind(state.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_cluster_tracking_state(
+        &self,
+        cluster_id: Uuid,
+    ) -> LedgerResult<Option<ClusterTrackingState>> {
+        let row = sqlx::query("select * from cluster_tracking_state where cluster_id = $1")
+            .bind(cluster_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        row.map(row_to_tracking_state).transpose()
+    }
+
+    async fn list_active_cluster_tracking_states(&self) -> LedgerResult<Vec<ClusterTrackingState>> {
+        let rows = sqlx::query(
+            "select * from cluster_tracking_state where tracking_status = 'active' order by updated_at asc",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter().map(row_to_tracking_state).collect()
+    }
+
+    async fn upsert_classified_transactions(
+        &self,
+        txs: &[ClassifiedTransaction],
+    ) -> LedgerResult<()> {
+        for tx in txs {
+            sqlx::query(
+                r#"
+                insert into classified_transactions (
+                  cluster_id, chain_id, tx_hash, address, block_number, block_timestamp, behavior_tag,
+                  protocol, token_in, token_out, amount_in, amount_out, value_usd, gas_cost_usd,
+                  estimated_pnl_usd, raw_json, created_at, updated_at
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                on conflict (cluster_id, tx_hash) do update set
+                  chain_id = excluded.chain_id,
+                  address = excluded.address,
+                  block_number = excluded.block_number,
+                  block_timestamp = excluded.block_timestamp,
+                  behavior_tag = excluded.behavior_tag,
+                  protocol = excluded.protocol,
+                  token_in = excluded.token_in,
+                  token_out = excluded.token_out,
+                  amount_in = excluded.amount_in,
+                  amount_out = excluded.amount_out,
+                  value_usd = excluded.value_usd,
+                  gas_cost_usd = excluded.gas_cost_usd,
+                  estimated_pnl_usd = excluded.estimated_pnl_usd,
+                  raw_json = excluded.raw_json,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(tx.cluster_id)
+            .bind(tx.chain_id as i64)
+            .bind(&tx.tx_hash)
+            .bind(&tx.address)
+            .bind(tx.block_number as i64)
+            .bind(tx.timestamp)
+            .bind(behavior_tag_to_str(&tx.behavior_tag))
+            .bind(&tx.protocol)
+            .bind(&tx.token_in)
+            .bind(&tx.token_out)
+            .bind(&tx.amount_in)
+            .bind(&tx.amount_out)
+            .bind(tx.value_usd)
+            .bind(tx.gas_cost_usd)
+            .bind(tx.estimated_pnl_usd)
+            .bind(Json(tx.raw_json.clone()))
+            .bind(tx.created_at)
+            .bind(tx.updated_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn list_recent_classified_transactions(
+        &self,
+        cluster_id: Uuid,
+        limit: u32,
+    ) -> LedgerResult<Vec<ClassifiedTransaction>> {
+        let rows = sqlx::query(
+            r#"
+            select *
+            from classified_transactions
+            where cluster_id = $1
+            order by block_timestamp desc nulls last, block_number desc, updated_at desc
+            limit $2
+            "#,
+        )
+        .bind(cluster_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter().map(row_to_classified_transaction).collect()
+    }
+
+    async fn replace_cluster_metrics_snapshots(
+        &self,
+        cluster_id: Uuid,
+        snapshots: &[ClusterMetricsSnapshot],
+    ) -> LedgerResult<()> {
+        sqlx::query("delete from cluster_metrics_snapshots where cluster_id = $1")
+            .bind(cluster_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        for snapshot in snapshots {
+            sqlx::query(
+                r#"
+                insert into cluster_metrics_snapshots (
+                  snapshot_id, cluster_id, chain_id, window, snapshot_timestamp, tx_count, volume_usd,
+                  gas_cost_usd, pnl_usd, roi, active_addresses_count, behavior_breakdown_json, metadata
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                "#,
+            )
+            .bind(snapshot.snapshot_id)
+            .bind(snapshot.cluster_id)
+            .bind(snapshot.chain_id as i64)
+            .bind(metrics_window_to_str(&snapshot.window))
+            .bind(snapshot.timestamp)
+            .bind(snapshot.tx_count as i32)
+            .bind(snapshot.volume_usd)
+            .bind(snapshot.gas_cost_usd)
+            .bind(snapshot.realized_pnl_usd)
+            .bind(snapshot.roi)
+            .bind(snapshot.active_addresses_count as i32)
+            .bind(Json(snapshot.behavior_breakdown.clone()))
+            .bind(Json(snapshot.metadata.clone()))
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn list_cluster_metrics_snapshots(
+        &self,
+        cluster_id: Uuid,
+    ) -> LedgerResult<Vec<ClusterMetricsSnapshot>> {
+        let rows = sqlx::query(
+            "select * from cluster_metrics_snapshots where cluster_id = $1 order by snapshot_timestamp desc",
+        )
+        .bind(cluster_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter().map(row_to_metrics_snapshot).collect()
+    }
+
+    async fn insert_cluster_alerts(&self, alerts: &[ClusterAlert]) -> LedgerResult<()> {
+        for alert in alerts {
+            sqlx::query(
+                r#"
+                insert into cluster_alerts (
+                  alert_id, cluster_id, chain_id, alert_type, severity, title, message,
+                  related_metric_json, triggered_at, is_read, read_at, metadata
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                on conflict (alert_id) do nothing
+                "#,
+            )
+            .bind(alert.alert_id)
+            .bind(alert.cluster_id)
+            .bind(alert.chain_id as i64)
+            .bind(alert_type_to_str(&alert.alert_type))
+            .bind(alert_severity_to_str(&alert.severity))
+            .bind(&alert.title)
+            .bind(&alert.message)
+            .bind(Json(alert.related_metric.clone()))
+            .bind(alert.triggered_at)
+            .bind(alert.is_read)
+            .bind(alert.read_at)
+            .bind(Json(alert.metadata.clone()))
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn list_cluster_alerts(
+        &self,
+        cluster_id: Uuid,
+        include_read: bool,
+        limit: u32,
+    ) -> LedgerResult<Vec<ClusterAlert>> {
+        let rows = if include_read {
+            sqlx::query(
+                "select * from cluster_alerts where cluster_id = $1 order by triggered_at desc limit $2",
+            )
+            .bind(cluster_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                "select * from cluster_alerts where cluster_id = $1 and is_read = false order by triggered_at desc limit $2",
+            )
+            .bind(cluster_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter().map(row_to_cluster_alert).collect()
+    }
+
+    async fn mark_cluster_alert_read(
+        &self,
+        cluster_id: Uuid,
+        alert_id: Uuid,
+    ) -> LedgerResult<Option<ClusterAlert>> {
+        let row = sqlx::query(
+            r#"
+            update cluster_alerts
+            set is_read = true, read_at = now()
+            where cluster_id = $1 and alert_id = $2
+            returning *
+            "#,
+        )
+        .bind(cluster_id)
+        .bind(alert_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        row.map(row_to_cluster_alert).transpose()
+    }
 }
 
 fn row_to_pack(row: sqlx::postgres::PgRow) -> LedgerResult<EvidencePack> {
@@ -918,6 +1195,202 @@ fn row_to_backfill_run(row: sqlx::postgres::PgRow) -> LedgerResult<ClusterBackfi
     })
 }
 
+fn row_to_tracking_state(row: sqlx::postgres::PgRow) -> LedgerResult<ClusterTrackingState> {
+    let Json(metadata): Json<Value> = row
+        .try_get("metadata")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    let status_raw = row
+        .try_get::<String, _>("tracking_status")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(ClusterTrackingState {
+        cluster_id: row
+            .try_get("cluster_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        chain_id: row
+            .try_get::<i64, _>("chain_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        status: parse_cluster_tracking_status(&status_raw)?,
+        last_processed_block: row
+            .try_get::<Option<i64>, _>("last_processed_block")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            .map(|value| value as u64),
+        last_processed_at: row
+            .try_get("last_processed_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        last_updated_at: row
+            .try_get("last_updated_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        error_message: row
+            .try_get("error_message")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        tracked_address_count: row
+            .try_get::<i32, _>("tracked_address_count")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u32,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        metadata,
+    })
+}
+
+fn row_to_classified_transaction(
+    row: sqlx::postgres::PgRow,
+) -> LedgerResult<ClassifiedTransaction> {
+    let Json(raw_json): Json<Value> = row
+        .try_get("raw_json")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    let behavior_tag_raw = row
+        .try_get::<String, _>("behavior_tag")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(ClassifiedTransaction {
+        cluster_id: row
+            .try_get("cluster_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        chain_id: row
+            .try_get::<i64, _>("chain_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        tx_hash: row
+            .try_get("tx_hash")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        address: row
+            .try_get("address")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        block_number: row
+            .try_get::<i64, _>("block_number")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        timestamp: row
+            .try_get("block_timestamp")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        behavior_tag: parse_behavior_tag(&behavior_tag_raw)?,
+        protocol: row
+            .try_get("protocol")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        token_in: row
+            .try_get("token_in")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        token_out: row
+            .try_get("token_out")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        amount_in: row
+            .try_get("amount_in")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        amount_out: row
+            .try_get("amount_out")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        value_usd: row
+            .try_get("value_usd")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        gas_cost_usd: row
+            .try_get("gas_cost_usd")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        estimated_pnl_usd: row
+            .try_get("estimated_pnl_usd")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        raw_json,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+    })
+}
+
+fn row_to_metrics_snapshot(row: sqlx::postgres::PgRow) -> LedgerResult<ClusterMetricsSnapshot> {
+    let Json(behavior_breakdown): Json<Value> = row
+        .try_get("behavior_breakdown_json")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    let Json(metadata): Json<Value> = row
+        .try_get("metadata")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    let window_raw = row
+        .try_get::<String, _>("window")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(ClusterMetricsSnapshot {
+        snapshot_id: row
+            .try_get("snapshot_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        cluster_id: row
+            .try_get("cluster_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        chain_id: row
+            .try_get::<i64, _>("chain_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        window: parse_metrics_window(&window_raw)?,
+        timestamp: row
+            .try_get("snapshot_timestamp")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        tx_count: row
+            .try_get::<i32, _>("tx_count")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u32,
+        volume_usd: row
+            .try_get("volume_usd")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        gas_cost_usd: row
+            .try_get("gas_cost_usd")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        realized_pnl_usd: row
+            .try_get("pnl_usd")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        roi: row
+            .try_get("roi")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        active_addresses_count: row
+            .try_get::<i32, _>("active_addresses_count")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u32,
+        behavior_breakdown,
+        metadata,
+    })
+}
+
+fn row_to_cluster_alert(row: sqlx::postgres::PgRow) -> LedgerResult<ClusterAlert> {
+    let Json(related_metric): Json<Value> = row
+        .try_get("related_metric_json")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    let Json(metadata): Json<Value> = row
+        .try_get("metadata")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    let alert_type_raw = row
+        .try_get::<String, _>("alert_type")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    let severity_raw = row
+        .try_get::<String, _>("severity")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(ClusterAlert {
+        alert_id: row
+            .try_get("alert_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        cluster_id: row
+            .try_get("cluster_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        chain_id: row
+            .try_get::<i64, _>("chain_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        alert_type: parse_alert_type(&alert_type_raw)?,
+        severity: parse_alert_severity(&severity_raw)?,
+        title: row
+            .try_get("title")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        message: row
+            .try_get("message")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        related_metric,
+        triggered_at: row
+            .try_get("triggered_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        is_read: row
+            .try_get("is_read")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        read_at: row
+            .try_get("read_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        metadata,
+    })
+}
+
 fn parse_cluster_backfill_status(value: &str) -> LedgerResult<ClusterBackfillStatus> {
     match value {
         "pending" => Ok(ClusterBackfillStatus::Pending),
@@ -927,6 +1400,65 @@ fn parse_cluster_backfill_status(value: &str) -> LedgerResult<ClusterBackfillSta
         "failed" => Ok(ClusterBackfillStatus::Failed),
         other => Err(LedgerError::Persistence(format!(
             "unknown cluster backfill status: {other}"
+        ))),
+    }
+}
+
+fn parse_cluster_tracking_status(value: &str) -> LedgerResult<ClusterTrackingStatus> {
+    match value {
+        "active" => Ok(ClusterTrackingStatus::Active),
+        "paused" => Ok(ClusterTrackingStatus::Paused),
+        "error" => Ok(ClusterTrackingStatus::Error),
+        other => Err(LedgerError::Persistence(format!(
+            "unknown cluster tracking status: {other}"
+        ))),
+    }
+}
+
+fn parse_behavior_tag(value: &str) -> LedgerResult<BehaviorTag> {
+    match value {
+        "arbitrage" => Ok(BehaviorTag::Arbitrage),
+        "position" => Ok(BehaviorTag::Position),
+        "lp" => Ok(BehaviorTag::Lp),
+        "liquidation" => Ok(BehaviorTag::Liquidation),
+        "unknown" => Ok(BehaviorTag::Unknown),
+        other => Err(LedgerError::Persistence(format!(
+            "unknown behavior tag: {other}"
+        ))),
+    }
+}
+
+fn parse_metrics_window(value: &str) -> LedgerResult<MetricsWindow> {
+    match value {
+        "1h" => Ok(MetricsWindow::OneHour),
+        "24h" => Ok(MetricsWindow::TwentyFourHours),
+        "7d" => Ok(MetricsWindow::SevenDays),
+        other => Err(LedgerError::Persistence(format!(
+            "unknown metrics window: {other}"
+        ))),
+    }
+}
+
+fn parse_alert_type(value: &str) -> LedgerResult<AlertType> {
+    match value {
+        "roi_anomaly" => Ok(AlertType::RoiAnomaly),
+        "tx_count_spike" => Ok(AlertType::TxCountSpike),
+        "volume_spike" => Ok(AlertType::VolumeSpike),
+        "behavior_shift" => Ok(AlertType::BehaviorShift),
+        "external_inflow" => Ok(AlertType::ExternalInflow),
+        other => Err(LedgerError::Persistence(format!(
+            "unknown alert type: {other}"
+        ))),
+    }
+}
+
+fn parse_alert_severity(value: &str) -> LedgerResult<AlertSeverity> {
+    match value {
+        "low" => Ok(AlertSeverity::Low),
+        "medium" => Ok(AlertSeverity::Medium),
+        "high" => Ok(AlertSeverity::High),
+        other => Err(LedgerError::Persistence(format!(
+            "unknown alert severity: {other}"
         ))),
     }
 }
@@ -946,5 +1478,49 @@ fn cluster_tx_status_to_str(value: &ClusterTxStatus) -> &'static str {
         ClusterTxStatus::Pending => "pending",
         ClusterTxStatus::Analyzed => "analyzed",
         ClusterTxStatus::Failed => "failed",
+    }
+}
+
+fn cluster_tracking_status_to_str(value: &ClusterTrackingStatus) -> &'static str {
+    match value {
+        ClusterTrackingStatus::Active => "active",
+        ClusterTrackingStatus::Paused => "paused",
+        ClusterTrackingStatus::Error => "error",
+    }
+}
+
+fn behavior_tag_to_str(value: &BehaviorTag) -> &'static str {
+    match value {
+        BehaviorTag::Arbitrage => "arbitrage",
+        BehaviorTag::Position => "position",
+        BehaviorTag::Lp => "lp",
+        BehaviorTag::Liquidation => "liquidation",
+        BehaviorTag::Unknown => "unknown",
+    }
+}
+
+fn metrics_window_to_str(value: &MetricsWindow) -> &'static str {
+    match value {
+        MetricsWindow::OneHour => "1h",
+        MetricsWindow::TwentyFourHours => "24h",
+        MetricsWindow::SevenDays => "7d",
+    }
+}
+
+fn alert_type_to_str(value: &AlertType) -> &'static str {
+    match value {
+        AlertType::RoiAnomaly => "roi_anomaly",
+        AlertType::TxCountSpike => "tx_count_spike",
+        AlertType::VolumeSpike => "volume_spike",
+        AlertType::BehaviorShift => "behavior_shift",
+        AlertType::ExternalInflow => "external_inflow",
+    }
+}
+
+fn alert_severity_to_str(value: &AlertSeverity) -> &'static str {
+    match value {
+        AlertSeverity::Low => "low",
+        AlertSeverity::Medium => "medium",
+        AlertSeverity::High => "high",
     }
 }

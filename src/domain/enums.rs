@@ -86,3 +86,49 @@ pub enum VerificationPurpose {
     Signup,
     Login,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterTrackingStatus {
+    Active,
+    Paused,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BehaviorTag {
+    Arbitrage,
+    Position,
+    Lp,
+    Liquidation,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetricsWindow {
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+    #[serde(rename = "7d")]
+    SevenDays,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertType {
+    RoiAnomaly,
+    TxCountSpike,
+    VolumeSpike,
+    BehaviorShift,
+    ExternalInflow,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertSeverity {
+    Low,
+    Medium,
+    High,
+}

@@ -11,7 +11,7 @@ use ledgerflow::{
     core::errors::LedgerResult,
     domain::{
         entities::ClusterAddress,
-        enums::{AddressHitDirection, ClusterBackfillStatus},
+        enums::{AddressHitDirection, BehaviorTag, ClusterBackfillStatus, ClusterTrackingStatus},
         interfaces::ClusterTxSource,
         value_objects::AddressTxRef,
     },
@@ -22,6 +22,7 @@ use ledgerflow::{
     services::{
         analysis::AnalysisService, cluster::ClusterService,
         cluster_backfill::ClusterBackfillRequest, cluster_backfill::ClusterBackfillService,
+        cluster_tracking::ClusterTrackingService,
     },
 };
 
@@ -409,6 +410,7 @@ async fn incremental_watch_enqueues_follow_up_range_after_initial_backfill() {
         4,
     );
     let cluster_service = ClusterService::new(repository.clone());
+    let tracking_service = ClusterTrackingService::new(repository.clone());
 
     let cluster = cluster_service
         .create_cluster(
@@ -436,6 +438,11 @@ async fn incremental_watch_enqueues_follow_up_range_after_initial_backfill() {
                 query_limit: None,
             },
         )
+        .await
+        .unwrap();
+
+    tracking_service
+        .enable_tracking(cluster.cluster_id)
         .await
         .unwrap();
 
@@ -471,4 +478,89 @@ async fn incremental_watch_enqueues_follow_up_range_after_initial_backfill() {
     assert_eq!(runs[0].status, ClusterBackfillStatus::Pending);
     assert_eq!(runs[0].start_block, Some(47));
     assert_eq!(runs[0].end_block, Some(62));
+}
+
+#[tokio::test]
+async fn tracking_state_and_classified_transactions_are_written() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository.clone(),
+        vec!["selector_presence".to_owned()],
+    ));
+    let backfill_service = ClusterBackfillService::new(
+        Arc::clone(&analysis_service),
+        Some(Arc::new(MockClusterTxSource {
+            last_indexed_block: 55,
+            refs_by_address: HashMap::from([(
+                "0x1111111111111111111111111111111111111111".to_owned(),
+                vec![AddressTxRef {
+                    address: "0x1111111111111111111111111111111111111111".to_owned(),
+                    tx_hash: "0xtracked-a".to_owned(),
+                    block_number: 42,
+                    tx_index: 0,
+                    direction: AddressHitDirection::From,
+                }],
+            )]),
+        })),
+        100,
+        8,
+    );
+    let cluster_service = ClusterService::new(repository.clone());
+    let tracking_service = ClusterTrackingService::new(repository.clone());
+
+    let cluster = cluster_service
+        .create_cluster(
+            8453,
+            "ops_team",
+            "tracked_cluster",
+            None,
+            vec![ClusterAddress {
+                address: "0x1111111111111111111111111111111111111111".to_owned(),
+                label: Some("bot".to_owned()),
+                role: Some("bot".to_owned()),
+                metadata: json!({}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let tracking = tracking_service
+        .enable_tracking(cluster.cluster_id)
+        .await
+        .unwrap();
+    assert_eq!(tracking.status, ClusterTrackingStatus::Active);
+
+    backfill_service
+        .backfill_cluster(
+            cluster.cluster_id,
+            ClusterBackfillRequest {
+                start_block: Some(0),
+                end_block: Some(55),
+                force_reanalyze: false,
+                query_limit: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+    let tracking = tracking_service
+        .get_tracking_state(cluster.cluster_id)
+        .await
+        .unwrap();
+    assert_eq!(tracking.last_processed_block, Some(55));
+    assert!(tracking.last_processed_at.is_some());
+
+    let classified = tracking_service
+        .list_recent_classified_transactions(cluster.cluster_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(classified.len(), 1);
+    assert_eq!(classified[0].tx_hash, "0xtracked-a");
+    assert_eq!(classified[0].behavior_tag, BehaviorTag::Unknown);
 }
