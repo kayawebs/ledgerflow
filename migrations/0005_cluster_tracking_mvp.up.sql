@@ -45,7 +45,7 @@ create table if not exists cluster_metrics_snapshots (
   snapshot_id uuid primary key,
   cluster_id uuid not null references address_clusters(cluster_id) on delete cascade,
   chain_id bigint not null,
-  window text not null,
+  metrics_window text not null,
   snapshot_timestamp timestamptz not null,
   tx_count integer not null default 0,
   volume_usd double precision,
@@ -58,7 +58,7 @@ create table if not exists cluster_metrics_snapshots (
 );
 
 create index if not exists idx_cluster_metrics_snapshots_cluster_window
-  on cluster_metrics_snapshots (cluster_id, window, snapshot_timestamp desc);
+  on cluster_metrics_snapshots (cluster_id, metrics_window, snapshot_timestamp desc);
 
 create table if not exists cluster_alerts (
   alert_id uuid primary key,

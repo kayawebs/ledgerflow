@@ -995,7 +995,7 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             sqlx::query(
                 r#"
                 insert into cluster_metrics_snapshots (
-                  snapshot_id, cluster_id, chain_id, window, snapshot_timestamp, tx_count, volume_usd,
+                  snapshot_id, cluster_id, chain_id, metrics_window, snapshot_timestamp, tx_count, volume_usd,
                   gas_cost_usd, pnl_usd, roi, active_addresses_count, behavior_breakdown_json, metadata
                 )
                 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
@@ -1332,7 +1332,7 @@ fn row_to_metrics_snapshot(row: sqlx::postgres::PgRow) -> LedgerResult<ClusterMe
         .try_get("metadata")
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
     let window_raw = row
-        .try_get::<String, _>("window")
+        .try_get::<String, _>("metrics_window")
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
     Ok(ClusterMetricsSnapshot {
         snapshot_id: row
