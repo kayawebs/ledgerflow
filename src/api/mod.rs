@@ -12,17 +12,19 @@ use uuid::Uuid;
 
 use crate::core::errors::LedgerError;
 use crate::domain::entities::{
-    AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterSpendSummary,
-    ClusterTrackingState,
+    AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterAlert,
+    ClusterMetricsSnapshot, ClusterSpendSummary, ClusterTrackingState,
 };
 use crate::plugins::loader::PluginManifest;
 use crate::services::analysis::AnalysisService;
+use crate::services::alerts::ClusterAlertService;
 use crate::services::cluster::ClusterService;
 use crate::services::cluster_backfill::{
     ClusterBackfillRequest as ServiceClusterBackfillRequest, ClusterBackfillResult,
     ClusterBackfillService,
 };
 use crate::services::cluster_tracking::ClusterTrackingService;
+use crate::services::metrics::ClusterMetricsService;
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -30,6 +32,8 @@ pub struct ApiState {
     pub cluster_service: Arc<ClusterService>,
     pub backfill_service: Arc<ClusterBackfillService>,
     pub tracking_service: Arc<ClusterTrackingService>,
+    pub metrics_service: Arc<ClusterMetricsService>,
+    pub alert_service: Arc<ClusterAlertService>,
     pub auto_backfill_on_cluster_create: bool,
 }
 
@@ -95,6 +99,12 @@ pub struct RecognizersResponse {
     pub plugins: Vec<PluginManifest>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ClusterAlertsQuery {
+    pub include_read: Option<bool>,
+    pub limit: Option<u32>,
+}
+
 pub fn router(
     service: Arc<AnalysisService>,
     backfill_service: Arc<ClusterBackfillService>,
@@ -102,6 +112,8 @@ pub fn router(
 ) -> Router {
     let cluster_service = Arc::new(ClusterService::new(service.repository.clone()));
     let tracking_service = Arc::new(ClusterTrackingService::new(service.repository.clone()));
+    let metrics_service = Arc::new(ClusterMetricsService::new(service.repository.clone()));
+    let alert_service = Arc::new(ClusterAlertService::new(service.repository.clone()));
     Router::new()
         .route("/health", get(health))
         .route("/analyses/tx", post(analyze_tx))
@@ -133,11 +145,19 @@ pub fn router(
             "/clusters/{cluster_id}/classified-transactions",
             get(list_classified_transactions),
         )
+        .route("/clusters/{cluster_id}/metrics", get(list_cluster_metrics))
+        .route("/clusters/{cluster_id}/alerts", get(list_cluster_alerts))
+        .route(
+            "/clusters/{cluster_id}/alerts/{alert_id}/read",
+            post(mark_cluster_alert_read),
+        )
         .with_state(ApiState {
             service,
             cluster_service,
             backfill_service,
             tracking_service,
+            metrics_service,
+            alert_service,
             auto_backfill_on_cluster_create,
         })
 }
@@ -423,6 +443,55 @@ async fn list_classified_transactions(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(txs))
+}
+
+async fn list_cluster_metrics(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Json<Vec<ClusterMetricsSnapshot>>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let snapshots = state
+        .metrics_service
+        .list_cluster_metrics(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(snapshots))
+}
+
+async fn list_cluster_alerts(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+    Query(query): Query<ClusterAlertsQuery>,
+) -> Result<Json<Vec<ClusterAlert>>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let alerts = state
+        .alert_service
+        .list_cluster_alerts(
+            cluster_id,
+            query.include_read.unwrap_or(false),
+            query.limit.unwrap_or(20),
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(alerts))
+}
+
+async fn mark_cluster_alert_read(
+    State(state): State<ApiState>,
+    Path((cluster_id, alert_id)): Path<(String, String)>,
+) -> Result<Json<ClusterAlert>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let alert_id = Uuid::parse_str(&alert_id)
+        .map_err(|err| ApiError::conflict(format!("invalid alert id: {err}")))?;
+    let alert = state
+        .alert_service
+        .mark_alert_read(cluster_id, alert_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(alert))
 }
 
 fn parse_time(value: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {

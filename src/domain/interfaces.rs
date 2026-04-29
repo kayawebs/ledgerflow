@@ -84,6 +84,12 @@ pub trait AnalysisRepository: Send + Sync {
         cluster_id: uuid::Uuid,
         limit: u32,
     ) -> LedgerResult<Vec<ClassifiedTransaction>>;
+    async fn list_classified_transactions_for_cluster(
+        &self,
+        cluster_id: uuid::Uuid,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> LedgerResult<Vec<ClassifiedTransaction>>;
     async fn replace_cluster_metrics_snapshots(
         &self,
         cluster_id: uuid::Uuid,

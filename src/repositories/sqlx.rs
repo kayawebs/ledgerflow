@@ -956,6 +956,31 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         rows.into_iter().map(row_to_classified_transaction).collect()
     }
 
+    async fn list_classified_transactions_for_cluster(
+        &self,
+        cluster_id: Uuid,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> LedgerResult<Vec<ClassifiedTransaction>> {
+        let rows = sqlx::query(
+            r#"
+            select *
+            from classified_transactions
+            where cluster_id = $1
+              and ($2::timestamptz is null or block_timestamp >= $2)
+              and ($3::timestamptz is null or block_timestamp <= $3)
+            order by block_timestamp desc nulls last, block_number desc, updated_at desc
+            "#,
+        )
+        .bind(cluster_id)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter().map(row_to_classified_transaction).collect()
+    }
+
     async fn replace_cluster_metrics_snapshots(
         &self,
         cluster_id: Uuid,

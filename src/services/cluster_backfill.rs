@@ -9,14 +9,16 @@ use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{
         entities::{
-            ClassifiedTransaction, ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx,
-            ClusterTrackingState,
+            ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx, ClusterTrackingState,
         },
-        enums::{BehaviorTag, ClusterBackfillStatus, ClusterTrackingStatus, ClusterTxStatus},
+        enums::{ClusterBackfillStatus, ClusterTrackingStatus, ClusterTxStatus},
         interfaces::ClusterTxSource,
         value_objects::AddressTxRef,
     },
-    services::analysis::AnalysisService,
+    services::{
+        alerts::ClusterAlertService, analysis::AnalysisService, behavior::BehaviorClassifier,
+        metrics::ClusterMetricsService,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -39,6 +41,9 @@ pub struct ClusterBackfillService {
     tx_source: Option<Arc<dyn ClusterTxSource>>,
     default_query_limit: u32,
     continuous_watch_lookback_blocks: u64,
+    behavior_classifier: BehaviorClassifier,
+    metrics_service: ClusterMetricsService,
+    alert_service: ClusterAlertService,
 }
 
 impl ClusterBackfillService {
@@ -48,11 +53,15 @@ impl ClusterBackfillService {
         default_query_limit: u32,
         continuous_watch_lookback_blocks: u64,
     ) -> Self {
+        let repository = analysis_service.repository.clone();
         Self {
             analysis_service,
             tx_source,
             default_query_limit,
             continuous_watch_lookback_blocks,
+            behavior_classifier: BehaviorClassifier::default(),
+            metrics_service: ClusterMetricsService::new(repository.clone()),
+            alert_service: ClusterAlertService::new(repository),
         }
     }
 
@@ -318,44 +327,6 @@ impl ClusterBackfillService {
         repository.upsert_cluster_tracking_state(&state).await
     }
 
-    fn classify_unknown_transaction(
-        &self,
-        cluster_id: Uuid,
-        chain_id: u64,
-        address: String,
-        analysis: &crate::domain::entities::TransactionAnalysis,
-    ) -> ClassifiedTransaction {
-        let protocol = analysis
-            .to_address
-            .clone()
-            .or_else(|| analysis.recognizer_results.first().map(|item| item.label.clone()));
-        ClassifiedTransaction {
-            cluster_id,
-            chain_id,
-            tx_hash: analysis.tx_hash.clone(),
-            address,
-            block_number: analysis.block_number.unwrap_or_default(),
-            timestamp: analysis.block_timestamp,
-            behavior_tag: BehaviorTag::Unknown,
-            protocol,
-            token_in: None,
-            token_out: None,
-            amount_in: None,
-            amount_out: None,
-            value_usd: None,
-            gas_cost_usd: None,
-            estimated_pnl_usd: None,
-            raw_json: json!({
-                "analysis_status": analysis.analysis_status,
-                "recognizer_labels": analysis.recognizer_results.iter().map(|item| item.label.clone()).collect::<Vec<_>>(),
-                "from_address": analysis.from_address,
-                "to_address": analysis.to_address,
-            }),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
     fn tx_address_for_cluster(
         &self,
         tx_ref: &AddressTxRef,
@@ -498,10 +469,9 @@ impl ClusterBackfillService {
                 if let Some(existing_analysis) =
                     repository.get_analysis(chain_id, &tx_ref.tx_hash).await?
                 {
-                    classified.push(self.classify_unknown_transaction(
-                        run.cluster_id,
-                        chain_id,
-                        self.tx_address_for_cluster(tx_ref, &cluster),
+                    classified.push(self.behavior_classifier.classify(
+                        &cluster,
+                        &self.tx_address_for_cluster(tx_ref, &cluster),
                         &existing_analysis,
                     ));
                 }
@@ -525,10 +495,9 @@ impl ClusterBackfillService {
                 .await
             {
                 Ok((analysis, _)) => {
-                    classified.push(self.classify_unknown_transaction(
-                        run.cluster_id,
-                        chain_id,
-                        self.tx_address_for_cluster(tx_ref, &cluster),
+                    classified.push(self.behavior_classifier.classify(
+                        &cluster,
+                        &self.tx_address_for_cluster(tx_ref, &cluster),
                         &analysis,
                     ));
                     repository
@@ -562,6 +531,10 @@ impl ClusterBackfillService {
         if !classified.is_empty() {
             repository.upsert_classified_transactions(&classified).await?;
         }
+        self.metrics_service
+            .refresh_cluster_metrics(run.cluster_id)
+            .await?;
+        self.alert_service.refresh_cluster_alerts(run.cluster_id).await?;
 
         run.discovered_tx_count = txs.len() as u32;
         run.analyzed_tx_count = analyzed_count;

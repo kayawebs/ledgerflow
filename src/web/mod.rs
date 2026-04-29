@@ -18,8 +18,9 @@ use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{
         entities::{
-            AddressCluster, AppUser, ClassifiedTransaction, ClusterBackfillRun, ClusterCoverage,
-            ClusterSpendSummary, ClusterTrackingState, EvidencePack, TransactionAnalysis,
+            AddressCluster, AppUser, ClassifiedTransaction, ClusterAlert, ClusterBackfillRun,
+            ClusterCoverage, ClusterMetricsSnapshot, ClusterSpendSummary, ClusterTrackingState,
+            EvidencePack, TransactionAnalysis,
         },
         enums::{AddressHitDirection, ClusterBackfillStatus, VerificationPurpose},
     },
@@ -283,6 +284,8 @@ struct ClusterLiveResponse {
     coverage: Option<ClusterCoverage>,
     runs: Vec<ClusterBackfillRun>,
     spend_summary: Option<ClusterSpendSummary>,
+    metrics: Vec<ClusterMetricsSnapshot>,
+    alerts: Vec<ClusterAlert>,
     classified_transactions: Vec<ClassifiedTransaction>,
 }
 
@@ -416,6 +419,10 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route(
             "/app/clusters/{cluster_id}/tracking/pause",
             post(pause_cluster_tracking),
+        )
+        .route(
+            "/app/clusters/{cluster_id}/alerts/{alert_id}/read",
+            post(mark_cluster_alert_read),
         )
         .route("/app/tx-analysis", get(tx_analysis_page))
         .route("/app/tx-analysis/run", post(run_tx_analysis))
@@ -910,6 +917,31 @@ async fn pause_cluster_tracking(
     }
 }
 
+async fn mark_cluster_alert_read(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path((cluster_id, alert_id)): Path<(String, String)>,
+) -> Result<Response, WebError> {
+    let Some(_user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    match api_post_json::<_, ClusterAlert>(
+        &state,
+        &format!("/clusters/{cluster_id}/alerts/{alert_id}/read"),
+        &json!({}),
+    )
+    .await
+    {
+        Ok(_) => Ok(redirect_response(&format!(
+            "/app/clusters/{cluster_id}?notice=alert-read"
+        ))),
+        Err(err) => Ok(redirect_response(&format!(
+            "/app/clusters/{cluster_id}?notice=alert-error&error={}",
+            urlencoding::encode(&err.to_string())
+        ))),
+    }
+}
+
 async fn run_tx_analysis(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -995,7 +1027,17 @@ async fn render_dashboard_response(
         .and_then(|cluster_id| clusters.iter().find(|item| item.cluster_id == cluster_id).cloned())
         .or_else(|| clusters.first().cloned());
 
-    let (tracking, coverage, runs, spend_summary, classified_transactions, cluster_status, cluster_error) =
+    let (
+        tracking,
+        coverage,
+        runs,
+        spend_summary,
+        metrics,
+        alerts,
+        classified_transactions,
+        cluster_status,
+        cluster_error,
+    ) =
         if tab == DashboardTab::ClusterAnalysis {
             if let Some(cluster) = selected_cluster.as_ref() {
                 match load_cluster_live_response(
@@ -1011,17 +1053,49 @@ async fn render_dashboard_response(
                         payload.coverage,
                         payload.runs,
                         payload.spend_summary,
+                        payload.metrics,
+                        payload.alerts,
                         payload.classified_transactions,
                         Some((payload.status_label, payload.status_tone)),
                         None::<String>,
                     ),
-                    Err(err) => (None, None, Vec::new(), None, Vec::new(), None, Some(err.to_string())),
+                    Err(err) => (
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Some(err.to_string()),
+                    ),
                 }
             } else {
-                (None, None, Vec::new(), None, Vec::new(), None, None)
+                (
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                )
             }
         } else {
-            (None, None, Vec::new(), None, Vec::new(), None, None)
+            (
+                None,
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+            )
         };
 
     let (indexer_progress, indexer_error) = if tab == DashboardTab::IndexerProgress {
@@ -1045,6 +1119,8 @@ async fn render_dashboard_response(
         coverage.as_ref(),
         &runs,
         spend_summary.as_ref(),
+        &metrics,
+        &alerts,
         &classified_transactions,
         cluster_status.as_ref(),
         tx_result.as_ref(),
@@ -1093,6 +1169,18 @@ async fn load_cluster_live_response(
         }
     };
     let spend_summary = api_get_json::<ClusterSpendSummary>(state, &summary_path).await.ok();
+    let metrics = api_get_json::<Vec<ClusterMetricsSnapshot>>(
+        state,
+        &format!("/clusters/{}/metrics", cluster_id),
+    )
+    .await
+    .unwrap_or_default();
+    let alerts = api_get_json::<Vec<ClusterAlert>>(
+        state,
+        &format!("/clusters/{}/alerts?include_read=false&limit=12", cluster_id),
+    )
+    .await
+    .unwrap_or_default();
     let classified_transactions = api_get_json::<Vec<ClassifiedTransaction>>(
         state,
         &format!("/clusters/{}/classified-transactions?limit=12", cluster_id),
@@ -1107,6 +1195,8 @@ async fn load_cluster_live_response(
         coverage,
         runs,
         spend_summary,
+        metrics,
+        alerts,
         classified_transactions,
     })
 }
@@ -1322,6 +1412,8 @@ fn render_notice_message(code: &str) -> Option<&'static str> {
         "tracking-enabled" => Some("Cluster tracking enabled."),
         "tracking-paused" => Some("Cluster tracking paused."),
         "tracking-error" => Some("Tracking action failed. Inspect the latest cluster state or server logs."),
+        "alert-read" => Some("Alert marked as read."),
+        "alert-error" => Some("Alert action failed. Refresh the cluster view and inspect server logs."),
         "auth-required" => Some("Sign in to continue."),
         _ => None,
     }
@@ -1542,6 +1634,8 @@ fn render_dashboard_page(
     coverage: Option<&ClusterCoverage>,
     runs: &[ClusterBackfillRun],
     spend_summary: Option<&ClusterSpendSummary>,
+    metrics: &[ClusterMetricsSnapshot],
+    alerts: &[ClusterAlert],
     classified_transactions: &[ClassifiedTransaction],
     cluster_status: Option<&(String, String)>,
     tx_result: Option<&serde_json::Value>,
@@ -1597,8 +1691,14 @@ fn render_dashboard_page(
     <div id="cluster-live-status" class="notice {}">{}</div>
     <h3>Tracking</h3>
     <div id="cluster-live-tracking">{}</div>
+    <h3>Rolling metrics</h3>
+    <div id="cluster-live-metrics">{}</div>
+    <h3>Behavior breakdown</h3>
+    <div id="cluster-live-behavior">{}</div>
     <h3>Coverage</h3>
     <div id="cluster-live-coverage">{}</div>
+    <h3>Alerts</h3>
+    <div id="cluster-live-alerts">{}</div>
     <h3>Spend summary</h3>
     <div id="cluster-live-summary">{}</div>
     <h3>Recent backfill runs</h3>
@@ -1619,7 +1719,10 @@ fn render_dashboard_page(
             escape_html(status_tone),
             escape_html(status_label),
             render_tracking_status_panel(cluster, tracking),
+            render_cluster_metrics_panel(metrics),
+            render_behavior_breakdown_panel(metrics),
             render_cluster_coverage_cards(coverage),
+            render_cluster_alerts_panel(cluster, alerts),
             render_cluster_summary_panel(spend_summary),
             render_cluster_runs_table(runs),
             render_recent_classified_transactions_panel(classified_transactions),
@@ -1877,6 +1980,141 @@ fn render_tracking_status_panel(
     )
 }
 
+fn render_cluster_metrics_panel(metrics: &[ClusterMetricsSnapshot]) -> String {
+    if metrics.is_empty() {
+        return "<div class=\"empty-state\">Rolling metrics have not been computed yet. They appear after classified transactions are written for this cluster.</div>".to_owned();
+    }
+    let one_hour = metrics
+        .iter()
+        .find(|item| matches!(item.window, crate::domain::enums::MetricsWindow::OneHour));
+    let twenty_four_hours = metrics.iter().find(|item| {
+        matches!(
+            item.window,
+            crate::domain::enums::MetricsWindow::TwentyFourHours
+        )
+    });
+    let seven_days = metrics
+        .iter()
+        .find(|item| matches!(item.window, crate::domain::enums::MetricsWindow::SevenDays));
+
+    format!(
+        r#"<div class="stats-grid">
+  <div class="stat"><span>1h PnL / ROI</span><strong>{} / {}</strong></div>
+  <div class="stat"><span>24h PnL / ROI</span><strong>{} / {}</strong></div>
+  <div class="stat"><span>7d PnL / ROI</span><strong>{} / {}</strong></div>
+  <div class="stat"><span>24h tx count</span><strong>{}</strong></div>
+  <div class="stat"><span>24h volume</span><strong>{}</strong></div>
+  <div class="stat"><span>24h gas cost</span><strong>{}</strong></div>
+</div>"#,
+        format_usd_option(one_hour.and_then(|item| item.realized_pnl_usd)),
+        format_roi_option(one_hour.and_then(|item| item.roi)),
+        format_usd_option(twenty_four_hours.and_then(|item| item.realized_pnl_usd)),
+        format_roi_option(twenty_four_hours.and_then(|item| item.roi)),
+        format_usd_option(seven_days.and_then(|item| item.realized_pnl_usd)),
+        format_roi_option(seven_days.and_then(|item| item.roi)),
+        twenty_four_hours
+            .map(|item| item.tx_count.to_string())
+            .unwrap_or_else(|| "0".to_owned()),
+        format_usd_option(twenty_four_hours.and_then(|item| item.volume_usd)),
+        format_usd_option(twenty_four_hours.and_then(|item| item.gas_cost_usd)),
+    )
+}
+
+fn render_behavior_breakdown_panel(metrics: &[ClusterMetricsSnapshot]) -> String {
+    let Some(snapshot) = metrics.iter().find(|item| {
+        matches!(
+            item.window,
+            crate::domain::enums::MetricsWindow::TwentyFourHours
+        )
+    }) else {
+        return "<div class=\"empty-state\">Behavior breakdown will appear after enough classified transactions are available.</div>".to_owned();
+    };
+
+    let keys = ["arbitrage", "position", "lp", "liquidation", "unknown"];
+    let rows = keys
+        .into_iter()
+        .map(|key| {
+            let entry = snapshot.behavior_breakdown.get(key);
+            let count = entry
+                .and_then(|value| value.get("count"))
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let ratio = entry
+                .and_then(|value| value.get("ratio"))
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0);
+            format!(
+                r#"<tr>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{:.1}%</td>
+  <td><div class="meter"><span style="width:{:.1}%"></span></div></td>
+</tr>"#,
+                escape_html(key),
+                count,
+                ratio * 100.0,
+                ratio * 100.0
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    format!(
+        r#"<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Behavior</th>
+        <th>Count</th>
+        <th>Ratio</th>
+        <th>Visual</th>
+      </tr>
+    </thead>
+    <tbody>{}</tbody>
+  </table>
+</div>"#,
+        rows
+    )
+}
+
+fn render_cluster_alerts_panel(
+    cluster: &DashboardClusterRecord,
+    alerts: &[ClusterAlert],
+) -> String {
+    if alerts.is_empty() {
+        return "<div class=\"empty-state\">No active alerts right now. Alert rules run after rolling metrics are refreshed.</div>".to_owned();
+    }
+    format!(
+        r#"<div class="alert-list">{}</div>"#,
+        alerts
+            .iter()
+            .map(|alert| {
+                format!(
+                    r#"<article class="alert-card severity-{}">
+  <div class="alert-card-head">
+    <strong>{}</strong>
+    <span>{}</span>
+  </div>
+  <p>{}</p>
+  <small>{}</small>
+  <form method="post" action="/app/clusters/{}/alerts/{}/read">
+    <button class="cta ghost" type="submit">Mark as read</button>
+  </form>
+</article>"#,
+                    alert_severity_class(alert),
+                    escape_html(&alert.title),
+                    escape_html(&format!("{:?}", alert.severity).to_lowercase()),
+                    escape_html(&alert.message),
+                    escape_html(&alert.triggered_at.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
+                    cluster.cluster_id,
+                    alert.alert_id
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    )
+}
+
 fn render_recent_classified_transactions_panel(txs: &[ClassifiedTransaction]) -> String {
     if txs.is_empty() {
         return "<div class=\"empty-state\">No classified transactions yet. Once tracking or backfill analyzes transactions, they will appear here.</div>".to_owned();
@@ -1888,8 +2126,11 @@ fn render_recent_classified_transactions_panel(txs: &[ClassifiedTransaction]) ->
       <tr>
         <th>Tx</th>
         <th>Time</th>
+        <th>Address</th>
         <th>Behavior</th>
         <th>Protocol</th>
+        <th>Token in / out</th>
+        <th>Volume USD</th>
         <th>Gas USD</th>
         <th>Estimated PnL USD</th>
       </tr>
@@ -1903,13 +2144,16 @@ fn render_recent_classified_transactions_panel(txs: &[ClassifiedTransaction]) ->
             .iter()
             .map(|tx| {
                 format!(
-                    "<tr><td><code>{}</code></td><td>{}</td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td><code>{}</code></td><td>{}</td><td><code>{}</code></td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     escape_html(&truncate_middle(&tx.tx_hash, 8)),
                     tx.timestamp
                         .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                         .unwrap_or_else(|| "n/a".to_owned()),
+                    escape_html(&truncate_middle(&tx.address, 6)),
                     tx.behavior_tag,
                     escape_html(tx.protocol.as_deref().unwrap_or("n/a")),
+                    escape_html(&format_token_flow(tx)),
+                    format_usd_option(tx.value_usd),
                     tx.gas_cost_usd
                         .map(|value| format!("{value:.2}"))
                         .unwrap_or_else(|| "n/a".to_owned()),
@@ -1921,6 +2165,40 @@ fn render_recent_classified_transactions_panel(txs: &[ClassifiedTransaction]) ->
             .collect::<Vec<_>>()
             .join("")
     )
+}
+
+fn alert_severity_class(alert: &ClusterAlert) -> &'static str {
+    match alert.severity {
+        crate::domain::enums::AlertSeverity::Low => "low",
+        crate::domain::enums::AlertSeverity::Medium => "medium",
+        crate::domain::enums::AlertSeverity::High => "high",
+    }
+}
+
+fn format_usd_option(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("${value:.2}"))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn format_roi_option(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.2}%", value * 100.0))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn format_token_flow(tx: &ClassifiedTransaction) -> String {
+    let token_in = tx
+        .token_in
+        .as_deref()
+        .map(|value| truncate_middle(value, 6))
+        .unwrap_or_else(|| "-".to_owned());
+    let token_out = tx
+        .token_out
+        .as_deref()
+        .map(|value| truncate_middle(value, 6))
+        .unwrap_or_else(|| "-".to_owned());
+    format!("{token_in} / {token_out}")
 }
 
 fn render_indexer_progress_panel(progress: Option<&IndexerProgressPayload>) -> String {
@@ -2262,11 +2540,14 @@ fn render_cluster_autorefresh_script(
   const end = {end:?};
   const statusNode = document.getElementById("cluster-live-status");
   const trackingNode = document.getElementById("cluster-live-tracking");
+  const metricsNode = document.getElementById("cluster-live-metrics");
+  const behaviorNode = document.getElementById("cluster-live-behavior");
   const coverageNode = document.getElementById("cluster-live-coverage");
+  const alertsNode = document.getElementById("cluster-live-alerts");
   const summaryNode = document.getElementById("cluster-live-summary");
   const runsNode = document.getElementById("cluster-live-runs");
   const classifiedNode = document.getElementById("cluster-live-classified");
-  if (!clusterId || !statusNode || !trackingNode || !coverageNode || !summaryNode || !runsNode || !classifiedNode) return;
+  if (!clusterId || !statusNode || !trackingNode || !metricsNode || !behaviorNode || !coverageNode || !alertsNode || !summaryNode || !runsNode || !classifiedNode) return;
 
   const escapeHtml = (value) => String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -2279,6 +2560,10 @@ fn render_cluster_autorefresh_script(
     const text = String(value ?? "");
     return text.length > 16 ? `${{text.slice(0, 8)}}...${{text.slice(-8)}}` : text;
   }};
+
+  const formatUsd = (value) => value == null ? "n/a" : `$${{Number(value).toFixed(2)}}`;
+  const formatPct = (value) => value == null ? "n/a" : `${{(Number(value) * 100).toFixed(2)}}%`;
+  const formatTime = (value) => value ? String(value).replace("T", " ").replace("Z", " UTC") : "n/a";
 
   const renderCoverage = (coverage) => {{
     if (!coverage) {{
@@ -2316,6 +2601,73 @@ fn render_cluster_autorefresh_script(
       <form method="post" action="${{actionPath}}">
         <button class="cta secondary" type="submit">${{actionLabel}}</button>
       </form>
+    `;
+  }};
+
+  const metricsByWindow = (metrics) => {{
+    const map = new Map();
+    for (const item of metrics || []) {{
+      map.set(item.window, item);
+    }}
+    return map;
+  }};
+
+  const renderMetrics = (metrics) => {{
+    if (!metrics || metrics.length === 0) {{
+      return '<div class="empty-state">Rolling metrics have not been computed yet. They appear after classified transactions are written for this cluster.</div>';
+    }}
+    const byWindow = metricsByWindow(metrics);
+    const oneHour = byWindow.get("1h");
+    const twentyFourHours = byWindow.get("24h");
+    const sevenDays = byWindow.get("7d");
+    return `
+      <div class="stats-grid">
+        <div class="stat"><span>1h PnL / ROI</span><strong>${{formatUsd(oneHour?.realized_pnl_usd)}} / ${{formatPct(oneHour?.roi)}}</strong></div>
+        <div class="stat"><span>24h PnL / ROI</span><strong>${{formatUsd(twentyFourHours?.realized_pnl_usd)}} / ${{formatPct(twentyFourHours?.roi)}}</strong></div>
+        <div class="stat"><span>7d PnL / ROI</span><strong>${{formatUsd(sevenDays?.realized_pnl_usd)}} / ${{formatPct(sevenDays?.roi)}}</strong></div>
+        <div class="stat"><span>24h tx count</span><strong>${{twentyFourHours?.tx_count ?? 0}}</strong></div>
+        <div class="stat"><span>24h volume</span><strong>${{formatUsd(twentyFourHours?.volume_usd)}}</strong></div>
+        <div class="stat"><span>24h gas cost</span><strong>${{formatUsd(twentyFourHours?.gas_cost_usd)}}</strong></div>
+      </div>
+    `;
+  }};
+
+  const renderBehavior = (metrics) => {{
+    if (!metrics || metrics.length === 0) {{
+      return '<div class="empty-state">Behavior breakdown will appear after enough classified transactions are available.</div>';
+    }}
+    const snapshot = metricsByWindow(metrics).get("24h");
+    if (!snapshot || !snapshot.behavior_breakdown) {{
+      return '<div class="empty-state">Behavior breakdown will appear after enough classified transactions are available.</div>';
+    }}
+    const keys = ["arbitrage", "position", "lp", "liquidation", "unknown"];
+    const rows = keys.map((key) => {{
+      const entry = snapshot.behavior_breakdown?.[key] || {{}};
+      const count = entry.count ?? 0;
+      const ratio = Number(entry.ratio ?? 0);
+      return `
+        <tr>
+          <td>${{escapeHtml(key)}}</td>
+          <td>${{count}}</td>
+          <td>${{(ratio * 100).toFixed(1)}}%</td>
+          <td><div class="meter"><span style="width:${{(ratio * 100).toFixed(1)}}%"></span></div></td>
+        </tr>
+      `;
+    }}).join("");
+    return `
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th>Behavior</th>
+              <th>Count</th>
+              <th>Ratio</th>
+              <th>Visual</th>
+            </tr>
+          </thead>
+          <tbody>${{rows}}</tbody>
+        </table>
+      </div>
     `;
   }};
 
@@ -2402,14 +2754,18 @@ fn render_cluster_autorefresh_script(
     if (!txs || txs.length === 0) {{
       return '<div class="empty-state">No classified transactions yet. Once tracking or backfill analyzes transactions, they will appear here.</div>';
     }}
+    const formatTokenFlow = (tx) => `${{tx.token_in ? truncate(tx.token_in) : "-"}} / ${{tx.token_out ? truncate(tx.token_out) : "-"}}`;
     const rows = txs.map((tx) => `
       <tr>
         <td><code>${{escapeHtml(truncate(tx.tx_hash))}}</code></td>
-        <td>${{escapeHtml(tx.timestamp ? String(tx.timestamp).replace("T", " ").replace("Z", " UTC") : "n/a")}}</td>
+        <td>${{escapeHtml(formatTime(tx.timestamp))}}</td>
+        <td><code>${{escapeHtml(truncate(tx.address))}}</code></td>
         <td>${{escapeHtml(tx.behavior_tag)}}</td>
         <td>${{escapeHtml(tx.protocol || "n/a")}}</td>
-        <td>${{escapeHtml(tx.gas_cost_usd != null ? Number(tx.gas_cost_usd).toFixed(2) : "n/a")}}</td>
-        <td>${{escapeHtml(tx.estimated_pnl_usd != null ? Number(tx.estimated_pnl_usd).toFixed(2) : "n/a")}}</td>
+        <td>${{escapeHtml(formatTokenFlow(tx))}}</td>
+        <td>${{escapeHtml(formatUsd(tx.value_usd))}}</td>
+        <td>${{escapeHtml(formatUsd(tx.gas_cost_usd))}}</td>
+        <td>${{escapeHtml(formatUsd(tx.estimated_pnl_usd))}}</td>
       </tr>
     `).join("");
     return `
@@ -2419,8 +2775,11 @@ fn render_cluster_autorefresh_script(
             <tr>
               <th>Tx</th>
               <th>Time</th>
+              <th>Address</th>
               <th>Behavior</th>
               <th>Protocol</th>
+              <th>Token in / out</th>
+              <th>Volume USD</th>
               <th>Gas USD</th>
               <th>Estimated PnL USD</th>
             </tr>
@@ -2431,11 +2790,33 @@ fn render_cluster_autorefresh_script(
     `;
   }};
 
+  const renderAlerts = (alerts) => {{
+    if (!alerts || alerts.length === 0) {{
+      return '<div class="empty-state">No active alerts right now. Alert rules run after rolling metrics are refreshed.</div>';
+    }}
+    return `<div class="alert-list">${{alerts.map((alert) => `
+      <article class="alert-card severity-${{escapeHtml(String(alert.severity || "low"))}}">
+        <div class="alert-card-head">
+          <strong>${{escapeHtml(alert.title)}}</strong>
+          <span>${{escapeHtml(String(alert.severity || ""))}}</span>
+        </div>
+        <p>${{escapeHtml(alert.message || "")}}</p>
+        <small>${{escapeHtml(formatTime(alert.triggered_at))}}</small>
+        <form method="post" action="/app/clusters/${{clusterId}}/alerts/${{alert.alert_id}}/read">
+          <button class="cta ghost" type="submit">Mark as read</button>
+        </form>
+      </article>
+    `).join("")}}</div>`;
+  }};
+
   const renderState = (payload) => {{
     statusNode.className = `notice ${{payload.status_tone || "info"}}`;
     statusNode.textContent = payload.status_label || "Waiting for discovery";
     trackingNode.innerHTML = renderTracking(payload.tracking);
+    metricsNode.innerHTML = renderMetrics(payload.metrics || []);
+    behaviorNode.innerHTML = renderBehavior(payload.metrics || []);
     coverageNode.innerHTML = renderCoverage(payload.coverage);
+    alertsNode.innerHTML = renderAlerts(payload.alerts || []);
     summaryNode.innerHTML = renderSummary(payload.spend_summary);
     runsNode.innerHTML = renderRuns(payload.runs || []);
     classifiedNode.innerHTML = renderClassified(payload.classified_transactions || []);
@@ -2571,6 +2952,15 @@ textarea { min-height: 140px; resize: vertical; }
 .table-shell { overflow: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.meter { height: 10px; border-radius: 999px; background: rgba(13,110,99,.08); overflow: hidden; min-width: 120px; }
+.meter span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), #2aa899); }
+.alert-list { display: grid; gap: 12px; }
+.alert-card { border: 1px solid var(--line); border-radius: 18px; background: rgba(255,255,255,.78); padding: 14px; display: grid; gap: 8px; }
+.alert-card-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+.alert-card p, .alert-card small { margin: 0; color: var(--muted); }
+.alert-card.severity-low { border-color: rgba(13,110,99,.22); }
+.alert-card.severity-medium { border-color: rgba(197,95,12,.35); background: rgba(255,248,240,.9); }
+.alert-card.severity-high { border-color: rgba(197,95,12,.5); background: rgba(255,244,238,.94); }
 .empty-state { padding: 18px; border: 1px dashed var(--line); border-radius: 16px; color: var(--muted); background: rgba(255,255,255,.5); }
 @media (max-width: 960px) {
   .hero, .dashboard-shell, .dashboard-grid { grid-template-columns: 1fr; }

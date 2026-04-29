@@ -374,6 +374,30 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
         Ok(items)
     }
 
+    async fn list_classified_transactions_for_cluster(
+        &self,
+        cluster_id: Uuid,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> LedgerResult<Vec<ClassifiedTransaction>> {
+        let mut items = self
+            .classified_transactions
+            .read()
+            .await
+            .values()
+            .filter(|item| item.cluster_id == cluster_id)
+            .filter(|item| within_range(item.timestamp, start, end))
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| right.block_number.cmp(&left.block_number))
+        });
+        Ok(items)
+    }
+
     async fn replace_cluster_metrics_snapshots(
         &self,
         cluster_id: Uuid,

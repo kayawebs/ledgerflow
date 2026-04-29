@@ -52,7 +52,7 @@ impl AppConfig {
             )
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5_000),
+            .unwrap_or(120_000),
             cluster_continuous_watch_enabled: env::var(
                 "LEDGERFLOW_CLUSTER_CONTINUOUS_WATCH_ENABLED",
             )
