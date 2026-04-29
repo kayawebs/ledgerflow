@@ -1932,6 +1932,7 @@ fn render_cluster_management_panel(default_chain_id: u64) -> String {
       <label>Cluster name<input type="text" name="name" placeholder="primary_searcher" required></label>
       <label>Description<input type="text" name="description" placeholder="main bot + treasury EOAs"></label>
       <label>Addresses<textarea name="addresses" placeholder="0x111...,bot-1,bot&#10;0x222...,treasury,eoa" required></textarea></label>
+      <div class="field-hint">One record per line. Format: <code>address,label,role</code>. Only the address is required, so <code>0xabc...</code> or <code>0xabc...,bot-1</code> also works.</div>
       <button class="cta primary" type="submit">Create cluster</button>
     </form>
   </div>
@@ -3006,6 +3007,8 @@ a { color: inherit; text-decoration: none; }
 .notice.warning { background: rgba(197,95,12,.12); color: var(--accent-2); }
 .notice.error { background: rgba(197,95,12,.1); color: var(--accent-2); }
 label { display: grid; gap: 8px; font-size: .95rem; }
+.field-hint { margin-top: -4px; color: var(--muted); font-size: .88rem; line-height: 1.5; }
+.field-hint code { font-size: .85rem; }
 input, textarea, select { width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); font: inherit; }
 textarea { min-height: 140px; resize: vertical; }
 .dashboard-body { background: #f2ede5; }
