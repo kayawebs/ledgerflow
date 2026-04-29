@@ -53,13 +53,15 @@ LedgerFlow reads configuration from environment variables.
 | `LEDGERFLOW_WEB_BASE_URL` | Public base URL used in verification email links | `http://127.0.0.1:3001` for host runs |
 | `LEDGERFLOW_API_BASE_URL` | Upstream analysis API used by the web process | `http://127.0.0.1:3000` for host runs, `http://app:8080` in Docker |
 | `LEDGERFLOW_SESSION_COOKIE_NAME` | Session cookie name for the web product | `ledgerflow_session` |
-| `LEDGERFLOW_EMAIL_DELIVERY_MODE` | Email delivery mode: `auto`, `log`, or `resend` | `auto` |
+| `LEDGERFLOW_EMAIL_DELIVERY_MODE` | Email delivery mode: `auto`, `log`, `postmark`, or `resend` | `auto` |
 | `LEDGERFLOW_EMAIL_FROM` | Sender address when using real email delivery | `noreply@yourdomain.xyz` |
+| `LEDGERFLOW_POSTMARK_SERVER_TOKEN` | Optional Postmark server token for verification emails | unset |
+| `LEDGERFLOW_POSTMARK_MESSAGE_STREAM` | Optional Postmark message stream | `outbound` |
 | `LEDGERFLOW_RESEND_API_KEY` | Optional Resend API key for verification emails | unset |
 | `LEDGERFLOW_VERIFICATION_TTL_MINUTES` | Verification code lifetime | `15` |
 | `LEDGERFLOW_SESSION_TTL_DAYS` | Passwordless session lifetime | `30` |
 
-If `LEDGERFLOW_EMAIL_DELIVERY_MODE=auto`, the web process sends real verification mail only when both `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_RESEND_API_KEY` are configured. Otherwise it falls back to log-only mode and the auth page plus `/health` will say so explicitly. You can also use unprefixed aliases `EMAIL_FROM` and `RESEND_API_KEY`.
+If `LEDGERFLOW_EMAIL_DELIVERY_MODE=auto`, the web process prefers Postmark when both `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_POSTMARK_SERVER_TOKEN` are configured; otherwise it falls back to Resend when `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_RESEND_API_KEY` are configured. If neither provider is configured, it falls back to log-only mode and the auth page plus `/health` will say so explicitly. You can also use unprefixed aliases `EMAIL_FROM`, `POSTMARK_SERVER_TOKEN`, and `RESEND_API_KEY`.
 
 The checked-in `.env.example` is the easiest starting point. Copy it to `.env` before using Docker Compose, because the compose stack reads `.env` as the runtime config file.
 

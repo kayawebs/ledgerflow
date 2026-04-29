@@ -433,6 +433,77 @@ impl VerificationSender for ResendVerificationSender {
     }
 }
 
+pub struct PostmarkVerificationSender {
+    client: Client,
+    server_token: String,
+    from_email: String,
+    message_stream: String,
+}
+
+impl PostmarkVerificationSender {
+    pub fn new(server_token: String, from_email: String, message_stream: String) -> Self {
+        Self {
+            client: Client::new(),
+            server_token,
+            from_email,
+            message_stream,
+        }
+    }
+}
+
+#[async_trait]
+impl VerificationSender for PostmarkVerificationSender {
+    async fn send_verification_code(
+        &self,
+        email: &str,
+        code: &str,
+        purpose: VerificationPurpose,
+        verify_url: &str,
+    ) -> LedgerResult<()> {
+        let subject = match purpose {
+            VerificationPurpose::Signup => "Verify your LedgerFlow signup",
+            VerificationPurpose::Login => "Your LedgerFlow sign-in code",
+        };
+        let response = self
+            .client
+            .post("https://api.postmarkapp.com/email")
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("X-Postmark-Server-Token", &self.server_token)
+            .json(&json!({
+                "From": self.from_email,
+                "To": email,
+                "Subject": subject,
+                "TextBody": format!(
+                    "Your LedgerFlow verification code is {}.\n\nYou can also open this link:\n{}",
+                    code, verify_url
+                ),
+                "HtmlBody": format!(
+                    "<div style=\"font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.5\"><p>Your LedgerFlow verification code is <strong style=\"font-size:24px\">{}</strong>.</p><p><a href=\"{}\">Verify in browser</a></p><p>This code expires in 15 minutes.</p></div>",
+                    code, verify_url
+                ),
+                "MessageStream": self.message_stream,
+            }))
+            .send()
+            .await
+            .map_err(|err| LedgerError::TransientIngestion(err.to_string()))?;
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(LedgerError::TransientIngestion(format!(
+                "postmark email delivery failed: {} {}",
+                subject, body
+            )));
+        }
+        info!(
+            email = %email,
+            purpose = %verification_purpose_to_str(&purpose),
+            delivery_mode = "postmark",
+            "verification email sent"
+        );
+        Ok(())
+    }
+}
+
 pub fn normalize_email(email_raw: &str) -> LedgerResult<String> {
     let email = email_raw.trim().to_lowercase();
     if email.is_empty() || !email.contains('@') || email.starts_with('@') || email.ends_with('@') {

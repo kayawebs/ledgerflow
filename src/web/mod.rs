@@ -26,8 +26,9 @@ use crate::{
     },
     services::{
         auth::{
-            AuthService, LogVerificationSender, ResendVerificationSender, VerificationSender,
-            verification_purpose_from_str, verification_purpose_to_str,
+            AuthService, LogVerificationSender, PostmarkVerificationSender,
+            ResendVerificationSender, VerificationSender, verification_purpose_from_str,
+            verification_purpose_to_str,
         },
         portal::{DashboardClusterRecord, PortalService},
     },
@@ -55,6 +56,7 @@ pub struct WebState {
 pub enum EmailDeliveryMode {
     Auto,
     Log,
+    Postmark,
     Resend,
 }
 
@@ -69,6 +71,8 @@ pub struct WebConfig {
     pub web_base_url: String,
     pub session_cookie_name: String,
     pub resend_api_key: Option<String>,
+    pub postmark_server_token: Option<String>,
+    pub postmark_message_stream: String,
     pub email_from: Option<String>,
     pub email_delivery_mode: EmailDeliveryMode,
     pub verification_ttl_minutes: i64,
@@ -78,6 +82,8 @@ pub struct WebConfig {
 impl WebConfig {
     pub fn from_env() -> Self {
         let resend_api_key = first_env(&["LEDGERFLOW_RESEND_API_KEY", "RESEND_API_KEY"]);
+        let postmark_server_token =
+            first_env(&["LEDGERFLOW_POSTMARK_SERVER_TOKEN", "POSTMARK_SERVER_TOKEN"]);
         let email_from = first_env(&["LEDGERFLOW_EMAIL_FROM", "EMAIL_FROM"]);
         Self {
             bind_addr: std::env::var("LEDGERFLOW_WEB_BIND_ADDR")
@@ -98,6 +104,9 @@ impl WebConfig {
             session_cookie_name: std::env::var("LEDGERFLOW_SESSION_COOKIE_NAME")
                 .unwrap_or_else(|_| "ledgerflow_session".to_owned()),
             resend_api_key,
+            postmark_server_token,
+            postmark_message_stream: std::env::var("LEDGERFLOW_POSTMARK_MESSAGE_STREAM")
+                .unwrap_or_else(|_| "outbound".to_owned()),
             email_from,
             email_delivery_mode: EmailDeliveryMode::from_env(),
             verification_ttl_minutes: std::env::var("LEDGERFLOW_VERIFICATION_TTL_MINUTES")
@@ -121,6 +130,7 @@ impl EmailDeliveryMode {
             .as_str()
         {
             "log" => Self::Log,
+            "postmark" => Self::Postmark,
             "resend" => Self::Resend,
             _ => Self::Auto,
         }
@@ -130,6 +140,7 @@ impl EmailDeliveryMode {
         match self {
             Self::Auto => "auto",
             Self::Log => "log",
+            Self::Postmark => "postmark",
             Self::Resend => "resend",
         }
     }
@@ -340,6 +351,28 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         bool,
     ) = match config.email_delivery_mode {
         EmailDeliveryMode::Log => (Arc::new(LogVerificationSender), "log", false),
+        EmailDeliveryMode::Postmark => {
+            let Some(server_token) = config.postmark_server_token.clone() else {
+                return Err(LedgerError::AnalysisInvariant(
+                    "email delivery mode is postmark but POSTMARK server token is missing"
+                        .to_owned(),
+                ));
+            };
+            let Some(from_email) = config.email_from.clone() else {
+                return Err(LedgerError::AnalysisInvariant(
+                    "email delivery mode is postmark but sender email is missing".to_owned(),
+                ));
+            };
+            (
+                Arc::new(PostmarkVerificationSender::new(
+                    server_token,
+                    from_email,
+                    config.postmark_message_stream.clone(),
+                )),
+                "postmark",
+                true,
+            )
+        }
         EmailDeliveryMode::Resend => {
             let Some(api_key) = config.resend_api_key.clone() else {
                 return Err(LedgerError::AnalysisInvariant(
@@ -358,7 +391,19 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
             )
         }
         EmailDeliveryMode::Auto => {
-            if let (Some(api_key), Some(from_email)) =
+            if let (Some(server_token), Some(from_email)) =
+                (config.postmark_server_token.clone(), config.email_from.clone())
+            {
+                (
+                    Arc::new(PostmarkVerificationSender::new(
+                        server_token,
+                        from_email,
+                        config.postmark_message_stream.clone(),
+                    )),
+                    "postmark",
+                    true,
+                )
+            } else if let (Some(api_key), Some(from_email)) =
                 (config.resend_api_key.clone(), config.email_from.clone())
             {
                 (
@@ -400,6 +445,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
     };
 
     Ok(Router::new()
+        .route("/assets/ledgerflow-mark.svg", get(brand_mark_svg))
         .route("/", get(homepage))
         .route("/pricing", get(pricing))
         .route("/auth", get(auth_page))
@@ -445,6 +491,14 @@ async fn health(State(state): State<WebState>) -> Html<String> {
         state.email_delivery_mode,
         state.email_delivery_ready
     ))
+}
+
+async fn brand_mark_svg() -> Response {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        brand_mark_svg_source(),
+    )
+        .into_response()
 }
 
 async fn homepage(State(state): State<WebState>, headers: HeaderMap) -> Result<Html<String>, WebError> {
@@ -1427,12 +1481,13 @@ fn render_marketing_page(title: &str, user: Option<&AppUser>, content: String) -
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{}</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
     <style>{}</style>
   </head>
   <body class="marketing">
     <div class="shell">
       <header class="topbar">
-        <a class="brand" href="/">LedgerFlow</a>
+        <a class="brand" href="/">{}</a>
         <nav class="navlinks">
           <a href="/">Home</a>
           <a href="/pricing">Pricing</a>
@@ -1445,6 +1500,7 @@ fn render_marketing_page(title: &str, user: Option<&AppUser>, content: String) -
 </html>"#,
         escape_html(title),
         shared_styles(),
+        brand_wordmark_html(),
         if user.is_some() {
             "<a class=\"cta ghost\" href=\"/app/clusters\">Dashboard</a>".to_owned()
         } else {
@@ -1617,7 +1673,7 @@ fn render_email_delivery_notice(email_delivery_mode: &str, email_delivery_ready:
         );
     }
     format!(
-        "<div class=\"notice warning\">Verification email delivery is in <strong>{}</strong> mode. Codes will be written to server logs unless you configure `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_RESEND_API_KEY` or force `LEDGERFLOW_EMAIL_DELIVERY_MODE=resend`.</div>",
+        "<div class=\"notice warning\">Verification email delivery is in <strong>{}</strong> mode. Codes will be written to server logs unless you configure `LEDGERFLOW_EMAIL_FROM` plus either `LEDGERFLOW_POSTMARK_SERVER_TOKEN` or `LEDGERFLOW_RESEND_API_KEY`, or force a real delivery mode explicitly.</div>",
         escape_html(email_delivery_mode)
     )
 }
@@ -1774,12 +1830,13 @@ fn render_dashboard_page(
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>LedgerFlow Dashboard</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
     <style>{}</style>
   </head>
   <body class="dashboard-body">
     <div class="dashboard-shell">
       <aside class="sidebar">
-        <a class="brand" href="/">LedgerFlow</a>
+        <a class="brand" href="/">{}</a>
         <div class="user-card">
           <span class="eyebrow">Signed in</span>
           <strong>{}</strong>
@@ -1832,6 +1889,7 @@ fn render_dashboard_page(
   </body>
 </html>"#,
         shared_styles(),
+        brand_wordmark_html(),
         escape_html(&user.email),
         DEFAULT_PRICE_ETH,
         active_class(tab, DashboardTab::Clusters),
@@ -2860,6 +2918,27 @@ fn render_error_block(message: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+fn brand_wordmark_html() -> String {
+    format!(
+        r#"<span class="brand-lockup"><span class="brand-mark">{}</span><span class="brand-text">LedgerFlow</span></span>"#,
+        brand_mark_svg_source()
+    )
+}
+
+fn brand_mark_svg_source() -> &'static str {
+    r##"<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" role="img">
+  <defs>
+    <linearGradient id="ledgerflowGradient" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0d6e63"/>
+      <stop offset="1" stop-color="#c55f0c"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="52" height="52" rx="16" fill="url(#ledgerflowGradient)"/>
+  <path d="M21 20H43V27H29V31H41V38H29V44H21V20Z" fill="#fffaf3"/>
+  <path d="M31 20H43V27H39V44H31V20Z" fill="#f3dfc8" opacity="0.92"/>
+</svg>"##
+}
+
 fn truncate_middle(value: &str, keep: usize) -> String {
     if value.len() <= keep * 2 {
         return value.to_owned();
@@ -2895,6 +2974,10 @@ a { color: inherit; text-decoration: none; }
 .shell, .dashboard-shell { width: min(1240px, calc(100vw - 40px)); margin: 0 auto; }
 .topbar { display: flex; justify-content: space-between; align-items: center; padding: 28px 0 16px; }
 .brand { font-size: 1.4rem; font-weight: 700; }
+.brand-lockup { display: inline-flex; align-items: center; gap: 10px; }
+.brand-mark { width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; }
+.brand-mark svg { width: 34px; height: 34px; display: block; }
+.brand-text { display: inline-block; }
 .navlinks { display: flex; gap: 12px; align-items: center; }
 .cta { display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; border: 1px solid transparent; padding: 11px 16px; font-weight: 700; }
 .cta.primary { background: var(--accent); color: white; }
