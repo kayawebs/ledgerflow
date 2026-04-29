@@ -2911,6 +2911,7 @@ a { color: inherit; text-decoration: none; }
 .hero-actions, .button-row { display: flex; gap: 12px; flex-wrap: wrap; }
 .feature-grid, .pricing-grid, .auth-grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .feature-card, .pricing-card, .auth-card { padding: 22px; }
+.auth-card { display: grid; gap: 14px; align-content: start; }
 .pricing-banner { margin: 30px 0 48px; padding: 22px; border: 1px solid var(--line); border-radius: 24px; background: linear-gradient(135deg, rgba(13,110,99,.08), rgba(197,95,12,.08)); display: flex; justify-content: space-between; gap: 16px; align-items: center; }
 .auth-shell, .verify-shell { display: grid; gap: 24px; padding: 40px 0; }
 .auth-card.narrow { max-width: 420px; }
