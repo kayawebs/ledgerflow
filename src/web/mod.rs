@@ -255,6 +255,7 @@ struct UpdateClusterForm {
 struct RunTxForm {
     chain_id: u64,
     tx_hash: String,
+    mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1300,14 +1301,10 @@ async fn run_tx_analysis(
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
-    let load_path = format!(
-        "/analyses/{}?chain_id={}",
-        form.tx_hash.trim(),
-        form.chain_id
-    );
-    let result = match api_get_json::<AnalysisEnvelope>(&state, &load_path).await {
-        Ok(payload) => Ok(serde_json::to_value(payload).unwrap_or_default()),
-        Err(_) => api_post_json::<_, AnalysisEnvelope>(
+    let mode = form.mode.as_deref().unwrap_or("analyze");
+    let load_path = format!("/analyses/{}?chain_id={}", form.tx_hash.trim(), form.chain_id);
+    let result = if mode == "reanalyze" {
+        api_post_json::<_, AnalysisEnvelope>(
             &state,
             "/analyses/tx",
             &AnalyzeTxRequest {
@@ -1316,7 +1313,21 @@ async fn run_tx_analysis(
             },
         )
         .await
-        .map(|payload| serde_json::to_value(payload).unwrap_or_default()),
+        .map(|payload| serde_json::to_value(payload).unwrap_or_default())
+    } else {
+        match api_get_json::<AnalysisEnvelope>(&state, &load_path).await {
+            Ok(payload) => Ok(serde_json::to_value(payload).unwrap_or_default()),
+            Err(_) => api_post_json::<_, AnalysisEnvelope>(
+                &state,
+                "/analyses/tx",
+                &AnalyzeTxRequest {
+                    chain_id: form.chain_id,
+                    tx_hash: form.tx_hash.clone(),
+                },
+            )
+            .await
+            .map(|payload| serde_json::to_value(payload).unwrap_or_default()),
+        }
     };
 
     let query = DashboardQuery {
@@ -2302,7 +2313,8 @@ fn render_dashboard_page(
       <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
       <label>Transaction hash<input type="text" name="tx_hash" placeholder="0x..." required></label>
       <div class="button-row">
-        <button class="cta secondary" type="submit">Analyze transaction</button>
+        <button class="cta secondary" type="submit" name="mode" value="analyze">Analyze transaction</button>
+        <button class="cta ghost" type="submit" name="mode" value="reanalyze">Reanalyze</button>
       </div>
     </form>
     {}
@@ -2313,7 +2325,7 @@ fn render_dashboard_page(
         tx_result
             .map(render_tx_analysis_result)
             .unwrap_or_else(|| {
-                "<div class=\"empty-state\">Enter one tx hash to load the saved result if it already exists, or run a fresh analysis if it does not.</div>".to_owned()
+                "<div class=\"empty-state\">Enter one tx hash to load the saved result if it already exists. Use Reanalyze when you want LedgerFlow to fetch evidence again and rerun the recognizers.</div>".to_owned()
             })
     );
     let cluster_discovery_panel = render_cluster_discovery_panel(discovery_result, discovery_query);
