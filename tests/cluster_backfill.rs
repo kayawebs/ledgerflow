@@ -495,6 +495,97 @@ async fn incremental_watch_enqueues_follow_up_range_after_initial_backfill() {
 }
 
 #[tokio::test]
+async fn incremental_watch_skips_empty_ranges_without_creating_noise_runs() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository.clone(),
+        vec!["selector_presence".to_owned(), "native_transfer".to_owned()],
+    ));
+    let tx_source = MutableClusterTxSource::new(
+        50,
+        HashMap::from([(
+            "0x1111111111111111111111111111111111111111".to_owned(),
+            vec![AddressTxRef {
+                address: "0x1111111111111111111111111111111111111111".to_owned(),
+                tx_hash: "0xwatch-a".to_owned(),
+                block_number: 40,
+                tx_index: 0,
+                direction: AddressHitDirection::From,
+                from_address: None,
+                to_address: None,
+            }],
+        )]),
+    );
+    let backfill_service = ClusterBackfillService::new(
+        Arc::clone(&analysis_service),
+        Some(Arc::new(tx_source.clone())),
+        100,
+        4,
+    );
+    let cluster_service = ClusterService::new(repository.clone());
+    let tracking_service = ClusterTrackingService::new(repository.clone());
+
+    let cluster = cluster_service
+        .create_cluster(
+            8453,
+            "ops_team",
+            "watch_cluster",
+            None,
+            vec![ClusterAddress {
+                address: "0x1111111111111111111111111111111111111111".to_owned(),
+                label: Some("bot".to_owned()),
+                role: Some("bot".to_owned()),
+                metadata: json!({}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    backfill_service
+        .backfill_cluster(
+            cluster.cluster_id,
+            ClusterBackfillRequest {
+                start_block: Some(0),
+                end_block: Some(50),
+                force_reanalyze: false,
+                query_limit: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    tracking_service
+        .enable_tracking(cluster.cluster_id)
+        .await
+        .unwrap();
+
+    tx_source.update_last_indexed_block(62);
+
+    let enqueued = backfill_service.enqueue_incremental_runs().await.unwrap();
+    assert_eq!(enqueued, 0);
+
+    let runs = backfill_service
+        .list_cluster_backfill_runs(cluster.cluster_id)
+        .await
+        .unwrap();
+    assert_eq!(runs.len(), 1);
+
+    let tracking = tracking_service
+        .get_tracking_state(cluster.cluster_id)
+        .await
+        .unwrap();
+    assert_eq!(tracking.last_processed_block, Some(62));
+    assert_eq!(tracking.status, ClusterTrackingStatus::Active);
+    assert_eq!(tracking.metadata["source"], "cluster_watch_probe");
+}
+
+#[tokio::test]
 async fn tracking_state_and_classified_transactions_are_written() {
     let repository = Arc::new(InMemoryAnalysisRepository::default());
     let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);

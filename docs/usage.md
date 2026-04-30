@@ -46,7 +46,7 @@ LedgerFlow reads configuration from environment variables.
 | `LEDGERFLOW_TRACE_ENABLED` | Enables trace fetch attempts | `false` |
 | `LEDGERFLOW_CLUSTER_BACKFILL_QUERY_LIMIT` | Per-request limit used when analysis reads tx refs from the indexer | `10000` |
 | `LEDGERFLOW_CLUSTER_AUTO_BACKFILL_ON_CREATE` | Start a background historical backfill immediately after cluster creation | `true` |
-| `LEDGERFLOW_CLUSTER_BACKFILL_WORKER_POLL_INTERVAL_MS` | Poll interval for the standalone backfill worker | `5000` |
+| `LEDGERFLOW_CLUSTER_BACKFILL_WORKER_POLL_INTERVAL_MS` | Poll interval for the standalone backfill worker | `120000` |
 | `LEDGERFLOW_ENABLED_RECOGNIZERS` | Comma-separated recognizer ids to run by default | `selector_presence,erc20_transfer_flow,...` |
 | `LEDGERFLOW_PLUGINS` | Comma-separated plugin packs to load | `sample_builtin_pack` |
 | `LEDGERFLOW_WEB_BIND_ADDR` | Web process bind address | `127.0.0.1:3001` for host runs, `0.0.0.0:3000` in Docker |

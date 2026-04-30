@@ -257,6 +257,28 @@ impl ClusterBackfillService {
                 continue;
             }
 
+            let mut tx_map = BTreeMap::<String, AddressTxRef>::new();
+            let mut warnings = Vec::new();
+            for address in &cluster.addresses {
+                self.collect_refs_for_range(
+                    tx_source.as_ref(),
+                    cluster.chain_id,
+                    &address.address,
+                    start_block,
+                    last_indexed_block,
+                    self.default_query_limit.max(1),
+                    &mut tx_map,
+                    &mut warnings,
+                )
+                .await?;
+            }
+
+            if tx_map.is_empty() {
+                self.sync_tracking_state_no_hits(&tracking, &cluster, last_indexed_block)
+                    .await?;
+                continue;
+            }
+
             self.enqueue_cluster(
                 cluster.cluster_id,
                 ClusterBackfillRequest {
@@ -271,6 +293,33 @@ impl ClusterBackfillService {
         }
 
         Ok(enqueued)
+    }
+
+    async fn sync_tracking_state_no_hits(
+        &self,
+        tracking: &ClusterTrackingState,
+        cluster: &crate::domain::entities::AddressCluster,
+        last_processed_block: u64,
+    ) -> LedgerResult<()> {
+        let repository = &self.analysis_service.repository;
+        let now = Utc::now();
+        let state = ClusterTrackingState {
+            cluster_id: tracking.cluster_id,
+            chain_id: cluster.chain_id,
+            status: tracking.status.clone(),
+            last_processed_block: Some(last_processed_block),
+            last_processed_at: Some(now),
+            last_updated_at: Some(now),
+            error_message: None,
+            tracked_address_count: cluster.addresses.len() as u32,
+            created_at: tracking.created_at,
+            updated_at: now,
+            metadata: json!({
+                "source": "cluster_watch_probe",
+                "result": "no_new_transactions",
+            }),
+        };
+        repository.upsert_cluster_tracking_state(&state).await
     }
 
     async fn sync_tracking_state_success(
