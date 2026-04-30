@@ -1077,6 +1077,7 @@ async fn cluster_status(
         cluster_id,
         query.start.as_deref(),
         query.end.as_deref(),
+        &ClusterAnalysisTab::from_query(query.cluster_tab.as_deref()),
     )
     .await?;
     Ok(Json(payload).into_response())
@@ -1437,6 +1438,7 @@ async fn render_dashboard_response(
                     cluster.cluster_id,
                     query.start.as_deref(),
                     query.end.as_deref(),
+                    &cluster_analysis_tab,
                 )
                 .await
                 {
@@ -1482,7 +1484,9 @@ async fn render_dashboard_response(
             )
         };
 
-    let classified_page = if tab == DashboardTab::ClusterAnalysis {
+    let classified_page = if tab == DashboardTab::ClusterAnalysis
+        && cluster_analysis_tab == ClusterAnalysisTab::Activity
+    {
         if let Some(cluster) = selected_cluster.as_ref() {
             let mut params = vec![
                 format!("page={}", classified_query.page),
@@ -1561,7 +1565,9 @@ async fn load_cluster_live_response(
     cluster_id: Uuid,
     start: Option<&str>,
     end: Option<&str>,
+    selected_tab: &ClusterAnalysisTab,
 ) -> Result<ClusterLiveResponse, WebError> {
+    let coverage_path = format!("/clusters/{}/coverage", cluster_id);
     let summary_path = match (start, end) {
         (None, None) => format!("/clusters/{}/spend-summary", cluster_id),
         _ => {
@@ -1575,27 +1581,44 @@ async fn load_cluster_live_response(
             format!("/clusters/{}/spend-summary?{}", cluster_id, params.join("&"))
         }
     };
-    let tracking_path = format!("/clusters/{}/tracking", cluster_id);
-    let coverage_path = format!("/clusters/{}/coverage", cluster_id);
-    let metrics_path = format!("/clusters/{}/metrics", cluster_id);
-    let alerts_path = format!("/clusters/{}/alerts?include_read=false&limit=12", cluster_id);
-    let tracking_fut = api_get_json::<ClusterTrackingState>(state, &tracking_path);
-    let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
-    let spend_summary_fut = api_get_json::<ClusterSpendSummary>(state, &summary_path);
-    let metrics_fut = api_get_json::<Vec<ClusterMetricsSnapshot>>(state, &metrics_path);
-    let alerts_fut = api_get_json::<Vec<ClusterAlert>>(state, &alerts_path);
-    let (tracking, coverage, spend_summary, metrics, alerts) = tokio::join!(
-        tracking_fut,
-        coverage_fut,
-        spend_summary_fut,
-        metrics_fut,
-        alerts_fut
-    );
-    let tracking = tracking.ok();
-    let coverage = coverage.ok();
-    let spend_summary = spend_summary.ok();
-    let metrics = metrics.unwrap_or_default();
-    let alerts = alerts.unwrap_or_default();
+    let (coverage, tracking, spend_summary, metrics, alerts) = match selected_tab {
+        ClusterAnalysisTab::Overview => {
+            let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+            let tracking_path = format!("/clusters/{}/tracking", cluster_id);
+            let alerts_path = format!("/clusters/{}/alerts?include_read=false&limit=12", cluster_id);
+            let tracking_fut = api_get_json::<ClusterTrackingState>(state, &tracking_path);
+            let alerts_fut = api_get_json::<Vec<ClusterAlert>>(state, &alerts_path);
+            let (coverage, tracking, alerts) = tokio::join!(coverage_fut, tracking_fut, alerts_fut);
+            (
+                coverage.ok(),
+                tracking.ok(),
+                None,
+                Vec::new(),
+                alerts.unwrap_or_default(),
+            )
+        }
+        ClusterAnalysisTab::Metrics => {
+            let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+            let summary_fut = api_get_json::<ClusterSpendSummary>(state, &summary_path);
+            let metrics_path = format!("/clusters/{}/metrics", cluster_id);
+            let metrics_fut = api_get_json::<Vec<ClusterMetricsSnapshot>>(state, &metrics_path);
+            let (coverage, spend_summary, metrics) = tokio::join!(coverage_fut, summary_fut, metrics_fut);
+            (
+                coverage.ok(),
+                None,
+                spend_summary.ok(),
+                metrics.unwrap_or_default(),
+                Vec::new(),
+            )
+        }
+        ClusterAnalysisTab::Activity => (
+            api_get_json::<ClusterCoverage>(state, &coverage_path).await.ok(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
     let (status_label, status_tone) = derive_cluster_status(coverage.as_ref());
     Ok(ClusterLiveResponse {
         status_label,
@@ -2215,6 +2238,59 @@ fn render_dashboard_page(
         } else {
             ""
         };
+        let overview_href = cluster_analysis_tab_href(
+            cluster.cluster_id,
+            start,
+            end,
+            ClusterAnalysisTab::Overview,
+        );
+        let metrics_href = cluster_analysis_tab_href(
+            cluster.cluster_id,
+            start,
+            end,
+            ClusterAnalysisTab::Metrics,
+        );
+        let activity_href = cluster_analysis_tab_href(
+            cluster.cluster_id,
+            start,
+            end,
+            ClusterAnalysisTab::Activity,
+        );
+        let tab_panel = match cluster_analysis_tab {
+            ClusterAnalysisTab::Overview => format!(
+                r#"<section class="cluster-tab-panel active" data-cluster-tab-panel="overview">
+      <h3>Tracking</h3>
+      <div id="cluster-live-tracking">{}</div>
+      <h3>Coverage</h3>
+      <div id="cluster-live-coverage">{}</div>
+      <h3>Alerts</h3>
+      <div id="cluster-live-alerts">{}</div>
+    </section>"#,
+                render_tracking_status_panel(cluster, tracking),
+                render_cluster_coverage_cards(coverage),
+                render_cluster_alerts_panel(cluster, alerts),
+            ),
+            ClusterAnalysisTab::Metrics => format!(
+                r#"<section class="cluster-tab-panel active" data-cluster-tab-panel="metrics">
+      <h3>Rolling metrics</h3>
+      <div id="cluster-live-metrics">{}</div>
+      <h3>Behavior breakdown</h3>
+      <div id="cluster-live-behavior">{}</div>
+      <h3>Spend summary</h3>
+      <div id="cluster-live-summary">{}</div>
+    </section>"#,
+                render_cluster_metrics_panel(metrics),
+                render_behavior_breakdown_panel(metrics),
+                render_cluster_summary_panel(spend_summary),
+            ),
+            ClusterAnalysisTab::Activity => format!(
+                r#"<section class="cluster-tab-panel active" data-cluster-tab-panel="activity">
+      <h3>Recent classified transactions</h3>
+      <div id="cluster-live-classified">{}</div>
+    </section>"#,
+                render_recent_classified_transactions_panel(cluster, classified_page, classified_query),
+            ),
+        };
         format!(
             r#"
 <section class="panel">
@@ -2230,30 +2306,11 @@ fn render_dashboard_page(
     <div id="cluster-live-root" data-cluster-id="{}" data-start="{}" data-end="{}"></div>
     <div id="cluster-live-status" class="notice {}">{}</div>
     <div class="cluster-tabbar" role="tablist" aria-label="Cluster analysis sections">
-      <button class="cluster-tab {}" type="button" data-cluster-tab-target="overview">Overview</button>
-      <button class="cluster-tab {}" type="button" data-cluster-tab-target="metrics">Metrics</button>
-      <button class="cluster-tab {}" type="button" data-cluster-tab-target="activity">Activity</button>
+      <a class="cluster-tab {}" href="{}">Overview</a>
+      <a class="cluster-tab {}" href="{}">Metrics</a>
+      <a class="cluster-tab {}" href="{}">Activity</a>
     </div>
-    <section class="cluster-tab-panel {}" data-cluster-tab-panel="overview">
-      <h3>Tracking</h3>
-      <div id="cluster-live-tracking">{}</div>
-      <h3>Coverage</h3>
-      <div id="cluster-live-coverage">{}</div>
-      <h3>Alerts</h3>
-      <div id="cluster-live-alerts">{}</div>
-    </section>
-    <section class="cluster-tab-panel {}" data-cluster-tab-panel="metrics">
-      <h3>Rolling metrics</h3>
-      <div id="cluster-live-metrics">{}</div>
-      <h3>Behavior breakdown</h3>
-      <div id="cluster-live-behavior">{}</div>
-      <h3>Spend summary</h3>
-      <div id="cluster-live-summary">{}</div>
-    </section>
-    <section class="cluster-tab-panel {}" data-cluster-tab-panel="activity">
-      <h3>Recent classified transactions</h3>
-      <div id="cluster-live-classified">{}</div>
-    </section>
+    {}
   </div>
 </section>
 "#,
@@ -2269,18 +2326,12 @@ fn render_dashboard_page(
             escape_html(status_tone),
             escape_html(status_label),
             overview_active,
+            overview_href,
             metrics_active,
+            metrics_href,
             activity_active,
-            overview_active,
-            render_tracking_status_panel(cluster, tracking),
-            render_cluster_coverage_cards(coverage),
-            render_cluster_alerts_panel(cluster, alerts),
-            metrics_active,
-            render_cluster_metrics_panel(metrics),
-            render_behavior_breakdown_panel(metrics),
-            render_cluster_summary_panel(spend_summary),
-            activity_active,
-            render_recent_classified_transactions_panel(cluster, classified_page, classified_query),
+            activity_href,
+            tab_panel,
         )
     } else {
         "<section class=\"panel\"><div class=\"panel-body\"><div class=\"empty-state\">Select or create a cluster to view analysis.</div></div></section>".to_owned()
@@ -3088,6 +3139,22 @@ fn classified_page_href(cluster_id: Uuid, query: &ClusterTxTableState, page: u32
     format!("/app/clusters/{cluster_id}?{}", params.join("&"))
 }
 
+fn cluster_analysis_tab_href(
+    cluster_id: Uuid,
+    start: Option<&str>,
+    end: Option<&str>,
+    tab: ClusterAnalysisTab,
+) -> String {
+    let mut params = vec![format!("cluster_tab={}", tab.as_str())];
+    if let Some(start) = start.filter(|value| !value.is_empty()) {
+        params.push(format!("start={}", urlencoding::encode(start)));
+    }
+    if let Some(end) = end.filter(|value| !value.is_empty()) {
+        params.push(format!("end={}", urlencoding::encode(end)));
+    }
+    format!("/app/clusters/{cluster_id}?{}", params.join("&"))
+}
+
 fn format_wei_compact(raw: &str) -> String {
     let Ok(value) = raw.trim().parse::<f64>() else {
         return raw.to_owned();
@@ -3392,27 +3459,7 @@ fn render_cluster_autorefresh_script(
   const coverageNode = document.getElementById("cluster-live-coverage");
   const alertsNode = document.getElementById("cluster-live-alerts");
   const summaryNode = document.getElementById("cluster-live-summary");
-  if (!clusterId || !statusNode || !trackingNode || !metricsNode || !behaviorNode || !coverageNode || !alertsNode || !summaryNode) return;
-  const tabButtons = Array.from(document.querySelectorAll("[data-cluster-tab-target]"));
-  const tabPanels = Array.from(document.querySelectorAll("[data-cluster-tab-panel]"));
-
-  const activateClusterTab = (nextTab) => {{
-    const target = ["overview", "metrics", "activity"].includes(nextTab) ? nextTab : "overview";
-    tabButtons.forEach((button) => {{
-      button.classList.toggle("active", button.dataset.clusterTabTarget === target);
-    }});
-    tabPanels.forEach((panel) => {{
-      panel.classList.toggle("active", panel.dataset.clusterTabPanel === target);
-    }});
-    const url = new URL(window.location.href);
-    url.searchParams.set("cluster_tab", target);
-    window.history.replaceState({{}}, "", url.toString());
-  }};
-
-  tabButtons.forEach((button) => {{
-    button.addEventListener("click", () => activateClusterTab(button.dataset.clusterTabTarget || "overview"));
-  }});
-  activateClusterTab(initialClusterTab);
+  if (!clusterId || !statusNode) return;
 
   const escapeHtml = (value) => String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -3608,17 +3655,30 @@ fn render_cluster_autorefresh_script(
   const renderState = (payload) => {{
     statusNode.className = `notice ${{payload.status_tone || "info"}}`;
     statusNode.textContent = payload.status_label || "Waiting for first historical sync";
-    trackingNode.innerHTML = renderTracking(payload.tracking);
-    metricsNode.innerHTML = renderMetrics(payload.metrics || []);
-    behaviorNode.innerHTML = renderBehavior(payload.metrics || []);
-    coverageNode.innerHTML = renderCoverage(payload.coverage);
-    alertsNode.innerHTML = renderAlerts(payload.alerts || []);
-    summaryNode.innerHTML = renderSummary(payload.spend_summary);
+    if (trackingNode && initialClusterTab === "overview") {{
+      trackingNode.innerHTML = renderTracking(payload.tracking);
+    }}
+    if (coverageNode && initialClusterTab === "overview") {{
+      coverageNode.innerHTML = renderCoverage(payload.coverage);
+    }}
+    if (alertsNode && initialClusterTab === "overview") {{
+      alertsNode.innerHTML = renderAlerts(payload.alerts || []);
+    }}
+    if (metricsNode && initialClusterTab === "metrics") {{
+      metricsNode.innerHTML = renderMetrics(payload.metrics || []);
+    }}
+    if (behaviorNode && initialClusterTab === "metrics") {{
+      behaviorNode.innerHTML = renderBehavior(payload.metrics || []);
+    }}
+    if (summaryNode && initialClusterTab === "metrics") {{
+      summaryNode.innerHTML = renderSummary(payload.spend_summary);
+    }}
   }};
 
   const fetchState = async () => {{
     const url = new URL("/app/clusters/status", window.location.origin);
     url.searchParams.set("cluster_id", clusterId);
+    url.searchParams.set("cluster_tab", initialClusterTab);
     if (start) url.searchParams.set("start", start);
     if (end) url.searchParams.set("end", end);
     const response = await fetch(url, {{ credentials: "same-origin" }});
