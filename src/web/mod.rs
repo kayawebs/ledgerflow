@@ -352,7 +352,6 @@ struct ClusterTxTableState {
 struct ClusterDiscoveryQuery {
     address: Option<String>,
     max_hops: Option<u8>,
-    per_address_limit: Option<u32>,
     notice: Option<String>,
 }
 
@@ -857,13 +856,11 @@ async fn cluster_discovery_page(
     };
     let (payload, error) = if let Some(address) = query.address.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         let max_hops = query.max_hops.unwrap_or(1).clamp(1, 3);
-        let per_address_limit = query.per_address_limit.unwrap_or(100).clamp(1, 250);
         let path = format!(
-            "/discovery/cluster?chain_id={}&seed_address={}&max_hops={}&per_address_limit={}",
+            "/discovery/cluster?chain_id={}&seed_address={}&max_hops={}",
             state.default_chain_id,
             urlencoding::encode(address),
-            max_hops,
-            per_address_limit
+            max_hops
         );
         match api_get_json::<ClusterDiscoveryResponse>(&state, &path).await {
             Ok(payload) => (Some(payload), None),
@@ -2509,9 +2506,6 @@ fn render_cluster_discovery_panel(
         .and_then(|value| value.address.as_deref())
         .unwrap_or_default();
     let max_hops = discovery_query.and_then(|value| value.max_hops).unwrap_or(1);
-    let per_address_limit = discovery_query
-        .and_then(|value| value.per_address_limit)
-        .unwrap_or(100);
     let result_panel = discovery_result
         .map(|payload| {
             let warnings = if payload.warnings.is_empty() {
@@ -2602,7 +2596,7 @@ fn render_cluster_discovery_panel(
             )
         })
         .unwrap_or_else(|| {
-            "<div class=\"empty-state\">Enter one Base address, choose 1 to 3 hops, and LedgerFlow will use the indexer discovery layer plus Base RPC to build a first-pass top-level connection graph.</div>".to_owned()
+            "<div class=\"empty-state\">Enter one Base address, choose 1 to 3 hops, and LedgerFlow will scan indexed top-level history in both directions to build a first-pass connection graph.</div>".to_owned()
         });
 
     format!(
@@ -2610,7 +2604,7 @@ fn render_cluster_discovery_panel(
 <section class="panel">
   <div class="panel-head"><h2>Cluster discovery</h2><span class="badge">top-level graph</span></div>
   <div class="panel-body">
-    <p class="panel-copy">This feature explores one-hop to three-hop top-level address connectivity from a seed Base address. It uses indexer tx refs to find candidate transactions, then resolves top-level counterparties through RPC and labels them as EOA or contract via <code>eth_getCode</code>.</p>
+    <p class="panel-copy">This feature explores one-hop to three-hop top-level address connectivity from a seed Base address. It scans indexed history for both incoming and outgoing top-level links, then labels counterparties as EOA or contract via <code>eth_getCode</code>.</p>
     <form class="stack-form" method="get" action="/app/cluster-discovery">
       <label>Seed address<input type="text" name="address" value="{}" placeholder="0x..." required></label>
       <div class="split-fields">
@@ -2621,9 +2615,8 @@ fn render_cluster_discovery_panel(
             <option value="3" {}>3 hops</option>
           </select>
         </label>
-        <label>Per-address tx ref limit<input type="number" name="per_address_limit" value="{}" min="1" max="250"></label>
       </div>
-      <div class="field-hint">This is intentionally top-level only for now. It is fast enough for operator exploration, but not a substitute for trace-based fund-flow attribution.</div>
+      <div class="field-hint">This is intentionally top-level only for now. It scans indexed history rather than sampling a fixed number of tx refs, but it is still not a substitute for trace-based fund-flow attribution.</div>
       <div class="button-row">
         <button class="cta secondary" type="submit">Discover connected addresses</button>
         <a class="cta ghost" href="/app/indexer/address-lookup">Open raw indexer lookup</a>
@@ -2637,7 +2630,6 @@ fn render_cluster_discovery_panel(
         if max_hops == 1 { "selected" } else { "" },
         if max_hops == 2 { "selected" } else { "" },
         if max_hops == 3 { "selected" } else { "" },
-        per_address_limit,
         result_panel
     )
 }

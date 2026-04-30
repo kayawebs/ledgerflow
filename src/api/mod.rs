@@ -121,7 +121,6 @@ pub struct ClusterDiscoveryQuery {
     pub chain_id: Option<u64>,
     pub seed_address: String,
     pub max_hops: Option<u8>,
-    pub per_address_limit: Option<u32>,
 }
 
 pub fn router(
@@ -307,7 +306,6 @@ async fn discover_cluster(
             chain_id: query.chain_id.unwrap_or(8453),
             seed_address: query.seed_address,
             max_hops: query.max_hops.unwrap_or(1),
-            per_address_limit: query.per_address_limit,
         })
         .await
         .map_err(ApiError::from)?;

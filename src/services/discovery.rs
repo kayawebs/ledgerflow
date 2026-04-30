@@ -11,9 +11,9 @@ use crate::{
     ingestion::rpc::RpcClient,
 };
 
-const DEFAULT_PER_ADDRESS_LIMIT: u32 = 100;
-const MAX_PER_ADDRESS_LIMIT: u32 = 250;
 const MAX_HOPS: u8 = 3;
+const DISCOVERY_BATCH_LIMIT: u32 = 10_000;
+const MAX_DISCOVERY_WINDOWS: usize = 5_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -28,7 +28,6 @@ pub struct ClusterDiscoveryRequest {
     pub chain_id: u64,
     pub seed_address: String,
     pub max_hops: u8,
-    pub per_address_limit: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,10 +78,6 @@ impl ClusterDiscoveryService {
     pub async fn discover(&self, request: ClusterDiscoveryRequest) -> LedgerResult<ClusterDiscoveryResponse> {
         let seed_address = normalize_address(&request.seed_address)?;
         let max_hops = request.max_hops.clamp(1, MAX_HOPS);
-        let per_address_limit = request
-            .per_address_limit
-            .unwrap_or(DEFAULT_PER_ADDRESS_LIMIT)
-            .clamp(1, MAX_PER_ADDRESS_LIMIT);
 
         let mut warnings = Vec::new();
         let mut frontier = VecDeque::from([(seed_address.clone(), 0u8)]);
@@ -111,21 +106,8 @@ impl ClusterDiscoveryService {
             }
 
             let refs = self
-                .tx_source
-                .query_address_refs(
-                    request.chain_id,
-                    &current_address,
-                    per_address_limit,
-                    None,
-                    None,
-                )
+                .collect_full_history_refs(request.chain_id, &current_address, &mut warnings)
                 .await?;
-            if refs.len() as u32 >= per_address_limit {
-                warnings.push(format!(
-                    "address {} hit the per-address tx ref limit {}, so the graph is truncated",
-                    current_address, per_address_limit
-                ));
-            }
 
             let mut unique_refs = BTreeMap::<String, AddressTxRef>::new();
             for tx_ref in refs {
@@ -238,6 +220,56 @@ impl ClusterDiscoveryService {
         };
         cache.insert(address.to_owned(), result.clone());
         result
+    }
+
+    async fn collect_full_history_refs(
+        &self,
+        chain_id: u64,
+        address: &str,
+        warnings: &mut Vec<String>,
+    ) -> LedgerResult<Vec<AddressTxRef>> {
+        let mut collected = Vec::new();
+        let mut seen_hashes = BTreeSet::<String>::new();
+        let mut to_block = None;
+        let mut windows = 0usize;
+
+        loop {
+            windows += 1;
+            if windows > MAX_DISCOVERY_WINDOWS {
+                warnings.push(format!(
+                    "address {} exceeded the discovery pagination safety cap, so results may be incomplete",
+                    address
+                ));
+                break;
+            }
+
+            let refs = self
+                .tx_source
+                .query_address_refs(chain_id, address, DISCOVERY_BATCH_LIMIT, None, to_block)
+                .await?;
+            if refs.is_empty() {
+                break;
+            }
+
+            let batch_len = refs.len();
+            let min_block = refs.iter().map(|tx_ref| tx_ref.block_number).min();
+            for tx_ref in refs {
+                if seen_hashes.insert(tx_ref.tx_hash.clone()) {
+                    collected.push(tx_ref);
+                }
+            }
+
+            if batch_len < DISCOVERY_BATCH_LIMIT as usize {
+                break;
+            }
+
+            let Some(next_to_block) = min_block.and_then(|value| value.checked_sub(1)) else {
+                break;
+            };
+            to_block = Some(next_to_block as u64);
+        }
+
+        Ok(collected)
     }
 }
 
