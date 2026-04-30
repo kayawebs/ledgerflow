@@ -1,5 +1,20 @@
 use std::env;
 
+const DEFAULT_ENABLED_RECOGNIZERS: &[&str] = &[
+    "selector_presence",
+    "failed_execution_classifier",
+    "erc20_transfer_flow",
+    "erc20_approval",
+    "native_transfer",
+    "batch_router_heuristic",
+    "swap_flow",
+    "approval_swap_scenario",
+    "bridge_like_transfer",
+    "deposit_withdraw_pattern",
+    "arbitrage_like_scenario",
+    "liquidation_like_scenario",
+];
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub env: String,
@@ -64,11 +79,8 @@ impl AppConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(8),
-            enabled_recognizers: parse_list(
-                &env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").unwrap_or_else(|_| {
-                    "selector_presence,failed_execution_classifier,erc20_transfer_flow,erc20_approval,native_transfer,batch_router_heuristic,swap_flow,approval_swap_scenario,bridge_like_transfer,deposit_withdraw_pattern,arbitrage_like_scenario,liquidation_like_scenario"
-                        .to_owned()
-                }),
+            enabled_recognizers: parse_enabled_recognizers(
+                env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").ok().as_deref(),
             ),
             plugins: parse_list(&env::var("LEDGERFLOW_PLUGINS").unwrap_or_else(|_| "sample_builtin_pack".to_owned())),
         }
@@ -82,4 +94,19 @@ fn parse_list(input: &str) -> Vec<String> {
         .filter(|item| !item.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn parse_enabled_recognizers(input: Option<&str>) -> Vec<String> {
+    let mut recognizers = DEFAULT_ENABLED_RECOGNIZERS
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    if let Some(input) = input {
+        for recognizer_id in parse_list(input) {
+            if !recognizers.iter().any(|existing| existing == &recognizer_id) {
+                recognizers.push(recognizer_id);
+            }
+        }
+    }
+    recognizers
 }
