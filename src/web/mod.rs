@@ -30,6 +30,7 @@ use crate::{
             ResendVerificationSender, VerificationSender, verification_purpose_from_str,
             verification_purpose_to_str,
         },
+        discovery::ClusterDiscoveryResponse,
         portal::{DashboardClusterRecord, PortalService},
     },
 };
@@ -300,10 +301,19 @@ struct ClusterLiveResponse {
     classified_transactions: Vec<ClassifiedTransaction>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct ClusterDiscoveryQuery {
+    address: Option<String>,
+    max_hops: Option<u8>,
+    per_address_limit: Option<u32>,
+    notice: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashboardTab {
     Clusters,
     ClusterAnalysis,
+    ClusterDiscovery,
     TxAnalysis,
     ClusterGraph,
     IndexerProgress,
@@ -314,6 +324,7 @@ fn section_title(tab: &DashboardTab) -> &'static str {
     match tab {
         DashboardTab::Clusters => "Cluster management",
         DashboardTab::ClusterAnalysis => "Cluster analysis",
+        DashboardTab::ClusterDiscovery => "Cluster discovery",
         DashboardTab::TxAnalysis => "Single tx analysis",
         DashboardTab::ClusterGraph => "Cluster graph",
         DashboardTab::IndexerProgress => "Indexer progress",
@@ -325,6 +336,7 @@ impl DashboardTab {
     fn from_query(value: Option<&str>) -> Self {
         match value {
             Some("cluster-analysis") => Self::ClusterAnalysis,
+            Some("cluster-discovery") => Self::ClusterDiscovery,
             Some("tx-analysis") => Self::TxAnalysis,
             Some("cluster-graph") => Self::ClusterGraph,
             Some("indexer-progress") => Self::IndexerProgress,
@@ -457,6 +469,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/clusters", get(clusters_page))
         .route("/app/clusters/status", get(cluster_status))
         .route("/app/clusters/{cluster_id}", get(cluster_analysis_page))
+        .route("/app/cluster-discovery", get(cluster_discovery_page))
         .route("/app/clusters/create", post(create_cluster))
         .route(
             "/app/clusters/{cluster_id}/tracking/enable",
@@ -670,6 +683,7 @@ async fn dashboard(
                 "/app/clusters".to_owned()
             }
         }
+        DashboardTab::ClusterDiscovery => "/app/cluster-discovery".to_owned(),
         DashboardTab::TxAnalysis => "/app/tx-analysis".to_owned(),
         DashboardTab::ClusterGraph => "/app/cluster-graph".to_owned(),
         DashboardTab::IndexerProgress => "/app/indexer/progress".to_owned(),
@@ -704,6 +718,8 @@ async fn clusters_page(
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -731,6 +747,53 @@ async fn cluster_analysis_page(
         None,
         None,
         None,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn cluster_discovery_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<ClusterDiscoveryQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let (payload, error) = if let Some(address) = query.address.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        let max_hops = query.max_hops.unwrap_or(1).clamp(1, 3);
+        let per_address_limit = query.per_address_limit.unwrap_or(100).clamp(1, 250);
+        let path = format!(
+            "/discovery/cluster?chain_id={}&seed_address={}&max_hops={}&per_address_limit={}",
+            state.default_chain_id,
+            urlencoding::encode(address),
+            max_hops,
+            per_address_limit
+        );
+        match api_get_json::<ClusterDiscoveryResponse>(&state, &path).await {
+            Ok(payload) => (Some(payload), None),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    render_dashboard_response(
+        &state,
+        user,
+        DashboardQuery {
+            tab: Some("cluster-discovery".to_owned()),
+            cluster_id: None,
+            start: None,
+            end: None,
+            notice: query.notice.clone(),
+        },
+        None,
+        error,
+        None,
+        None,
+        payload,
+        Some(query),
     )
     .await
 }
@@ -753,6 +816,8 @@ async fn tx_analysis_page(
             end: None,
             notice: query.notice,
         },
+        None,
+        None,
         None,
         None,
         None,
@@ -783,6 +848,8 @@ async fn cluster_graph_page(
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -805,6 +872,8 @@ async fn indexer_progress_page(
             end: None,
             notice: query.notice,
         },
+        None,
+        None,
         None,
         None,
         None,
@@ -844,6 +913,8 @@ async fn indexer_lookup_page(
         error,
         payload,
         Some(query),
+        None,
+        None,
     )
     .await
 }
@@ -915,7 +986,17 @@ async fn create_cluster(
                 end: None,
                 notice: None,
             };
-            render_dashboard_response(&state, user, query, None, Some(err.to_string()), None, None)
+            render_dashboard_response(
+                &state,
+                user,
+                query,
+                None,
+                Some(err.to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
                 .await
         }
     }
@@ -1051,11 +1132,32 @@ async fn run_tx_analysis(
     };
     match result {
         Ok(payload) => {
-            render_dashboard_response(&state, user, query, Some(payload), None, None, None).await
+            render_dashboard_response(
+                &state,
+                user,
+                query,
+                Some(payload),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         }
         Err(err) => {
-            render_dashboard_response(&state, user, query, None, Some(err.to_string()), None, None)
-                .await
+            render_dashboard_response(
+                &state,
+                user,
+                query,
+                None,
+                Some(err.to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         }
     }
 }
@@ -1068,6 +1170,8 @@ async fn render_dashboard_response(
     error: Option<String>,
     indexer_lookup: Option<IndexerAddressRefsPayload>,
     indexer_query: Option<IndexerLookupQuery>,
+    discovery_result: Option<ClusterDiscoveryResponse>,
+    discovery_query: Option<ClusterDiscoveryQuery>,
 ) -> Result<Response, WebError> {
     let tab = DashboardTab::from_query(query.tab.as_deref());
     let clusters = state
@@ -1178,6 +1282,8 @@ async fn render_dashboard_response(
         &classified_transactions,
         cluster_status.as_ref(),
         tx_result.as_ref(),
+        discovery_result.as_ref(),
+        discovery_query.as_ref(),
         indexer_progress.as_ref(),
         indexer_lookup.as_ref(),
         indexer_query.as_ref(),
@@ -1695,6 +1801,8 @@ fn render_dashboard_page(
     classified_transactions: &[ClassifiedTransaction],
     cluster_status: Option<&(String, String)>,
     tx_result: Option<&serde_json::Value>,
+    discovery_result: Option<&ClusterDiscoveryResponse>,
+    discovery_query: Option<&ClusterDiscoveryQuery>,
     indexer_progress: Option<&IndexerProgressPayload>,
     indexer_lookup: Option<&IndexerAddressRefsPayload>,
     indexer_query: Option<&IndexerLookupQuery>,
@@ -1818,6 +1926,7 @@ fn render_dashboard_page(
                 "<div class=\"empty-state\">Run one analyze / load / replay action to inspect a transaction.</div>".to_owned()
             })
     );
+    let cluster_discovery_panel = render_cluster_discovery_panel(discovery_result, discovery_query);
 
     let graph_panel = render_cluster_graph_panel(clusters);
     let indexer_progress_panel = render_indexer_progress_panel(indexer_progress);
@@ -1845,6 +1954,7 @@ fn render_dashboard_page(
         <nav class="side-nav">
           <a class="{}" href="/app/clusters">Cluster management</a>
           <a class="{}" href="{}">Cluster analysis</a>
+          <a class="{}" href="/app/cluster-discovery">Cluster discovery</a>
           <a class="{}" href="/app/cluster-graph">Cluster graph</a>
           <a class="{}" href="/app/tx-analysis">Single tx analysis</a>
           <a class="{}" href="/app/indexer/progress">Indexer progress</a>
@@ -1873,7 +1983,7 @@ fn render_dashboard_page(
               <div class="panel-body cluster-list">{}</div>
             </section>
             <section class="panel">
-              <div class="panel-head"><h2>Pricing</h2><span class="badge">beta</span></div>
+              <div class="panel-head"><h2>Pricing</h2></div>
               <div class="panel-body">
                 <div class="price-card">
                   <strong>{} ETH / month</strong>
@@ -1897,6 +2007,7 @@ fn render_dashboard_page(
         selected_cluster
             .map(|cluster| format!("/app/clusters/{}", cluster.cluster_id))
             .unwrap_or_else(|| "/app/clusters".to_owned()),
+        active_class(tab, DashboardTab::ClusterDiscovery),
         active_class(tab, DashboardTab::ClusterGraph),
         active_class(tab, DashboardTab::TxAnalysis),
         active_class(tab, DashboardTab::IndexerProgress),
@@ -1907,6 +2018,7 @@ fn render_dashboard_page(
         match tab {
             DashboardTab::Clusters => render_cluster_management_panel(state.default_chain_id),
             DashboardTab::ClusterAnalysis => cluster_analysis_panel,
+            DashboardTab::ClusterDiscovery => cluster_discovery_panel,
             DashboardTab::TxAnalysis => tx_panel,
             DashboardTab::ClusterGraph => graph_panel,
             DashboardTab::IndexerProgress => indexer_progress_panel,
@@ -1939,6 +2051,147 @@ fn render_cluster_management_panel(default_chain_id: u64) -> String {
 </section>
 "#,
         default_chain_id
+    )
+}
+
+fn render_cluster_discovery_panel(
+    discovery_result: Option<&ClusterDiscoveryResponse>,
+    discovery_query: Option<&ClusterDiscoveryQuery>,
+) -> String {
+    let address = discovery_query
+        .and_then(|value| value.address.as_deref())
+        .unwrap_or_default();
+    let max_hops = discovery_query.and_then(|value| value.max_hops).unwrap_or(1);
+    let per_address_limit = discovery_query
+        .and_then(|value| value.per_address_limit)
+        .unwrap_or(100);
+    let result_panel = discovery_result
+        .map(|payload| {
+            let warnings = if payload.warnings.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<div class=\"notice warning\">{}</div>",
+                    escape_html(&payload.warnings.join(" | "))
+                )
+            };
+            format!(
+                r#"
+{}<div class="stats-grid">
+  <div class="stat"><span>Seed</span><strong><code>{}</code></strong></div>
+  <div class="stat"><span>Max hops</span><strong>{}</strong></div>
+  <div class="stat"><span>Nodes</span><strong>{}</strong></div>
+  <div class="stat"><span>Edges</span><strong>{}</strong></div>
+</div>
+<div class="split-panels">
+  <div class="table-shell">
+    <table>
+      <thead>
+        <tr>
+          <th>Address</th>
+          <th>Type</th>
+          <th>First hop</th>
+          <th>Inbound</th>
+          <th>Outbound</th>
+        </tr>
+      </thead>
+      <tbody>{}</tbody>
+    </table>
+  </div>
+  <div class="table-shell">
+    <table>
+      <thead>
+        <tr>
+          <th>From</th>
+          <th>To</th>
+          <th>Hop</th>
+          <th>Tx count</th>
+          <th>Blocks</th>
+        </tr>
+      </thead>
+      <tbody>{}</tbody>
+    </table>
+  </div>
+</div>
+"#,
+                warnings,
+                escape_html(&truncate_middle(&payload.seed_address, 8)),
+                payload.max_hops,
+                payload.total_nodes,
+                payload.total_edges,
+                payload
+                    .nodes
+                    .iter()
+                    .take(200)
+                    .map(|node| {
+                        format!(
+                            "<tr><td><code>{}</code></td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            escape_html(&truncate_middle(&node.address, 8)),
+                            node.address_type,
+                            node.first_seen_hop,
+                            node.inbound_edge_count,
+                            node.outbound_edge_count
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+                payload
+                    .edges
+                    .iter()
+                    .take(200)
+                    .map(|edge| {
+                        format!(
+                            "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{} - {}</td></tr>",
+                            escape_html(&truncate_middle(&edge.from_address, 8)),
+                            escape_html(&truncate_middle(&edge.to_address, 8)),
+                            edge.first_seen_hop,
+                            edge.tx_count,
+                            edge.min_block_number.map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned()),
+                            edge.max_block_number.map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            )
+        })
+        .unwrap_or_else(|| {
+            "<div class=\"empty-state\">Enter one Base address, choose 1 to 3 hops, and LedgerFlow will use the indexer discovery layer plus Base RPC to build a first-pass top-level connection graph.</div>".to_owned()
+        });
+
+    format!(
+        r#"
+<section class="panel">
+  <div class="panel-head"><h2>Cluster discovery</h2><span class="badge">top-level graph</span></div>
+  <div class="panel-body">
+    <p class="panel-copy">This feature explores one-hop to three-hop top-level address connectivity from a seed Base address. It uses indexer tx refs to find candidate transactions, then resolves top-level counterparties through RPC and labels them as EOA or contract via <code>eth_getCode</code>.</p>
+    <form class="stack-form" method="get" action="/app/cluster-discovery">
+      <label>Seed address<input type="text" name="address" value="{}" placeholder="0x..." required></label>
+      <div class="split-fields">
+        <label>Max hops
+          <select name="max_hops">
+            <option value="1" {}>1 hop</option>
+            <option value="2" {}>2 hops</option>
+            <option value="3" {}>3 hops</option>
+          </select>
+        </label>
+        <label>Per-address tx ref limit<input type="number" name="per_address_limit" value="{}" min="1" max="250"></label>
+      </div>
+      <div class="field-hint">This is intentionally top-level only for now. It is fast enough for operator exploration, but not a substitute for trace-based fund-flow attribution.</div>
+      <div class="button-row">
+        <button class="cta secondary" type="submit">Discover connected addresses</button>
+        <a class="cta ghost" href="/app/indexer/address-lookup">Open raw indexer lookup</a>
+      </div>
+    </form>
+    {}
+  </div>
+</section>
+"#,
+        escape_html(address),
+        if max_hops == 1 { "selected" } else { "" },
+        if max_hops == 2 { "selected" } else { "" },
+        if max_hops == 3 { "selected" } else { "" },
+        per_address_limit,
+        result_panel
     )
 }
 
@@ -2260,6 +2513,22 @@ fn format_token_flow(tx: &ClassifiedTransaction) -> String {
     format!("{token_in} / {token_out}")
 }
 
+fn format_wei_compact(raw: &str) -> String {
+    let Ok(value) = raw.trim().parse::<f64>() else {
+        return raw.to_owned();
+    };
+    let eth = value / 1_000_000_000_000_000_000_f64;
+    if eth >= 1000.0 {
+        format!("{eth:.2} ETH")
+    } else if eth >= 1.0 {
+        format!("{eth:.4} ETH")
+    } else if eth > 0.0 {
+        format!("{eth:.6} ETH")
+    } else {
+        "0 ETH".to_owned()
+    }
+}
+
 fn render_indexer_progress_panel(progress: Option<&IndexerProgressPayload>) -> String {
     let body = progress
         .map(|progress| {
@@ -2502,9 +2771,9 @@ fn render_cluster_summary_panel(spend_summary: Option<&ClusterSpendSummary>) -> 
   </table>
 </div>"#,
                 summary.analyzed_tx_count,
-                escape_html(&summary.total_gas_cost_raw),
-                escape_html(&summary.total_external_native_outflow_raw),
-                escape_html(&summary.total_incoming_native_raw),
+                escape_html(&format_wei_compact(&summary.total_gas_cost_raw)),
+                escape_html(&format_wei_compact(&summary.total_external_native_outflow_raw)),
+                escape_html(&format_wei_compact(&summary.total_incoming_native_raw)),
                 if summary.transactions.is_empty() {
                     "<tr><td colspan=\"6\">No analyzed transactions in this window yet.</td></tr>"
                         .to_owned()
@@ -2623,6 +2892,15 @@ fn render_cluster_autorefresh_script(
   const formatUsd = (value) => value == null ? "n/a" : `$${{Number(value).toFixed(2)}}`;
   const formatPct = (value) => value == null ? "n/a" : `${{(Number(value) * 100).toFixed(2)}}%`;
   const formatTime = (value) => value ? String(value).replace("T", " ").replace("Z", " UTC") : "n/a";
+  const formatWeiCompact = (value) => {{
+    const numeric = Number(value ?? 0);
+    if (!Number.isFinite(numeric)) return String(value ?? "n/a");
+    const eth = numeric / 1e18;
+    if (eth >= 1000) return `${{eth.toFixed(2)}} ETH`;
+    if (eth >= 1) return `${{eth.toFixed(4)}} ETH`;
+    if (eth > 0) return `${{eth.toFixed(6)}} ETH`;
+    return "0 ETH";
+  }};
 
   const renderCoverage = (coverage) => {{
     if (!coverage) {{
@@ -2747,9 +3025,9 @@ fn render_cluster_autorefresh_script(
     return `
       <div class="stats-grid">
         <div class="stat"><span>Analyzed txs</span><strong>${{summary.analyzed_tx_count}}</strong></div>
-        <div class="stat"><span>Gas spent</span><strong>${{escapeHtml(summary.total_gas_cost_raw)}}</strong></div>
-        <div class="stat"><span>Native outflow</span><strong>${{escapeHtml(summary.total_external_native_outflow_raw)}}</strong></div>
-        <div class="stat"><span>Incoming native</span><strong>${{escapeHtml(summary.total_incoming_native_raw)}}</strong></div>
+        <div class="stat"><span>Gas spent</span><strong>${{escapeHtml(formatWeiCompact(summary.total_gas_cost_raw))}}</strong></div>
+        <div class="stat"><span>Native outflow</span><strong>${{escapeHtml(formatWeiCompact(summary.total_external_native_outflow_raw))}}</strong></div>
+        <div class="stat"><span>Incoming native</span><strong>${{escapeHtml(formatWeiCompact(summary.total_incoming_native_raw))}}</strong></div>
       </div>
       <div class="table-shell">
         <table>
@@ -3023,14 +3301,16 @@ textarea { min-height: 140px; resize: vertical; }
 .dashboard-grid { display: grid; grid-template-columns: 1.45fr .95fr; gap: 20px; }
 .main-column, .side-column { display: grid; gap: 20px; }
 .panel-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 18px 20px 8px; }
+.panel-head .badge { flex-shrink: 0; white-space: nowrap; }
 .panel-body { padding: 0 20px 20px; }
 .badge { padding: 6px 10px; border-radius: 999px; background: var(--cream); color: var(--muted); font-size: .82rem; }
 .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 14px 0 20px; }
 .stat { border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.78); padding: 14px; }
 .stat span { display: block; color: var(--muted); font-size: .82rem; text-transform: uppercase; letter-spacing: .08em; }
-.stat strong { display: block; margin-top: 8px; font-size: 1.1rem; }
+.stat strong { display: block; margin-top: 8px; font-size: 1.05rem; line-height: 1.3; overflow-wrap: anywhere; }
 .stack-form, .inline-form { display: grid; gap: 12px; }
 .split-fields { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.split-panels { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
 .inline-form { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); align-items: end; margin-bottom: 12px; }
 .cluster-list { display: grid; gap: 12px; }
 .cluster-card { display: grid; gap: 6px; padding: 16px; }

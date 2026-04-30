@@ -24,6 +24,7 @@ use crate::services::cluster_backfill::{
     ClusterBackfillService,
 };
 use crate::services::cluster_tracking::ClusterTrackingService;
+use crate::services::discovery::{ClusterDiscoveryRequest, ClusterDiscoveryResponse, ClusterDiscoveryService};
 use crate::services::metrics::ClusterMetricsService;
 
 #[derive(Clone)]
@@ -34,6 +35,7 @@ pub struct ApiState {
     pub tracking_service: Arc<ClusterTrackingService>,
     pub metrics_service: Arc<ClusterMetricsService>,
     pub alert_service: Arc<ClusterAlertService>,
+    pub discovery_service: Option<Arc<ClusterDiscoveryService>>,
     pub auto_backfill_on_cluster_create: bool,
 }
 
@@ -105,9 +107,18 @@ pub struct ClusterAlertsQuery {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ClusterDiscoveryQuery {
+    pub chain_id: Option<u64>,
+    pub seed_address: String,
+    pub max_hops: Option<u8>,
+    pub per_address_limit: Option<u32>,
+}
+
 pub fn router(
     service: Arc<AnalysisService>,
     backfill_service: Arc<ClusterBackfillService>,
+    discovery_service: Option<Arc<ClusterDiscoveryService>>,
     auto_backfill_on_cluster_create: bool,
 ) -> Router {
     let cluster_service = Arc::new(ClusterService::new(service.repository.clone()));
@@ -121,6 +132,7 @@ pub fn router(
         .route("/evidence-packs/{pack_id}", get(get_evidence_pack))
         .route("/recognizers", get(list_recognizers))
         .route("/replay/tx", post(replay_tx))
+        .route("/discovery/cluster", get(discover_cluster))
         .route("/clusters", post(create_cluster))
         .route(
             "/clusters/{cluster_id}/spend-summary",
@@ -158,6 +170,7 @@ pub fn router(
             tracking_service,
             metrics_service,
             alert_service,
+            discovery_service,
             auto_backfill_on_cluster_create,
         })
 }
@@ -266,6 +279,27 @@ async fn replay_tx(
         analysis,
         evidence_pack,
     }))
+}
+
+async fn discover_cluster(
+    State(state): State<ApiState>,
+    Query(query): Query<ClusterDiscoveryQuery>,
+) -> Result<Json<ClusterDiscoveryResponse>, ApiError> {
+    let Some(discovery_service) = state.discovery_service.as_ref() else {
+        return Err(ApiError::conflict(
+            "cluster discovery requires a configured indexer api".to_owned(),
+        ));
+    };
+    let payload = discovery_service
+        .discover(ClusterDiscoveryRequest {
+            chain_id: query.chain_id.unwrap_or(8453),
+            seed_address: query.seed_address,
+            max_hops: query.max_hops.unwrap_or(1),
+            per_address_limit: query.per_address_limit,
+        })
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(payload))
 }
 
 async fn create_cluster(

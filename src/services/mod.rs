@@ -5,6 +5,7 @@ pub mod behavior;
 pub mod cluster;
 pub mod cluster_backfill;
 pub mod cluster_tracking;
+pub mod discovery;
 pub mod indexer_client;
 pub mod metrics;
 pub mod portal;

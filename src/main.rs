@@ -10,7 +10,7 @@ use ledgerflow::{
     repositories::sqlx::SqlxAnalysisRepository,
     services::{
         analysis::AnalysisService, cluster_backfill::ClusterBackfillService,
-        indexer_client::IndexerHttpClient,
+        discovery::ClusterDiscoveryService, indexer_client::IndexerHttpClient,
     },
 };
 use std::sync::Arc as StdArc;
@@ -32,7 +32,7 @@ async fn main() {
         .expect("migrations should succeed");
 
     let rpc_client = StdArc::new(HttpRpcClient::new(config.rpc_url.clone()));
-    let fetcher = TransactionBundleFetcher::new(rpc_client, config.trace_enabled);
+    let fetcher = TransactionBundleFetcher::new(rpc_client.clone(), config.trace_enabled);
     let service = Arc::new(AnalysisService::new(
         fetcher,
         registry,
@@ -46,6 +46,9 @@ async fn main() {
             config.indexer_api_bearer_token.clone(),
         )) as Arc<dyn ClusterTxSource>
     });
+    let discovery_service = tx_source
+        .clone()
+        .map(|source| Arc::new(ClusterDiscoveryService::new(source, rpc_client)));
     let backfill_service = Arc::new(ClusterBackfillService::new(
         Arc::clone(&service),
         tx_source,
@@ -61,6 +64,7 @@ async fn main() {
         api::router(
             service,
             backfill_service,
+            discovery_service,
             config.cluster_auto_backfill_on_create,
         ),
     )
