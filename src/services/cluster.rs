@@ -76,6 +76,56 @@ impl ClusterService {
         Ok(self.summarize_cluster(&cluster, &analyses, start, end, coverage))
     }
 
+    pub async fn get_cluster(&self, cluster_id: Uuid) -> LedgerResult<AddressCluster> {
+        self.repository
+            .get_cluster(cluster_id)
+            .await?
+            .ok_or_else(|| LedgerError::NotFound(format!("cluster {cluster_id} not found")))
+    }
+
+    pub async fn update_cluster(
+        &self,
+        cluster_id: Uuid,
+        chain_id: u64,
+        owner_label: &str,
+        name: &str,
+        description: Option<String>,
+        addresses: Vec<ClusterAddress>,
+    ) -> LedgerResult<AddressCluster> {
+        let existing = self
+            .repository
+            .get_cluster(cluster_id)
+            .await?
+            .ok_or_else(|| LedgerError::NotFound(format!("cluster {cluster_id} not found")))?;
+        if addresses.is_empty() {
+            return Err(LedgerError::AnalysisInvariant(
+                "cluster must contain at least one address".to_owned(),
+            ));
+        }
+        let cluster = AddressCluster {
+            cluster_id,
+            chain_id,
+            owner_label: owner_label.to_owned(),
+            name: name.to_owned(),
+            description,
+            addresses: normalize_addresses(addresses),
+            metadata: existing.metadata,
+        };
+        self.repository.create_cluster(&cluster).await?;
+        self.repository
+            .replace_cluster_addresses(cluster.cluster_id, &cluster.addresses)
+            .await?;
+        Ok(cluster)
+    }
+
+    pub async fn delete_cluster(&self, cluster_id: Uuid) -> LedgerResult<()> {
+        self.repository
+            .get_cluster(cluster_id)
+            .await?
+            .ok_or_else(|| LedgerError::NotFound(format!("cluster {cluster_id} not found")))?;
+        self.repository.delete_cluster(cluster_id).await
+    }
+
     fn summarize_cluster(
         &self,
         cluster: &AddressCluster,

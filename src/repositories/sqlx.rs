@@ -384,6 +384,15 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         Ok(())
     }
 
+    async fn delete_cluster(&self, cluster_id: Uuid) -> LedgerResult<()> {
+        sqlx::query("delete from address_clusters where cluster_id = $1")
+            .bind(cluster_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
     async fn get_cluster(&self, cluster_id: Uuid) -> LedgerResult<Option<AddressCluster>> {
         let cluster_row = sqlx::query(
             "select cluster_id, chain_id, owner_label, name, description, metadata from address_clusters where cluster_id = $1",

@@ -34,6 +34,7 @@ pub trait AnalysisRepository: Send + Sync {
         cluster_id: uuid::Uuid,
         addresses: &[ClusterAddress],
     ) -> LedgerResult<()>;
+    async fn delete_cluster(&self, cluster_id: uuid::Uuid) -> LedgerResult<()>;
     async fn get_cluster(&self, cluster_id: uuid::Uuid) -> LedgerResult<Option<AddressCluster>>;
     async fn list_clusters(&self) -> LedgerResult<Vec<AddressCluster>>;
     async fn list_analyses_for_cluster(

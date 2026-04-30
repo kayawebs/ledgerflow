@@ -108,6 +108,26 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
         Ok(())
     }
 
+    async fn delete_cluster(&self, cluster_id: Uuid) -> LedgerResult<()> {
+        self.clusters.write().await.remove(&cluster_id);
+        self.cluster_backfill_runs.write().await.remove(&cluster_id);
+        self.cluster_tracking_states.write().await.remove(&cluster_id);
+        self.cluster_metrics_snapshots
+            .write()
+            .await
+            .remove(&cluster_id);
+        self.cluster_alerts.write().await.remove(&cluster_id);
+        self.cluster_discovered_txs
+            .write()
+            .await
+            .retain(|(stored_cluster_id, _), _| *stored_cluster_id != cluster_id);
+        self.classified_transactions
+            .write()
+            .await
+            .retain(|(stored_cluster_id, _), _| *stored_cluster_id != cluster_id);
+        Ok(())
+    }
+
     async fn get_cluster(&self, cluster_id: Uuid) -> LedgerResult<Option<AddressCluster>> {
         Ok(self.clusters.read().await.get(&cluster_id).cloned())
     }

@@ -68,6 +68,15 @@ pub struct CreateClusterRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct UpdateClusterRequest {
+    pub chain_id: u64,
+    pub owner_label: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub addresses: Vec<ClusterAddressInput>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ClusterAddressInput {
     pub address: String,
     pub label: Option<String>,
@@ -134,6 +143,9 @@ pub fn router(
         .route("/replay/tx", post(replay_tx))
         .route("/discovery/cluster", get(discover_cluster))
         .route("/clusters", post(create_cluster))
+        .route("/clusters/{cluster_id}", get(get_cluster))
+        .route("/clusters/{cluster_id}/update", post(update_cluster))
+        .route("/clusters/{cluster_id}/delete", post(delete_cluster))
         .route(
             "/clusters/{cluster_id}/spend-summary",
             get(get_cluster_spend_summary),
@@ -342,6 +354,66 @@ async fn create_cluster(
             .map_err(ApiError::from)?;
     }
     Ok(Json(cluster))
+}
+
+async fn get_cluster(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Json<AddressCluster>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let cluster = state
+        .cluster_service
+        .get_cluster(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(cluster))
+}
+
+async fn update_cluster(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+    Json(request): Json<UpdateClusterRequest>,
+) -> Result<Json<AddressCluster>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let addresses = request
+        .addresses
+        .into_iter()
+        .map(|entry| ClusterAddress {
+            address: entry.address,
+            label: entry.label,
+            role: entry.role,
+            metadata: json!({}),
+        })
+        .collect();
+    let cluster = state
+        .cluster_service
+        .update_cluster(
+            cluster_id,
+            request.chain_id,
+            &request.owner_label,
+            &request.name,
+            request.description,
+            addresses,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(cluster))
+}
+
+async fn delete_cluster(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    state
+        .cluster_service
+        .delete_cluster(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "status": "deleted" })))
 }
 
 async fn get_cluster_spend_summary(

@@ -195,6 +195,12 @@ struct PageNoticeQuery {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+struct ClustersPageQuery {
+    notice: Option<String>,
+    cluster_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct ClusterDetailQuery {
     start: Option<String>,
     end: Option<String>,
@@ -217,6 +223,15 @@ struct VerifyCodeForm {
 
 #[derive(Debug, Deserialize)]
 struct CreateClusterForm {
+    chain_id: u64,
+    owner_label: String,
+    name: String,
+    description: Option<String>,
+    addresses: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateClusterForm {
     chain_id: u64,
     owner_label: String,
     name: String,
@@ -500,6 +515,8 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/clusters/{cluster_id}", get(cluster_analysis_page))
         .route("/app/cluster-discovery", get(cluster_discovery_page))
         .route("/app/clusters/create", post(create_cluster))
+        .route("/app/clusters/{cluster_id}/update", post(update_cluster))
+        .route("/app/clusters/{cluster_id}/delete", post(delete_cluster))
         .route(
             "/app/clusters/{cluster_id}/tracking/enable",
             post(enable_cluster_tracking),
@@ -728,22 +745,27 @@ async fn app_home() -> Response {
 async fn clusters_page(
     State(state): State<WebState>,
     headers: HeaderMap,
-    Query(query): Query<PageNoticeQuery>,
+    Query(query): Query<ClustersPageQuery>,
 ) -> Result<Response, WebError> {
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
+    if let Some(cluster_id) = query.cluster_id.as_deref() {
+        ensure_user_owns_cluster(&state, user.user_id, cluster_id).await?;
+    }
+    let editable_cluster = load_editable_cluster(&state, query.cluster_id.as_deref()).await?;
     render_dashboard_response(
         &state,
         user,
         DashboardQuery {
             tab: Some("clusters".to_owned()),
-            cluster_id: None,
+            cluster_id: query.cluster_id.clone(),
             start: None,
             end: None,
             cluster_tab: None,
             notice: query.notice,
         },
+        editable_cluster.as_ref(),
         None,
         None,
         None,
@@ -774,6 +796,7 @@ async fn cluster_analysis_page(
             cluster_tab: query.cluster_tab,
             notice: query.notice,
         },
+        None,
         None,
         None,
         None,
@@ -821,6 +844,7 @@ async fn cluster_discovery_page(
             notice: query.notice.clone(),
         },
         None,
+        None,
         error,
         None,
         None,
@@ -849,6 +873,7 @@ async fn tx_analysis_page(
             cluster_tab: None,
             notice: query.notice,
         },
+        None,
         None,
         None,
         None,
@@ -884,6 +909,7 @@ async fn cluster_graph_page(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -907,6 +933,7 @@ async fn indexer_progress_page(
             cluster_tab: None,
             notice: query.notice,
         },
+        None,
         None,
         None,
         None,
@@ -945,6 +972,7 @@ async fn indexer_lookup_page(
             cluster_tab: None,
             notice: query.notice.clone(),
         },
+        None,
         None,
         error,
         payload,
@@ -1028,6 +1056,7 @@ async fn create_cluster(
                 user,
                 query,
                 None,
+                None,
                 Some(err.to_string()),
                 None,
                 None,
@@ -1036,6 +1065,85 @@ async fn create_cluster(
             )
                 .await
         }
+    }
+}
+
+async fn update_cluster(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(cluster_id): Path<String>,
+    Form(form): Form<UpdateClusterForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    ensure_user_owns_cluster(&state, user.user_id, &cluster_id).await?;
+    let addresses = parse_cluster_addresses(&form.addresses)?;
+    let request = CreateClusterRequest {
+        chain_id: form.chain_id,
+        owner_label: form.owner_label,
+        name: form.name,
+        description: form.description.filter(|value| !value.trim().is_empty()),
+        addresses,
+    };
+    match api_post_json::<_, AddressCluster>(
+        &state,
+        &format!("/clusters/{cluster_id}/update"),
+        &request,
+    )
+    .await
+    {
+        Ok(cluster) => Ok(redirect_response(&format!(
+            "/app/clusters?cluster_id={}&notice=cluster-updated",
+            cluster.cluster_id
+        ))),
+        Err(err) => {
+            let editable_cluster = load_editable_cluster(&state, Some(&cluster_id)).await?;
+            render_dashboard_response(
+                &state,
+                user,
+                DashboardQuery {
+                    tab: Some("clusters".to_owned()),
+                    cluster_id: Some(cluster_id),
+                    start: None,
+                    end: None,
+                    cluster_tab: None,
+                    notice: None,
+                },
+                editable_cluster.as_ref(),
+                None,
+                Some(err.to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+    }
+}
+
+async fn delete_cluster(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(cluster_id): Path<String>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    ensure_user_owns_cluster(&state, user.user_id, &cluster_id).await?;
+    match api_post_json::<_, serde_json::Value>(
+        &state,
+        &format!("/clusters/{cluster_id}/delete"),
+        &json!({}),
+    )
+    .await
+    {
+        Ok(_) => Ok(redirect_response("/app/clusters?notice=cluster-deleted")),
+        Err(err) => Ok(redirect_response(&format!(
+            "/app/clusters?cluster_id={cluster_id}&notice=cluster-delete-error&error={}",
+            urlencoding::encode(&err.to_string())
+        ))),
     }
 }
 
@@ -1174,6 +1282,7 @@ async fn run_tx_analysis(
                 &state,
                 user,
                 query,
+                None,
                 Some(payload),
                 None,
                 None,
@@ -1188,6 +1297,7 @@ async fn run_tx_analysis(
                 &state,
                 user,
                 query,
+                None,
                 None,
                 Some(err.to_string()),
                 None,
@@ -1204,6 +1314,7 @@ async fn render_dashboard_response(
     state: &WebState,
     user: AppUser,
     query: DashboardQuery,
+    editable_cluster: Option<&AddressCluster>,
     tx_result: Option<serde_json::Value>,
     error: Option<String>,
     indexer_lookup: Option<IndexerAddressRefsPayload>,
@@ -1311,6 +1422,7 @@ async fn render_dashboard_response(
         &tab,
         notice,
         &clusters,
+        editable_cluster,
         selected_cluster.as_ref(),
         tracking.as_ref(),
         coverage.as_ref(),
@@ -1401,6 +1513,42 @@ async fn load_cluster_live_response(
     })
 }
 
+async fn load_editable_cluster(
+    state: &WebState,
+    cluster_id: Option<&str>,
+) -> Result<Option<AddressCluster>, WebError> {
+    let Some(cluster_id) = cluster_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let cluster_id = Uuid::parse_str(cluster_id)
+        .map_err(|err| WebError::bad_request(format!("invalid cluster id: {err}")))?;
+    api_get_json::<AddressCluster>(state, &format!("/clusters/{cluster_id}"))
+        .await
+        .map(Some)
+}
+
+async fn ensure_user_owns_cluster(
+    state: &WebState,
+    user_id: Uuid,
+    cluster_id: &str,
+) -> Result<(), WebError> {
+    let cluster_id = Uuid::parse_str(cluster_id)
+        .map_err(|err| WebError::bad_request(format!("invalid cluster id: {err}")))?;
+    let allowed = state
+        .portal_service
+        .list_clusters_for_user(user_id)
+        .await?
+        .into_iter()
+        .any(|cluster| cluster.cluster_id == cluster_id);
+    if allowed {
+        Ok(())
+    } else {
+        Err(WebError::bad_request(
+            "cluster is not available for the current user".to_owned(),
+        ))
+    }
+}
+
 async fn current_user(state: &WebState, headers: &HeaderMap) -> Result<Option<AppUser>, WebError> {
     let Some(token) = session_token_from_headers(headers, &state.session_cookie_name) else {
         return Ok(None);
@@ -1434,6 +1582,24 @@ fn parse_cluster_addresses(raw: &str) -> LedgerResult<Vec<ClusterAddressInput>> 
         ));
     }
     Ok(addresses)
+}
+
+fn format_cluster_addresses(cluster: &AddressCluster) -> String {
+    cluster
+        .addresses
+        .iter()
+        .map(|address| {
+            let mut parts = vec![address.address.clone()];
+            if address.label.is_some() || address.role.is_some() {
+                parts.push(address.label.clone().unwrap_or_default());
+            }
+            if address.role.is_some() {
+                parts.push(address.role.clone().unwrap_or_default());
+            }
+            parts.join(",")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_recognizer_ids(raw: Option<&str>) -> Option<Vec<String>> {
@@ -1609,6 +1775,9 @@ fn render_notice_message(code: &str) -> Option<&'static str> {
         "signed-in" => Some("Signed in."),
         "logged-out" => Some("Signed out."),
         "cluster-created" => Some("Cluster created and queued for historical backfill."),
+        "cluster-updated" => Some("Cluster definition updated."),
+        "cluster-deleted" => Some("Cluster deleted."),
+        "cluster-delete-error" => Some("Cluster delete failed. Inspect the latest server response or logs."),
         "tracking-enabled" => Some("Cluster tracking enabled."),
         "tracking-paused" => Some("Cluster tracking paused."),
         "tracking-error" => Some("Tracking action failed. Inspect the latest cluster state or server logs."),
@@ -1831,6 +2000,7 @@ fn render_dashboard_page(
     tab: &DashboardTab,
     notice: Option<&str>,
     clusters: &[DashboardClusterRecord],
+    editable_cluster: Option<&AddressCluster>,
     selected_cluster: Option<&DashboardClusterRecord>,
     tracking: Option<&ClusterTrackingState>,
     coverage: Option<&ClusterCoverage>,
@@ -1858,16 +2028,26 @@ fn render_dashboard_page(
             .iter()
             .map(|cluster| {
                 format!(
-                    r#"<a class="cluster-card" href="/app/clusters/{}">
-<strong>{}</strong>
-<span>{}</span>
-<small>{} addresses · chain {}</small>
-</a>"#,
+                    r#"<article class="cluster-card">
+<a class="cluster-card-link" href="/app/clusters/{}">
+  <strong>{}</strong>
+  <span>{}</span>
+  <small>{} addresses · chain {}</small>
+</a>
+<div class="cluster-card-actions">
+  <a class="cta ghost tiny" href="/app/clusters?cluster_id={}">Edit</a>
+  <form method="post" action="/app/clusters/{}/delete" onsubmit="return confirm('Delete this cluster and its tracking history?');">
+    <button class="cta ghost tiny danger" type="submit">Delete</button>
+  </form>
+</div>
+</article>"#,
                     cluster.cluster_id,
                     escape_html(&cluster.name),
                     escape_html(cluster.description.as_deref().unwrap_or("No description")),
                     cluster.address_count,
-                    cluster.chain_id
+                    cluster.chain_id,
+                    cluster.cluster_id,
+                    cluster.cluster_id
                 )
             })
             .collect::<Vec<_>>()
@@ -2010,19 +2190,9 @@ fn render_dashboard_page(
         r#"<section class="panel">
               <div class="panel-head"><h2>Your clusters</h2><span class="badge">{}</span></div>
               <div class="panel-body cluster-list">{}</div>
-            </section>
-            <section class="panel">
-              <div class="panel-head"><h2>Pricing</h2></div>
-              <div class="panel-body">
-                <div class="price-card">
-                  <strong>{} ETH / month</strong>
-                  <span>Private beta override: free for now.</span>
-                </div>
-              </div>
             </section>"#,
         clusters.len(),
-        cluster_cards,
-        DEFAULT_PRICE_ETH
+        cluster_cards
     );
     let content_layout = if *tab == DashboardTab::ClusterAnalysis {
         format!(
@@ -2047,7 +2217,9 @@ fn render_dashboard_page(
           </div>
         </section>"#,
             match tab {
-                DashboardTab::Clusters => render_cluster_management_panel(state.default_chain_id),
+                DashboardTab::Clusters => {
+                    render_cluster_management_panel(state.default_chain_id, editable_cluster)
+                }
                 DashboardTab::ClusterAnalysis => cluster_analysis_panel.clone(),
                 DashboardTab::ClusterDiscovery => cluster_discovery_panel.clone(),
                 DashboardTab::TxAnalysis => tx_panel.clone(),
@@ -2128,26 +2300,70 @@ fn render_dashboard_page(
     )
 }
 
-fn render_cluster_management_panel(default_chain_id: u64) -> String {
+fn render_cluster_management_panel(
+    default_chain_id: u64,
+    editable_cluster: Option<&AddressCluster>,
+) -> String {
+    let is_editing = editable_cluster.is_some();
+    let cluster_id = editable_cluster.map(|cluster| cluster.cluster_id.to_string());
+    let chain_id = editable_cluster
+        .map(|cluster| cluster.chain_id)
+        .unwrap_or(default_chain_id);
+    let owner_label = editable_cluster
+        .map(|cluster| cluster.owner_label.as_str())
+        .unwrap_or_default();
+    let name = editable_cluster
+        .map(|cluster| cluster.name.as_str())
+        .unwrap_or_default();
+    let description = editable_cluster
+        .and_then(|cluster| cluster.description.as_deref())
+        .unwrap_or_default();
+    let addresses = editable_cluster
+        .map(format_cluster_addresses)
+        .unwrap_or_default();
+    let action = cluster_id
+        .as_ref()
+        .map(|cluster_id| format!("/app/clusters/{cluster_id}/update"))
+        .unwrap_or_else(|| "/app/clusters/create".to_owned());
     format!(
         r#"
 <section class="panel">
-  <div class="panel-head"><h2>Create cluster</h2><span class="badge">management</span></div>
+  <div class="panel-head"><h2>{}</h2><span class="badge">management</span></div>
   <div class="panel-body">
-    <p class="panel-copy">Create a cluster for one operator, wallet family, or bot set. As soon as creation succeeds, LedgerFlow queues a historical backfill job for the separate worker process.</p>
-    <form class="stack-form" method="post" action="/app/clusters/create">
+    <p class="panel-copy">{}</p>
+    <form class="stack-form" method="post" action="{}">
       <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
-      <label>Owner label<input type="text" name="owner_label" placeholder="ops_team" required></label>
-      <label>Cluster name<input type="text" name="name" placeholder="primary_searcher" required></label>
-      <label>Description<input type="text" name="description" placeholder="main bot + treasury EOAs"></label>
-      <label>Addresses<textarea name="addresses" placeholder="0x111...,bot-1,bot&#10;0x222...,treasury,eoa" required></textarea></label>
+      <label>Owner label<input type="text" name="owner_label" value="{}" placeholder="ops_team" required></label>
+      <label>Cluster name<input type="text" name="name" value="{}" placeholder="primary_searcher" required></label>
+      <label>Description<input type="text" name="description" value="{}" placeholder="main bot + treasury EOAs"></label>
+      <label>Addresses<textarea name="addresses" placeholder="0x111...,bot-1,bot&#10;0x222...,treasury,eoa" required>{}</textarea></label>
       <div class="field-hint">One record per line. Format: <code>address,label,role</code>. Only the address is required, so <code>0xabc...</code> or <code>0xabc...,bot-1</code> also works.</div>
-      <button class="cta primary" type="submit">Create cluster</button>
+      <div class="button-row">
+        <button class="cta primary" type="submit">{}</button>
+        {}
+      </div>
     </form>
   </div>
 </section>
 "#,
-        default_chain_id
+        if is_editing { "Edit cluster" } else { "Create cluster" },
+        if is_editing {
+            "Update the cluster definition in place. Existing analyses stay in the database, while future tracking and backfill runs use the edited address set."
+        } else {
+            "Create a cluster for one operator, wallet family, or bot set. As soon as creation succeeds, LedgerFlow queues a historical backfill job for the separate worker process."
+        },
+        action,
+        chain_id,
+        escape_html(owner_label),
+        escape_html(name),
+        escape_html(description),
+        escape_html(&addresses),
+        if is_editing { "Save cluster changes" } else { "Create cluster" },
+        if is_editing {
+            "<a class=\"cta ghost\" href=\"/app/clusters\">Cancel edit</a>".to_owned()
+        } else {
+            String::new()
+        }
     )
 }
 
@@ -2407,7 +2623,8 @@ fn render_cluster_metrics_panel(metrics: &[ClusterMetricsSnapshot]) -> String {
         .find(|item| matches!(item.window, crate::domain::enums::MetricsWindow::SevenDays));
 
     format!(
-        r#"<div class="stats-grid">
+        r#"<div class="field-hint">Rolling metrics are fixed windows for the MVP: <code>1h</code>, <code>24h</code>, and <code>7d</code>. The custom start/end fields above only affect the spend summary table below, not these rolling snapshots.</div>
+<div class="stats-grid">
   <div class="stat"><span>1h PnL / ROI</span><strong>{} / {}</strong></div>
   <div class="stat"><span>24h PnL / ROI</span><strong>{} / {}</strong></div>
   <div class="stat"><span>7d PnL / ROI</span><strong>{} / {}</strong></div>
@@ -2798,14 +3015,18 @@ fn derive_cluster_status(
             coverage.latest_run_status,
             Some(ClusterBackfillStatus::Pending | ClusterBackfillStatus::Running)
         ) {
-            return ("Backfill queued".to_owned(), "info".to_owned());
+            return if coverage.discovered_tx_count > 0 {
+                ("Incremental sync queued".to_owned(), "info".to_owned())
+            } else {
+                ("Waiting for first historical sync".to_owned(), "info".to_owned())
+            };
         }
     }
 
     if let Some(run) = runs.first() {
         return match run.status {
             ClusterBackfillStatus::Pending | ClusterBackfillStatus::Running => {
-                ("Backfill queued".to_owned(), "info".to_owned())
+                ("Incremental sync queued".to_owned(), "info".to_owned())
             }
             ClusterBackfillStatus::Partial => (
                 "Analysis completed with failures".to_owned(),
@@ -2818,14 +3039,15 @@ fn derive_cluster_status(
         };
     }
 
-    ("Waiting for discovery".to_owned(), "info".to_owned())
+    ("Waiting for first historical sync".to_owned(), "info".to_owned())
 }
 
 fn render_cluster_coverage_cards(coverage: Option<&ClusterCoverage>) -> String {
     coverage
         .map(|coverage| {
             format!(
-                r#"<div class="stats-grid">
+                r#"<div class="field-hint">Coverage is transaction-level, not block-level. <strong>Discovered</strong> means tx hashes found for this cluster, <strong>Analyzed</strong> means analysis rows already exist, <strong>Failed</strong> means analysis errored, and <strong>Pending</strong> means discovery happened but analysis has not finished yet.</div>
+<div class="stats-grid">
   <div class="stat"><span>Discovered</span><strong>{}</strong></div>
   <div class="stat"><span>Analyzed</span><strong>{}</strong></div>
   <div class="stat"><span>Failed</span><strong>{}</strong></div>
@@ -3028,6 +3250,7 @@ fn render_cluster_autorefresh_script(
       return '<div class="empty-state">Coverage is not available yet. The worker may still be discovering transactions.</div>';
     }}
     return `
+      <div class="field-hint">Coverage is transaction-level, not block-level. <strong>Discovered</strong> means tx hashes found for this cluster, <strong>Analyzed</strong> means saved analysis exists, <strong>Failed</strong> means analysis errored, and <strong>Pending</strong> means discovery happened but analysis has not finished yet.</div>
       <div class="stats-grid">
         <div class="stat"><span>Discovered</span><strong>${{coverage.discovered_tx_count}}</strong></div>
         <div class="stat"><span>Analyzed</span><strong>${{coverage.analyzed_tx_count}}</strong></div>
@@ -3079,6 +3302,7 @@ fn render_cluster_autorefresh_script(
     const twentyFourHours = byWindow.get("24h");
     const sevenDays = byWindow.get("7d");
     return `
+      <div class="field-hint">Rolling metrics are fixed windows for the MVP: <code>1h</code>, <code>24h</code>, and <code>7d</code>. The custom start/end fields above only affect the spend summary table, not these rolling snapshots.</div>
       <div class="stats-grid">
         <div class="stat"><span>1h PnL / ROI</span><strong>${{formatUsd(oneHour?.realized_pnl_usd)}} / ${{formatPct(oneHour?.roi)}}</strong></div>
         <div class="stat"><span>24h PnL / ROI</span><strong>${{formatUsd(twentyFourHours?.realized_pnl_usd)}} / ${{formatPct(twentyFourHours?.roi)}}</strong></div>
@@ -3381,9 +3605,11 @@ a { color: inherit; text-decoration: none; }
 .brand-text { display: inline-block; }
 .navlinks { display: flex; gap: 12px; align-items: center; }
 .cta { display: inline-flex; align-items: center; justify-content: center; border-radius: 999px; border: 1px solid transparent; padding: 11px 16px; font-weight: 700; }
+.cta.tiny { padding: 8px 12px; font-size: .9rem; }
 .cta.primary { background: var(--accent); color: white; }
 .cta.secondary { background: var(--cream); }
 .cta.ghost { background: transparent; border-color: var(--line); }
+.cta.danger { color: var(--accent-2); border-color: rgba(197,95,12,.28); }
 .hero { display: grid; grid-template-columns: 1.4fr 1fr; gap: 24px; padding: 28px 0 48px; align-items: center; }
 .hero h1, .pricing-card h1, .auth-copy h1, .verify-shell h1, .dashboard-hero h1 { font-size: clamp(2.2rem, 4vw, 4.2rem); line-height: .98; margin: 0 0 14px; }
 .hero p, .auth-copy p, .panel-copy, .dashboard-hero p { color: var(--muted); line-height: 1.6; }
@@ -3443,6 +3669,9 @@ textarea { min-height: 140px; resize: vertical; }
 .inline-form { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); align-items: end; margin-bottom: 12px; }
 .cluster-list { display: grid; gap: 12px; }
 .cluster-card { display: grid; gap: 6px; padding: 16px; min-width: 0; }
+.cluster-card-link { display: grid; gap: 6px; min-width: 0; }
+.cluster-card-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.cluster-card-actions form { margin: 0; }
 .cluster-card span, .cluster-card small { color: var(--muted); }
 .json-shell { margin: 0; padding: 16px; border-radius: 16px; background: #14110d; color: #f7f2ea; overflow: auto; font-size: 12px; line-height: 1.55; }
 .table-shell { overflow: auto; }
