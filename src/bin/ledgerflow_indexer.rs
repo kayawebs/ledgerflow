@@ -21,6 +21,11 @@ async fn main() {
         worker.run_worker_forever().await;
     });
 
+    let endpoint_backfill = service.clone();
+    tokio::spawn(async move {
+        endpoint_backfill.run_endpoint_backfill_until_caught_up().await;
+    });
+
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .expect("indexer bind should succeed");

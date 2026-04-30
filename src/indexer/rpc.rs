@@ -30,6 +30,10 @@ impl IndexerRpcClient {
         .await
     }
 
+    pub async fn get_transaction_by_hash(&self, tx_hash: &str) -> LedgerResult<Value> {
+        self.call("eth_getTransactionByHash", json!([tx_hash])).await
+    }
+
     async fn call(&self, method: &str, params: Value) -> LedgerResult<Value> {
         let response = self
             .client

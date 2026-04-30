@@ -40,12 +40,24 @@ impl ClickHouseClient {
               block_number UInt32,
               tx_index UInt32,
               direction Enum8('from' = 1, 'to' = 2),
+              from_address Nullable(String),
+              to_address Nullable(String),
               inserted_at DateTime DEFAULT now()
             )
             ENGINE = ReplacingMergeTree(inserted_at)
             PARTITION BY intDiv(block_number, 1000000)
             ORDER BY (chain_id, address, block_number, tx_index, direction, tx_hash)
             "#,
+            self.database
+        ))
+        .await?;
+        self.execute(&format!(
+            "ALTER TABLE {}.address_tx_refs ADD COLUMN IF NOT EXISTS from_address Nullable(String)",
+            self.database
+        ))
+        .await?;
+        self.execute(&format!(
+            "ALTER TABLE {}.address_tx_refs ADD COLUMN IF NOT EXISTS to_address Nullable(String)",
             self.database
         ))
         .await?;
@@ -144,7 +156,7 @@ impl ClickHouseClient {
         let payload = self
             .query_json(&format!(
                 r#"
-                SELECT chain_id, address, tx_hash, block_number, tx_index, direction
+                SELECT chain_id, address, tx_hash, block_number, tx_index, direction, from_address, to_address
                 FROM {}.address_tx_refs
                 WHERE {}
                 ORDER BY block_number DESC, tx_index DESC, direction ASC
@@ -206,6 +218,62 @@ impl ClickHouseClient {
                     .map(str::to_owned)
             })
             .collect())
+    }
+
+    pub async fn query_refs_missing_endpoints(
+        &self,
+        chain_id: u32,
+        limit: u32,
+    ) -> LedgerResult<Vec<AddressTxRef>> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT chain_id, address, tx_hash, block_number, tx_index, direction, from_address, to_address
+                FROM {}.address_tx_refs
+                WHERE chain_id = {}
+                  AND isNull(from_address)
+                ORDER BY block_number ASC, tx_index ASC, direction ASC, tx_hash ASC
+                LIMIT {}
+                FORMAT JSON
+                "#,
+                self.database, chain_id, limit
+            ))
+            .await?;
+        payload["data"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| {
+                serde_json::from_value(item)
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))
+            })
+            .collect()
+    }
+
+    pub async fn count_refs_missing_endpoints(&self, chain_id: u32) -> LedgerResult<u64> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT count() AS pending_rows
+                FROM {}.address_tx_refs
+                WHERE chain_id = {}
+                  AND isNull(from_address)
+                FORMAT JSON
+                "#,
+                self.database, chain_id
+            ))
+            .await?;
+        Ok(payload["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("pending_rows"))
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+            })
+            .unwrap_or(0))
     }
 
     async fn execute(&self, sql: &str) -> LedgerResult<()> {

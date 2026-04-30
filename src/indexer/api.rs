@@ -46,10 +46,16 @@ async fn progress(
     State(state): State<IndexerApiState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let progress = state.service.get_progress().await.map_err(ApiError::from)?;
+    let endpoint_backfill_pending_rows = state
+        .service
+        .get_endpoint_backfill_pending_rows()
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(json!({
         "chain_id": state.service.config.chain_id,
         "worker_id": state.service.config.worker_id,
         "last_indexed_block": progress,
+        "endpoint_backfill_pending_rows": endpoint_backfill_pending_rows,
     })))
 }
 

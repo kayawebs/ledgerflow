@@ -4,7 +4,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::{
     core::errors::{LedgerError, LedgerResult},
@@ -90,7 +89,6 @@ impl ClusterDiscoveryService {
         let mut expanded = BTreeSet::new();
         let mut nodes = BTreeMap::<String, ClusterDiscoveryNode>::new();
         let mut edges = BTreeMap::<(String, String), ClusterDiscoveryEdge>::new();
-        let mut tx_cache = BTreeMap::<String, TransactionEndpoints>::new();
         let mut code_cache = BTreeMap::<String, DiscoveredAddressType>::new();
 
         let seed_type = self
@@ -135,14 +133,18 @@ impl ClusterDiscoveryService {
             }
 
             for tx_ref in unique_refs.into_values() {
-                let Some(endpoints) = self
-                    .load_tx_endpoints(request.chain_id, &tx_ref.tx_hash, &mut tx_cache)
-                    .await?
+                let Some(from) = tx_ref
+                    .from_address
+                    .as_deref()
+                    .map(normalize_address_lossy)
                 else {
+                    warnings.push(format!(
+                        "tx {} is missing top-level from/to fields in the indexer result",
+                        tx_ref.tx_hash
+                    ));
                     continue;
                 };
-                let from = endpoints.from_address.clone();
-                let to = endpoints.to_address.clone();
+                let to = tx_ref.to_address.as_deref().map(normalize_address_lossy);
                 let Some(counterparty) = resolve_counterparty(&current_address, &from, to.as_deref())
                 else {
                     continue;
@@ -220,38 +222,6 @@ impl ClusterDiscoveryService {
         })
     }
 
-    async fn load_tx_endpoints(
-        &self,
-        chain_id: u64,
-        tx_hash: &str,
-        cache: &mut BTreeMap<String, TransactionEndpoints>,
-    ) -> LedgerResult<Option<TransactionEndpoints>> {
-        if let Some(cached) = cache.get(tx_hash) {
-            return Ok(Some(cached.clone()));
-        }
-        let payload = self.rpc_client.get_transaction(chain_id, tx_hash).await?;
-        if payload.is_null() {
-            return Ok(None);
-        }
-        let from_address = payload
-            .get("from")
-            .and_then(Value::as_str)
-            .map(normalize_address_lossy)
-            .ok_or_else(|| {
-                LedgerError::MalformedEvidence("eth_getTransactionByHash missing from".to_owned())
-            })?;
-        let to_address = payload
-            .get("to")
-            .and_then(Value::as_str)
-            .map(normalize_address_lossy);
-        let endpoints = TransactionEndpoints {
-            from_address,
-            to_address,
-        };
-        cache.insert(tx_hash.to_owned(), endpoints.clone());
-        Ok(Some(endpoints))
-    }
-
     async fn address_type(
         &self,
         chain_id: u64,
@@ -269,12 +239,6 @@ impl ClusterDiscoveryService {
         cache.insert(address.to_owned(), result.clone());
         result
     }
-}
-
-#[derive(Clone)]
-struct TransactionEndpoints {
-    from_address: String,
-    to_address: Option<String>,
 }
 
 fn resolve_counterparty(current_address: &str, from: &str, to: Option<&str>) -> Option<String> {

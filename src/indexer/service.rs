@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
@@ -51,9 +51,41 @@ impl IndexerService {
         }
     }
 
+    pub async fn run_endpoint_backfill_until_caught_up(&self) {
+        if !self.config.endpoint_backfill_enabled {
+            info!("indexer endpoint backfill disabled");
+            return;
+        }
+
+        loop {
+            match self.backfill_missing_endpoints_batch().await {
+                Ok(0) => {
+                    info!("indexer endpoint backfill complete");
+                    return;
+                }
+                Ok(processed) => {
+                    info!(processed_rows = processed, "indexer endpoint backfill batch");
+                    if self.config.rpc_request_delay_ms > 0 {
+                        sleep(Duration::from_millis(self.config.rpc_request_delay_ms)).await;
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "indexer endpoint backfill failed");
+                    sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+                }
+            }
+        }
+    }
+
     pub async fn get_progress(&self) -> LedgerResult<Option<u64>> {
         self.clickhouse
             .get_progress(self.config.chain_id, &self.config.worker_id)
+            .await
+    }
+
+    pub async fn get_endpoint_backfill_pending_rows(&self) -> LedgerResult<u64> {
+        self.clickhouse
+            .count_refs_missing_endpoints(self.config.chain_id)
             .await
     }
 
@@ -151,6 +183,44 @@ impl IndexerService {
         }
 
         Ok(())
+    }
+
+    async fn backfill_missing_endpoints_batch(&self) -> LedgerResult<usize> {
+        let refs = self
+            .clickhouse
+            .query_refs_missing_endpoints(
+                self.config.chain_id,
+                self.config.endpoint_backfill_batch_size.max(1),
+            )
+            .await?;
+        if refs.is_empty() {
+            return Ok(0);
+        }
+
+        let mut endpoint_cache = BTreeMap::<String, TransactionEndpoints>::new();
+        let mut updated_refs = Vec::with_capacity(refs.len());
+        for mut tx_ref in refs {
+            let endpoints = if let Some(cached) = endpoint_cache.get(&tx_ref.tx_hash) {
+                cached.clone()
+            } else {
+                let payload = self.rpc.get_transaction_by_hash(&tx_ref.tx_hash).await?;
+                if payload.is_null() {
+                    continue;
+                }
+                let endpoints = TransactionEndpoints::from_rpc_payload(&payload)?;
+                endpoint_cache.insert(tx_ref.tx_hash.clone(), endpoints.clone());
+                endpoints
+            };
+            tx_ref.from_address = Some(endpoints.from_address.clone());
+            tx_ref.to_address = endpoints.to_address.clone();
+            updated_refs.push(tx_ref);
+        }
+
+        if updated_refs.is_empty() {
+            return Ok(0);
+        }
+        self.clickhouse.insert_refs(&updated_refs).await?;
+        Ok(updated_refs.len())
     }
 
     async fn fetch_batch_refs(&self, start_block: u64, end_block: u64) -> LedgerResult<Vec<crate::indexer::models::AddressTxRef>> {
@@ -267,4 +337,34 @@ fn is_rate_limit_error(error: &LedgerError) -> bool {
 fn retry_delay_ms(base_ms: u64, max_ms: u64, attempt: u32) -> u64 {
     let multiplier = 1_u64.checked_shl(attempt.min(16)).unwrap_or(u64::MAX);
     base_ms.saturating_mul(multiplier).min(max_ms)
+}
+
+#[derive(Clone)]
+struct TransactionEndpoints {
+    from_address: String,
+    to_address: Option<String>,
+}
+
+impl TransactionEndpoints {
+    fn from_rpc_payload(payload: &serde_json::Value) -> LedgerResult<Self> {
+        let from_address = normalize_address(
+            payload
+                .get("from")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    LedgerError::MalformedEvidence(
+                        "eth_getTransactionByHash missing from".to_owned(),
+                    )
+                })?,
+        )?;
+        let to_address = payload
+            .get("to")
+            .and_then(serde_json::Value::as_str)
+            .map(normalize_address)
+            .transpose()?;
+        Ok(Self {
+            from_address,
+            to_address,
+        })
+    }
 }

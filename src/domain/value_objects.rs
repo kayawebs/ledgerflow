@@ -59,4 +59,6 @@ pub struct AddressTxRef {
     pub block_number: u64,
     pub tx_index: u32,
     pub direction: AddressHitDirection,
+    pub from_address: Option<String>,
+    pub to_address: Option<String>,
 }

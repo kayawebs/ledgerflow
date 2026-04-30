@@ -271,6 +271,8 @@ struct IndexerProgressPayload {
     chain_id: u64,
     worker_id: String,
     last_indexed_block: u64,
+    #[serde(default)]
+    endpoint_backfill_pending_rows: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2537,6 +2539,7 @@ fn render_indexer_progress_panel(progress: Option<&IndexerProgressPayload>) -> S
   <div class="stat"><span>Chain ID</span><strong>{}</strong></div>
   <div class="stat"><span>Worker ID</span><strong>{}</strong></div>
   <div class="stat"><span>Last indexed block</span><strong>{}</strong></div>
+  <div class="stat"><span>Pending from/to backfill rows</span><strong>{}</strong></div>
 </div>
 <div class="panel-copy">This portal keeps indexer and analysis separate. The indexer discovers address-level transaction references; the analysis stack consumes those references for cluster backfill, tx interpretation, and spend attribution.</div>
 <div class="button-row">
@@ -2545,7 +2548,8 @@ fn render_indexer_progress_panel(progress: Option<&IndexerProgressPayload>) -> S
 </div>"#,
                 progress.chain_id,
                 escape_html(&progress.worker_id),
-                progress.last_indexed_block
+                progress.last_indexed_block,
+                progress.endpoint_backfill_pending_rows.unwrap_or(0)
             )
         })
         .unwrap_or_else(|| {

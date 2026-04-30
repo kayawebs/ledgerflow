@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use ledgerflow::{
     core::errors::LedgerResult,
@@ -42,14 +42,14 @@ impl ClusterTxSource for MockDiscoveryTxSource {
 
 #[derive(Clone)]
 struct MockDiscoveryRpc {
-    txs: HashMap<String, Value>,
     codes: HashMap<String, String>,
 }
 
 #[async_trait]
 impl RpcClient for MockDiscoveryRpc {
     async fn get_transaction(&self, _chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
-        Ok(self.txs.get(tx_hash).cloned().unwrap_or(Value::Null))
+        let _ = tx_hash;
+        Ok(Value::Null)
     }
 
     async fn get_receipt(&self, _chain_id: u64, _tx_hash: &str) -> LedgerResult<Value> {
@@ -91,6 +91,8 @@ async fn cluster_discovery_finds_neighbors_and_types_across_two_hops() {
                         block_number: 10,
                         tx_index: 0,
                         direction: AddressHitDirection::From,
+                        from_address: Some("0x1111111111111111111111111111111111111111".to_owned()),
+                        to_address: Some("0x2222222222222222222222222222222222222222".to_owned()),
                     }],
                 ),
                 (
@@ -101,27 +103,13 @@ async fn cluster_discovery_finds_neighbors_and_types_across_two_hops() {
                         block_number: 12,
                         tx_index: 0,
                         direction: AddressHitDirection::From,
+                        from_address: Some("0x2222222222222222222222222222222222222222".to_owned()),
+                        to_address: Some("0x3333333333333333333333333333333333333333".to_owned()),
                     }],
                 ),
             ]),
         }),
         Arc::new(MockDiscoveryRpc {
-            txs: HashMap::from([
-                (
-                    "0xtx-a".to_owned(),
-                    json!({
-                        "from": "0x1111111111111111111111111111111111111111",
-                        "to": "0x2222222222222222222222222222222222222222"
-                    }),
-                ),
-                (
-                    "0xtx-b".to_owned(),
-                    json!({
-                        "from": "0x2222222222222222222222222222222222222222",
-                        "to": "0x3333333333333333333333333333333333333333"
-                    }),
-                ),
-            ]),
             codes: HashMap::from([
                 (
                     "0x1111111111111111111111111111111111111111".to_owned(),

@@ -18,6 +18,8 @@ pub struct AddressTxRef {
     pub block_number: u32,
     pub tx_index: u32,
     pub direction: AddressTxDirection,
+    pub from_address: Option<String>,
+    pub to_address: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,24 +70,33 @@ pub fn extract_block_refs(chain_id: u32, block_payload: &Value) -> LedgerResult<
             normalize_address(transaction.get("from").and_then(Value::as_str).ok_or_else(
                 || LedgerError::MalformedEvidence("transaction missing from".to_owned()),
             )?)?;
+        let to_address = transaction
+            .get("to")
+            .and_then(Value::as_str)
+            .map(normalize_address)
+            .transpose()?;
         let tx_index = parse_hex_u32(transaction.get("transactionIndex").and_then(Value::as_str))?;
         refs.push(AddressTxRef {
             chain_id,
-            address: from_address,
+            address: from_address.clone(),
             tx_hash: tx_hash.clone(),
             block_number,
             tx_index,
             direction: AddressTxDirection::From,
+            from_address: Some(from_address.clone()),
+            to_address: to_address.clone(),
         });
 
-        if let Some(to_address) = transaction.get("to").and_then(Value::as_str) {
+        if let Some(to_address) = to_address {
             refs.push(AddressTxRef {
                 chain_id,
-                address: normalize_address(to_address)?,
+                address: to_address.clone(),
                 tx_hash,
                 block_number,
                 tx_index,
                 direction: AddressTxDirection::To,
+                from_address: Some(from_address),
+                to_address: Some(to_address),
             });
         }
     }
