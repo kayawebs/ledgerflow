@@ -18,7 +18,7 @@ use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{
         entities::{
-            AddressCluster, AppUser, ClassifiedTransaction, ClusterAlert, ClusterBackfillRun,
+            AddressCluster, AppUser, ClassifiedTransaction, ClusterAlert,
             ClusterCoverage, ClusterMetricsSnapshot, ClusterSpendSummary, ClusterTrackingState,
             EvidencePack, TransactionAnalysis,
         },
@@ -176,6 +176,12 @@ struct DashboardQuery {
     start: Option<String>,
     end: Option<String>,
     cluster_tab: Option<String>,
+    tx_page: Option<String>,
+    tx_page_size: Option<String>,
+    tx_behavior: Option<String>,
+    tx_protocol: Option<String>,
+    tx_sort_by: Option<String>,
+    tx_sort_dir: Option<String>,
     notice: Option<String>,
 }
 
@@ -205,6 +211,12 @@ struct ClusterDetailQuery {
     start: Option<String>,
     end: Option<String>,
     cluster_tab: Option<String>,
+    tx_page: Option<u32>,
+    tx_page_size: Option<u32>,
+    tx_behavior: Option<String>,
+    tx_protocol: Option<String>,
+    tx_sort_by: Option<String>,
+    tx_sort_dir: Option<String>,
     notice: Option<String>,
 }
 
@@ -307,17 +319,33 @@ struct IndexerAddressRef {
     direction: AddressHitDirection,
 }
 
+#[derive(Debug, Deserialize)]
+struct ClassifiedTransactionsPagePayload {
+    items: Vec<ClassifiedTransaction>,
+    total: u64,
+    page: u32,
+    page_size: u32,
+}
+
 #[derive(Debug, Serialize)]
 struct ClusterLiveResponse {
     status_label: String,
     status_tone: String,
     tracking: Option<ClusterTrackingState>,
     coverage: Option<ClusterCoverage>,
-    runs: Vec<ClusterBackfillRun>,
     spend_summary: Option<ClusterSpendSummary>,
     metrics: Vec<ClusterMetricsSnapshot>,
     alerts: Vec<ClusterAlert>,
-    classified_transactions: Vec<ClassifiedTransaction>,
+}
+
+#[derive(Debug, Clone)]
+struct ClusterTxTableState {
+    page: u32,
+    page_size: u32,
+    behavior_tag: Option<String>,
+    protocol: Option<String>,
+    sort_by: String,
+    sort_dir: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -763,6 +791,12 @@ async fn clusters_page(
             start: None,
             end: None,
             cluster_tab: None,
+            tx_page: None,
+            tx_page_size: None,
+            tx_behavior: None,
+            tx_protocol: None,
+            tx_sort_by: None,
+            tx_sort_dir: None,
             notice: query.notice,
         },
         editable_cluster.as_ref(),
@@ -794,6 +828,12 @@ async fn cluster_analysis_page(
             start: query.start,
             end: query.end,
             cluster_tab: query.cluster_tab,
+            tx_page: query.tx_page.map(|value| value.to_string()),
+            tx_page_size: query.tx_page_size.map(|value| value.to_string()),
+            tx_behavior: query.tx_behavior,
+            tx_protocol: query.tx_protocol,
+            tx_sort_by: query.tx_sort_by,
+            tx_sort_dir: query.tx_sort_dir,
             notice: query.notice,
         },
         None,
@@ -841,6 +881,12 @@ async fn cluster_discovery_page(
             start: None,
             end: None,
             cluster_tab: None,
+            tx_page: None,
+            tx_page_size: None,
+            tx_behavior: None,
+            tx_protocol: None,
+            tx_sort_by: None,
+            tx_sort_dir: None,
             notice: query.notice.clone(),
         },
         None,
@@ -871,6 +917,12 @@ async fn tx_analysis_page(
             start: None,
             end: None,
             cluster_tab: None,
+            tx_page: None,
+            tx_page_size: None,
+            tx_behavior: None,
+            tx_protocol: None,
+            tx_sort_by: None,
+            tx_sort_dir: None,
             notice: query.notice,
         },
         None,
@@ -901,6 +953,12 @@ async fn cluster_graph_page(
             start: None,
             end: None,
             cluster_tab: None,
+            tx_page: None,
+            tx_page_size: None,
+            tx_behavior: None,
+            tx_protocol: None,
+            tx_sort_by: None,
+            tx_sort_dir: None,
             notice: query.notice,
         },
         None,
@@ -931,6 +989,12 @@ async fn indexer_progress_page(
             start: None,
             end: None,
             cluster_tab: None,
+            tx_page: None,
+            tx_page_size: None,
+            tx_behavior: None,
+            tx_protocol: None,
+            tx_sort_by: None,
+            tx_sort_dir: None,
             notice: query.notice,
         },
         None,
@@ -970,6 +1034,12 @@ async fn indexer_lookup_page(
             start: None,
             end: None,
             cluster_tab: None,
+            tx_page: None,
+            tx_page_size: None,
+            tx_behavior: None,
+            tx_protocol: None,
+            tx_sort_by: None,
+            tx_sort_dir: None,
             notice: query.notice.clone(),
         },
         None,
@@ -1049,6 +1119,12 @@ async fn create_cluster(
                 start: None,
                 end: None,
                 cluster_tab: None,
+                tx_page: None,
+                tx_page_size: None,
+                tx_behavior: None,
+                tx_protocol: None,
+                tx_sort_by: None,
+                tx_sort_dir: None,
                 notice: None,
             };
             render_dashboard_response(
@@ -1108,6 +1184,12 @@ async fn update_cluster(
                     start: None,
                     end: None,
                     cluster_tab: None,
+                    tx_page: None,
+                    tx_page_size: None,
+                    tx_behavior: None,
+                    tx_protocol: None,
+                    tx_sort_by: None,
+                    tx_sort_dir: None,
                     notice: None,
                 },
                 editable_cluster.as_ref(),
@@ -1274,6 +1356,12 @@ async fn run_tx_analysis(
         start: None,
         end: None,
         cluster_tab: None,
+        tx_page: None,
+        tx_page_size: None,
+        tx_behavior: None,
+        tx_protocol: None,
+        tx_sort_by: None,
+        tx_sort_dir: None,
         notice: None,
     };
     match result {
@@ -1324,6 +1412,7 @@ async fn render_dashboard_response(
 ) -> Result<Response, WebError> {
     let tab = DashboardTab::from_query(query.tab.as_deref());
     let cluster_analysis_tab = ClusterAnalysisTab::from_query(query.cluster_tab.as_deref());
+    let classified_query = cluster_tx_table_state_from_query(&query);
     let clusters = state
         .portal_service
         .list_clusters_for_user(user.user_id)
@@ -1338,11 +1427,9 @@ async fn render_dashboard_response(
     let (
         tracking,
         coverage,
-        runs,
         spend_summary,
         metrics,
         alerts,
-        classified_transactions,
         cluster_status,
         cluster_error,
     ) =
@@ -1359,20 +1446,16 @@ async fn render_dashboard_response(
                     Ok(payload) => (
                         payload.tracking,
                         payload.coverage,
-                        payload.runs,
                         payload.spend_summary,
                         payload.metrics,
                         payload.alerts,
-                        payload.classified_transactions,
                         Some((payload.status_label, payload.status_tone)),
                         None::<String>,
                     ),
                     Err(err) => (
                         None,
                         None,
-                        Vec::new(),
                         None,
-                        Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         None,
@@ -1383,9 +1466,7 @@ async fn render_dashboard_response(
                 (
                     None,
                     None,
-                    Vec::new(),
                     None,
-                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     None,
@@ -1396,15 +1477,44 @@ async fn render_dashboard_response(
             (
                 None,
                 None,
-                Vec::new(),
                 None,
-                Vec::new(),
                 Vec::new(),
                 Vec::new(),
                 None,
                 None,
             )
         };
+
+    let classified_page = if tab == DashboardTab::ClusterAnalysis {
+        if let Some(cluster) = selected_cluster.as_ref() {
+            let mut params = vec![
+                format!("page={}", classified_query.page),
+                format!("page_size={}", classified_query.page_size),
+                format!("sort_by={}", urlencoding::encode(&classified_query.sort_by)),
+                format!("sort_dir={}", urlencoding::encode(&classified_query.sort_dir)),
+            ];
+            if let Some(behavior_tag) = classified_query.behavior_tag.as_deref() {
+                params.push(format!("behavior_tag={}", urlencoding::encode(behavior_tag)));
+            }
+            if let Some(protocol) = classified_query.protocol.as_deref() {
+                params.push(format!("protocol={}", urlencoding::encode(protocol)));
+            }
+            api_get_json::<ClassifiedTransactionsPagePayload>(
+                state,
+                &format!(
+                    "/clusters/{}/classified-transactions?{}",
+                    cluster.cluster_id,
+                    params.join("&")
+                ),
+            )
+            .await
+            .ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let (indexer_progress, indexer_error) = if tab == DashboardTab::IndexerProgress {
         match indexer_get_json::<IndexerProgressPayload>(state, "/progress").await {
@@ -1426,11 +1536,11 @@ async fn render_dashboard_response(
         selected_cluster.as_ref(),
         tracking.as_ref(),
         coverage.as_ref(),
-        &runs,
         spend_summary.as_ref(),
         &metrics,
         &alerts,
-        &classified_transactions,
+        classified_page.as_ref(),
+        &classified_query,
         cluster_status.as_ref(),
         &cluster_analysis_tab,
         tx_result.as_ref(),
@@ -1455,18 +1565,6 @@ async fn load_cluster_live_response(
     start: Option<&str>,
     end: Option<&str>,
 ) -> Result<ClusterLiveResponse, WebError> {
-    let tracking = api_get_json::<ClusterTrackingState>(state, &format!("/clusters/{}/tracking", cluster_id))
-        .await
-        .ok();
-    let coverage = api_get_json::<ClusterCoverage>(state, &format!("/clusters/{}/coverage", cluster_id))
-        .await
-        .ok();
-    let runs = api_get_json::<Vec<ClusterBackfillRun>>(
-        state,
-        &format!("/clusters/{}/backfill-runs", cluster_id),
-    )
-    .await
-    .unwrap_or_default();
     let summary_path = match (start, end) {
         (None, None) => format!("/clusters/{}/spend-summary", cluster_id),
         _ => {
@@ -1480,36 +1578,36 @@ async fn load_cluster_live_response(
             format!("/clusters/{}/spend-summary?{}", cluster_id, params.join("&"))
         }
     };
-    let spend_summary = api_get_json::<ClusterSpendSummary>(state, &summary_path).await.ok();
-    let metrics = api_get_json::<Vec<ClusterMetricsSnapshot>>(
-        state,
-        &format!("/clusters/{}/metrics", cluster_id),
-    )
-    .await
-    .unwrap_or_default();
-    let alerts = api_get_json::<Vec<ClusterAlert>>(
-        state,
-        &format!("/clusters/{}/alerts?include_read=false&limit=12", cluster_id),
-    )
-    .await
-    .unwrap_or_default();
-    let classified_transactions = api_get_json::<Vec<ClassifiedTransaction>>(
-        state,
-        &format!("/clusters/{}/classified-transactions?limit=12", cluster_id),
-    )
-    .await
-    .unwrap_or_default();
-    let (status_label, status_tone) = derive_cluster_status(coverage.as_ref(), &runs);
+    let tracking_path = format!("/clusters/{}/tracking", cluster_id);
+    let coverage_path = format!("/clusters/{}/coverage", cluster_id);
+    let metrics_path = format!("/clusters/{}/metrics", cluster_id);
+    let alerts_path = format!("/clusters/{}/alerts?include_read=false&limit=12", cluster_id);
+    let tracking_fut = api_get_json::<ClusterTrackingState>(state, &tracking_path);
+    let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+    let spend_summary_fut = api_get_json::<ClusterSpendSummary>(state, &summary_path);
+    let metrics_fut = api_get_json::<Vec<ClusterMetricsSnapshot>>(state, &metrics_path);
+    let alerts_fut = api_get_json::<Vec<ClusterAlert>>(state, &alerts_path);
+    let (tracking, coverage, spend_summary, metrics, alerts) = tokio::join!(
+        tracking_fut,
+        coverage_fut,
+        spend_summary_fut,
+        metrics_fut,
+        alerts_fut
+    );
+    let tracking = tracking.ok();
+    let coverage = coverage.ok();
+    let spend_summary = spend_summary.ok();
+    let metrics = metrics.unwrap_or_default();
+    let alerts = alerts.unwrap_or_default();
+    let (status_label, status_tone) = derive_cluster_status(coverage.as_ref());
     Ok(ClusterLiveResponse {
         status_label,
         status_tone,
         tracking,
         coverage,
-        runs,
         spend_summary,
         metrics,
         alerts,
-        classified_transactions,
     })
 }
 
@@ -1600,6 +1698,49 @@ fn format_cluster_addresses(cluster: &AddressCluster) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn cluster_tx_table_state_from_query(query: &DashboardQuery) -> ClusterTxTableState {
+    let page = query
+        .tx_page
+        .as_deref()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = query
+        .tx_page_size
+        .as_deref()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(25)
+        .clamp(10, 50);
+    let sort_by = query
+        .tx_sort_by
+        .as_deref()
+        .filter(|value| matches!(*value, "timestamp" | "block_number" | "value_usd" | "gas_cost_usd" | "estimated_pnl_usd"))
+        .unwrap_or("timestamp")
+        .to_owned();
+    let sort_dir = match query.tx_sort_dir.as_deref() {
+        Some("asc") => "asc".to_owned(),
+        _ => "desc".to_owned(),
+    };
+    ClusterTxTableState {
+        page,
+        page_size,
+        behavior_tag: query
+            .tx_behavior
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        protocol: query
+            .tx_protocol
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        sort_by,
+        sort_dir,
+    }
 }
 
 fn parse_recognizer_ids(raw: Option<&str>) -> Option<Vec<String>> {
@@ -1886,16 +2027,17 @@ fn render_pricing_content() -> String {
       <li>Single-tx evidence analysis</li>
       <li>Email-based auth</li>
     </ul>
-    <div class="price-note">Private beta override: <strong>currently free</strong></div>
+    <div class="price-note">Current beta status: <strong>free to use during internal testing</strong>.</div>
     <a class="cta primary" href="/auth">Register for beta</a>
   </article>
   <article class="pricing-card">
-    <span class="eyebrow">Status</span>
-    <h2>Internal platform starter</h2>
-    <p>The billing surface is productized now, but enforcement is intentionally disabled while the workflow and recognizers are still under active iteration.</p>
+    <span class="eyebrow">Billing status</span>
+    <h2>Beta access is free right now</h2>
+    <p>Formal subscription pricing is still <strong>{} ETH / month</strong>, but enforcement is disabled during the current internal beta while workflow and recognizers continue to harden.</p>
   </article>
 </section>
 "#,
+        DEFAULT_PRICE_ETH,
         DEFAULT_PRICE_ETH
     )
 }
@@ -2004,11 +2146,11 @@ fn render_dashboard_page(
     selected_cluster: Option<&DashboardClusterRecord>,
     tracking: Option<&ClusterTrackingState>,
     coverage: Option<&ClusterCoverage>,
-    runs: &[ClusterBackfillRun],
     spend_summary: Option<&ClusterSpendSummary>,
     metrics: &[ClusterMetricsSnapshot],
     alerts: &[ClusterAlert],
-    classified_transactions: &[ClassifiedTransaction],
+    classified_page: Option<&ClassifiedTransactionsPagePayload>,
+    classified_query: &ClusterTxTableState,
     cluster_status: Option<&(String, String)>,
     cluster_analysis_tab: &ClusterAnalysisTab,
     tx_result: Option<&serde_json::Value>,
@@ -2114,8 +2256,6 @@ fn render_dashboard_page(
     <section class="cluster-tab-panel {}" data-cluster-tab-panel="activity">
       <h3>Recent classified transactions</h3>
       <div id="cluster-live-classified">{}</div>
-      <h3>Recent backfill runs</h3>
-      <div id="cluster-live-runs">{}</div>
     </section>
   </div>
 </section>
@@ -2143,8 +2283,7 @@ fn render_dashboard_page(
             render_behavior_breakdown_panel(metrics),
             render_cluster_summary_panel(spend_summary),
             activity_active,
-            render_recent_classified_transactions_panel(classified_transactions),
-            render_cluster_runs_table(runs),
+            render_recent_classified_transactions_panel(cluster, classified_page, classified_query),
         )
     } else {
         "<section class=\"panel\"><div class=\"panel-body\"><div class=\"empty-state\">Select or create a cluster to view analysis.</div></div></section>".to_owned()
@@ -2195,18 +2334,18 @@ fn render_dashboard_page(
         cluster_cards
     );
     let content_layout = if *tab == DashboardTab::ClusterAnalysis {
-        format!(
-            r#"<section class="dashboard-stack">
-          <div class="main-column">
-            {}
-          </div>
-          <div class="side-column compact-side-column">
-            {}
-          </div>
-        </section>"#,
-            cluster_analysis_panel, side_column
-        )
-    } else {
+        cluster_analysis_panel
+    } else if *tab == DashboardTab::IndexerLookup {
+        indexer_lookup_panel.clone()
+    } else if *tab == DashboardTab::IndexerProgress {
+        indexer_progress_panel.clone()
+    } else if *tab == DashboardTab::ClusterDiscovery {
+        cluster_discovery_panel.clone()
+    } else if *tab == DashboardTab::TxAnalysis {
+        tx_panel.clone()
+    } else if *tab == DashboardTab::ClusterGraph {
+        graph_panel.clone()
+    } else if *tab == DashboardTab::Clusters {
         format!(
             r#"<section class="dashboard-grid">
           <div class="main-column">
@@ -2217,18 +2356,13 @@ fn render_dashboard_page(
           </div>
         </section>"#,
             match tab {
-                DashboardTab::Clusters => {
-                    render_cluster_management_panel(state.default_chain_id, editable_cluster)
-                }
-                DashboardTab::ClusterAnalysis => cluster_analysis_panel.clone(),
-                DashboardTab::ClusterDiscovery => cluster_discovery_panel.clone(),
-                DashboardTab::TxAnalysis => tx_panel.clone(),
-                DashboardTab::ClusterGraph => graph_panel.clone(),
-                DashboardTab::IndexerProgress => indexer_progress_panel.clone(),
-                DashboardTab::IndexerLookup => indexer_lookup_panel.clone(),
+                DashboardTab::Clusters => render_cluster_management_panel(state.default_chain_id, editable_cluster),
+                _ => String::new(),
             },
             side_column
         )
+    } else {
+        String::new()
     };
 
     format!(
@@ -2741,12 +2875,44 @@ fn render_cluster_alerts_panel(
     )
 }
 
-fn render_recent_classified_transactions_panel(txs: &[ClassifiedTransaction]) -> String {
-    if txs.is_empty() {
+fn render_recent_classified_transactions_panel(
+    cluster: &DashboardClusterRecord,
+    page: Option<&ClassifiedTransactionsPagePayload>,
+    query: &ClusterTxTableState,
+) -> String {
+    let Some(page) = page else {
         return "<div class=\"empty-state\">No classified transactions yet. Once tracking or backfill analyzes transactions, they will appear here.</div>".to_owned();
+    };
+    if page.items.is_empty() {
+        return format!(
+            r#"<form class="stack-form compact-form" method="get" action="/app/clusters/{}">
+  <input type="hidden" name="cluster_tab" value="activity">
+  {}
+  <div class="button-row">
+    <button class="cta secondary" type="submit">Apply filters</button>
+    <a class="cta ghost" href="/app/clusters/{}?cluster_tab=activity">Reset</a>
+  </div>
+</form>
+<div class="empty-state">No classified transactions matched the current filters.</div>"#,
+            cluster.cluster_id,
+            render_classified_transaction_filters(query),
+            cluster.cluster_id
+        );
     }
+    let total_pages = ((page.total + page.page_size as u64 - 1) / page.page_size as u64).max(1);
+    let previous_page = page.page.saturating_sub(1).max(1);
+    let next_page = (page.page + 1).min(total_pages as u32);
     format!(
-        r#"<div class="table-shell">
+        r#"<form class="stack-form compact-form" method="get" action="/app/clusters/{}">
+  <input type="hidden" name="cluster_tab" value="activity">
+  {}
+  <div class="button-row">
+    <button class="cta secondary" type="submit">Apply filters</button>
+    <a class="cta ghost" href="/app/clusters/{}?cluster_tab=activity">Reset</a>
+  </div>
+</form>
+<div class="field-hint">Showing page {} of {} · {} total classified transactions.</div>
+<div class="table-shell">
   <table>
     <thead>
       <tr>
@@ -2765,8 +2931,18 @@ fn render_recent_classified_transactions_panel(txs: &[ClassifiedTransaction]) ->
       {}
     </tbody>
   </table>
+</div>
+<div class="button-row pagination-row">
+  {}
+  {}
 </div>"#,
-        txs
+        cluster.cluster_id,
+        render_classified_transaction_filters(query),
+        cluster.cluster_id,
+        page.page,
+        total_pages,
+        page.total,
+        page.items
             .iter()
             .map(|tx| {
                 format!(
@@ -2789,7 +2965,23 @@ fn render_recent_classified_transactions_panel(txs: &[ClassifiedTransaction]) ->
                 )
             })
             .collect::<Vec<_>>()
-            .join("")
+            .join(""),
+        if page.page > 1 {
+            format!(
+                "<a class=\"cta ghost\" href=\"{}\">Previous</a>",
+                classified_page_href(cluster.cluster_id, query, previous_page)
+            )
+        } else {
+            "<span></span>".to_owned()
+        },
+        if page.page < total_pages as u32 {
+            format!(
+                "<a class=\"cta ghost\" href=\"{}\">Next</a>",
+                classified_page_href(cluster.cluster_id, query, next_page)
+            )
+        } else {
+            "<span></span>".to_owned()
+        }
     )
 }
 
@@ -2825,6 +3017,83 @@ fn format_token_flow(tx: &ClassifiedTransaction) -> String {
         .map(|value| truncate_middle(value, 6))
         .unwrap_or_else(|| "-".to_owned());
     format!("{token_in} / {token_out}")
+}
+
+fn render_classified_transaction_filters(query: &ClusterTxTableState) -> String {
+    format!(
+        r#"<div class="split-fields">
+  <label>Behavior
+    <select name="tx_behavior">
+      <option value="" {}>all</option>
+      <option value="arbitrage" {}>arbitrage</option>
+      <option value="position" {}>position</option>
+      <option value="lp" {}>lp</option>
+      <option value="liquidation" {}>liquidation</option>
+      <option value="unknown" {}>unknown</option>
+    </select>
+  </label>
+  <label>Protocol contains<input type="text" name="tx_protocol" value="{}" placeholder="aave / morpho / custom router"></label>
+</div>
+<div class="split-fields">
+  <label>Sort by
+    <select name="tx_sort_by">
+      <option value="timestamp" {}>time</option>
+      <option value="block_number" {}>block</option>
+      <option value="value_usd" {}>volume usd</option>
+      <option value="gas_cost_usd" {}>gas usd</option>
+      <option value="estimated_pnl_usd" {}>estimated pnl usd</option>
+    </select>
+  </label>
+  <label>Direction
+    <select name="tx_sort_dir">
+      <option value="desc" {}>desc</option>
+      <option value="asc" {}>asc</option>
+    </select>
+  </label>
+  <label>Page size
+    <select name="tx_page_size">
+      <option value="10" {}>10</option>
+      <option value="25" {}>25</option>
+      <option value="50" {}>50</option>
+    </select>
+  </label>
+</div>
+<input type="hidden" name="tx_page" value="1">"#,
+        if query.behavior_tag.is_none() { "selected" } else { "" },
+        if query.behavior_tag.as_deref() == Some("arbitrage") { "selected" } else { "" },
+        if query.behavior_tag.as_deref() == Some("position") { "selected" } else { "" },
+        if query.behavior_tag.as_deref() == Some("lp") { "selected" } else { "" },
+        if query.behavior_tag.as_deref() == Some("liquidation") { "selected" } else { "" },
+        if query.behavior_tag.as_deref() == Some("unknown") { "selected" } else { "" },
+        escape_html(query.protocol.as_deref().unwrap_or_default()),
+        if query.sort_by == "timestamp" { "selected" } else { "" },
+        if query.sort_by == "block_number" { "selected" } else { "" },
+        if query.sort_by == "value_usd" { "selected" } else { "" },
+        if query.sort_by == "gas_cost_usd" { "selected" } else { "" },
+        if query.sort_by == "estimated_pnl_usd" { "selected" } else { "" },
+        if query.sort_dir == "desc" { "selected" } else { "" },
+        if query.sort_dir == "asc" { "selected" } else { "" },
+        if query.page_size == 10 { "selected" } else { "" },
+        if query.page_size == 25 { "selected" } else { "" },
+        if query.page_size == 50 { "selected" } else { "" },
+    )
+}
+
+fn classified_page_href(cluster_id: Uuid, query: &ClusterTxTableState, page: u32) -> String {
+    let mut params = vec![
+        "cluster_tab=activity".to_owned(),
+        format!("tx_page={page}"),
+        format!("tx_page_size={}", query.page_size),
+        format!("tx_sort_by={}", urlencoding::encode(&query.sort_by)),
+        format!("tx_sort_dir={}", urlencoding::encode(&query.sort_dir)),
+    ];
+    if let Some(behavior_tag) = query.behavior_tag.as_deref() {
+        params.push(format!("tx_behavior={}", urlencoding::encode(behavior_tag)));
+    }
+    if let Some(protocol) = query.protocol.as_deref() {
+        params.push(format!("tx_protocol={}", urlencoding::encode(protocol)));
+    }
+    format!("/app/clusters/{cluster_id}?{}", params.join("&"))
 }
 
 fn format_wei_compact(raw: &str) -> String {
@@ -2992,10 +3261,7 @@ fn render_indexer_lookup_panel(
     )
 }
 
-fn derive_cluster_status(
-    coverage: Option<&ClusterCoverage>,
-    runs: &[ClusterBackfillRun],
-) -> (String, String) {
+fn derive_cluster_status(coverage: Option<&ClusterCoverage>) -> (String, String) {
     if let Some(coverage) = coverage {
         if coverage.pending_tx_count > 0 {
             return ("Backfill in progress".to_owned(), "info".to_owned());
@@ -3021,22 +3287,6 @@ fn derive_cluster_status(
                 ("Waiting for first historical sync".to_owned(), "info".to_owned())
             };
         }
-    }
-
-    if let Some(run) = runs.first() {
-        return match run.status {
-            ClusterBackfillStatus::Pending | ClusterBackfillStatus::Running => {
-                ("Incremental sync queued".to_owned(), "info".to_owned())
-            }
-            ClusterBackfillStatus::Partial => (
-                "Analysis completed with failures".to_owned(),
-                "warning".to_owned(),
-            ),
-            ClusterBackfillStatus::Completed => {
-                ("History fully analyzed".to_owned(), "success".to_owned())
-            }
-            ClusterBackfillStatus::Failed => ("Backfill failed".to_owned(), "error".to_owned()),
-        };
     }
 
     ("Waiting for first historical sync".to_owned(), "info".to_owned())
@@ -3126,52 +3376,6 @@ fn render_cluster_summary_panel(spend_summary: Option<&ClusterSpendSummary>) -> 
         })
 }
 
-fn render_cluster_runs_table(runs: &[ClusterBackfillRun]) -> String {
-    if runs.is_empty() {
-        return "<div class=\"empty-state\">No backfill runs recorded yet.</div>".to_owned();
-    }
-
-    format!(
-        r#"<div class="table-shell">
-  <table>
-    <thead>
-      <tr>
-        <th>Requested</th>
-        <th>Status</th>
-        <th>Range</th>
-        <th>Discovered</th>
-        <th>Analyzed</th>
-        <th>Failed</th>
-      </tr>
-    </thead>
-    <tbody>
-      {}
-    </tbody>
-  </table>
-</div>"#,
-        runs.iter()
-            .take(10)
-            .map(|run| {
-                format!(
-                    "<tr><td>{}</td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    run.requested_at.format("%Y-%m-%d %H:%M:%S UTC"),
-                    run.status,
-                    match (run.start_block, run.end_block) {
-                        (Some(start), Some(end)) => format!("{start} - {end}"),
-                        (Some(start), None) => format!("{start} - latest"),
-                        (None, Some(end)) => format!("0 - {end}"),
-                        (None, None) => "full history".to_owned(),
-                    },
-                    run.discovered_tx_count,
-                    run.analyzed_tx_count,
-                    run.failed_tx_count
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    )
-}
-
 fn render_cluster_autorefresh_script(
     selected_cluster: Option<&DashboardClusterRecord>,
     start: Option<&str>,
@@ -3196,9 +3400,7 @@ fn render_cluster_autorefresh_script(
   const coverageNode = document.getElementById("cluster-live-coverage");
   const alertsNode = document.getElementById("cluster-live-alerts");
   const summaryNode = document.getElementById("cluster-live-summary");
-  const runsNode = document.getElementById("cluster-live-runs");
-  const classifiedNode = document.getElementById("cluster-live-classified");
-  if (!clusterId || !statusNode || !trackingNode || !metricsNode || !behaviorNode || !coverageNode || !alertsNode || !summaryNode || !runsNode || !classifiedNode) return;
+  if (!clusterId || !statusNode || !trackingNode || !metricsNode || !behaviorNode || !coverageNode || !alertsNode || !summaryNode) return;
   const tabButtons = Array.from(document.querySelectorAll("[data-cluster-tab-target]"));
   const tabPanels = Array.from(document.querySelectorAll("[data-cluster-tab-panel]"));
 
@@ -3392,86 +3594,6 @@ fn render_cluster_autorefresh_script(
     `;
   }};
 
-  const renderRuns = (runs) => {{
-    if (!runs || runs.length === 0) {{
-      return '<div class="empty-state">No backfill runs recorded yet.</div>';
-    }}
-    const rows = runs.slice(0, 10).map((run) => {{
-      let range = "full history";
-      if (run.start_block != null && run.end_block != null) range = `${{run.start_block}} - ${{run.end_block}}`;
-      else if (run.start_block != null) range = `${{run.start_block}} - latest`;
-      else if (run.end_block != null) range = `0 - ${{run.end_block}}`;
-      const requestedAt = escapeHtml(String(run.requested_at || "").replace("T", " ").replace("Z", " UTC"));
-      return `
-        <tr>
-          <td>${{requestedAt}}</td>
-          <td>${{escapeHtml(run.status)}}</td>
-          <td>${{escapeHtml(range)}}</td>
-          <td>${{run.discovered_tx_count}}</td>
-          <td>${{run.analyzed_tx_count}}</td>
-          <td>${{run.failed_tx_count}}</td>
-        </tr>
-      `;
-    }}).join("");
-    return `
-      <div class="table-shell">
-        <table>
-          <thead>
-            <tr>
-              <th>Requested</th>
-              <th>Status</th>
-              <th>Range</th>
-              <th>Discovered</th>
-              <th>Analyzed</th>
-              <th>Failed</th>
-            </tr>
-          </thead>
-          <tbody>${{rows}}</tbody>
-        </table>
-      </div>
-    `;
-  }};
-
-  const renderClassified = (txs) => {{
-    if (!txs || txs.length === 0) {{
-      return '<div class="empty-state">No classified transactions yet. Once tracking or backfill analyzes transactions, they will appear here.</div>';
-    }}
-    const formatTokenFlow = (tx) => `${{tx.token_in ? truncate(tx.token_in) : "-"}} / ${{tx.token_out ? truncate(tx.token_out) : "-"}}`;
-    const rows = txs.map((tx) => `
-      <tr>
-        <td><code>${{escapeHtml(truncate(tx.tx_hash))}}</code></td>
-        <td>${{escapeHtml(formatTime(tx.timestamp))}}</td>
-        <td><code>${{escapeHtml(truncate(tx.address))}}</code></td>
-        <td>${{escapeHtml(tx.behavior_tag)}}</td>
-        <td>${{escapeHtml(tx.protocol || "n/a")}}</td>
-        <td>${{escapeHtml(formatTokenFlow(tx))}}</td>
-        <td>${{escapeHtml(formatUsd(tx.value_usd))}}</td>
-        <td>${{escapeHtml(formatUsd(tx.gas_cost_usd))}}</td>
-        <td>${{escapeHtml(formatUsd(tx.estimated_pnl_usd))}}</td>
-      </tr>
-    `).join("");
-    return `
-      <div class="table-shell">
-        <table>
-          <thead>
-            <tr>
-              <th>Tx</th>
-              <th>Time</th>
-              <th>Address</th>
-              <th>Behavior</th>
-              <th>Protocol</th>
-              <th>Token in / out</th>
-              <th>Volume USD</th>
-              <th>Gas USD</th>
-              <th>Estimated PnL USD</th>
-            </tr>
-          </thead>
-          <tbody>${{rows}}</tbody>
-        </table>
-      </div>
-    `;
-  }};
-
   const renderAlerts = (alerts) => {{
     if (!alerts || alerts.length === 0) {{
       return '<div class="empty-state">No active alerts right now. Alert rules run after rolling metrics are refreshed.</div>';
@@ -3493,15 +3615,13 @@ fn render_cluster_autorefresh_script(
 
   const renderState = (payload) => {{
     statusNode.className = `notice ${{payload.status_tone || "info"}}`;
-    statusNode.textContent = payload.status_label || "Waiting for discovery";
+    statusNode.textContent = payload.status_label || "Waiting for first historical sync";
     trackingNode.innerHTML = renderTracking(payload.tracking);
     metricsNode.innerHTML = renderMetrics(payload.metrics || []);
     behaviorNode.innerHTML = renderBehavior(payload.metrics || []);
     coverageNode.innerHTML = renderCoverage(payload.coverage);
     alertsNode.innerHTML = renderAlerts(payload.alerts || []);
     summaryNode.innerHTML = renderSummary(payload.spend_summary);
-    runsNode.innerHTML = renderRuns(payload.runs || []);
-    classifiedNode.innerHTML = renderClassified(payload.classified_transactions || []);
   }};
 
   const fetchState = async () => {{

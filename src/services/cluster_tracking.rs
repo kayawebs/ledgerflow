@@ -8,10 +8,18 @@ use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{
         entities::{ClassifiedTransaction, ClusterTrackingState},
-        enums::{ClusterBackfillStatus, ClusterTrackingStatus},
+        enums::{BehaviorTag, ClusterBackfillStatus, ClusterTrackingStatus},
         interfaces::AnalysisRepository,
     },
 };
+
+#[derive(Clone, Debug)]
+pub struct ClassifiedTransactionsPage {
+    pub items: Vec<ClassifiedTransaction>,
+    pub total: u64,
+    pub page: u32,
+    pub page_size: u32,
+}
 
 #[derive(Clone)]
 pub struct ClusterTrackingService {
@@ -106,5 +114,42 @@ impl ClusterTrackingService {
         self.repository
             .list_recent_classified_transactions(cluster_id, limit.max(1))
             .await
+    }
+
+    pub async fn list_classified_transactions_page(
+        &self,
+        cluster_id: Uuid,
+        page: u32,
+        page_size: u32,
+        behavior_tag: Option<BehaviorTag>,
+        protocol_query: Option<String>,
+        sort_by: String,
+        descending: bool,
+    ) -> LedgerResult<ClassifiedTransactionsPage> {
+        self.repository
+            .get_cluster(cluster_id)
+            .await?
+            .ok_or_else(|| LedgerError::NotFound(format!("cluster {cluster_id} not found")))?;
+        let safe_page = page.max(1);
+        let safe_page_size = page_size.clamp(1, 100);
+        let offset = (safe_page - 1) * safe_page_size;
+        let (items, total) = self
+            .repository
+            .list_classified_transactions_page(
+                cluster_id,
+                safe_page_size,
+                offset,
+                behavior_tag,
+                protocol_query,
+                sort_by,
+                descending,
+            )
+            .await?;
+        Ok(ClassifiedTransactionsPage {
+            items,
+            total,
+            page: safe_page,
+            page_size: safe_page_size,
+        })
     }
 }

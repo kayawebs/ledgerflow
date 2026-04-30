@@ -492,6 +492,20 @@ async fn list_cluster_backfill_runs(
 #[derive(Debug, Deserialize)]
 pub struct ClassifiedTransactionsQuery {
     pub limit: Option<u32>,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+    pub behavior_tag: Option<String>,
+    pub protocol: Option<String>,
+    pub sort_by: Option<String>,
+    pub sort_dir: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClassifiedTransactionsPage {
+    pub items: Vec<ClassifiedTransaction>,
+    pub total: u64,
+    pub page: u32,
+    pub page_size: u32,
 }
 
 async fn get_cluster_tracking(
@@ -540,15 +554,30 @@ async fn list_classified_transactions(
     State(state): State<ApiState>,
     Path(cluster_id): Path<String>,
     Query(query): Query<ClassifiedTransactionsQuery>,
-) -> Result<Json<Vec<ClassifiedTransaction>>, ApiError> {
+) -> Result<Json<ClassifiedTransactionsPage>, ApiError> {
     let cluster_id = Uuid::parse_str(&cluster_id)
         .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
-    let txs = state
+    let behavior_tag = parse_behavior_tag_query(query.behavior_tag.as_deref())?;
+    let descending = !matches!(query.sort_dir.as_deref(), Some("asc"));
+    let page = state
         .tracking_service
-        .list_recent_classified_transactions(cluster_id, query.limit.unwrap_or(20))
+        .list_classified_transactions_page(
+            cluster_id,
+            query.page.unwrap_or(1),
+            query.page_size.or(query.limit).unwrap_or(20),
+            behavior_tag,
+            query.protocol.clone(),
+            query.sort_by.unwrap_or_else(|| "timestamp".to_owned()),
+            descending,
+        )
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(txs))
+    Ok(Json(ClassifiedTransactionsPage {
+        items: page.items,
+        total: page.total,
+        page: page.page,
+        page_size: page.page_size,
+    }))
 }
 
 async fn list_cluster_metrics(
@@ -606,6 +635,22 @@ fn parse_time(value: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc
         Some(value) => chrono::DateTime::parse_from_rfc3339(value)
             .map(|value| Some(value.with_timezone(&chrono::Utc)))
             .map_err(|err| ApiError::conflict(format!("invalid timestamp: {err}"))),
+    }
+}
+
+fn parse_behavior_tag_query(
+    value: Option<&str>,
+) -> Result<Option<crate::domain::enums::BehaviorTag>, ApiError> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some("arbitrage") => Ok(Some(crate::domain::enums::BehaviorTag::Arbitrage)),
+        Some("position") => Ok(Some(crate::domain::enums::BehaviorTag::Position)),
+        Some("lp") => Ok(Some(crate::domain::enums::BehaviorTag::Lp)),
+        Some("liquidation") => Ok(Some(crate::domain::enums::BehaviorTag::Liquidation)),
+        Some("unknown") => Ok(Some(crate::domain::enums::BehaviorTag::Unknown)),
+        Some(other) => Err(ApiError::conflict(format!(
+            "invalid behavior_tag filter: {other}"
+        ))),
     }
 }
 

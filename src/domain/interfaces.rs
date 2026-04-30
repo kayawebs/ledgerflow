@@ -9,6 +9,7 @@ use crate::domain::entities::{
     ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState,
     EvidencePack, RecognizerResult, TransactionAnalysis,
 };
+use crate::domain::enums::BehaviorTag;
 use crate::domain::value_objects::{AddressTxRef, AssetFlow, ValidationMessage};
 use crate::ingestion::models::RawTransactionBundle;
 
@@ -85,6 +86,16 @@ pub trait AnalysisRepository: Send + Sync {
         cluster_id: uuid::Uuid,
         limit: u32,
     ) -> LedgerResult<Vec<ClassifiedTransaction>>;
+    async fn list_classified_transactions_page(
+        &self,
+        cluster_id: uuid::Uuid,
+        limit: u32,
+        offset: u32,
+        behavior_tag: Option<BehaviorTag>,
+        protocol_query: Option<String>,
+        sort_by: String,
+        descending: bool,
+    ) -> LedgerResult<(Vec<ClassifiedTransaction>, u64)>;
     async fn list_classified_transactions_for_cluster(
         &self,
         cluster_id: uuid::Uuid,

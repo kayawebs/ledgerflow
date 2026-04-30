@@ -965,6 +965,77 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         rows.into_iter().map(row_to_classified_transaction).collect()
     }
 
+    async fn list_classified_transactions_page(
+        &self,
+        cluster_id: Uuid,
+        limit: u32,
+        offset: u32,
+        behavior_tag: Option<BehaviorTag>,
+        protocol_query: Option<String>,
+        sort_by: String,
+        descending: bool,
+    ) -> LedgerResult<(Vec<ClassifiedTransaction>, u64)> {
+        let order_column = match sort_by.as_str() {
+            "value_usd" => "value_usd",
+            "gas_cost_usd" => "gas_cost_usd",
+            "estimated_pnl_usd" => "estimated_pnl_usd",
+            "block_number" => "block_number",
+            _ => "block_timestamp",
+        };
+        let direction = if descending { "desc" } else { "asc" };
+        let nulls = if descending { "nulls last" } else { "nulls first" };
+        let behavior_tag = behavior_tag.map(|value| behavior_tag_to_str(&value).to_owned());
+        let protocol_query = protocol_query
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+
+        let count_row = sqlx::query(
+            r#"
+            select count(*)::bigint as total
+            from classified_transactions
+            where cluster_id = $1
+              and ($2::text is null or behavior_tag = $2)
+              and ($3::text is null or coalesce(protocol, '') ilike '%' || $3 || '%')
+            "#,
+        )
+        .bind(cluster_id)
+        .bind(&behavior_tag)
+        .bind(&protocol_query)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let total = count_row
+            .try_get::<i64, _>("total")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64;
+
+        let sql = format!(
+            r#"
+            select *
+            from classified_transactions
+            where cluster_id = $1
+              and ($2::text is null or behavior_tag = $2)
+              and ($3::text is null or coalesce(protocol, '') ilike '%' || $3 || '%')
+            order by {order_column} {direction} {nulls}, block_number desc, updated_at desc
+            limit $4
+            offset $5
+            "#
+        );
+        let rows = sqlx::query(&sql)
+            .bind(cluster_id)
+            .bind(&behavior_tag)
+            .bind(&protocol_query)
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let items = rows
+            .into_iter()
+            .map(row_to_classified_transaction)
+            .collect::<LedgerResult<Vec<_>>>()?;
+        Ok((items, total))
+    }
+
     async fn list_classified_transactions_for_cluster(
         &self,
         cluster_id: Uuid,

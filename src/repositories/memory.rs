@@ -394,6 +394,52 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
         Ok(items)
     }
 
+    async fn list_classified_transactions_page(
+        &self,
+        cluster_id: Uuid,
+        limit: u32,
+        offset: u32,
+        behavior_tag: Option<crate::domain::enums::BehaviorTag>,
+        protocol_query: Option<String>,
+        sort_by: String,
+        descending: bool,
+    ) -> LedgerResult<(Vec<ClassifiedTransaction>, u64)> {
+        let mut items = self
+            .classified_transactions
+            .read()
+            .await
+            .values()
+            .filter(|item| item.cluster_id == cluster_id)
+            .filter(|item| {
+                behavior_tag
+                    .as_ref()
+                    .map(|value| &item.behavior_tag == value)
+                    .unwrap_or(true)
+            })
+            .filter(|item| {
+                protocol_query
+                    .as_ref()
+                    .map(|value| {
+                        item.protocol
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_ascii_lowercase()
+                            .contains(&value.to_ascii_lowercase())
+                    })
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| compare_classified_tx(left, right, &sort_by, descending));
+        let total = items.len() as u64;
+        let page_items = items
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect::<Vec<_>>();
+        Ok((page_items, total))
+    }
+
     async fn list_classified_transactions_for_cluster(
         &self,
         cluster_id: Uuid,
@@ -512,4 +558,38 @@ fn within_range(
         }
     }
     true
+}
+
+fn compare_classified_tx(
+    left: &ClassifiedTransaction,
+    right: &ClassifiedTransaction,
+    sort_by: &str,
+    descending: bool,
+) -> std::cmp::Ordering {
+    let ordering = match sort_by {
+        "value_usd" => partial_cmp_option_f64(left.value_usd, right.value_usd),
+        "gas_cost_usd" => partial_cmp_option_f64(left.gas_cost_usd, right.gas_cost_usd),
+        "estimated_pnl_usd" => partial_cmp_option_f64(left.estimated_pnl_usd, right.estimated_pnl_usd),
+        "block_number" => left.block_number.cmp(&right.block_number),
+        _ => left
+            .timestamp
+            .cmp(&right.timestamp)
+            .then(left.block_number.cmp(&right.block_number)),
+    };
+    if descending {
+        ordering.reverse()
+    } else {
+        ordering
+    }
+}
+
+fn partial_cmp_option_f64(left: Option<f64>, right: Option<f64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left
+            .partial_cmp(&right)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
 }
