@@ -48,9 +48,11 @@ impl BehaviorClassifier {
             .iter()
             .map(|item| item.label.clone())
             .collect::<Vec<_>>();
-        let protocol = analysis
-            .to_address
-            .clone()
+        let protocol = labels
+            .iter()
+            .find(|label| !matches!(label.as_str(), "selector_present" | "failed_execution"))
+            .cloned()
+            .or_else(|| analysis.to_address.clone())
             .or_else(|| labels.first().cloned());
 
         let (token_in, amount_in, token_out, amount_out) =
@@ -209,11 +211,7 @@ fn classify_behavior_tag(
     estimated_pnl_usd: Option<f64>,
     gas_cost_usd: Option<f64>,
 ) -> BehaviorTag {
-    if labels
-        .iter()
-        .any(|label| label == "liquidation_like_activity" || label == "failed_execution")
-        && labels.iter().any(|label| label == "liquidation_like_activity")
-    {
+    if labels.iter().any(|label| label == "liquidation_like_activity") {
         return BehaviorTag::Liquidation;
     }
     if labels.iter().any(|label| label == "arbitrage_like_activity")

@@ -37,7 +37,9 @@ impl Default for MockRpcClient {
 #[async_trait]
 impl RpcClient for MockRpcClient {
     async fn get_transaction(&self, chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
-        let input = if tx_hash.contains("approve") {
+        let input = if tx_hash.contains("liquidation") {
+            format!("{}{}", "0x12345678", "00".repeat(32))
+        } else if tx_hash.contains("approve") {
             format!("{}{}", "0x095ea7b3", "00".repeat(32))
         } else if tx_hash.contains("transfer") {
             format!("{}{}", "0xa9059cbb", "00".repeat(32))
@@ -104,6 +106,7 @@ impl RpcClient for MockRpcClient {
     }
 
     async fn get_trace(&self, _chain_id: u64, _tx_hash: &str) -> LedgerResult<Option<Value>> {
+        let tx_hash = _tx_hash;
         if self.raise_trace_unsupported {
             return Err(LedgerError::UnsupportedTrace(
                 "trace unavailable".to_owned(),
@@ -111,6 +114,33 @@ impl RpcClient for MockRpcClient {
         }
         if !self.include_trace {
             return Ok(None);
+        }
+        if tx_hash.contains("liquidation") {
+            return Ok(Some(json!({
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value": "0x0",
+                "input": "0x12345678",
+                "type": "call",
+                "calls": [
+                    {
+                        "from": "0x2222222222222222222222222222222222222222",
+                        "to": "0x5555555555555555555555555555555555555555",
+                        "value": "0x0",
+                        "input": "0x00a718a9",
+                        "type": "call",
+                        "calls": []
+                    },
+                    {
+                        "from": "0x2222222222222222222222222222222222222222",
+                        "to": "0x3333333333333333333333333333333333333333",
+                        "value": "0x0",
+                        "input": "0xa9059cbb",
+                        "type": "call",
+                        "calls": []
+                    }
+                ]
+            })));
         }
         Ok(Some(json!({
             "from": "0x1111111111111111111111111111111111111111",

@@ -56,6 +56,28 @@ fn approval_edge_entries(analysis: &TransactionAnalysis) -> Vec<(String, String,
         .collect()
 }
 
+fn trace_selectors(analysis: &TransactionAnalysis) -> BTreeSet<String> {
+    analysis
+        .normalized_execution_facts
+        .derived_facts
+        .get("trace_selectors")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str().map(|value| value.to_lowercase()))
+        .collect()
+}
+
+fn is_known_liquidation_selector(selector: &str) -> bool {
+    matches!(
+        selector,
+        "0x00a718a9" // Aave liquidationCall(address,address,address,uint256,bool)
+            | "0xf5e3c462" // Compound v2 liquidateBorrow(address,uint256,address)
+            | "0xc1342574" // Euler liquidate(address,address,uint256,uint256)
+            | "0x267a47ca" // Morpho-style liquidate(address,address,uint256,address,bool)
+    )
+}
+
 pub struct SelectorPresenceRecognizer;
 
 impl Recognizer for SelectorPresenceRecognizer {
@@ -626,6 +648,44 @@ impl Recognizer for LiquidationLikeScenarioRecognizer {
 
     fn recognize(&self, analysis: &TransactionAnalysis) -> LedgerResult<Option<RecognizerResult>> {
         let sender = analysis.from_address.to_lowercase();
+        let selector = analysis
+            .normalized_execution_facts
+            .selector
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase();
+        let trace_selector_set = trace_selectors(analysis);
+        let matched_liquidation_selectors = std::iter::once(selector.clone())
+            .chain(trace_selector_set.iter().cloned())
+            .filter(|value| is_known_liquidation_selector(value))
+            .collect::<BTreeSet<_>>();
+        if !matched_liquidation_selectors.is_empty() {
+            return Ok(Some(RecognizerResult {
+                recognizer_id: self.recognizer_id().to_owned(),
+                recognizer_version: self.version().to_owned(),
+                label: "liquidation_like_activity".to_owned(),
+                confidence: if matched_liquidation_selectors.contains(&selector) {
+                    0.91
+                } else {
+                    0.84
+                },
+                evidence_refs: analysis.raw_evidence_refs.clone(),
+                attributes: json!({
+                    "sender": sender,
+                    "selector": selector,
+                    "matched_liquidation_selectors": matched_liquidation_selectors,
+                    "internal_call_count": analysis.normalized_execution_facts.internal_call_count,
+                }),
+                unresolved_points: vec![UnresolvedItem {
+                    code: "protocol_roles_unresolved".to_owned(),
+                    message: "Known liquidation function selector detected, but protocol roles and exact debt/collateral assets are not fully decoded yet."
+                        .to_owned(),
+                    evidence_refs: Vec::new(),
+                }],
+                warnings: vec!["selector_matched_without_full_protocol_decoder".to_owned()],
+            }));
+        }
+
         let approvals = approval_edge_entries(analysis);
         let deltas = token_net_delta_entries(analysis)
             .into_iter()
@@ -642,7 +702,6 @@ impl Recognizer for LiquidationLikeScenarioRecognizer {
         if analysis.normalized_execution_facts.internal_call_count < 2
             || outgoing.is_empty()
             || incoming.is_empty()
-            || !approvals.is_empty()
         {
             return Ok(None);
         }
@@ -658,6 +717,7 @@ impl Recognizer for LiquidationLikeScenarioRecognizer {
                 "repay_asset_count": outgoing.len(),
                 "seized_asset_count": incoming.len(),
                 "internal_call_count": analysis.normalized_execution_facts.internal_call_count,
+                "approval_edge_count": approvals.len(),
             }),
             unresolved_points: vec![UnresolvedItem {
                 code: "liquidation_roles_unresolved".to_owned(),
@@ -665,7 +725,14 @@ impl Recognizer for LiquidationLikeScenarioRecognizer {
                     .to_owned(),
                 evidence_refs: Vec::new(),
             }],
-            warnings: vec!["heuristic_only".to_owned()],
+            warnings: if approvals.is_empty() {
+                vec!["heuristic_only".to_owned()]
+            } else {
+                vec![
+                    "heuristic_only".to_owned(),
+                    "approval_edges_present".to_owned(),
+                ]
+            },
         }))
     }
 }

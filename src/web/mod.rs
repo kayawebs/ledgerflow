@@ -175,6 +175,7 @@ struct DashboardQuery {
     cluster_id: Option<String>,
     start: Option<String>,
     end: Option<String>,
+    cluster_tab: Option<String>,
     notice: Option<String>,
 }
 
@@ -197,6 +198,7 @@ struct PageNoticeQuery {
 struct ClusterDetailQuery {
     start: Option<String>,
     end: Option<String>,
+    cluster_tab: Option<String>,
     notice: Option<String>,
 }
 
@@ -309,6 +311,31 @@ struct ClusterDiscoveryQuery {
     max_hops: Option<u8>,
     per_address_limit: Option<u32>,
     notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+enum ClusterAnalysisTab {
+    Overview,
+    Metrics,
+    Activity,
+}
+
+impl ClusterAnalysisTab {
+    fn from_query(value: Option<&str>) -> Self {
+        match value {
+            Some("metrics") => Self::Metrics,
+            Some("activity") => Self::Activity,
+            _ => Self::Overview,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Metrics => "metrics",
+            Self::Activity => "activity",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -714,6 +741,7 @@ async fn clusters_page(
             cluster_id: None,
             start: None,
             end: None,
+            cluster_tab: None,
             notice: query.notice,
         },
         None,
@@ -743,6 +771,7 @@ async fn cluster_analysis_page(
             cluster_id: Some(cluster_id),
             start: query.start,
             end: query.end,
+            cluster_tab: query.cluster_tab,
             notice: query.notice,
         },
         None,
@@ -788,6 +817,7 @@ async fn cluster_discovery_page(
             cluster_id: None,
             start: None,
             end: None,
+            cluster_tab: None,
             notice: query.notice.clone(),
         },
         None,
@@ -816,6 +846,7 @@ async fn tx_analysis_page(
             cluster_id: None,
             start: None,
             end: None,
+            cluster_tab: None,
             notice: query.notice,
         },
         None,
@@ -844,6 +875,7 @@ async fn cluster_graph_page(
             cluster_id: None,
             start: None,
             end: None,
+            cluster_tab: None,
             notice: query.notice,
         },
         None,
@@ -872,6 +904,7 @@ async fn indexer_progress_page(
             cluster_id: None,
             start: None,
             end: None,
+            cluster_tab: None,
             notice: query.notice,
         },
         None,
@@ -909,6 +942,7 @@ async fn indexer_lookup_page(
             cluster_id: None,
             start: None,
             end: None,
+            cluster_tab: None,
             notice: query.notice.clone(),
         },
         None,
@@ -986,6 +1020,7 @@ async fn create_cluster(
                 cluster_id: None,
                 start: None,
                 end: None,
+                cluster_tab: None,
                 notice: None,
             };
             render_dashboard_response(
@@ -1130,6 +1165,7 @@ async fn run_tx_analysis(
         cluster_id: None,
         start: None,
         end: None,
+        cluster_tab: None,
         notice: None,
     };
     match result {
@@ -1176,6 +1212,7 @@ async fn render_dashboard_response(
     discovery_query: Option<ClusterDiscoveryQuery>,
 ) -> Result<Response, WebError> {
     let tab = DashboardTab::from_query(query.tab.as_deref());
+    let cluster_analysis_tab = ClusterAnalysisTab::from_query(query.cluster_tab.as_deref());
     let clusters = state
         .portal_service
         .list_clusters_for_user(user.user_id)
@@ -1283,6 +1320,7 @@ async fn render_dashboard_response(
         &alerts,
         &classified_transactions,
         cluster_status.as_ref(),
+        &cluster_analysis_tab,
         tx_result.as_ref(),
         discovery_result.as_ref(),
         discovery_query.as_ref(),
@@ -1802,6 +1840,7 @@ fn render_dashboard_page(
     alerts: &[ClusterAlert],
     classified_transactions: &[ClassifiedTransaction],
     cluster_status: Option<&(String, String)>,
+    cluster_analysis_tab: &ClusterAnalysisTab,
     tx_result: Option<&serde_json::Value>,
     discovery_result: Option<&ClusterDiscoveryResponse>,
     discovery_query: Option<&ClusterDiscoveryQuery>,
@@ -1842,6 +1881,21 @@ fn render_dashboard_page(
         let status_tone = cluster_status
             .map(|item| item.1.as_str())
             .unwrap_or("info");
+        let overview_active = if *cluster_analysis_tab == ClusterAnalysisTab::Overview {
+            "active"
+        } else {
+            ""
+        };
+        let metrics_active = if *cluster_analysis_tab == ClusterAnalysisTab::Metrics {
+            "active"
+        } else {
+            ""
+        };
+        let activity_active = if *cluster_analysis_tab == ClusterAnalysisTab::Activity {
+            "active"
+        } else {
+            ""
+        };
         format!(
             r#"
 <section class="panel">
@@ -1851,26 +1905,38 @@ fn render_dashboard_page(
       <div class="stat"><span>Cluster</span><strong>{}</strong></div>
       <label>Start<input type="text" name="start" value="{}" placeholder="2026-04-01T00:00:00Z"></label>
       <label>End<input type="text" name="end" value="{}" placeholder="2026-04-30T23:59:59Z"></label>
+      <input type="hidden" name="cluster_tab" value="{}">
       <button class="cta secondary" type="submit">Refresh analysis</button>
     </form>
     <div id="cluster-live-root" data-cluster-id="{}" data-start="{}" data-end="{}"></div>
     <div id="cluster-live-status" class="notice {}">{}</div>
-    <h3>Tracking</h3>
-    <div id="cluster-live-tracking">{}</div>
-    <h3>Rolling metrics</h3>
-    <div id="cluster-live-metrics">{}</div>
-    <h3>Behavior breakdown</h3>
-    <div id="cluster-live-behavior">{}</div>
-    <h3>Coverage</h3>
-    <div id="cluster-live-coverage">{}</div>
-    <h3>Alerts</h3>
-    <div id="cluster-live-alerts">{}</div>
-    <h3>Spend summary</h3>
-    <div id="cluster-live-summary">{}</div>
-    <h3>Recent backfill runs</h3>
-    <div id="cluster-live-runs">{}</div>
-    <h3>Recent classified transactions</h3>
-    <div id="cluster-live-classified">{}</div>
+    <div class="cluster-tabbar" role="tablist" aria-label="Cluster analysis sections">
+      <button class="cluster-tab {}" type="button" data-cluster-tab-target="overview">Overview</button>
+      <button class="cluster-tab {}" type="button" data-cluster-tab-target="metrics">Metrics</button>
+      <button class="cluster-tab {}" type="button" data-cluster-tab-target="activity">Activity</button>
+    </div>
+    <section class="cluster-tab-panel {}" data-cluster-tab-panel="overview">
+      <h3>Tracking</h3>
+      <div id="cluster-live-tracking">{}</div>
+      <h3>Coverage</h3>
+      <div id="cluster-live-coverage">{}</div>
+      <h3>Alerts</h3>
+      <div id="cluster-live-alerts">{}</div>
+    </section>
+    <section class="cluster-tab-panel {}" data-cluster-tab-panel="metrics">
+      <h3>Rolling metrics</h3>
+      <div id="cluster-live-metrics">{}</div>
+      <h3>Behavior breakdown</h3>
+      <div id="cluster-live-behavior">{}</div>
+      <h3>Spend summary</h3>
+      <div id="cluster-live-summary">{}</div>
+    </section>
+    <section class="cluster-tab-panel {}" data-cluster-tab-panel="activity">
+      <h3>Recent classified transactions</h3>
+      <div id="cluster-live-classified">{}</div>
+      <h3>Recent backfill runs</h3>
+      <div id="cluster-live-runs">{}</div>
+    </section>
   </div>
 </section>
 "#,
@@ -1879,19 +1945,26 @@ fn render_dashboard_page(
             escape_html(&format!("{} · {}", cluster.name, cluster.owner_label)),
             escape_html(start.unwrap_or_default()),
             escape_html(end.unwrap_or_default()),
+            cluster_analysis_tab.as_str(),
             cluster.cluster_id,
             escape_html(start.unwrap_or_default()),
             escape_html(end.unwrap_or_default()),
             escape_html(status_tone),
             escape_html(status_label),
+            overview_active,
+            metrics_active,
+            activity_active,
+            overview_active,
             render_tracking_status_panel(cluster, tracking),
-            render_cluster_metrics_panel(metrics),
-            render_behavior_breakdown_panel(metrics),
             render_cluster_coverage_cards(coverage),
             render_cluster_alerts_panel(cluster, alerts),
+            metrics_active,
+            render_cluster_metrics_panel(metrics),
+            render_behavior_breakdown_panel(metrics),
             render_cluster_summary_panel(spend_summary),
-            render_cluster_runs_table(runs),
+            activity_active,
             render_recent_classified_transactions_panel(classified_transactions),
+            render_cluster_runs_table(runs),
         )
     } else {
         "<section class=\"panel\"><div class=\"panel-body\"><div class=\"empty-state\">Select or create a cluster to view analysis.</div></div></section>".to_owned()
@@ -1933,6 +2006,58 @@ fn render_dashboard_page(
     let graph_panel = render_cluster_graph_panel(clusters);
     let indexer_progress_panel = render_indexer_progress_panel(indexer_progress);
     let indexer_lookup_panel = render_indexer_lookup_panel(indexer_lookup, indexer_query);
+    let side_column = format!(
+        r#"<section class="panel">
+              <div class="panel-head"><h2>Your clusters</h2><span class="badge">{}</span></div>
+              <div class="panel-body cluster-list">{}</div>
+            </section>
+            <section class="panel">
+              <div class="panel-head"><h2>Pricing</h2></div>
+              <div class="panel-body">
+                <div class="price-card">
+                  <strong>{} ETH / month</strong>
+                  <span>Private beta override: free for now.</span>
+                </div>
+              </div>
+            </section>"#,
+        clusters.len(),
+        cluster_cards,
+        DEFAULT_PRICE_ETH
+    );
+    let content_layout = if *tab == DashboardTab::ClusterAnalysis {
+        format!(
+            r#"<section class="dashboard-stack">
+          <div class="main-column">
+            {}
+          </div>
+          <div class="side-column compact-side-column">
+            {}
+          </div>
+        </section>"#,
+            cluster_analysis_panel, side_column
+        )
+    } else {
+        format!(
+            r#"<section class="dashboard-grid">
+          <div class="main-column">
+            {}
+          </div>
+          <div class="side-column">
+            {}
+          </div>
+        </section>"#,
+            match tab {
+                DashboardTab::Clusters => render_cluster_management_panel(state.default_chain_id),
+                DashboardTab::ClusterAnalysis => cluster_analysis_panel.clone(),
+                DashboardTab::ClusterDiscovery => cluster_discovery_panel.clone(),
+                DashboardTab::TxAnalysis => tx_panel.clone(),
+                DashboardTab::ClusterGraph => graph_panel.clone(),
+                DashboardTab::IndexerProgress => indexer_progress_panel.clone(),
+                DashboardTab::IndexerLookup => indexer_lookup_panel.clone(),
+            },
+            side_column
+        )
+    };
 
     format!(
         r#"<!doctype html>
@@ -1975,26 +2100,7 @@ fn render_dashboard_page(
           {}
           {}
         </section>
-        <section class="dashboard-grid">
-          <div class="main-column">
-            {}
-          </div>
-          <div class="side-column">
-            <section class="panel">
-              <div class="panel-head"><h2>Your clusters</h2><span class="badge">{}</span></div>
-              <div class="panel-body cluster-list">{}</div>
-            </section>
-            <section class="panel">
-              <div class="panel-head"><h2>Pricing</h2></div>
-              <div class="panel-body">
-                <div class="price-card">
-                  <strong>{} ETH / month</strong>
-                  <span>Private beta override: free for now.</span>
-                </div>
-              </div>
-            </section>
-          </div>
-        </section>
+        {}
       </main>
     </div>
     {}
@@ -2017,19 +2123,8 @@ fn render_dashboard_page(
         escape_html(section_title(tab)),
         render_notice_block(notice),
         render_error_block(error),
-        match tab {
-            DashboardTab::Clusters => render_cluster_management_panel(state.default_chain_id),
-            DashboardTab::ClusterAnalysis => cluster_analysis_panel,
-            DashboardTab::ClusterDiscovery => cluster_discovery_panel,
-            DashboardTab::TxAnalysis => tx_panel,
-            DashboardTab::ClusterGraph => graph_panel,
-            DashboardTab::IndexerProgress => indexer_progress_panel,
-            DashboardTab::IndexerLookup => indexer_lookup_panel,
-        },
-        clusters.len(),
-        cluster_cards,
-        DEFAULT_PRICE_ETH,
-        render_cluster_autorefresh_script(selected_cluster, start, end)
+        content_layout,
+        render_cluster_autorefresh_script(selected_cluster, start, end, cluster_analysis_tab)
     )
 }
 
@@ -2859,6 +2954,7 @@ fn render_cluster_autorefresh_script(
     selected_cluster: Option<&DashboardClusterRecord>,
     start: Option<&str>,
     end: Option<&str>,
+    selected_tab: &ClusterAnalysisTab,
 ) -> String {
     let Some(cluster) = selected_cluster else {
         return String::new();
@@ -2870,6 +2966,7 @@ fn render_cluster_autorefresh_script(
   const clusterId = {cluster_id:?};
   const start = {start:?};
   const end = {end:?};
+  const initialClusterTab = {selected_tab:?};
   const statusNode = document.getElementById("cluster-live-status");
   const trackingNode = document.getElementById("cluster-live-tracking");
   const metricsNode = document.getElementById("cluster-live-metrics");
@@ -2880,6 +2977,26 @@ fn render_cluster_autorefresh_script(
   const runsNode = document.getElementById("cluster-live-runs");
   const classifiedNode = document.getElementById("cluster-live-classified");
   if (!clusterId || !statusNode || !trackingNode || !metricsNode || !behaviorNode || !coverageNode || !alertsNode || !summaryNode || !runsNode || !classifiedNode) return;
+  const tabButtons = Array.from(document.querySelectorAll("[data-cluster-tab-target]"));
+  const tabPanels = Array.from(document.querySelectorAll("[data-cluster-tab-panel]"));
+
+  const activateClusterTab = (nextTab) => {{
+    const target = ["overview", "metrics", "activity"].includes(nextTab) ? nextTab : "overview";
+    tabButtons.forEach((button) => {{
+      button.classList.toggle("active", button.dataset.clusterTabTarget === target);
+    }});
+    tabPanels.forEach((panel) => {{
+      panel.classList.toggle("active", panel.dataset.clusterTabPanel === target);
+    }});
+    const url = new URL(window.location.href);
+    url.searchParams.set("cluster_tab", target);
+    window.history.replaceState({{}}, "", url.toString());
+  }};
+
+  tabButtons.forEach((button) => {{
+    button.addEventListener("click", () => activateClusterTab(button.dataset.clusterTabTarget || "overview"));
+  }});
+  activateClusterTab(initialClusterTab);
 
   const escapeHtml = (value) => String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -3181,7 +3298,8 @@ fn render_cluster_autorefresh_script(
 </script>"#,
         cluster_id = cluster.cluster_id.to_string(),
         start = start.unwrap_or_default(),
-        end = end.unwrap_or_default()
+        end = end.unwrap_or_default(),
+        selected_tab = selected_tab.as_str()
     )
 }
 
@@ -3252,7 +3370,7 @@ fn shared_styles() -> &'static str {
   --shadow: 0 20px 40px rgba(34, 24, 14, 0.08);
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: radial-gradient(circle at top left, rgba(13,110,99,.12), transparent 28rem), linear-gradient(180deg, #f7f2ea 0%, var(--bg) 100%); color: var(--ink); font-family: "Iowan Old Style", Georgia, serif; }
+body { margin: 0; overflow-x: hidden; background: radial-gradient(circle at top left, rgba(13,110,99,.12), transparent 28rem), linear-gradient(180deg, #f7f2ea 0%, var(--bg) 100%); color: var(--ink); font-family: "Iowan Old Style", Georgia, serif; }
 a { color: inherit; text-decoration: none; }
 .shell, .dashboard-shell { width: min(1240px, calc(100vw - 40px)); margin: 0 auto; }
 .topbar { display: flex; justify-content: space-between; align-items: center; padding: 28px 0 16px; }
@@ -3294,38 +3412,48 @@ label { display: grid; gap: 8px; font-size: .95rem; }
 input, textarea, select { width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); font: inherit; }
 textarea { min-height: 140px; resize: vertical; }
 .dashboard-body { background: #f2ede5; }
-.dashboard-shell { display: grid; grid-template-columns: 280px 1fr; gap: 24px; padding: 24px 0; }
+.dashboard-shell { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 24px; padding: 24px 0; }
 .sidebar { position: sticky; top: 18px; height: fit-content; display: grid; gap: 16px; }
 .user-card { padding: 18px; border: 1px solid var(--line); border-radius: 20px; background: rgba(255,255,255,.72); }
 .side-nav { display: grid; gap: 8px; }
 .side-nav a { padding: 12px 14px; border-radius: 14px; border: 1px solid transparent; color: var(--muted); }
 .side-nav a.active { background: var(--panel); border-color: var(--line); color: var(--ink); }
-.dashboard-main { display: grid; gap: 20px; }
+.dashboard-main { display: grid; gap: 20px; min-width: 0; }
 .dashboard-hero { padding: 8px 0 0; }
-.dashboard-grid { display: grid; grid-template-columns: 1.45fr .95fr; gap: 20px; }
-.main-column, .side-column { display: grid; gap: 20px; }
+.dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(260px, .95fr); gap: 20px; min-width: 0; align-items: start; }
+.dashboard-stack { display: grid; gap: 20px; min-width: 0; }
+.main-column, .side-column, .compact-side-column { display: grid; gap: 20px; min-width: 0; }
 .panel-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 18px 20px 8px; }
 .panel-head .badge { flex-shrink: 0; white-space: nowrap; }
+.panel, .panel-body, .table-shell { min-width: 0; }
 .panel-body { padding: 0 20px 20px; }
 .badge { padding: 6px 10px; border-radius: 999px; background: var(--cream); color: var(--muted); font-size: .82rem; }
 .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 14px 0 20px; }
 .stat { border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.78); padding: 14px; }
 .stat span { display: block; color: var(--muted); font-size: .82rem; text-transform: uppercase; letter-spacing: .08em; }
 .stat strong { display: block; margin-top: 8px; font-size: 1.05rem; line-height: 1.3; overflow-wrap: anywhere; }
+.cluster-tabbar { display: flex; flex-wrap: wrap; gap: 10px; margin: 6px 0 18px; }
+.cluster-tab { border: 1px solid var(--line); background: rgba(255,255,255,.72); color: var(--muted); border-radius: 999px; padding: 10px 14px; font: inherit; font-weight: 700; cursor: pointer; }
+.cluster-tab.active { background: var(--cream); color: var(--ink); border-color: rgba(13,110,99,.24); }
+.cluster-tab-panel { display: none; gap: 0; }
+.cluster-tab-panel.active { display: block; }
 .stack-form, .inline-form { display: grid; gap: 12px; }
 .split-fields { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
 .split-panels { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
 .inline-form { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); align-items: end; margin-bottom: 12px; }
 .cluster-list { display: grid; gap: 12px; }
-.cluster-card { display: grid; gap: 6px; padding: 16px; }
+.cluster-card { display: grid; gap: 6px; padding: 16px; min-width: 0; }
 .cluster-card span, .cluster-card small { color: var(--muted); }
 .json-shell { margin: 0; padding: 16px; border-radius: 16px; background: #14110d; color: #f7f2ea; overflow: auto; font-size: 12px; line-height: 1.55; }
 .table-shell { overflow: auto; }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
 .meter { height: 10px; border-radius: 999px; background: rgba(13,110,99,.08); overflow: hidden; min-width: 120px; }
 .meter span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), #2aa899); }
 .alert-list { display: grid; gap: 12px; }
+.price-card { padding: 18px; display: grid; gap: 10px; min-width: 0; }
+.price-card strong { display: block; font-size: clamp(1.35rem, 2vw, 1.9rem); line-height: 1.15; overflow-wrap: anywhere; }
+.price-card span { color: var(--muted); line-height: 1.6; }
 .alert-card { border: 1px solid var(--line); border-radius: 18px; background: rgba(255,255,255,.78); padding: 14px; display: grid; gap: 8px; }
 .alert-card-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
 .alert-card p, .alert-card small { margin: 0; color: var(--muted); }
