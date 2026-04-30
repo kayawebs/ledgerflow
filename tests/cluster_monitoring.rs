@@ -109,10 +109,59 @@ async fn behavior_classifier_marks_liquidation_when_trace_hits_known_selector() 
     );
 
     assert_eq!(classified.behavior_tag, BehaviorTag::Liquidation);
-    assert_eq!(
-        classified.protocol.as_deref(),
-        Some("liquidation_like_activity")
+    assert_eq!(classified.protocol.as_deref(), Some("aave"));
+}
+
+#[tokio::test]
+async fn behavior_classifier_marks_morpho_liquidation_without_trace_when_event_matches() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(
+        MockRpcClient {
+            include_trace: false,
+            ..Default::default()
+        }
+        .boxed(),
+        false,
     );
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository.clone(),
+        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+    ));
+    let cluster_service = ClusterService::new(repository);
+
+    let cluster = cluster_service
+        .create_cluster(
+            8453,
+            "ops_team",
+            "morpho_liquidator_cluster",
+            None,
+            vec![ClusterAddress {
+                address: "0x1111111111111111111111111111111111111111".to_owned(),
+                label: Some("liquidator".to_owned()),
+                role: Some("bot".to_owned()),
+                metadata: json!({}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let (analysis, _) = analysis_service
+        .analyze_transaction(8453, "0xmorpho-liquidation-case")
+        .await
+        .unwrap();
+    let classified = BehaviorClassifier::default().classify(
+        &cluster,
+        "0x1111111111111111111111111111111111111111",
+        &analysis,
+    );
+
+    assert_eq!(classified.behavior_tag, BehaviorTag::Liquidation);
+    assert_eq!(classified.protocol.as_deref(), Some("morpho_blue"));
 }
 
 #[tokio::test]

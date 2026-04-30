@@ -48,10 +48,19 @@ impl BehaviorClassifier {
             .iter()
             .map(|item| item.label.clone())
             .collect::<Vec<_>>();
-        let protocol = labels
+        let protocol = analysis
+            .recognizer_results
+            .iter()
+            .find_map(|item| {
+                item.attributes
+                    .get("protocol")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .or_else(|| labels
             .iter()
             .find(|label| !matches!(label.as_str(), "selector_present" | "failed_execution"))
-            .cloned()
+            .cloned())
             .or_else(|| analysis.to_address.clone())
             .or_else(|| labels.first().cloned());
 

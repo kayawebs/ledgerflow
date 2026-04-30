@@ -37,20 +37,42 @@ impl Default for MockRpcClient {
 #[async_trait]
 impl RpcClient for MockRpcClient {
     async fn get_transaction(&self, chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
-        let input = if tx_hash.contains("liquidation") {
-            format!("{}{}", "0x12345678", "00".repeat(32))
+        let (from_address, to_address, input) = if tx_hash.contains("morpho-liquidation") {
+            (
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                format!("{}{}", "0x12345678", "00".repeat(32)),
+            )
+        } else if tx_hash.contains("liquidation") {
+            (
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                format!("{}{}", "0x12345678", "00".repeat(32)),
+            )
         } else if tx_hash.contains("approve") {
-            format!("{}{}", "0x095ea7b3", "00".repeat(32))
+            (
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                format!("{}{}", "0x095ea7b3", "00".repeat(32)),
+            )
         } else if tx_hash.contains("transfer") {
-            format!("{}{}", "0xa9059cbb", "00".repeat(32))
+            (
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                format!("{}{}", "0xa9059cbb", "00".repeat(32)),
+            )
         } else {
-            format!("{}{}", "0x38ed1739", "00".repeat(32))
+            (
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                format!("{}{}", "0x38ed1739", "00".repeat(32)),
+            )
         };
         Ok(json!({
             "hash": tx_hash,
             "blockNumber": format!("0x{:x}", 123456u64),
-            "from": "0x1111111111111111111111111111111111111111",
-            "to": "0x2222222222222222222222222222222222222222",
+            "from": from_address,
+            "to": to_address,
             "value": format!("0x{:x}", 1000u64),
             "input": input,
             "nonce": "0x7",
@@ -60,6 +82,56 @@ impl RpcClient for MockRpcClient {
 
     async fn get_receipt(&self, _chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
         let status = if tx_hash.contains("fail") { "0x0" } else { "0x1" };
+        if tx_hash.contains("morpho-liquidation") {
+            return Ok(json!({
+                "status": status,
+                "gasUsed": format!("0x{:x}", 21000u64),
+                "effectiveGasPrice": format!("0x{:x}", 1_000_000_000u64),
+                "logs": [
+                    {
+                        "logIndex": "0x0",
+                        "address": "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb",
+                        "topics": [
+                            "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41",
+                            "0x090bb600c50dd50358b2b513eba567070b4f6f874a1cac2d7af7ff4da17be5a9",
+                            pad_address("0x2222222222222222222222222222222222222222"),
+                            pad_address("0xe7bc1ed115b368b946d97e45ee79f47a14ebf179")
+                        ],
+                        "data": "0x0"
+                    },
+                    {
+                        "logIndex": "0x1",
+                        "address": "0x4200000000000000000000000000000000000006",
+                        "topics": [
+                            "0xddf252ad00000000000000000000000000000000000000000000000000000000",
+                            pad_address("0x2222222222222222222222222222222222222222"),
+                            pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb")
+                        ],
+                        "data": format!("0x{:x}", 42u64)
+                    },
+                    {
+                        "logIndex": "0x2",
+                        "address": "0x091a5abe6616e26268e5eecff256c2212fce2707",
+                        "topics": [
+                            "0xddf252ad00000000000000000000000000000000000000000000000000000000",
+                            pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb"),
+                            pad_address("0x2222222222222222222222222222222222222222")
+                        ],
+                        "data": format!("0x{:x}", 1394u64)
+                    },
+                    {
+                        "logIndex": "0x3",
+                        "address": "0x4200000000000000000000000000000000000006",
+                        "topics": [
+                            APPROVAL_TOPIC,
+                            pad_address("0x2222222222222222222222222222222222222222"),
+                            pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb")
+                        ],
+                        "data": format!("0x{:x}", 42u64)
+                    }
+                ]
+            }));
+        }
         Ok(json!({
             "status": status,
             "gasUsed": format!("0x{:x}", 21000u64),
