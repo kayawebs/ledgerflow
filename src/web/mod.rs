@@ -255,8 +255,6 @@ struct UpdateClusterForm {
 struct RunTxForm {
     chain_id: u64,
     tx_hash: String,
-    recognizer_ids: Option<String>,
-    action: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -279,14 +277,6 @@ struct CreateClusterRequest {
 struct AnalyzeTxRequest {
     chain_id: u64,
     tx_hash: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ReplayTxRequest {
-    chain_id: u64,
-    tx_hash: String,
-    ruleset_id: Option<String>,
-    recognizer_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1310,33 +1300,14 @@ async fn run_tx_analysis(
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
-    let result = match form.action.as_str() {
-        "load" => {
-            let path = format!(
-                "/analyses/{}?chain_id={}",
-                form.tx_hash.trim(),
-                form.chain_id
-            );
-            api_get_json::<AnalysisEnvelope>(&state, &path)
-                .await
-                .map(|payload| serde_json::to_value(payload).unwrap_or_default())
-        }
-        "replay" => {
-            let recognizer_ids = parse_recognizer_ids(form.recognizer_ids.as_deref());
-            api_post_json::<_, AnalysisEnvelope>(
-                &state,
-                "/replay/tx",
-                &ReplayTxRequest {
-                    chain_id: form.chain_id,
-                    tx_hash: form.tx_hash.clone(),
-                    ruleset_id: Some("base.ruleset.v0".to_owned()),
-                    recognizer_ids: recognizer_ids.clone(),
-                },
-            )
-            .await
-            .map(|payload| serde_json::to_value(payload).unwrap_or_default())
-        }
-        _ => api_post_json::<_, AnalysisEnvelope>(
+    let load_path = format!(
+        "/analyses/{}?chain_id={}",
+        form.tx_hash.trim(),
+        form.chain_id
+    );
+    let result = match api_get_json::<AnalysisEnvelope>(&state, &load_path).await {
+        Ok(payload) => Ok(serde_json::to_value(payload).unwrap_or_default()),
+        Err(_) => api_post_json::<_, AnalysisEnvelope>(
             &state,
             "/analyses/tx",
             &AnalyzeTxRequest {
@@ -1760,21 +1731,6 @@ fn cluster_tx_table_state_from_query(query: &DashboardQuery) -> ClusterTxTableSt
             .map(str::to_owned),
         sort_by,
         sort_dir,
-    }
-}
-
-fn parse_recognizer_ids(raw: Option<&str>) -> Option<Vec<String>> {
-    let values = raw
-        .unwrap_or_default()
-        .split([',', '\n'])
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if values.is_empty() {
-        None
-    } else {
-        Some(values)
     }
 }
 
@@ -2345,17 +2301,8 @@ fn render_dashboard_page(
     <form class="stack-form" method="post" action="/app/tx-analysis/run">
       <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
       <label>Transaction hash<input type="text" name="tx_hash" placeholder="0x..." required></label>
-      <label>Recognizer overrides (Replay only)<input type="text" name="recognizer_ids" placeholder="selector_presence,native_transfer"></label>
-      <div class="field-hint">Only used by <strong>Replay</strong>. Leave this empty for the normal recognizer set, or enter a comma-separated subset if you want to rerun the saved evidence with specific recognizers only.</div>
       <div class="button-row">
-        <button class="cta secondary" type="submit" name="action" value="analyze">Analyze</button>
-        <button class="cta secondary" type="submit" name="action" value="load">Load saved</button>
-        <button class="cta secondary" type="submit" name="action" value="replay">Replay</button>
-      </div>
-      <div class="split-fields tx-action-guide">
-        <div class="mini-card"><strong>Analyze</strong><span>Fetch fresh chain evidence, analyze it now, and save the result.</span></div>
-        <div class="mini-card"><strong>Load saved</strong><span>Load the saved analysis and evidence pack if this tx was already analyzed.</span></div>
-        <div class="mini-card"><strong>Replay</strong><span>Rerun analysis from saved evidence and versions, optionally with recognizer overrides.</span></div>
+        <button class="cta secondary" type="submit">Analyze transaction</button>
       </div>
     </form>
     {}
@@ -2366,7 +2313,7 @@ fn render_dashboard_page(
         tx_result
             .map(render_tx_analysis_result)
             .unwrap_or_else(|| {
-                "<div class=\"empty-state\">Run one analyze / load / replay action to inspect a transaction.</div>".to_owned()
+                "<div class=\"empty-state\">Enter one tx hash to load the saved result if it already exists, or run a fresh analysis if it does not.</div>".to_owned()
             })
     );
     let cluster_discovery_panel = render_cluster_discovery_panel(discovery_result, discovery_query);
@@ -2686,6 +2633,95 @@ fn render_cluster_discovery_panel(
     )
 }
 
+fn summarize_primary_activity(analysis: &TransactionAnalysis) -> (String, String, String) {
+    let mut best: Option<(&str, f32, &str)> = None;
+    for result in &analysis.recognizer_results {
+        let mapped = match result.label.as_str() {
+            "liquidation_like_activity" => Some((
+                "liquidation",
+                "A liquidation-like recognizer fired on this tx.",
+            )),
+            "swap_like_activity" | "approval_then_swap_like" => {
+                Some(("swap", "The tx shows token-in / token-out swap-like behavior."))
+            }
+            "erc20_approval_activity" => Some((
+                "approve",
+                "The tx granted ERC20 allowance to a spender contract.",
+            )),
+            "native_transfer_activity" => Some((
+                "native transfer",
+                "The tx primarily looks like native asset movement.",
+            )),
+            "erc20_transfer_activity" => Some((
+                "token transfer",
+                "The tx mainly looks like ERC20 transfer activity.",
+            )),
+            "batch_router_exec" => Some((
+                "batch router",
+                "The tx looks like a multi-step router or aggregator execution.",
+            )),
+            "arbitrage_like_activity" => Some((
+                "arbitrage",
+                "The tx looks like multi-leg token cycling or arbitrage-like activity.",
+            )),
+            "deposit_like_activity" => Some((
+                "deposit",
+                "The tx resembles depositing assets into a contract or position.",
+            )),
+            "withdraw_like_activity" => Some((
+                "withdraw",
+                "The tx resembles withdrawing assets from a contract or position.",
+            )),
+            "bridge_like_asset_exit" => Some((
+                "bridge-like transfer",
+                "The tx looks like an asset exit into a bridge or escrow-style destination.",
+            )),
+            "failed_execution" => Some((
+                "failed execution",
+                "The top-level transaction reverted or failed.",
+            )),
+            _ => None,
+        };
+        let Some((activity, reason)) = mapped else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|(_, confidence, _)| result.confidence > *confidence)
+            .unwrap_or(true)
+        {
+            best = Some((activity, result.confidence, reason));
+        }
+    }
+
+    if let Some((activity, confidence, reason)) = best {
+        return (
+            activity.to_owned(),
+            reason.to_owned(),
+            format!("{confidence:.2}"),
+        );
+    }
+
+    if analysis
+        .normalized_execution_facts
+        .selector
+        .as_deref()
+        .is_some()
+    {
+        (
+            "generic contract call".to_owned(),
+            "The system found a selector, but no higher-level recognizer produced a narrow activity label.".to_owned(),
+            "n/a".to_owned(),
+        )
+    } else {
+        (
+            "unknown".to_owned(),
+            "The current recognizers could not confidently classify this transaction yet.".to_owned(),
+            "n/a".to_owned(),
+        )
+    }
+}
+
 fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
     let raw_json = serde_json::to_string_pretty(payload).unwrap_or_default();
     let Ok(envelope) = serde_json::from_value::<AnalysisEnvelope>(payload.clone()) else {
@@ -2701,6 +2737,8 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
         .selector
         .as_deref()
         .unwrap_or("n/a");
+    let (primary_activity, primary_activity_reason, primary_confidence) =
+        summarize_primary_activity(analysis);
     let recognizer_rows = if analysis.recognizer_results.is_empty() {
         "<div class=\"empty-state\">No recognizers fired. The tx may still be analyzable, but the current recognizer set did not produce a label.</div>".to_owned()
     } else {
@@ -2851,7 +2889,11 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
 
     format!(
         r#"<div class="tx-analysis-shell">
-  <div class="field-hint">This page is a normalized interpretation of one tx: raw chain evidence goes in, recognizers and flow derivation run, and the output below tells you what the system could confidently reconstruct.</div>
+  <div class="mini-card">
+    <strong>Most likely activity: {}</strong>
+    <span>{}</span>
+    <small>Confidence: {}</small>
+  </div>
   <div class="stats-grid">
     <div class="stat"><span>Tx hash</span><strong><code>{}</code></strong></div>
     <div class="stat"><span>Tx status</span><strong>{}</strong></div>
@@ -2859,6 +2901,30 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
     <div class="stat"><span>Block</span><strong>{}</strong></div>
     <div class="stat"><span>Selector</span><strong><code>{}</code></strong></div>
     <div class="stat"><span>Recognizers / flows</span><strong>{} / {}</strong></div>
+  </div>
+  <div class="table-shell">
+    <table>
+      <thead>
+        <tr>
+          <th>Concept</th>
+          <th>What it means here</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Selector</strong></td>
+          <td>The first 4 bytes of calldata. It is a method-id hint, not a full semantic answer by itself.</td>
+        </tr>
+        <tr>
+          <td><strong>Recognizers</strong></td>
+          <td>Rule-based detectors that label patterns such as approve, swap, liquidation, arbitrage, or native transfer.</td>
+        </tr>
+        <tr>
+          <td><strong>Flows</strong></td>
+          <td>Normalized asset movements the system reconstructed from logs, value, and execution facts.</td>
+        </tr>
+      </tbody>
+    </table>
   </div>
   <div class="table-shell">
     <table>
@@ -2897,6 +2963,9 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
     <pre class="json-shell">{}</pre>
   </details>
 </div>"#,
+        escape_html(&primary_activity),
+        escape_html(&primary_activity_reason),
+        escape_html(&primary_confidence),
         escape_html(&truncate_middle(&analysis.tx_hash, 12)),
         escape_html(&enum_label(&analysis.status)),
         escape_html(&enum_label(&analysis.analysis_status)),
