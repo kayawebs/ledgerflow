@@ -2345,11 +2345,17 @@ fn render_dashboard_page(
     <form class="stack-form" method="post" action="/app/tx-analysis/run">
       <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
       <label>Transaction hash<input type="text" name="tx_hash" placeholder="0x..." required></label>
-      <label>Recognizer overrides<input type="text" name="recognizer_ids" placeholder="selector_presence,native_transfer"></label>
+      <label>Recognizer overrides (Replay only)<input type="text" name="recognizer_ids" placeholder="selector_presence,native_transfer"></label>
+      <div class="field-hint">Only used by <strong>Replay</strong>. Leave this empty for the normal recognizer set, or enter a comma-separated subset if you want to rerun the saved evidence with specific recognizers only.</div>
       <div class="button-row">
         <button class="cta secondary" type="submit" name="action" value="analyze">Analyze</button>
         <button class="cta secondary" type="submit" name="action" value="load">Load saved</button>
         <button class="cta secondary" type="submit" name="action" value="replay">Replay</button>
+      </div>
+      <div class="split-fields tx-action-guide">
+        <div class="mini-card"><strong>Analyze</strong><span>Fetch fresh chain evidence, analyze it now, and save the result.</span></div>
+        <div class="mini-card"><strong>Load saved</strong><span>Load the saved analysis and evidence pack if this tx was already analyzed.</span></div>
+        <div class="mini-card"><strong>Replay</strong><span>Rerun analysis from saved evidence and versions, optionally with recognizer overrides.</span></div>
       </div>
     </form>
     {}
@@ -2358,12 +2364,7 @@ fn render_dashboard_page(
 "#,
         state.default_chain_id,
         tx_result
-            .map(|payload| {
-                format!(
-                    "<pre class=\"json-shell\">{}</pre>",
-                    escape_html(&serde_json::to_string_pretty(payload).unwrap_or_default())
-                )
-            })
+            .map(render_tx_analysis_result)
             .unwrap_or_else(|| {
                 "<div class=\"empty-state\">Run one analyze / load / replay action to inspect a transaction.</div>".to_owned()
             })
@@ -2682,6 +2683,249 @@ fn render_cluster_discovery_panel(
         if max_hops == 2 { "selected" } else { "" },
         if max_hops == 3 { "selected" } else { "" },
         result_panel
+    )
+}
+
+fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
+    let raw_json = serde_json::to_string_pretty(payload).unwrap_or_default();
+    let Ok(envelope) = serde_json::from_value::<AnalysisEnvelope>(payload.clone()) else {
+        return format!(
+            "<details class=\"raw-json-shell\" open><summary>Raw analysis JSON</summary><pre class=\"json-shell\">{}</pre></details>",
+            escape_html(&raw_json)
+        );
+    };
+    let analysis = &envelope.analysis;
+    let evidence_pack = &envelope.evidence_pack;
+    let selector = analysis
+        .normalized_execution_facts
+        .selector
+        .as_deref()
+        .unwrap_or("n/a");
+    let recognizer_rows = if analysis.recognizer_results.is_empty() {
+        "<div class=\"empty-state\">No recognizers fired. The tx may still be analyzable, but the current recognizer set did not produce a label.</div>".to_owned()
+    } else {
+        analysis
+            .recognizer_results
+            .iter()
+            .map(|result| {
+                format!(
+                    r#"<article class="mini-card tx-recognizer-card">
+  <strong>{}</strong>
+  <span>{} · confidence {:.2}</span>
+  <small>id: {} · version: {}</small>
+  {}
+  {}
+</article>"#,
+                    escape_html(&result.label),
+                    escape_html(&result.recognizer_id),
+                    result.confidence,
+                    escape_html(&result.recognizer_id),
+                    escape_html(&result.recognizer_version),
+                    if result.warnings.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "<small>warnings: {}</small>",
+                            escape_html(&result.warnings.join(" | "))
+                        )
+                    },
+                    if result.unresolved_points.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "<small>unresolved: {}</small>",
+                            escape_html(
+                                &result
+                                    .unresolved_points
+                                    .iter()
+                                    .map(|item| item.code.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        )
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let flow_rows = if analysis.derived_flows.is_empty() {
+        "<div class=\"empty-state\">No normalized asset flows were derived for this tx.</div>".to_owned()
+    } else {
+        format!(
+            r#"<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Asset</th>
+        <th>Token</th>
+        <th>From</th>
+        <th>To</th>
+        <th>Amount raw</th>
+        <th>Method</th>
+        <th>Confidence</th>
+      </tr>
+    </thead>
+    <tbody>{}</tbody>
+  </table>
+</div>"#,
+            analysis
+                .derived_flows
+                .iter()
+                .map(|flow| {
+                    format!(
+                        "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{:.2}</td></tr>",
+                        escape_html(&enum_label(&flow.asset_type)),
+                        escape_html(&truncate_middle(flow.token_address.as_deref().unwrap_or("native"), 8)),
+                        escape_html(&truncate_middle(&flow.from_address, 8)),
+                        escape_html(&truncate_middle(&flow.to_address, 8)),
+                        escape_html(&flow.amount_raw),
+                        escape_html(&flow.derivation_method),
+                        flow.confidence
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
+    let validation_rows = if analysis.validation_results.is_empty() {
+        "<div class=\"empty-state\">No validation messages were emitted for this tx.</div>".to_owned()
+    } else {
+        format!(
+            r#"<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Validator</th>
+        <th>Status</th>
+        <th>Message</th>
+      </tr>
+    </thead>
+    <tbody>{}</tbody>
+  </table>
+</div>"#,
+            analysis
+                .validation_results
+                .iter()
+                .map(|message| {
+                    format!(
+                        "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                        escape_html(&message.validator_id),
+                        escape_html(&enum_label(&message.status)),
+                        escape_html(&message.message)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
+    let unresolved_rows = if analysis.unresolved_items.is_empty() {
+        "<div class=\"empty-state\">No unresolved points were recorded.</div>".to_owned()
+    } else {
+        format!(
+            r#"<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Code</th>
+        <th>Message</th>
+      </tr>
+    </thead>
+    <tbody>{}</tbody>
+  </table>
+</div>"#,
+            analysis
+                .unresolved_items
+                .iter()
+                .map(|item| {
+                    format!(
+                        "<tr><td>{}</td><td>{}</td></tr>",
+                        escape_html(&item.code),
+                        escape_html(&item.message)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
+
+    format!(
+        r#"<div class="tx-analysis-shell">
+  <div class="field-hint">This page is a normalized interpretation of one tx: raw chain evidence goes in, recognizers and flow derivation run, and the output below tells you what the system could confidently reconstruct.</div>
+  <div class="stats-grid">
+    <div class="stat"><span>Tx hash</span><strong><code>{}</code></strong></div>
+    <div class="stat"><span>Tx status</span><strong>{}</strong></div>
+    <div class="stat"><span>Analysis status</span><strong>{}</strong></div>
+    <div class="stat"><span>Block</span><strong>{}</strong></div>
+    <div class="stat"><span>Selector</span><strong><code>{}</code></strong></div>
+    <div class="stat"><span>Recognizers / flows</span><strong>{} / {}</strong></div>
+  </div>
+  <div class="table-shell">
+    <table>
+      <thead>
+        <tr>
+          <th>From</th>
+          <th>To</th>
+          <th>Value raw</th>
+          <th>Timestamp</th>
+          <th>Pack</th>
+          <th>Ruleset</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>{}</code></td>
+          <td><code>{}</code></td>
+          <td>{}</td>
+          <td>{}</td>
+          <td><code>{}</code></td>
+          <td>{}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Recognizer outputs</h3>
+  <div class="split-fields tx-recognizer-grid">{}</div>
+  <h3>Derived flows</h3>
+  {}
+  <h3>Validation results</h3>
+  {}
+  <h3>Unresolved points</h3>
+  {}
+  <details class="raw-json-shell">
+    <summary>Raw analysis JSON</summary>
+    <pre class="json-shell">{}</pre>
+  </details>
+</div>"#,
+        escape_html(&truncate_middle(&analysis.tx_hash, 12)),
+        escape_html(&enum_label(&analysis.status)),
+        escape_html(&enum_label(&analysis.analysis_status)),
+        analysis
+            .block_number
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned()),
+        escape_html(selector),
+        analysis.recognizer_results.len(),
+        analysis.derived_flows.len(),
+        escape_html(&truncate_middle(&analysis.from_address, 10)),
+        escape_html(&truncate_middle(
+            analysis.to_address.as_deref().unwrap_or("contract creation / none"),
+            10
+        )),
+        escape_html(&analysis.value),
+        escape_html(
+            &analysis
+                .block_timestamp
+                .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| "n/a".to_owned())
+        ),
+        escape_html(&truncate_middle(&evidence_pack.pack_id.to_string(), 12)),
+        escape_html(&evidence_pack.ruleset_id),
+        recognizer_rows,
+        flow_rows,
+        validation_rows,
+        unresolved_rows,
+        escape_html(&raw_json)
     )
 }
 
@@ -3743,6 +3987,13 @@ fn truncate_middle(value: &str, keep: usize) -> String {
     format!("{}...{}", &value[..keep], &value[value.len() - keep..])
 }
 
+fn enum_label<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|item| item.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -3846,6 +4097,15 @@ textarea { min-height: 140px; resize: vertical; }
 .cluster-card-actions form { margin: 0; }
 .cluster-card span, .cluster-card small { color: var(--muted); }
 .json-shell { margin: 0; padding: 16px; border-radius: 16px; background: #14110d; color: #f7f2ea; overflow: auto; font-size: 12px; line-height: 1.55; }
+.mini-card { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.78); min-width: 0; }
+.mini-card span, .mini-card small { color: var(--muted); line-height: 1.45; }
+.tx-analysis-shell { display: grid; gap: 18px; }
+.tx-action-guide { margin-top: 4px; }
+.tx-recognizer-grid { align-items: stretch; }
+.tx-recognizer-card strong { font-size: 1rem; }
+.raw-json-shell { border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.45); overflow: hidden; }
+.raw-json-shell summary { cursor: pointer; padding: 14px 16px; font-weight: 700; }
+.raw-json-shell[open] summary { border-bottom: 1px solid var(--line); }
 .table-shell { overflow: auto; }
 table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; overflow-wrap: anywhere; }
