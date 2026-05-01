@@ -350,6 +350,7 @@ struct ClusterDiscoveryQuery {
 enum ClusterAnalysisTab {
     Overview,
     Metrics,
+    Summary,
     Activity,
 }
 
@@ -357,6 +358,7 @@ impl ClusterAnalysisTab {
     fn from_query(value: Option<&str>) -> Self {
         match value {
             Some("metrics") => Self::Metrics,
+            Some("summary") => Self::Summary,
             Some("activity") => Self::Activity,
             _ => Self::Overview,
         }
@@ -366,6 +368,7 @@ impl ClusterAnalysisTab {
         match self {
             Self::Overview => "overview",
             Self::Metrics => "metrics",
+            Self::Summary => "summary",
             Self::Activity => "activity",
         }
     }
@@ -1581,15 +1584,26 @@ async fn load_cluster_live_response(
         }
         ClusterAnalysisTab::Metrics => {
             let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
-            let summary_fut = api_get_json::<ClusterSpendSummary>(state, &summary_path);
             let metrics_path = format!("/clusters/{}/metrics", cluster_id);
             let metrics_fut = api_get_json::<Vec<ClusterMetricsSnapshot>>(state, &metrics_path);
-            let (coverage, spend_summary, metrics) = tokio::join!(coverage_fut, summary_fut, metrics_fut);
+            let (coverage, metrics) = tokio::join!(coverage_fut, metrics_fut);
+            (
+                coverage.ok(),
+                None,
+                None,
+                metrics.unwrap_or_default(),
+                Vec::new(),
+            )
+        }
+        ClusterAnalysisTab::Summary => {
+            let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+            let summary_fut = api_get_json::<ClusterSpendSummary>(state, &summary_path);
+            let (coverage, spend_summary) = tokio::join!(coverage_fut, summary_fut);
             (
                 coverage.ok(),
                 None,
                 spend_summary.ok(),
-                metrics.unwrap_or_default(),
+                Vec::new(),
                 Vec::new(),
             )
         }
@@ -2200,6 +2214,11 @@ fn render_dashboard_page(
         } else {
             ""
         };
+        let summary_active = if *cluster_analysis_tab == ClusterAnalysisTab::Summary {
+            "active"
+        } else {
+            ""
+        };
         let activity_active = if *cluster_analysis_tab == ClusterAnalysisTab::Activity {
             "active"
         } else {
@@ -2216,6 +2235,12 @@ fn render_dashboard_page(
             start,
             end,
             ClusterAnalysisTab::Metrics,
+        );
+        let summary_href = cluster_analysis_tab_href(
+            cluster.cluster_id,
+            start,
+            end,
+            ClusterAnalysisTab::Summary,
         );
         let activity_href = cluster_analysis_tab_href(
             cluster.cluster_id,
@@ -2243,11 +2268,15 @@ fn render_dashboard_page(
       <div id="cluster-live-metrics">{}</div>
       <h3>Behavior breakdown</h3>
       <div id="cluster-live-behavior">{}</div>
-      <h3>Spend summary</h3>
-      <div id="cluster-live-summary">{}</div>
     </section>"#,
                 render_cluster_metrics_panel(metrics),
                 render_behavior_breakdown_panel(metrics),
+            ),
+            ClusterAnalysisTab::Summary => format!(
+                r#"<section class="cluster-tab-panel active" data-cluster-tab-panel="summary">
+      <h3>Spend summary</h3>
+      <div id="cluster-live-summary">{}</div>
+    </section>"#,
                 render_cluster_summary_panel(spend_summary),
             ),
             ClusterAnalysisTab::Activity => format!(
@@ -2275,6 +2304,7 @@ fn render_dashboard_page(
     <div class="cluster-tabbar" role="tablist" aria-label="Cluster analysis sections">
       <a class="cluster-tab {}" href="{}">Overview</a>
       <a class="cluster-tab {}" href="{}">Metrics</a>
+      <a class="cluster-tab {}" href="{}">Summary</a>
       <a class="cluster-tab {}" href="{}">Activity</a>
     </div>
     {}
@@ -2296,6 +2326,8 @@ fn render_dashboard_page(
             overview_href,
             metrics_active,
             metrics_href,
+            summary_active,
+            summary_href,
             activity_active,
             activity_href,
             tab_panel,
