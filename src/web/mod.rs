@@ -3087,6 +3087,7 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
     let call_path = render_storyline_call_path(storyline.get("call_path"));
+    let storyline_visual = render_storyline_visual(storyline, kind, protocol, initiator, executor);
     let funding_sources = render_storyline_flow_group("Funding into executor", storyline.get("funding_sources"));
     let repay_legs = render_storyline_flow_group("Repay / protocol-facing legs", storyline.get("repay_legs"));
     let collateral_receipts =
@@ -3108,12 +3109,14 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
 {}
 {}
 {}
+{}
 "#,
         escape_html(&format!("{} storyline", kind)),
         escape_html(summary),
         escape_html(protocol),
         escape_html(&truncate_middle(initiator, 10)),
         escape_html(&truncate_middle(executor, 10)),
+        storyline_visual,
         call_path,
         funding_sources,
         repay_legs,
@@ -3124,6 +3127,160 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
         } else {
             String::new()
         },
+    )
+}
+
+fn render_storyline_visual(
+    storyline: &serde_json::Value,
+    kind: &str,
+    protocol: &str,
+    initiator: &str,
+    executor: &str,
+) -> String {
+    let funding_lane = render_storyline_lane(
+        "Funding",
+        "Where the executor got assets or approvals before protocol interaction.",
+        storyline.get("funding_sources"),
+    );
+    let repay_lane = render_storyline_lane(
+        "Protocol-facing legs",
+        if kind == "liquidation" {
+            "Debt repayment or direct protocol-facing asset movement."
+        } else {
+            "Venue-facing execution legs."
+        },
+        storyline.get("repay_legs").or_else(|| storyline.get("cycle_legs")),
+    );
+    let receipt_lane = render_storyline_lane(
+        if kind == "liquidation" {
+            "Collateral / rewards back"
+        } else {
+            "Assets back to executor"
+        },
+        "What came back to the executor after the core action.",
+        storyline.get("collateral_receipts"),
+    );
+    let exit_lane = render_storyline_lane(
+        if kind == "liquidation" {
+            "Disposition / settlement"
+        } else {
+            "Exit / settlement"
+        },
+        "Where assets moved next after the main action.",
+        storyline.get("disposition_legs").or_else(|| storyline.get("exit_legs")),
+    );
+
+    format!(
+        r#"<div class="storyline-visual-shell">
+  <div class="storyline-main-path">
+    <div class="story-node">
+      <span class="story-node-label">Initiator</span>
+      <strong>{}</strong>
+      <small>EOA or top-level caller</small>
+    </div>
+    <div class="story-arrow">→</div>
+    <div class="story-node accent">
+      <span class="story-node-label">Executor</span>
+      <strong>{}</strong>
+      <small>Contract or account that orchestrated the flow</small>
+    </div>
+    <div class="story-arrow">→</div>
+    <div class="story-node protocol">
+      <span class="story-node-label">Protocol</span>
+      <strong>{}</strong>
+      <small>{}</small>
+    </div>
+  </div>
+  <div class="storyline-lanes">
+    {}
+    {}
+    {}
+    {}
+  </div>
+</div>"#,
+        escape_html(&truncate_middle(initiator, 10)),
+        escape_html(&truncate_middle(executor, 10)),
+        escape_html(protocol),
+        escape_html(if kind == "liquidation" {
+            "Detected liquidation target"
+        } else if kind == "arbitrage" {
+            "Detected venue set"
+        } else {
+            "Resolved execution target"
+        }),
+        funding_lane,
+        repay_lane,
+        receipt_lane,
+        exit_lane
+    )
+}
+
+fn render_storyline_lane(title: &str, subtitle: &str, value: Option<&serde_json::Value>) -> String {
+    let items = value
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .take(4)
+                .map(render_storyline_flow_chip)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let lane_body = if items.is_empty() {
+        "<div class=\"story-chip empty\">No clear leg observed</div>".to_owned()
+    } else {
+        items.join("")
+    };
+    format!(
+        r#"<section class="story-lane">
+  <div class="story-lane-head">
+    <strong>{}</strong>
+    <small>{}</small>
+  </div>
+  <div class="story-chip-row">{}</div>
+</section>"#,
+        escape_html(title),
+        escape_html(subtitle),
+        lane_body
+    )
+}
+
+fn render_storyline_flow_chip(item: &serde_json::Value) -> String {
+    let asset_type = item
+        .get("asset_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("asset");
+    let token = item
+        .get("token_address")
+        .and_then(|value| value.as_str())
+        .map(|value| truncate_middle(value, 8))
+        .unwrap_or_else(|| "native".to_owned());
+    let from_address = item
+        .get("from_address")
+        .and_then(|value| value.as_str())
+        .map(|value| truncate_middle(value, 10))
+        .unwrap_or_else(|| "n/a".to_owned());
+    let to_address = item
+        .get("to_address")
+        .and_then(|value| value.as_str())
+        .map(|value| truncate_middle(value, 10))
+        .unwrap_or_else(|| "n/a".to_owned());
+    let amount_raw = item
+        .get("amount_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    format!(
+        r#"<article class="story-chip">
+  <span class="story-chip-badge">{}</span>
+  <strong>{}</strong>
+  <small><code>{}</code> → <code>{}</code></small>
+  <small>raw amount: {}</small>
+</article>"#,
+        escape_html(asset_type),
+        escape_html(&token),
+        escape_html(&from_address),
+        escape_html(&to_address),
+        escape_html(amount_raw)
     )
 }
 
@@ -4382,6 +4539,25 @@ textarea { min-height: 140px; resize: vertical; }
 .mini-card { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.78); min-width: 0; }
 .mini-card span, .mini-card small { color: var(--muted); line-height: 1.45; }
 .tx-analysis-shell { display: grid; gap: 18px; }
+.storyline-visual-shell { display: grid; gap: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 18px; background: rgba(255,255,255,.72); }
+.storyline-main-path { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr); align-items: stretch; }
+.story-node { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.9); min-width: 0; }
+.story-node.accent { border-color: rgba(13,110,99,.32); background: rgba(239,250,247,.92); }
+.story-node.protocol { border-color: rgba(197,95,12,.22); background: rgba(255,249,240,.92); }
+.story-node-label { font-size: .75rem; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
+.story-node strong { font-size: 1rem; overflow-wrap: anywhere; }
+.story-node small { color: var(--muted); line-height: 1.45; }
+.story-arrow { display: grid; place-items: center; font-size: 1.4rem; color: var(--muted); padding: 0 4px; }
+.storyline-lanes { display: grid; gap: 12px; }
+.story-lane { display: grid; gap: 10px; padding: 14px; border: 1px dashed var(--line); border-radius: 16px; background: rgba(255,255,255,.58); }
+.story-lane-head { display: grid; gap: 4px; }
+.story-lane-head small { color: var(--muted); line-height: 1.45; }
+.story-chip-row { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.story-chip { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); min-width: 0; }
+.story-chip.empty { color: var(--muted); display: flex; align-items: center; justify-content: center; }
+.story-chip-badge { width: fit-content; padding: 4px 8px; border-radius: 999px; background: rgba(13,110,99,.08); color: var(--accent); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; }
+.story-chip strong { overflow-wrap: anywhere; }
+.story-chip small { color: var(--muted); line-height: 1.45; overflow-wrap: anywhere; }
 .tx-action-guide { margin-top: 4px; }
 .tx-recognizer-grid { align-items: stretch; }
 .tx-recognizer-card strong { font-size: 1rem; }
@@ -4407,6 +4583,8 @@ th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--lin
 @media (max-width: 960px) {
   .hero, .dashboard-shell, .dashboard-grid { grid-template-columns: 1fr; }
   .sidebar { position: static; }
+  .storyline-main-path { grid-template-columns: 1fr; }
+  .story-arrow { transform: rotate(90deg); padding: 4px 0; }
 }
 "#
 }
