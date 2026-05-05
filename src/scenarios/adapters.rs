@@ -317,9 +317,11 @@ fn render_effect_entry(
     direction: &str,
 ) -> Value {
     let token = token_descriptor(asset_type, token_address);
+    let amount_display = format_token_amount(amount_raw, &token);
     json!({
         "direction": direction,
         "amount_raw": amount_raw.to_string(),
+        "amount_display": amount_display,
         "asset_type": match asset_type {
             AssetType::Native => "native",
             AssetType::Erc20 => "erc20",
@@ -368,10 +370,16 @@ fn extend_steps(
             .get("token")
             .cloned()
             .unwrap_or_else(|| token_descriptor(&AssetType::Native, None));
-        let symbol = token
-            .get("symbol")
+        let amount_display = flow
+            .get("amount_display")
             .and_then(|value| value.as_str())
-            .unwrap_or("asset");
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                flow.get("amount_raw")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "n/a".to_owned())
+            });
         let amount_raw = flow.get("amount_raw").and_then(|value| value.as_str()).unwrap_or("n/a");
         let from_address = flow.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a");
         let to_address = flow.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a");
@@ -379,15 +387,15 @@ fn extend_steps(
             "order": start_order + index,
             "title": title,
             "summary": format!(
-                "{} {} {} from {} to {}.",
+                "{} {} from {} to {}.",
                 prefix,
-                amount_raw,
-                symbol,
+                amount_display,
                 short_address(from_address),
                 short_address(to_address)
             ),
             "token": token,
             "amount_raw": amount_raw,
+            "amount_display": amount_display,
             "from_address": from_address,
             "to_address": to_address,
         }));
@@ -406,20 +414,16 @@ fn build_liquidation_headline(protocol: &str, net_effect: &Value) -> String {
         .and_then(|items| items.first());
     match (spent, gained) {
         (Some(spent), Some(gained)) => format!(
-            "{} liquidation: strategy spent {} {} and received {} {}.",
+            "{} liquidation: strategy spent {} and received {}.",
             protocol,
-            spent.get("amount_raw").and_then(|value| value.as_str()).unwrap_or("n/a"),
             spent
-                .get("token")
-                .and_then(|value| value.get("symbol"))
+                .get("amount_display")
                 .and_then(|value| value.as_str())
-                .unwrap_or("asset"),
-            gained.get("amount_raw").and_then(|value| value.as_str()).unwrap_or("n/a"),
+                .unwrap_or("n/a"),
             gained
-                .get("token")
-                .and_then(|value| value.get("symbol"))
+                .get("amount_display")
                 .and_then(|value| value.as_str())
-                .unwrap_or("asset"),
+                .unwrap_or("n/a"),
         ),
         _ => format!("{protocol} liquidation detected for the strategy scope."),
     }
@@ -440,20 +444,51 @@ fn token_descriptor(asset_type: &AssetType, token_address: Option<&str>) -> Valu
             "symbol": "ETH",
             "name": "Ether",
             "address": null,
+            "decimals": 18,
         }),
         AssetType::Erc20 => {
             let address = token_address.unwrap_or_default().to_lowercase();
-            let (symbol, name) = match address.as_str() {
-                "0x4200000000000000000000000000000000000006" => ("WETH", "Wrapped Ether"),
-                "0x091a5abe6616e26268e5eecff256c2212fce2707" => ("BondETH", "Bond ETH"),
-                _ => ("ERC20", "Unlabeled token"),
+            let (symbol, name, decimals) = match address.as_str() {
+                "0x4200000000000000000000000000000000000006" => ("WETH", "Wrapped Ether", Some(18)),
+                "0x091a5abe6616e26268e5eecff256c2212fce2707" => ("BondETH", "Bond ETH", Some(18)),
+                _ => ("ERC20", "Unlabeled token", None),
             };
             json!({
                 "symbol": symbol,
                 "name": name,
                 "address": token_address,
+                "decimals": decimals,
             })
         }
+    }
+}
+
+fn format_token_amount(amount_raw: i128, token: &Value) -> String {
+    let decimals = token
+        .get("decimals")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32);
+    let symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("asset");
+    match decimals {
+        Some(decimals) => format!("{} {}", format_units_compact(amount_raw, decimals), symbol),
+        None => format!("{} raw {}", amount_raw, symbol),
+    }
+}
+
+fn format_units_compact(amount_raw: i128, decimals: u32) -> String {
+    let divisor = 10_f64.powi(decimals as i32);
+    let value = amount_raw as f64 / divisor;
+    if value.abs() >= 1000.0 {
+        format!("{value:.2}")
+    } else if value.abs() >= 1.0 {
+        format!("{value:.4}")
+    } else if value.abs() > 0.0 {
+        format!("{value:.6}")
+    } else {
+        "0".to_owned()
     }
 }
 
@@ -559,6 +594,7 @@ where
         .filter(|flow| predicate(flow))
         .map(|flow| {
             let token = token_descriptor(&flow.asset_type, flow.token_address.as_deref());
+            let amount_raw_i128 = flow.amount_raw.parse::<i128>().unwrap_or_default();
             json!({
                 "asset_type": match flow.asset_type {
                     AssetType::Native => "native",
@@ -569,6 +605,7 @@ where
                 "from_address": flow.from_address,
                 "to_address": flow.to_address,
                 "amount_raw": flow.amount_raw,
+                "amount_display": format_token_amount(amount_raw_i128, &token),
                 "derivation_method": flow.derivation_method,
                 "confidence": flow.confidence,
             })

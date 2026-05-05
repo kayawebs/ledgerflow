@@ -3223,10 +3223,6 @@ fn render_effect_group(title: &str, value: Option<&serde_json::Value>) -> String
 
 fn render_effect_chip(item: &serde_json::Value) -> String {
     let token = item.get("token").unwrap_or(&serde_json::Value::Null);
-    let symbol = token
-        .get("symbol")
-        .and_then(|value| value.as_str())
-        .unwrap_or("asset");
     let name = token
         .get("name")
         .and_then(|value| value.as_str())
@@ -3240,15 +3236,20 @@ fn render_effect_chip(item: &serde_json::Value) -> String {
         .get("amount_raw")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let amount_display = item
+        .get("amount_display")
+        .and_then(|value| value.as_str())
+        .unwrap_or(amount_raw);
     format!(
         r#"<article class="effect-chip">
-  <strong>{} {}</strong>
+  <strong>{}</strong>
   <span>{}</span>
+  <small>{}</small>
   <small><code>{}</code></small>
 </article>"#,
-        escape_html(amount_raw),
-        escape_html(symbol),
+        escape_html(amount_display),
         escape_html(name),
+        escape_html(&format!("raw: {}", amount_raw)),
         escape_html(&address),
     )
 }
@@ -3274,18 +3275,23 @@ fn render_storyline_steps(value: Option<&serde_json::Value>) -> String {
                 let token = item.get("token").unwrap_or(&serde_json::Value::Null);
                 let symbol = token.get("symbol").and_then(|value| value.as_str()).unwrap_or("asset");
                 let name = token.get("name").and_then(|value| value.as_str()).unwrap_or("unlabeled");
+                let amount_display = item
+                    .get("amount_display")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("n/a");
                 format!(
                     r#"<article class="timeline-step">
   <div class="timeline-index">{}</div>
   <div class="timeline-copy">
     <strong>{}</strong>
     <p>{}</p>
-    <small>{} · {}</small>
+    <small>{} · {} · {}</small>
   </div>
 </article>"#,
                     order,
                     escape_html(title),
                     escape_html(summary),
+                    escape_html(amount_display),
                     escape_html(symbol),
                     escape_html(name)
                 )
@@ -3484,6 +3490,10 @@ fn render_storyline_flow_chip(
         .get("amount_raw")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let amount_display = item
+        .get("amount_display")
+        .and_then(|value| value.as_str())
+        .unwrap_or(amount_raw);
     let from_raw = item
         .get("from_address")
         .and_then(|value| value.as_str())
@@ -3503,7 +3513,7 @@ fn render_storyline_flow_chip(
   <strong>{}</strong>
   <small>{} · <code>{}</code></small>
   <small><code>{}</code> {} → <code>{}</code> {}</small>
-  <small>raw amount: {}</small>
+  <small>{}</small>
 </article>"#,
         escape_html(lane_kind),
         escape_html(asset_type),
@@ -3515,7 +3525,7 @@ fn render_storyline_flow_chip(
         from_roles,
         escape_html(&to_address),
         to_roles,
-        escape_html(amount_raw)
+        escape_html(&format!("{} · raw: {}", amount_display, amount_raw))
     )
 }
 
