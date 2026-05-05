@@ -2336,6 +2336,7 @@ fn render_dashboard_page(
         "<section class=\"panel\"><div class=\"panel-body\"><div class=\"empty-state\">Select or create a cluster to view analysis.</div></div></section>".to_owned()
     };
 
+    let (tx_hash_prefill, chain_id_prefill) = tx_form_prefill(tx_result, state.default_chain_id);
     let tx_panel = format!(
         r#"
 <section class="panel">
@@ -2343,7 +2344,7 @@ fn render_dashboard_page(
   <div class="panel-body">
     <form class="stack-form" method="post" action="/app/tx-analysis/run">
       <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
-      <label>Transaction hash<input type="text" name="tx_hash" placeholder="0x..." required></label>
+      <label>Transaction hash<input type="text" name="tx_hash" value="{}" placeholder="0x..." required></label>
       <div class="button-row">
         <button class="cta secondary" type="submit" name="mode" value="analyze">Analyze transaction</button>
         <button class="cta ghost" type="submit" name="mode" value="reanalyze">Reanalyze</button>
@@ -2353,7 +2354,8 @@ fn render_dashboard_page(
   </div>
 </section>
 "#,
-        state.default_chain_id,
+        chain_id_prefill,
+        escape_html(&tx_hash_prefill),
         tx_result
             .map(render_tx_analysis_result)
             .unwrap_or_else(|| {
@@ -2775,12 +2777,6 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
         );
     };
     let analysis = &envelope.analysis;
-    let evidence_pack = &envelope.evidence_pack;
-    let selector = analysis
-        .normalized_execution_facts
-        .selector
-        .as_deref()
-        .unwrap_or("n/a");
     let (primary_activity, primary_activity_reason, primary_confidence) =
         summarize_primary_activity(analysis);
     let recognizer_rows = if analysis.recognizer_results.is_empty() {
@@ -2927,20 +2923,10 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
                     )
                 })
                 .collect::<Vec<_>>()
-                .join("")
+            .join("")
         )
     };
     let storyline_panel = render_tx_storyline_panel(&analysis.scenario_outputs);
-    let behavior_fingerprint = analysis
-        .scenario_outputs
-        .get("behavior_fingerprint")
-        .and_then(|value| value.as_str())
-        .unwrap_or("n/a");
-    let storyline_protocol = analysis
-        .scenario_outputs
-        .get("protocol")
-        .and_then(|value| value.as_str())
-        .unwrap_or("n/a");
 
     format!(
         r#"<div class="tx-analysis-shell">
@@ -2949,75 +2935,19 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
     <span>{}</span>
     <small>Confidence: {}</small>
   </div>
-  <div class="stats-grid">
-    <div class="stat"><span>Tx hash</span><strong><code>{}</code></strong></div>
-    <div class="stat"><span>Tx status</span><strong>{}</strong></div>
-    <div class="stat"><span>Analysis status</span><strong>{}</strong></div>
-    <div class="stat"><span>Block</span><strong>{}</strong></div>
-    <div class="stat"><span>Selector</span><strong><code>{}</code></strong></div>
-    <div class="stat"><span>Recognizers / flows</span><strong>{} / {}</strong></div>
-  </div>
-  <div class="table-shell">
-    <table>
-      <thead>
-        <tr>
-          <th>Concept</th>
-          <th>What it means here</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><strong>Selector</strong></td>
-          <td>The first 4 bytes of calldata. It is a method-id hint, not a full semantic answer by itself.</td>
-        </tr>
-        <tr>
-          <td><strong>Recognizers</strong></td>
-          <td>Rule-based detectors that label patterns such as approve, swap, liquidation, arbitrage, or native transfer.</td>
-        </tr>
-        <tr>
-          <td><strong>Flows</strong></td>
-          <td>Normalized asset movements the system reconstructed from logs, value, and execution facts.</td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-  <div class="table-shell">
-    <table>
-      <thead>
-        <tr>
-          <th>From</th>
-          <th>To</th>
-          <th>Protocol</th>
-          <th>Behavior fingerprint</th>
-          <th>Value raw</th>
-          <th>Timestamp</th>
-          <th>Pack</th>
-          <th>Ruleset</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><code>{}</code></td>
-          <td><code>{}</code></td>
-          <td>{}</td>
-          <td><code>{}</code></td>
-          <td>{}</td>
-          <td>{}</td>
-          <td><code>{}</code></td>
-          <td>{}</td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-  <h3>Execution storyline</h3>
+  <div class="field-hint">Tx <code>{}</code> · status {} · analysis {}.</div>
+  <div class="field-hint">Selector <code>{}</code> · {} recognizers · {} derived flows.</div>
+  <div class="field-hint">If the activity looks stale or obviously wrong, use <strong>Reanalyze</strong>. Analyze transaction may load a previously saved result first.</div>
+  <div class="section-head"><h3>Execution storyline</h3></div>
   {}
-  <h3>Recognizer outputs</h3>
+  {}
+  <div class="section-head"><h3>Recognizer outputs</h3>{}</div>
   <div class="split-fields tx-recognizer-grid">{}</div>
-  <h3>Derived flows</h3>
+  <div class="section-head"><h3>Derived flows</h3>{}</div>
   {}
-  <h3>Validation results</h3>
+  <div class="section-head"><h3>Validation results</h3>{}</div>
   {}
-  <h3>Unresolved points</h3>
+  <div class="section-head"><h3>Unresolved points</h3></div>
   {}
   <details class="raw-json-shell">
     <summary>Raw analysis JSON</summary>
@@ -3030,35 +2960,87 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
         escape_html(&truncate_middle(&analysis.tx_hash, 12)),
         escape_html(&enum_label(&analysis.status)),
         escape_html(&enum_label(&analysis.analysis_status)),
-        analysis
-            .block_number
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "n/a".to_owned()),
-        escape_html(selector),
+        escape_html(
+            analysis
+                .normalized_execution_facts
+                .selector
+                .as_deref()
+                .unwrap_or("n/a")
+        ),
         analysis.recognizer_results.len(),
         analysis.derived_flows.len(),
-        escape_html(&truncate_middle(&analysis.from_address, 10)),
-        escape_html(&truncate_middle(
-            analysis.to_address.as_deref().unwrap_or("contract creation / none"),
-            10
-        )),
-        escape_html(storyline_protocol),
-        escape_html(behavior_fingerprint),
-        escape_html(&analysis.value),
-        escape_html(
-            &analysis
-                .block_timestamp
-                .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                .unwrap_or_else(|| "n/a".to_owned())
-        ),
-        escape_html(&truncate_middle(&evidence_pack.pack_id.to_string(), 12)),
-        escape_html(&evidence_pack.ruleset_id),
         storyline_panel,
+        render_storyline_gap_explanation(&analysis.scenario_outputs)
+            .map(|message| format!(r#"<div class="notice info">{}</div>"#, escape_html(&message)))
+            .unwrap_or_default(),
+        render_info_popover(
+            "What am I looking at?",
+            "Recognizers are rule-based detectors that classify the transaction into interpretable activities such as approve, swap, liquidation, arbitrage, or native transfer."
+        ),
         recognizer_rows,
+        render_info_popover(
+            "What are flows?",
+            "Derived flows are normalized asset movements reconstructed from logs, value transfer, and execution facts. They are the raw material used to explain where funds entered, moved, and exited."
+        ),
         flow_rows,
+        render_info_popover(
+            "What are validations?",
+            "Validation results are internal checks that compare the inferred story against the available evidence and surface inconsistencies or missing information."
+        ),
         validation_rows,
         unresolved_rows,
         escape_html(&raw_json)
+    )
+}
+
+fn render_storyline_gap_explanation(scenario_outputs: &serde_json::Value) -> Option<String> {
+    let storyline = scenario_outputs.get("storyline")?;
+    let has_visible_lane = [
+        "funding_sources",
+        "repay_legs",
+        "collateral_receipts",
+        "disposition_legs",
+        "cycle_legs",
+        "exit_legs",
+    ]
+    .iter()
+    .any(|key| {
+        storyline
+            .get(*key)
+            .and_then(|value| value.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    });
+    if has_visible_lane {
+        return None;
+    }
+    Some(
+        "LedgerFlow matched the protocol or method pattern, but the current flow reconstruction did not confidently attach concrete funding, repay, reward, or settlement legs yet. In practice this means the protocol match is ahead of the asset-leg attribution."
+            .to_owned(),
+    )
+}
+
+fn render_info_popover(label: &str, body: &str) -> String {
+    format!(
+        r#"<details class="help-popover">
+  <summary aria-label="{}">?</summary>
+  <div class="help-popover-card">{}</div>
+</details>"#,
+        escape_html(label),
+        escape_html(body)
+    )
+}
+
+fn tx_form_prefill(payload: Option<&serde_json::Value>, default_chain_id: u64) -> (String, String) {
+    let Some(payload) = payload else {
+        return (String::new(), default_chain_id.to_string());
+    };
+    let Ok(envelope) = serde_json::from_value::<AnalysisEnvelope>(payload.clone()) else {
+        return (String::new(), default_chain_id.to_string());
+    };
+    (
+        envelope.analysis.tx_hash,
+        envelope.analysis.chain_id.to_string(),
     )
 }
 
@@ -3261,11 +3243,10 @@ fn render_storyline_lane(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let lane_body = if items.is_empty() {
-        "<div class=\"story-chip empty\">No clear leg observed</div>".to_owned()
-    } else {
-        items.join("")
-    };
+    if items.is_empty() {
+        return String::new();
+    }
+    let lane_body = items.join("");
     format!(
         r#"<section class="story-lane story-lane-{}">
   <div class="story-lane-head">
@@ -4623,6 +4604,12 @@ textarea { min-height: 140px; resize: vertical; }
 .mini-card { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.78); min-width: 0; }
 .mini-card span, .mini-card small { color: var(--muted); line-height: 1.45; }
 .tx-analysis-shell { display: grid; gap: 18px; }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.section-head h3 { margin: 0; }
+.help-popover { position: relative; }
+.help-popover summary { list-style: none; cursor: pointer; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,.88); color: var(--muted); font-weight: 700; }
+.help-popover summary::-webkit-details-marker { display: none; }
+.help-popover-card { position: absolute; right: 0; top: calc(100% + 8px); width: min(320px, 75vw); padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.98); box-shadow: 0 10px 28px rgba(20,17,13,.08); color: var(--muted); line-height: 1.55; z-index: 4; }
 .storyline-visual-shell { display: grid; gap: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 18px; background: rgba(255,255,255,.72); }
 .storyline-main-path { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr); align-items: stretch; }
 .story-node { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.9); min-width: 0; }
@@ -4642,7 +4629,6 @@ textarea { min-height: 140px; resize: vertical; }
 .story-lane-head small { color: var(--muted); line-height: 1.45; }
 .story-chip-row { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 .story-chip { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); min-width: 0; }
-.story-chip.empty { color: var(--muted); display: flex; align-items: center; justify-content: center; }
 .story-chip-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 .story-chip-badge { width: fit-content; padding: 4px 8px; border-radius: 999px; background: rgba(13,110,99,.08); color: var(--accent); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; }
 .story-chip-lane-label { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; }
