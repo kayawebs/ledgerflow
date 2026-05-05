@@ -3048,6 +3048,10 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
     let Some(storyline) = scenario_outputs.get("storyline") else {
         return "<div class=\"empty-state\">No execution storyline is available yet for this transaction.</div>".to_owned();
     };
+    let headline = storyline
+        .get("headline")
+        .and_then(|value| value.as_str())
+        .unwrap_or("No transaction headline is available yet.");
     let summary = storyline
         .get("summary")
         .and_then(|value| value.as_str())
@@ -3068,6 +3072,9 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
         .get("initiator_address")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let subject_scope = render_subject_scope(storyline.get("subject_scope"));
+    let net_effect = render_net_effect_panel(storyline.get("net_effect"));
+    let step_timeline = render_storyline_steps(storyline.get("steps"));
     let call_path = render_storyline_call_path(storyline.get("call_path"));
     let storyline_visual = render_storyline_visual(storyline, kind, protocol, initiator, executor);
     let funding_sources = render_storyline_flow_group("Funding into executor", storyline.get("funding_sources"));
@@ -3080,7 +3087,8 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
     let exit_legs = render_storyline_flow_group("Exit legs", storyline.get("exit_legs"));
 
     format!(
-        r#"<div class="mini-card">
+        r#"<div class="storyline-summary-card">
+  <span class="storyline-kicker">{}</span>
   <strong>{}</strong>
   <span>{}</span>
   <small>Protocol: {} · Initiator: <code>{}</code> · Executor: <code>{}</code></small>
@@ -3088,27 +3096,202 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
 {}
 {}
 {}
-{}
-{}
-{}
-{}
+<details class="storyline-evidence-shell">
+  <summary>Open execution evidence view</summary>
+  {}
+  {}
+  {}
+  {}
+  {}
+  {}
+  {}
+</details>
 "#,
         escape_html(&format!("{} storyline", kind)),
+        escape_html(headline),
         escape_html(summary),
         escape_html(protocol),
         escape_html(&truncate_middle(initiator, 10)),
         escape_html(&truncate_middle(executor, 10)),
+        subject_scope,
+        net_effect,
+        step_timeline,
         storyline_visual,
         call_path,
         funding_sources,
         repay_legs,
         collateral_receipts,
         disposition_legs,
-        if kind == "arbitrage" {
-            format!("{}{}", cycle_legs, exit_legs)
-        } else {
-            String::new()
-        },
+        if kind == "arbitrage" { format!("{}{}", cycle_legs, exit_legs) } else { String::new() },
+    )
+}
+
+fn render_subject_scope(value: Option<&serde_json::Value>) -> String {
+    let Some(scope) = value else {
+        return String::new();
+    };
+    let label = scope
+        .get("label")
+        .and_then(|value| value.as_str())
+        .unwrap_or("subject scope");
+    let addresses = scope
+        .get("addresses")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(|value| format!("<code>{}</code>", escape_html(&truncate_middle(value, 10))))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<div class="mini-card">
+  <strong>Subject scope</strong>
+  <span>{}</span>
+  <div class="address-pill-row">{}</div>
+</div>"#,
+        escape_html(label),
+        addresses
+    )
+}
+
+fn render_net_effect_panel(value: Option<&serde_json::Value>) -> String {
+    let Some(effect) = value else {
+        return String::new();
+    };
+    let gained = render_effect_group("Assets gained", effect.get("gained"));
+    let spent = render_effect_group("Assets spent", effect.get("spent"));
+    let gas = render_effect_single("Gas paid", effect.get("gas"));
+    format!(
+        r#"<section class="storyline-net-effect">
+  <div class="panel-head"><h4>Net effect for strategy</h4><span class="badge">user view</span></div>
+  <div class="panel-body split-panels">
+    {}
+    {}
+    {}
+  </div>
+</section>"#,
+        gained,
+        spent,
+        gas
+    )
+}
+
+fn render_effect_single(title: &str, value: Option<&serde_json::Value>) -> String {
+    let body = if let Some(value) = value.filter(|value| !value.is_null()) {
+        format!(r#"<div class="effect-chip-row">{}</div>"#, render_effect_chip(value))
+    } else {
+        "<div class=\"empty-state compact\">None detected.</div>".to_owned()
+    };
+    format!(
+        r#"<article class="mini-card effect-group">
+  <strong>{}</strong>
+  {}
+</article>"#,
+        escape_html(title),
+        body
+    )
+}
+
+fn render_effect_group(title: &str, value: Option<&serde_json::Value>) -> String {
+    let rows = value
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(render_effect_chip)
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    let body = if rows.is_empty() {
+        "<div class=\"empty-state compact\">None detected.</div>".to_owned()
+    } else {
+        format!(r#"<div class="effect-chip-row">{}</div>"#, rows)
+    };
+    format!(
+        r#"<article class="mini-card effect-group">
+  <strong>{}</strong>
+  {}
+</article>"#,
+        escape_html(title),
+        body
+    )
+}
+
+fn render_effect_chip(item: &serde_json::Value) -> String {
+    let token = item.get("token").unwrap_or(&serde_json::Value::Null);
+    let symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("asset");
+    let name = token
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unlabeled");
+    let address = token
+        .get("address")
+        .and_then(|value| value.as_str())
+        .map(|value| truncate_middle(value, 8))
+        .unwrap_or_else(|| "native".to_owned());
+    let amount_raw = item
+        .get("amount_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    format!(
+        r#"<article class="effect-chip">
+  <strong>{} {}</strong>
+  <span>{}</span>
+  <small><code>{}</code></small>
+</article>"#,
+        escape_html(amount_raw),
+        escape_html(symbol),
+        escape_html(name),
+        escape_html(&address),
+    )
+}
+
+fn render_storyline_steps(value: Option<&serde_json::Value>) -> String {
+    let Some(items) = value.and_then(|value| value.as_array()) else {
+        return String::new();
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<section class="storyline-steps">
+  <div class="panel-head"><h4>What happened, step by step</h4><span class="badge">timeline</span></div>
+  <div class="timeline-list">{}</div>
+</section>"#,
+        items
+            .iter()
+            .map(|item| {
+                let order = item.get("order").and_then(|value| value.as_u64()).unwrap_or(0);
+                let title = item.get("title").and_then(|value| value.as_str()).unwrap_or("Step");
+                let summary = item.get("summary").and_then(|value| value.as_str()).unwrap_or("No summary.");
+                let token = item.get("token").unwrap_or(&serde_json::Value::Null);
+                let symbol = token.get("symbol").and_then(|value| value.as_str()).unwrap_or("asset");
+                let name = token.get("name").and_then(|value| value.as_str()).unwrap_or("unlabeled");
+                format!(
+                    r#"<article class="timeline-step">
+  <div class="timeline-index">{}</div>
+  <div class="timeline-copy">
+    <strong>{}</strong>
+    <p>{}</p>
+    <small>{} · {}</small>
+  </div>
+</article>"#,
+                    order,
+                    escape_html(title),
+                    escape_html(summary),
+                    escape_html(symbol),
+                    escape_html(name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
     )
 }
 
@@ -3273,8 +3456,17 @@ fn render_storyline_flow_chip(
         .get("asset_type")
         .and_then(|value| value.as_str())
         .unwrap_or("asset");
-    let token = item
-        .get("token_address")
+    let token = item.get("token").unwrap_or(&serde_json::Value::Null);
+    let token_symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or(asset_type);
+    let token_name = token
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unlabeled asset");
+    let token_address = token
+        .get("address")
         .and_then(|value| value.as_str())
         .map(|value| truncate_middle(value, 8))
         .unwrap_or_else(|| "native".to_owned());
@@ -3309,13 +3501,16 @@ fn render_storyline_flow_chip(
     <span class="story-chip-lane-label">{}</span>
   </div>
   <strong>{}</strong>
+  <small>{} · <code>{}</code></small>
   <small><code>{}</code> {} → <code>{}</code> {}</small>
   <small>raw amount: {}</small>
 </article>"#,
         escape_html(lane_kind),
         escape_html(asset_type),
         escape_html(lane_kind),
-        escape_html(&token),
+        escape_html(token_symbol),
+        escape_html(token_name),
+        escape_html(&token_address),
         escape_html(&from_address),
         from_roles,
         escape_html(&to_address),
@@ -4604,6 +4799,25 @@ textarea { min-height: 140px; resize: vertical; }
 .mini-card { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.78); min-width: 0; }
 .mini-card span, .mini-card small { color: var(--muted); line-height: 1.45; }
 .tx-analysis-shell { display: grid; gap: 18px; }
+.storyline-summary-card { display: grid; gap: 8px; padding: 18px; border: 1px solid var(--line); border-radius: 18px; background: rgba(255,255,255,.84); }
+.storyline-summary-card strong { font-size: clamp(1.1rem, 2vw, 1.4rem); line-height: 1.25; }
+.storyline-kicker { color: var(--accent); text-transform: uppercase; letter-spacing: .14em; font-size: .75rem; font-weight: 700; }
+.address-pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.address-pill-row code { padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.82); }
+.storyline-net-effect, .storyline-steps { display: grid; gap: 12px; }
+.effect-chip-row { display: grid; gap: 10px; }
+.effect-chip { display: grid; gap: 4px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); }
+.effect-chip strong { font-size: 1rem; }
+.effect-chip span, .effect-chip small { color: var(--muted); line-height: 1.45; }
+.timeline-list { display: grid; gap: 10px; }
+.timeline-step { display: grid; gap: 12px; grid-template-columns: 40px minmax(0, 1fr); padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.84); }
+.timeline-index { width: 40px; height: 40px; border-radius: 999px; display: grid; place-items: center; background: rgba(13,110,99,.08); color: var(--accent); font-weight: 700; }
+.timeline-copy { display: grid; gap: 4px; min-width: 0; }
+.timeline-copy p, .timeline-copy small { margin: 0; color: var(--muted); line-height: 1.5; }
+.storyline-evidence-shell { border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.42); overflow: hidden; }
+.storyline-evidence-shell summary { cursor: pointer; padding: 14px 16px; font-weight: 700; }
+.storyline-evidence-shell[open] { padding-bottom: 14px; }
+.storyline-evidence-shell[open] summary { border-bottom: 1px solid var(--line); margin-bottom: 14px; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .section-head h3 { margin: 0; }
 .help-popover { position: relative; }
@@ -4666,6 +4880,7 @@ th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--lin
   .sidebar { position: static; }
   .storyline-main-path { grid-template-columns: 1fr; }
   .story-arrow { transform: rotate(90deg); padding: 4px 0; }
+  .timeline-step { grid-template-columns: 1fr; }
 }
 "#
 }

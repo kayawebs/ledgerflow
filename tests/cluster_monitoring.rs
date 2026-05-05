@@ -192,6 +192,13 @@ async fn scenario_outputs_include_liquidation_storyline_for_morpho_case() {
         storyline.get("kind").and_then(|value| value.as_str()),
         Some("liquidation")
     );
+    assert!(
+        storyline
+            .get("headline")
+            .and_then(|value| value.as_str())
+            .map(|value| value.contains("morpho_blue liquidation"))
+            .unwrap_or(false)
+    );
     assert_eq!(
         analysis
             .scenario_outputs
@@ -216,6 +223,29 @@ async fn scenario_outputs_include_liquidation_storyline_for_morpho_case() {
     assert!(
         storyline
             .get("funding_sources")
+            .and_then(|value| value.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(
+        storyline
+            .get("net_effect")
+            .and_then(|value| value.get("gained"))
+            .and_then(|value| value.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(
+        storyline
+            .get("net_effect")
+            .and_then(|value| value.get("spent"))
+            .and_then(|value| value.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(
+        storyline
+            .get("steps")
             .and_then(|value| value.as_array())
             .map(|items| !items.is_empty())
             .unwrap_or(false)
