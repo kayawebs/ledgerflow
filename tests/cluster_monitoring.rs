@@ -237,6 +237,45 @@ async fn scenario_outputs_include_liquidation_storyline_for_morpho_case() {
 }
 
 #[tokio::test]
+async fn morpho_liquidation_case_derives_erc20_flows() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(
+        MockRpcClient {
+            include_trace: false,
+            ..Default::default()
+        }
+        .boxed(),
+        false,
+    );
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository,
+        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+    ));
+
+    let (analysis, _) = analysis_service
+        .analyze_transaction(8453, "0xmorpho-liquidation-case")
+        .await
+        .unwrap();
+
+    assert!(
+        !analysis.derived_flows.is_empty(),
+        "expected ERC20 transfer logs to produce derived flows"
+    );
+    assert!(
+        analysis
+            .derived_flows
+            .iter()
+            .any(|flow| flow.token_address.as_deref() == Some("0x4200000000000000000000000000000000000006")),
+        "expected WETH-like transfer flow to be derived"
+    );
+}
+
+#[tokio::test]
 async fn metrics_and_alerts_are_computed_from_recent_classified_transactions() {
     let repository = Arc::new(InMemoryAnalysisRepository::default());
     let cluster_service = ClusterService::new(repository.clone());

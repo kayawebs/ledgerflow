@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use ledgerflow::{
     core::errors::{LedgerError, LedgerResult},
     ingestion::rpc::RpcClient,
-    normalization::service::APPROVAL_TOPIC,
+    normalization::service::{APPROVAL_TOPIC, TRANSFER_TOPIC},
 };
 
 fn pad_address(address: &str) -> String {
@@ -103,7 +103,7 @@ impl RpcClient for MockRpcClient {
                         "logIndex": "0x1",
                         "address": "0x4200000000000000000000000000000000000006",
                         "topics": [
-                            "0xddf252ad00000000000000000000000000000000000000000000000000000000",
+                            TRANSFER_TOPIC,
                             pad_address("0x2222222222222222222222222222222222222222"),
                             pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb")
                         ],
@@ -113,7 +113,7 @@ impl RpcClient for MockRpcClient {
                         "logIndex": "0x2",
                         "address": "0x091a5abe6616e26268e5eecff256c2212fce2707",
                         "topics": [
-                            "0xddf252ad00000000000000000000000000000000000000000000000000000000",
+                            TRANSFER_TOPIC,
                             pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb"),
                             pad_address("0x2222222222222222222222222222222222222222")
                         ],
@@ -151,7 +151,7 @@ impl RpcClient for MockRpcClient {
                     "logIndex": "0x1",
                     "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "topics": [
-                        "0xddf252ad00000000000000000000000000000000000000000000000000000000",
+                        TRANSFER_TOPIC,
                         pad_address("0x1111111111111111111111111111111111111111"),
                         pad_address("0x3333333333333333333333333333333333333333")
                     ],
@@ -161,7 +161,7 @@ impl RpcClient for MockRpcClient {
                     "logIndex": "0x2",
                     "address": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "topics": [
-                        "0xddf252ad00000000000000000000000000000000000000000000000000000000",
+                        TRANSFER_TOPIC,
                         pad_address("0x4444444444444444444444444444444444444444"),
                         pad_address("0x1111111111111111111111111111111111111111")
                     ],

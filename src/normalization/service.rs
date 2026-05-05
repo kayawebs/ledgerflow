@@ -11,9 +11,9 @@ use crate::domain::value_objects::{CodeIdentitySummary, EvidenceRef};
 use crate::ingestion::models::{RawTraceFrame, RawTransactionBundle};
 
 pub const TRANSFER_TOPIC: &str =
-    "0xddf252ad00000000000000000000000000000000000000000000000000000000";
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 pub const APPROVAL_TOPIC: &str =
-    "0x8c5be1e5ebec7d5bd14f714f7c0d1e84f3dd0314c0f7b2291e5f1f0ee4f6f7c1";
+    "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
 
 fn count_trace(frame: Option<&RawTraceFrame>) -> (u32, u32) {
     match frame {
