@@ -3137,10 +3137,17 @@ fn render_storyline_visual(
     initiator: &str,
     executor: &str,
 ) -> String {
+    let protocol_contract = storyline
+        .get("protocol_contract")
+        .and_then(|value| value.as_str());
     let funding_lane = render_storyline_lane(
         "Funding",
         "Where the executor got assets or approvals before protocol interaction.",
         storyline.get("funding_sources"),
+        "funding",
+        initiator,
+        executor,
+        protocol_contract,
     );
     let repay_lane = render_storyline_lane(
         "Protocol-facing legs",
@@ -3150,6 +3157,10 @@ fn render_storyline_visual(
             "Venue-facing execution legs."
         },
         storyline.get("repay_legs").or_else(|| storyline.get("cycle_legs")),
+        "protocol",
+        initiator,
+        executor,
+        protocol_contract,
     );
     let receipt_lane = render_storyline_lane(
         if kind == "liquidation" {
@@ -3159,6 +3170,10 @@ fn render_storyline_visual(
         },
         "What came back to the executor after the core action.",
         storyline.get("collateral_receipts"),
+        "receipt",
+        initiator,
+        executor,
+        protocol_contract,
     );
     let exit_lane = render_storyline_lane(
         if kind == "liquidation" {
@@ -3168,6 +3183,10 @@ fn render_storyline_visual(
         },
         "Where assets moved next after the main action.",
         storyline.get("disposition_legs").or_else(|| storyline.get("exit_legs")),
+        "exit",
+        initiator,
+        executor,
+        protocol_contract,
     );
 
     format!(
@@ -3215,14 +3234,30 @@ fn render_storyline_visual(
     )
 }
 
-fn render_storyline_lane(title: &str, subtitle: &str, value: Option<&serde_json::Value>) -> String {
+fn render_storyline_lane(
+    title: &str,
+    subtitle: &str,
+    value: Option<&serde_json::Value>,
+    lane_kind: &str,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+) -> String {
     let items = value
         .and_then(|value| value.as_array())
         .map(|items| {
             items
                 .iter()
                 .take(4)
-                .map(render_storyline_flow_chip)
+                .map(|item| {
+                    render_storyline_flow_chip(
+                        item,
+                        lane_kind,
+                        initiator,
+                        executor,
+                        protocol_contract,
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -3232,20 +3267,27 @@ fn render_storyline_lane(title: &str, subtitle: &str, value: Option<&serde_json:
         items.join("")
     };
     format!(
-        r#"<section class="story-lane">
+        r#"<section class="story-lane story-lane-{}">
   <div class="story-lane-head">
     <strong>{}</strong>
     <small>{}</small>
   </div>
   <div class="story-chip-row">{}</div>
 </section>"#,
+        escape_html(lane_kind),
         escape_html(title),
         escape_html(subtitle),
         lane_body
     )
 }
 
-fn render_storyline_flow_chip(item: &serde_json::Value) -> String {
+fn render_storyline_flow_chip(
+    item: &serde_json::Value,
+    lane_kind: &str,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+) -> String {
     let asset_type = item
         .get("asset_type")
         .and_then(|value| value.as_str())
@@ -3269,19 +3311,61 @@ fn render_storyline_flow_chip(item: &serde_json::Value) -> String {
         .get("amount_raw")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let from_raw = item
+        .get("from_address")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let to_raw = item
+        .get("to_address")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let from_roles = render_storyline_roles(from_raw, initiator, executor, protocol_contract);
+    let to_roles = render_storyline_roles(to_raw, initiator, executor, protocol_contract);
     format!(
-        r#"<article class="story-chip">
-  <span class="story-chip-badge">{}</span>
+        r#"<article class="story-chip story-chip-{}">
+  <div class="story-chip-head">
+    <span class="story-chip-badge">{}</span>
+    <span class="story-chip-lane-label">{}</span>
+  </div>
   <strong>{}</strong>
-  <small><code>{}</code> → <code>{}</code></small>
+  <small><code>{}</code> {} → <code>{}</code> {}</small>
   <small>raw amount: {}</small>
 </article>"#,
+        escape_html(lane_kind),
         escape_html(asset_type),
+        escape_html(lane_kind),
         escape_html(&token),
         escape_html(&from_address),
+        from_roles,
         escape_html(&to_address),
+        to_roles,
         escape_html(amount_raw)
     )
+}
+
+fn render_storyline_roles(
+    address: &str,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+) -> String {
+    let mut tags = Vec::new();
+    if address.eq_ignore_ascii_case(initiator) {
+        tags.push("<span class=\"story-role-tag initiator\">initiator</span>".to_owned());
+    }
+    if address.eq_ignore_ascii_case(executor) {
+        tags.push("<span class=\"story-role-tag executor\">executor</span>".to_owned());
+    }
+    if protocol_contract
+        .map(|value| address.eq_ignore_ascii_case(value))
+        .unwrap_or(false)
+    {
+        tags.push("<span class=\"story-role-tag protocol\">protocol</span>".to_owned());
+    }
+    if tags.is_empty() && address != "n/a" {
+        tags.push("<span class=\"story-role-tag external\">external</span>".to_owned());
+    }
+    tags.join("")
 }
 
 fn render_storyline_call_path(value: Option<&serde_json::Value>) -> String {
@@ -4550,14 +4634,25 @@ textarea { min-height: 140px; resize: vertical; }
 .story-arrow { display: grid; place-items: center; font-size: 1.4rem; color: var(--muted); padding: 0 4px; }
 .storyline-lanes { display: grid; gap: 12px; }
 .story-lane { display: grid; gap: 10px; padding: 14px; border: 1px dashed var(--line); border-radius: 16px; background: rgba(255,255,255,.58); }
+.story-lane-funding { border-color: rgba(29,94,168,.20); background: rgba(241,247,255,.72); }
+.story-lane-protocol { border-color: rgba(197,95,12,.24); background: rgba(255,247,238,.78); }
+.story-lane-receipt { border-color: rgba(13,110,99,.24); background: rgba(240,251,247,.78); }
+.story-lane-exit { border-color: rgba(111,92,64,.22); background: rgba(250,247,241,.78); }
 .story-lane-head { display: grid; gap: 4px; }
 .story-lane-head small { color: var(--muted); line-height: 1.45; }
 .story-chip-row { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
 .story-chip { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); min-width: 0; }
 .story-chip.empty { color: var(--muted); display: flex; align-items: center; justify-content: center; }
+.story-chip-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
 .story-chip-badge { width: fit-content; padding: 4px 8px; border-radius: 999px; background: rgba(13,110,99,.08); color: var(--accent); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; }
+.story-chip-lane-label { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; }
 .story-chip strong { overflow-wrap: anywhere; }
 .story-chip small { color: var(--muted); line-height: 1.45; overflow-wrap: anywhere; }
+.story-role-tag { display: inline-flex; align-items: center; margin-left: 6px; padding: 2px 7px; border-radius: 999px; font-size: .68rem; line-height: 1.2; border: 1px solid var(--line); background: rgba(255,255,255,.82); color: var(--muted); vertical-align: middle; }
+.story-role-tag.initiator { border-color: rgba(29,94,168,.25); color: #1d5ea8; }
+.story-role-tag.executor { border-color: rgba(13,110,99,.28); color: #0d6e63; }
+.story-role-tag.protocol { border-color: rgba(197,95,12,.28); color: #b25a10; }
+.story-role-tag.external { border-color: rgba(111,92,64,.2); color: #6f5c40; }
 .tx-action-guide { margin-top: 4px; }
 .tx-recognizer-grid { align-items: stretch; }
 .tx-recognizer-card strong { font-size: 1rem; }
