@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 
 use crate::domain::{
@@ -89,33 +91,50 @@ fn build_liquidation_story(analysis: &TransactionAnalysis, protocol: Option<&str
         .unwrap_or_else(|| analysis.from_address.to_lowercase());
     let sender = analysis.from_address.to_lowercase();
     let call_path = call_path_steps(&analysis.normalized_execution_facts.call_tree, 8);
-    let protocol_contract = protocol_contract_from_recognizers(analysis);
+    let adapter_attributes = liquidation_adapter_attributes(analysis);
+    let protocol_contract = adapter_attributes
+        .as_ref()
+        .and_then(|value| value.get("protocol_contract"))
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .or_else(|| protocol_contract_from_recognizers(analysis));
+    let liquidator = adapter_attributes
+        .as_ref()
+        .and_then(|value| value.get("liquidator"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_lowercase())
+        .unwrap_or_else(|| executor.clone());
+    let borrower = adapter_attributes
+        .as_ref()
+        .and_then(|value| value.get("borrower"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_lowercase());
+    let protocol_neighborhood = liquidation_protocol_neighborhood(
+        &call_path,
+        protocol_contract.as_deref(),
+        &sender,
+        &executor,
+        borrower.as_deref(),
+    );
+    let actor_addresses = vec![executor.clone(), liquidator.clone()];
 
     let funding_sources = related_flows(analysis, |flow| {
-        flow.to_address.eq_ignore_ascii_case(&executor) && !flow.from_address.eq_ignore_ascii_case(&executor)
+        address_in_set(&flow.to_address, &actor_addresses)
+            && !address_in_set(&flow.from_address, &actor_addresses)
+            && !address_in_set(&flow.from_address, &protocol_neighborhood)
     });
     let repay_legs = related_flows(analysis, |flow| {
-        flow.from_address.eq_ignore_ascii_case(&executor)
-            && protocol_contract
-                .as_deref()
-                .map(|value| flow.to_address.eq_ignore_ascii_case(value))
-                .unwrap_or(false)
+        address_in_set(&flow.from_address, &actor_addresses)
+            && address_in_set(&flow.to_address, &protocol_neighborhood)
     });
     let collateral_receipts = related_flows(analysis, |flow| {
-        flow.to_address.eq_ignore_ascii_case(&executor)
-            && protocol_contract
-                .as_deref()
-                .map(|value| flow.from_address.eq_ignore_ascii_case(value))
-                .unwrap_or(false)
+        address_in_set(&flow.to_address, &actor_addresses)
+            && address_in_set(&flow.from_address, &protocol_neighborhood)
     });
     let disposition_legs = related_flows(analysis, |flow| {
-        flow.from_address.eq_ignore_ascii_case(&executor)
-            && !flow.to_address.eq_ignore_ascii_case(&sender)
-            && !flow.to_address.eq_ignore_ascii_case(&executor)
-            && protocol_contract
-                .as_deref()
-                .map(|value| !flow.to_address.eq_ignore_ascii_case(value))
-                .unwrap_or(true)
+        address_in_set(&flow.from_address, &actor_addresses)
+            && !address_in_set(&flow.to_address, &actor_addresses)
+            && !address_in_set(&flow.to_address, &protocol_neighborhood)
     });
 
     if funding_sources.is_empty()
@@ -136,7 +155,9 @@ fn build_liquidation_story(analysis: &TransactionAnalysis, protocol: Option<&str
             protocol.unwrap_or("an unresolved liquidation protocol")
         ),
         "executor_address": executor,
+        "liquidator_address": liquidator,
         "initiator_address": sender,
+        "borrower_address": borrower,
         "protocol": protocol,
         "protocol_contract": protocol_contract,
         "call_path": call_path,
@@ -199,6 +220,46 @@ fn protocol_contract_from_recognizers(analysis: &TransactionAnalysis) -> Option<
                 .and_then(|value| value.as_str())
                 .map(str::to_owned)
         })
+}
+
+fn liquidation_adapter_attributes(analysis: &TransactionAnalysis) -> Option<Value> {
+    analysis
+        .recognizer_results
+        .iter()
+        .find(|item| item.label == "liquidation_like_activity")
+        .and_then(|item| item.attributes.get("adapter_attributes"))
+        .cloned()
+}
+
+fn liquidation_protocol_neighborhood(
+    call_path: &[Value],
+    protocol_contract: Option<&str>,
+    sender: &str,
+    executor: &str,
+    borrower: Option<&str>,
+) -> Vec<String> {
+    let mut addresses = BTreeSet::new();
+    if let Some(protocol_contract) = protocol_contract {
+        addresses.insert(protocol_contract.to_lowercase());
+    }
+    for step in call_path {
+        for key in ["from_address", "to_address"] {
+            if let Some(address) = step.get(key).and_then(|value| value.as_str()) {
+                let address = address.to_lowercase();
+                if address != sender
+                    && address != executor
+                    && borrower.map(|value| address != value).unwrap_or(true)
+                {
+                    addresses.insert(address);
+                }
+            }
+        }
+    }
+    addresses.into_iter().collect()
+}
+
+fn address_in_set(address: &str, values: &[String]) -> bool {
+    values.iter().any(|value| address.eq_ignore_ascii_case(value))
 }
 
 fn call_path_steps(call_tree: &Value, limit: usize) -> Vec<Value> {
