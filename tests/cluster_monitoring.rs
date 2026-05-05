@@ -165,6 +165,78 @@ async fn behavior_classifier_marks_morpho_liquidation_without_trace_when_event_m
 }
 
 #[tokio::test]
+async fn scenario_outputs_include_liquidation_storyline_for_morpho_case() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository,
+        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+    ));
+
+    let (analysis, _) = analysis_service
+        .analyze_transaction(8453, "0xmorpho-liquidation-case")
+        .await
+        .unwrap();
+
+    let storyline = analysis
+        .scenario_outputs
+        .get("storyline")
+        .expect("storyline should exist for morpho liquidation");
+
+    assert_eq!(
+        storyline.get("kind").and_then(|value| value.as_str()),
+        Some("liquidation")
+    );
+    assert_eq!(
+        analysis
+            .scenario_outputs
+            .get("protocol")
+            .and_then(|value| value.as_str()),
+        Some("morpho_blue")
+    );
+    assert!(
+        analysis
+            .scenario_outputs
+            .get("behavior_fingerprint")
+            .and_then(|value| value.as_str())
+            .is_some()
+    );
+    assert!(
+        storyline
+            .get("call_path")
+            .and_then(|value| value.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(
+        storyline
+            .get("funding_sources")
+            .and_then(|value| value.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(
+        storyline
+            .get("repay_legs")
+            .and_then(|value| value.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    );
+    assert!(
+        storyline
+            .get("collateral_receipts")
+            .and_then(|value| value.as_array())
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    );
+}
+
+#[tokio::test]
 async fn metrics_and_alerts_are_computed_from_recent_classified_transactions() {
     let repository = Arc::new(InMemoryAnalysisRepository::default());
     let cluster_service = ClusterService::new(repository.clone());

@@ -2930,6 +2930,17 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
                 .join("")
         )
     };
+    let storyline_panel = render_tx_storyline_panel(&analysis.scenario_outputs);
+    let behavior_fingerprint = analysis
+        .scenario_outputs
+        .get("behavior_fingerprint")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let storyline_protocol = analysis
+        .scenario_outputs
+        .get("protocol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
 
     format!(
         r#"<div class="tx-analysis-shell">
@@ -2976,6 +2987,8 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
         <tr>
           <th>From</th>
           <th>To</th>
+          <th>Protocol</th>
+          <th>Behavior fingerprint</th>
           <th>Value raw</th>
           <th>Timestamp</th>
           <th>Pack</th>
@@ -2987,6 +3000,8 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
           <td><code>{}</code></td>
           <td><code>{}</code></td>
           <td>{}</td>
+          <td><code>{}</code></td>
+          <td>{}</td>
           <td>{}</td>
           <td><code>{}</code></td>
           <td>{}</td>
@@ -2994,6 +3009,8 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
       </tbody>
     </table>
   </div>
+  <h3>Execution storyline</h3>
+  {}
   <h3>Recognizer outputs</h3>
   <div class="split-fields tx-recognizer-grid">{}</div>
   <h3>Derived flows</h3>
@@ -3025,6 +3042,8 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
             analysis.to_address.as_deref().unwrap_or("contract creation / none"),
             10
         )),
+        escape_html(storyline_protocol),
+        escape_html(behavior_fingerprint),
         escape_html(&analysis.value),
         escape_html(
             &analysis
@@ -3034,11 +3053,161 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
         ),
         escape_html(&truncate_middle(&evidence_pack.pack_id.to_string(), 12)),
         escape_html(&evidence_pack.ruleset_id),
+        storyline_panel,
         recognizer_rows,
         flow_rows,
         validation_rows,
         unresolved_rows,
         escape_html(&raw_json)
+    )
+}
+
+fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
+    let Some(storyline) = scenario_outputs.get("storyline") else {
+        return "<div class=\"empty-state\">No execution storyline is available yet for this transaction.</div>".to_owned();
+    };
+    let summary = storyline
+        .get("summary")
+        .and_then(|value| value.as_str())
+        .unwrap_or("LedgerFlow did not derive a storyline summary.");
+    let kind = storyline
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let protocol = storyline
+        .get("protocol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let executor = storyline
+        .get("executor_address")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let initiator = storyline
+        .get("initiator_address")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let call_path = render_storyline_call_path(storyline.get("call_path"));
+    let funding_sources = render_storyline_flow_group("Funding into executor", storyline.get("funding_sources"));
+    let repay_legs = render_storyline_flow_group("Repay / protocol-facing legs", storyline.get("repay_legs"));
+    let collateral_receipts =
+        render_storyline_flow_group("Collateral / reward receipts", storyline.get("collateral_receipts"));
+    let disposition_legs =
+        render_storyline_flow_group("Disposition / settlement legs", storyline.get("disposition_legs"));
+    let cycle_legs = render_storyline_flow_group("Cycle legs", storyline.get("cycle_legs"));
+    let exit_legs = render_storyline_flow_group("Exit legs", storyline.get("exit_legs"));
+
+    format!(
+        r#"<div class="mini-card">
+  <strong>{}</strong>
+  <span>{}</span>
+  <small>Protocol: {} · Initiator: <code>{}</code> · Executor: <code>{}</code></small>
+</div>
+{}
+{}
+{}
+{}
+{}
+{}
+"#,
+        escape_html(&format!("{} storyline", kind)),
+        escape_html(summary),
+        escape_html(protocol),
+        escape_html(&truncate_middle(initiator, 10)),
+        escape_html(&truncate_middle(executor, 10)),
+        call_path,
+        funding_sources,
+        repay_legs,
+        collateral_receipts,
+        disposition_legs,
+        if kind == "arbitrage" {
+            format!("{}{}", cycle_legs, exit_legs)
+        } else {
+            String::new()
+        },
+    )
+}
+
+fn render_storyline_call_path(value: Option<&serde_json::Value>) -> String {
+    let Some(items) = value.and_then(|value| value.as_array()) else {
+        return "<div class=\"empty-state\">No trace call path was recorded.</div>".to_owned();
+    };
+    if items.is_empty() {
+        return "<div class=\"empty-state\">No trace call path was recorded.</div>".to_owned();
+    }
+    format!(
+        r#"<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Depth</th>
+        <th>From</th>
+        <th>To</th>
+        <th>Selector</th>
+        <th>Call type</th>
+        <th>Value</th>
+      </tr>
+    </thead>
+    <tbody>{}</tbody>
+  </table>
+</div>"#,
+        items
+            .iter()
+            .map(|item| {
+                format!(
+                    "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                    item.get("depth").and_then(|value| value.as_u64()).map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned()),
+                    escape_html(&truncate_middle(item.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10)),
+                    escape_html(&truncate_middle(item.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10)),
+                    escape_html(item.get("selector").and_then(|value| value.as_str()).unwrap_or("n/a")),
+                    escape_html(item.get("call_type").and_then(|value| value.as_str()).unwrap_or("n/a")),
+                    escape_html(item.get("value").and_then(|value| value.as_str()).unwrap_or("n/a")),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    )
+}
+
+fn render_storyline_flow_group(title: &str, value: Option<&serde_json::Value>) -> String {
+    let Some(items) = value.and_then(|value| value.as_array()) else {
+        return String::new();
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<h4>{}</h4>
+<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Asset</th>
+        <th>Token</th>
+        <th>From</th>
+        <th>To</th>
+        <th>Amount raw</th>
+        <th>Method</th>
+      </tr>
+    </thead>
+    <tbody>{}</tbody>
+  </table>
+</div>"#,
+        escape_html(title),
+        items
+            .iter()
+            .map(|item| {
+                format!(
+                    "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                    escape_html(item.get("asset_type").and_then(|value| value.as_str()).unwrap_or("n/a")),
+                    escape_html(&truncate_middle(item.get("token_address").and_then(|value| value.as_str()).unwrap_or("native"), 8)),
+                    escape_html(&truncate_middle(item.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10)),
+                    escape_html(&truncate_middle(item.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10)),
+                    escape_html(item.get("amount_raw").and_then(|value| value.as_str()).unwrap_or("n/a")),
+                    escape_html(item.get("derivation_method").and_then(|value| value.as_str()).unwrap_or("n/a")),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
     )
 }
 
