@@ -3064,6 +3064,9 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
         .get("protocol")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let protocol_contract = storyline
+        .get("protocol_contract")
+        .and_then(|value| value.as_str());
     let executor = storyline
         .get("executor_address")
         .and_then(|value| value.as_str())
@@ -3073,8 +3076,14 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
     let subject_scope = render_subject_scope(storyline.get("subject_scope"));
-    let net_effect = render_net_effect_panel(storyline.get("net_effect"));
-    let step_timeline = render_storyline_steps(storyline.get("steps"));
+    let subject_scope_label = storyline
+        .get("subject_scope")
+        .and_then(|value| value.get("label"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("subject scope");
+    let net_effect = render_net_effect_panel(storyline.get("net_effect"), subject_scope_label);
+    let step_timeline =
+        render_storyline_steps(storyline.get("steps"), initiator, executor, protocol_contract);
     let call_path = render_storyline_call_path(storyline.get("call_path"));
     let storyline_visual = render_storyline_visual(storyline, kind, protocol, initiator, executor);
     let funding_sources = render_storyline_flow_group("Funding into executor", storyline.get("funding_sources"));
@@ -3157,7 +3166,7 @@ fn render_subject_scope(value: Option<&serde_json::Value>) -> String {
     )
 }
 
-fn render_net_effect_panel(value: Option<&serde_json::Value>) -> String {
+fn render_net_effect_panel(value: Option<&serde_json::Value>, subject_scope_label: &str) -> String {
     let Some(effect) = value else {
         return String::new();
     };
@@ -3166,13 +3175,15 @@ fn render_net_effect_panel(value: Option<&serde_json::Value>) -> String {
     let gas = render_effect_single("Gas paid", effect.get("gas"));
     format!(
         r#"<section class="storyline-net-effect">
-  <div class="panel-head"><h4>Net effect for strategy</h4><span class="badge">user view</span></div>
+  <div class="panel-head"><h4>Net effect for strategy</h4><span class="badge">subject scope view</span></div>
+  <div class="panel-copy">Calculated across <strong>{}</strong>. Movements entirely inside this scope are ignored; only assets crossing this boundary show up here.</div>
   <div class="panel-body split-panels">
     {}
     {}
     {}
   </div>
 </section>"#,
+        escape_html(subject_scope_label),
         gained,
         spent,
         gas
@@ -3254,7 +3265,12 @@ fn render_effect_chip(item: &serde_json::Value) -> String {
     )
 }
 
-fn render_storyline_steps(value: Option<&serde_json::Value>) -> String {
+fn render_storyline_steps(
+    value: Option<&serde_json::Value>,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+) -> String {
     let Some(items) = value.and_then(|value| value.as_array()) else {
         return String::new();
     };
@@ -3271,29 +3287,72 @@ fn render_storyline_steps(value: Option<&serde_json::Value>) -> String {
             .map(|item| {
                 let order = item.get("order").and_then(|value| value.as_u64()).unwrap_or(0);
                 let title = item.get("title").and_then(|value| value.as_str()).unwrap_or("Step");
-                let summary = item.get("summary").and_then(|value| value.as_str()).unwrap_or("No summary.");
                 let token = item.get("token").unwrap_or(&serde_json::Value::Null);
                 let symbol = token.get("symbol").and_then(|value| value.as_str()).unwrap_or("asset");
                 let name = token.get("name").and_then(|value| value.as_str()).unwrap_or("unlabeled");
+                let token_address = token
+                    .get("address")
+                    .and_then(|value| value.as_str())
+                    .map(|value| truncate_middle(value, 8))
+                    .unwrap_or_else(|| "native".to_owned());
                 let amount_display = item
                     .get("amount_display")
                     .and_then(|value| value.as_str())
                     .unwrap_or("n/a");
+                let amount_raw = item
+                    .get("amount_raw")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("n/a");
+                let from_raw = item
+                    .get("from_address")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("n/a");
+                let to_raw = item
+                    .get("to_address")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("n/a");
+                let from_short = truncate_middle(from_raw, 10);
+                let to_short = truncate_middle(to_raw, 10);
+                let from_roles =
+                    render_storyline_roles(from_raw, initiator, executor, protocol_contract);
+                let to_roles =
+                    render_storyline_roles(to_raw, initiator, executor, protocol_contract);
                 format!(
                     r#"<article class="timeline-step">
-  <div class="timeline-index">{}</div>
-  <div class="timeline-copy">
-    <strong>{}</strong>
-    <p>{}</p>
-    <small>{} · {} · {}</small>
+  <div class="timeline-head">
+    <div class="timeline-index">{}</div>
+    <div class="timeline-copy">
+      <strong>{}</strong>
+      <small>{} · {} · raw: {}</small>
+    </div>
+  </div>
+  <div class="timeline-flow">
+    <div class="timeline-endpoint">
+      <code>{}</code>
+      <div class="timeline-role-row">{}</div>
+    </div>
+    <div class="timeline-transfer">
+      <strong>{}</strong>
+      <span>{}</span>
+      <div class="timeline-arrow">→</div>
+    </div>
+    <div class="timeline-endpoint">
+      <code>{}</code>
+      <div class="timeline-role-row">{}</div>
+    </div>
   </div>
 </article>"#,
                     order,
                     escape_html(title),
-                    escape_html(summary),
-                    escape_html(amount_display),
                     escape_html(symbol),
-                    escape_html(name)
+                    escape_html(name),
+                    escape_html(amount_raw),
+                    escape_html(&from_short),
+                    from_roles,
+                    escape_html(amount_display),
+                    escape_html(&format!("{} · {}", name, token_address)),
+                    escape_html(&to_short),
+                    to_roles,
                 )
             })
             .collect::<Vec<_>>()
@@ -4820,10 +4879,18 @@ textarea { min-height: 140px; resize: vertical; }
 .effect-chip strong { font-size: 1rem; }
 .effect-chip span, .effect-chip small { color: var(--muted); line-height: 1.45; }
 .timeline-list { display: grid; gap: 10px; }
-.timeline-step { display: grid; gap: 12px; grid-template-columns: 40px minmax(0, 1fr); padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.84); }
+.timeline-step { display: grid; gap: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.84); }
+.timeline-head { display: grid; gap: 12px; grid-template-columns: 40px minmax(0, 1fr); align-items: start; }
 .timeline-index { width: 40px; height: 40px; border-radius: 999px; display: grid; place-items: center; background: rgba(13,110,99,.08); color: var(--accent); font-weight: 700; }
 .timeline-copy { display: grid; gap: 4px; min-width: 0; }
 .timeline-copy p, .timeline-copy small { margin: 0; color: var(--muted); line-height: 1.5; }
+.timeline-flow { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr) minmax(220px, .9fr) minmax(0, 1fr); align-items: center; }
+.timeline-endpoint { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); min-width: 0; }
+.timeline-endpoint code { overflow-wrap: anywhere; }
+.timeline-role-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.timeline-transfer { display: grid; gap: 4px; justify-items: center; text-align: center; }
+.timeline-transfer strong { font-size: 1rem; }
+.timeline-transfer span { color: var(--muted); line-height: 1.45; }
 .storyline-evidence-shell { border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.42); overflow: hidden; }
 .storyline-evidence-shell summary { cursor: pointer; padding: 14px 16px; font-weight: 700; }
 .storyline-evidence-shell[open] { padding-bottom: 14px; }
