@@ -3170,70 +3170,78 @@ fn render_net_effect_panel(value: Option<&serde_json::Value>, subject_scope_labe
     let Some(effect) = value else {
         return String::new();
     };
-    let gained = render_effect_group("Assets gained", effect.get("gained"));
-    let spent = render_effect_group("Assets spent", effect.get("spent"));
-    let gas = render_effect_single("Gas paid", effect.get("gas"));
+    let rows = render_net_effect_rows(effect);
     format!(
         r#"<section class="storyline-net-effect">
   <div class="panel-head"><h4>Net effect for strategy</h4><span class="badge">subject scope view</span></div>
   <div class="panel-copy">Calculated across <strong>{}</strong>. Movements entirely inside this scope are ignored; only assets crossing this boundary show up here.</div>
-  <div class="panel-body split-panels">
-    {}
-    {}
-    {}
+  <div class="table-shell compact-table-shell">
+    <table class="compact-table">
+      <thead>
+        <tr>
+          <th>Direction</th>
+          <th>Amount</th>
+          <th>Asset</th>
+          <th>Raw</th>
+          <th>Address</th>
+        </tr>
+      </thead>
+      <tbody>{}</tbody>
+    </table>
   </div>
 </section>"#,
         escape_html(subject_scope_label),
-        gained,
-        spent,
-        gas
+        rows
     )
 }
 
-fn render_effect_single(title: &str, value: Option<&serde_json::Value>) -> String {
-    let body = if let Some(value) = value.filter(|value| !value.is_null()) {
-        format!(r#"<div class="effect-chip-row">{}</div>"#, render_effect_chip(value))
+fn render_net_effect_rows(effect: &serde_json::Value) -> String {
+    let mut rows = Vec::new();
+    rows.extend(render_net_effect_entries(
+        "gained",
+        "Assets gained",
+        effect.get("gained").and_then(|value| value.as_array()),
+    ));
+    rows.extend(render_net_effect_entries(
+        "spent",
+        "Assets spent",
+        effect.get("spent").and_then(|value| value.as_array()),
+    ));
+    if let Some(gas) = effect.get("gas").filter(|value| !value.is_null()) {
+        rows.push(render_net_effect_row("gas", "Gas paid", gas));
+    }
+    if rows.is_empty() {
+        "<tr><td colspan=\"5\">No net asset changes detected yet.</td></tr>".to_owned()
     } else {
-        "<div class=\"empty-state compact\">None detected.</div>".to_owned()
-    };
-    format!(
-        r#"<article class="mini-card effect-group">
-  <strong>{}</strong>
-  {}
-</article>"#,
-        escape_html(title),
-        body
-    )
+        rows.join("")
+    }
 }
 
-fn render_effect_group(title: &str, value: Option<&serde_json::Value>) -> String {
-    let rows = value
-        .and_then(|value| value.as_array())
+fn render_net_effect_entries(
+    direction_code: &str,
+    direction_label: &str,
+    items: Option<&Vec<serde_json::Value>>,
+) -> Vec<String> {
+    items
         .map(|items| {
             items
                 .iter()
-                .map(render_effect_chip)
+                .map(|item| render_net_effect_row(direction_code, direction_label, item))
                 .collect::<Vec<_>>()
-                .join("")
         })
-        .unwrap_or_default();
-    let body = if rows.is_empty() {
-        "<div class=\"empty-state compact\">None detected.</div>".to_owned()
-    } else {
-        format!(r#"<div class="effect-chip-row">{}</div>"#, rows)
-    };
-    format!(
-        r#"<article class="mini-card effect-group">
-  <strong>{}</strong>
-  {}
-</article>"#,
-        escape_html(title),
-        body
-    )
+        .unwrap_or_default()
 }
 
-fn render_effect_chip(item: &serde_json::Value) -> String {
+fn render_net_effect_row(
+    direction_code: &str,
+    direction_label: &str,
+    item: &serde_json::Value,
+) -> String {
     let token = item.get("token").unwrap_or(&serde_json::Value::Null);
+    let symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("asset");
     let name = token
         .get("name")
         .and_then(|value| value.as_str())
@@ -3252,15 +3260,13 @@ fn render_effect_chip(item: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or(amount_raw);
     format!(
-        r#"<article class="effect-chip">
-  <strong>{}</strong>
-  <span>{}</span>
-  <small>{}</small>
-  <small><code>{}</code></small>
-</article>"#,
+        "<tr><td><span class=\"table-badge {}\">{}</span></td><td>{}</td><td>{} · {}</td><td>{}</td><td><code>{}</code></td></tr>",
+        escape_html(direction_code),
+        escape_html(direction_label),
         escape_html(amount_display),
+        escape_html(symbol),
         escape_html(name),
-        escape_html(&format!("raw: {}", amount_raw)),
+        escape_html(amount_raw),
         escape_html(&address),
     )
 }
@@ -3331,17 +3337,17 @@ fn render_storyline_steps(
       {}
     </div>
   </div>
-  <div class="timeline-flow">
-    <div class="timeline-endpoint">
+  <div class="timeline-flow compact">
+    <div class="timeline-side">
       <code>{}</code>
       <div class="timeline-role-row">{}</div>
     </div>
-    <div class="timeline-transfer">
+    <div class="timeline-mid">
       <strong>{}</strong>
       <span>{}</span>
-      <div class="timeline-arrow">→</div>
+      <span class="timeline-arrow-inline">→</span>
     </div>
-    <div class="timeline-endpoint">
+    <div class="timeline-side">
       <code>{}</code>
       <div class="timeline-role-row">{}</div>
     </div>
@@ -4896,24 +4902,27 @@ textarea { min-height: 140px; resize: vertical; }
 .address-pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .address-pill-row code { padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.82); }
 .storyline-net-effect, .storyline-steps { display: grid; gap: 12px; }
-.effect-chip-row { display: grid; gap: 10px; }
-.effect-chip { display: grid; gap: 4px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); }
-.effect-chip strong { font-size: 1rem; }
-.effect-chip span, .effect-chip small { color: var(--muted); line-height: 1.45; }
+.compact-table-shell { margin-top: 4px; }
+.compact-table td, .compact-table th { padding: 8px 10px; }
+.table-badge { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px; font-size: .78rem; line-height: 1.2; border: 1px solid var(--line); background: rgba(255,255,255,.88); color: var(--muted); }
+.table-badge.gained { border-color: rgba(13,110,99,.24); color: var(--accent); }
+.table-badge.spent, .table-badge.gas { border-color: rgba(197,95,12,.24); color: var(--accent-2); }
 .timeline-list { display: grid; gap: 10px; }
-.timeline-step { display: grid; gap: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.84); }
+.timeline-step { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.84); }
 .timeline-head { display: grid; gap: 12px; grid-template-columns: 40px minmax(0, 1fr); align-items: start; }
 .timeline-index { width: 40px; height: 40px; border-radius: 999px; display: grid; place-items: center; background: rgba(13,110,99,.08); color: var(--accent); font-weight: 700; }
 .timeline-copy { display: grid; gap: 4px; min-width: 0; }
 .timeline-copy p, .timeline-copy small { margin: 0; color: var(--muted); line-height: 1.5; }
 .timeline-hint { width: fit-content; margin-top: 2px; padding: 4px 8px; border-radius: 999px; background: rgba(29,94,168,.08); color: #1d5ea8; font-size: .78rem; line-height: 1.3; }
-.timeline-flow { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr) minmax(220px, .9fr) minmax(0, 1fr); align-items: center; }
-.timeline-endpoint { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); min-width: 0; }
-.timeline-endpoint code { overflow-wrap: anywhere; }
+.timeline-flow { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) minmax(180px, .7fr) minmax(0, 1fr); align-items: center; }
+.timeline-flow.compact { gap: 8px; }
+.timeline-side { display: grid; gap: 6px; min-width: 0; }
+.timeline-side code { padding: 8px 10px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.92); overflow-wrap: anywhere; }
 .timeline-role-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-.timeline-transfer { display: grid; gap: 4px; justify-items: center; text-align: center; }
-.timeline-transfer strong { font-size: 1rem; }
-.timeline-transfer span { color: var(--muted); line-height: 1.45; }
+.timeline-mid { display: grid; gap: 2px; justify-items: center; text-align: center; }
+.timeline-mid strong { font-size: 1rem; line-height: 1.2; }
+.timeline-mid span { color: var(--muted); line-height: 1.35; }
+.timeline-arrow-inline { font-size: 1.1rem; color: var(--muted); }
 .storyline-evidence-shell { border: 1px solid var(--line); border-radius: 16px; background: rgba(255,255,255,.42); overflow: hidden; }
 .storyline-evidence-shell summary { cursor: pointer; padding: 14px 16px; font-weight: 700; }
 .storyline-evidence-shell[open] { padding-bottom: 14px; }
