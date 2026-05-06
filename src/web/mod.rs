@@ -3183,10 +3183,11 @@ fn render_net_effect_panel(value: Option<&serde_json::Value>, subject_scope_labe
     <table class="compact-table">
       <thead>
         <tr>
-          <th>Direction</th>
-          <th>Amount</th>
-          <th>Asset</th>
-          <th>Raw</th>
+          <th>Symbol</th>
+          <th>In</th>
+          <th>Out</th>
+          <th>Net</th>
+          <th>Token</th>
           <th>Address</th>
         </tr>
       </thead>
@@ -3200,47 +3201,27 @@ fn render_net_effect_panel(value: Option<&serde_json::Value>, subject_scope_labe
 }
 
 fn render_net_effect_rows(effect: &serde_json::Value) -> String {
-    let mut rows = Vec::new();
-    rows.extend(render_net_effect_entries(
-        "gained",
-        "Assets gained",
-        effect.get("gained").and_then(|value| value.as_array()),
-    ));
-    rows.extend(render_net_effect_entries(
-        "spent",
-        "Assets spent",
-        effect.get("spent").and_then(|value| value.as_array()),
-    ));
+    let mut rows = effect
+        .get("rows")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(render_net_effect_asset_row)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     if let Some(gas) = effect.get("gas").filter(|value| !value.is_null()) {
-        rows.push(render_net_effect_row("gas", "Gas paid", gas));
+        rows.push(render_net_effect_gas_row(gas));
     }
     if rows.is_empty() {
-        "<tr><td colspan=\"5\">No net asset changes detected yet.</td></tr>".to_owned()
+        "<tr><td colspan=\"6\">No scope-crossing asset changes detected yet.</td></tr>".to_owned()
     } else {
         rows.join("")
     }
 }
 
-fn render_net_effect_entries(
-    direction_code: &str,
-    direction_label: &str,
-    items: Option<&Vec<serde_json::Value>>,
-) -> Vec<String> {
-    items
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| render_net_effect_row(direction_code, direction_label, item))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-fn render_net_effect_row(
-    direction_code: &str,
-    direction_label: &str,
-    item: &serde_json::Value,
-) -> String {
+fn render_net_effect_asset_row(item: &serde_json::Value) -> String {
     let token = item.get("token").unwrap_or(&serde_json::Value::Null);
     let symbol = token
         .get("symbol")
@@ -3255,23 +3236,51 @@ fn render_net_effect_row(
         .and_then(|value| value.as_str())
         .map(|value| truncate_middle(value, 8))
         .unwrap_or_else(|| "native".to_owned());
-    let amount_raw = item
-        .get("amount_raw")
+    let inflow_display = item
+        .get("inflow_display")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let outflow_display = item
+        .get("outflow_display")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let net_display = item
+        .get("net_display")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    format!(
+        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} · {}</td><td><code>{}</code></td></tr>",
+        escape_html(symbol),
+        escape_html(inflow_display),
+        escape_html(outflow_display),
+        escape_html(net_display),
+        escape_html(symbol),
+        escape_html(name),
+        escape_html(&address),
+    )
+}
+
+fn render_net_effect_gas_row(item: &serde_json::Value) -> String {
+    let token = item.get("token").unwrap_or(&serde_json::Value::Null);
+    let symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("ETH");
+    let name = token
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Ether");
     let amount_display = item
         .get("amount_display")
         .and_then(|value| value.as_str())
-        .unwrap_or(amount_raw);
+        .unwrap_or("n/a");
     format!(
-        "<tr><td><span class=\"table-badge {}\">{}</span></td><td>{}</td><td>{} · {}</td><td>{}</td><td><code>{}</code></td></tr>",
-        escape_html(direction_code),
-        escape_html(direction_label),
+        "<tr><td>{}</td><td>0</td><td>{}</td><td>{}</td><td>{} · {}</td><td><code>native</code></td></tr>",
+        escape_html(symbol),
         escape_html(amount_display),
+        escape_html(&format!("-{}", amount_display)),
         escape_html(symbol),
         escape_html(name),
-        escape_html(amount_raw),
-        escape_html(&address),
     )
 }
 

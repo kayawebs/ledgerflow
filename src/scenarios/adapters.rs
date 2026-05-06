@@ -273,6 +273,8 @@ fn build_subject_scope(initiator: &str, actor_addresses: &[String]) -> SubjectSc
 }
 
 fn build_net_effect(analysis: &TransactionAnalysis, subject_addresses: &[String]) -> Value {
+    let mut inflows = BTreeMap::<(AssetType, Option<String>), i128>::new();
+    let mut outflows = BTreeMap::<(AssetType, Option<String>), i128>::new();
     let mut deltas = BTreeMap::<(AssetType, Option<String>), i128>::new();
     for flow in &analysis.derived_flows {
         let from_in_scope = address_in_set(&flow.from_address, subject_addresses);
@@ -285,8 +287,14 @@ fn build_net_effect(analysis: &TransactionAnalysis, subject_addresses: &[String]
             .entry((flow.asset_type.clone(), flow.token_address.clone()))
             .or_default();
         if to_in_scope {
+            *inflows
+                .entry((flow.asset_type.clone(), flow.token_address.clone()))
+                .or_default() += amount;
             *entry += amount;
         } else {
+            *outflows
+                .entry((flow.asset_type.clone(), flow.token_address.clone()))
+                .or_default() += amount;
             *entry -= amount;
         }
     }
@@ -307,9 +315,30 @@ fn build_net_effect(analysis: &TransactionAnalysis, subject_addresses: &[String]
         .filter(|(_, delta)| **delta < 0)
         .map(|((asset_type, token_address), delta)| render_effect_entry(delta.abs(), asset_type, token_address.as_deref(), "spent"))
         .collect::<Vec<_>>();
+    let rows = deltas
+        .iter()
+        .map(|((asset_type, token_address), net_delta)| {
+            let inflow_raw = inflows
+                .get(&(asset_type.clone(), token_address.clone()))
+                .copied()
+                .unwrap_or_default();
+            let outflow_raw = outflows
+                .get(&(asset_type.clone(), token_address.clone()))
+                .copied()
+                .unwrap_or_default();
+            render_effect_row(
+                asset_type.clone(),
+                token_address.as_deref(),
+                inflow_raw,
+                outflow_raw,
+                *net_delta,
+            )
+        })
+        .collect::<Vec<_>>();
     json!({
         "gained": gained,
         "spent": spent,
+        "rows": rows,
         "gas": if gas_cost_raw > 0 {
             Some(render_effect_entry(gas_cost_raw, &AssetType::Native, None, "gas"))
         } else {
@@ -335,6 +364,25 @@ fn render_effect_entry(
             AssetType::Erc20 => "erc20",
         },
         "token": token,
+    })
+}
+
+fn render_effect_row(
+    asset_type: AssetType,
+    token_address: Option<&str>,
+    inflow_raw: i128,
+    outflow_raw: i128,
+    net_raw: i128,
+) -> Value {
+    let token = token_descriptor(&asset_type, token_address);
+    json!({
+        "token": token,
+        "inflow_raw": inflow_raw.to_string(),
+        "inflow_display": format_token_amount(inflow_raw, &token),
+        "outflow_raw": outflow_raw.to_string(),
+        "outflow_display": format_token_amount(outflow_raw, &token),
+        "net_raw": net_raw.to_string(),
+        "net_display": format_signed_token_amount(net_raw, &token),
     })
 }
 
@@ -484,6 +532,16 @@ fn format_token_amount(amount_raw: i128, token: &Value) -> String {
     match decimals {
         Some(decimals) => format!("{} {}", format_units_compact(amount_raw, decimals), symbol),
         None => format!("{} raw {}", amount_raw, symbol),
+    }
+}
+
+fn format_signed_token_amount(amount_raw: i128, token: &Value) -> String {
+    if amount_raw > 0 {
+        format!("+{}", format_token_amount(amount_raw, token))
+    } else if amount_raw < 0 {
+        format!("-{}", format_token_amount(amount_raw.abs(), token))
+    } else {
+        format!("0 {}", token.get("symbol").and_then(|value| value.as_str()).unwrap_or("asset"))
     }
 }
 
