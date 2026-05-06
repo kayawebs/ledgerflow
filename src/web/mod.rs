@@ -3178,7 +3178,7 @@ fn render_net_effect_panel(value: Option<&serde_json::Value>, subject_scope_labe
     format!(
         r#"<section class="storyline-net-effect">
   <div class="panel-head"><h4>Net effect for strategy</h4><span class="badge">subject scope view</span></div>
-  <div class="panel-copy">Calculated across <strong>{}</strong>. Movements entirely inside this scope are ignored; only assets crossing this boundary show up here.</div>
+  <div class="panel-copy">Calculated across <strong>{}</strong>. Movements entirely inside this scope are ignored; only assets crossing this boundary show up here. <strong>In</strong> means assets entered the scope, <strong>Out</strong> means assets left it, and <strong>Net</strong> is <strong>In - Out</strong>.</div>
   <div class="table-shell compact-table-shell">
     <table class="compact-table">
       <thead>
@@ -3240,20 +3240,32 @@ fn render_net_effect_asset_row(item: &serde_json::Value) -> String {
         .get("inflow_display")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let inflow_raw = item
+        .get("inflow_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or("0");
     let outflow_display = item
         .get("outflow_display")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let outflow_raw = item
+        .get("outflow_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or("0");
     let net_display = item
         .get("net_display")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let net_raw = item
+        .get("net_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or("0");
     format!(
         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} · {}</td><td><code>{}</code></td></tr>",
         escape_html(symbol),
-        escape_html(inflow_display),
-        escape_html(outflow_display),
-        escape_html(net_display),
+        render_amount_stack(inflow_display, inflow_raw),
+        render_amount_stack(outflow_display, outflow_raw),
+        render_amount_stack(net_display, net_raw),
         escape_html(symbol),
         escape_html(name),
         escape_html(&address),
@@ -3274,13 +3286,26 @@ fn render_net_effect_gas_row(item: &serde_json::Value) -> String {
         .get("amount_display")
         .and_then(|value| value.as_str())
         .unwrap_or("n/a");
+    let amount_raw = item
+        .get("amount_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or("0");
     format!(
-        "<tr><td>{}</td><td>0</td><td>{}</td><td>{}</td><td>{} · {}</td><td><code>native</code></td></tr>",
+        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} · {}</td><td><code>native</code></td></tr>",
         escape_html(symbol),
-        escape_html(amount_display),
-        escape_html(&format!("-{}", amount_display)),
+        render_amount_stack("0", "0"),
+        render_amount_stack(amount_display, amount_raw),
+        render_amount_stack(&format!("-{}", amount_display), &format!("-{}", amount_raw)),
         escape_html(symbol),
         escape_html(name),
+    )
+}
+
+fn render_amount_stack(display: &str, raw: &str) -> String {
+    format!(
+        "<div class=\"amount-stack\"><strong>{}</strong><small>raw: {}</small></div>",
+        escape_html(display),
+        escape_html(raw),
     )
 }
 
@@ -4917,6 +4942,9 @@ textarea { min-height: 140px; resize: vertical; }
 .storyline-net-effect, .storyline-steps { display: grid; gap: 12px; }
 .compact-table-shell { margin-top: 4px; }
 .compact-table td, .compact-table th { padding: 8px 10px; }
+.amount-stack { display: grid; gap: 2px; }
+.amount-stack strong { font-size: .96rem; line-height: 1.25; }
+.amount-stack small { color: var(--muted); line-height: 1.3; }
 .table-badge { display: inline-flex; align-items: center; padding: 4px 8px; border-radius: 999px; font-size: .78rem; line-height: 1.2; border: 1px solid var(--line); background: rgba(255,255,255,.88); color: var(--muted); }
 .table-badge.gained { border-color: rgba(13,110,99,.24); color: var(--accent); }
 .table-badge.spent, .table-badge.gas { border-color: rgba(197,95,12,.24); color: var(--accent-2); }
