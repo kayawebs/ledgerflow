@@ -7,6 +7,11 @@ use crate::domain::{
     enums::AssetType,
 };
 
+const AAVE_V3_FLASH_LOAN_SIMPLE_SELECTOR: &str = "0x42b0b77c";
+const AAVE_V3_FLASH_LOAN_SELECTOR: &str = "0xab9c4b5d";
+const BALANCER_VAULT_FLASH_LOAN_SELECTOR: &str = "0x5c38449e";
+const UNISWAP_V3_FLASH_SELECTOR: &str = "0x490e6cbc";
+
 #[derive(Default, Clone)]
 pub struct ScenarioAdapterService;
 
@@ -118,11 +123,14 @@ fn build_liquidation_story(analysis: &TransactionAnalysis, protocol: Option<&str
     );
     let actor_addresses = vec![executor.clone(), liquidator.clone()];
 
-    let funding_sources = related_flows(analysis, |flow| {
+    let funding_sources = sort_story_flows(enrich_funding_sources(related_flows(analysis, |flow| {
         address_in_set(&flow.to_address, &actor_addresses)
             && !address_in_set(&flow.from_address, &actor_addresses)
-            && !address_in_set(&flow.from_address, &protocol_neighborhood)
-    });
+            && !protocol_contract
+                .as_deref()
+                .map(|value| flow.from_address.eq_ignore_ascii_case(value))
+                .unwrap_or(false)
+    }), &call_path));
     let repay_legs = related_flows(analysis, |flow| {
         address_in_set(&flow.from_address, &actor_addresses)
             && address_in_set(&flow.to_address, &protocol_neighborhood)
@@ -197,9 +205,9 @@ fn build_arbitrage_story(analysis: &TransactionAnalysis, protocol: Option<&str>)
         .unwrap_or_else(|| analysis.from_address.to_lowercase());
     let sender = analysis.from_address.to_lowercase();
     let call_path = call_path_steps(&analysis.normalized_execution_facts.call_tree, 8);
-    let funding_sources = related_flows(analysis, |flow| {
+    let funding_sources = sort_story_flows(enrich_funding_sources(related_flows(analysis, |flow| {
         flow.to_address.eq_ignore_ascii_case(&executor) && !flow.from_address.eq_ignore_ascii_case(&executor)
-    });
+    }), &call_path));
     let exit_legs = related_flows(analysis, |flow| {
         flow.from_address.eq_ignore_ascii_case(&executor)
             && !flow.to_address.eq_ignore_ascii_case(&executor)
@@ -398,6 +406,7 @@ fn extend_steps(
             "amount_display": amount_display,
             "from_address": from_address,
             "to_address": to_address,
+            "source_hint": flow.get("source_hint").cloned(),
         }));
     }
     start_order + flows.len()
@@ -611,6 +620,85 @@ where
             })
         })
         .collect()
+}
+
+fn enrich_funding_sources(flows: Vec<Value>, call_path: &[Value]) -> Vec<Value> {
+    flows
+        .into_iter()
+        .map(|mut flow| {
+            if let Some(hint) = infer_funding_source_hint(&flow, call_path) {
+                if let Some(object) = flow.as_object_mut() {
+                    object.insert("source_hint".to_owned(), hint);
+                }
+            }
+            flow
+        })
+        .collect()
+}
+
+fn sort_story_flows(mut flows: Vec<Value>) -> Vec<Value> {
+    flows.sort_by(|left, right| {
+        let left_hint = left.get("source_hint").is_some();
+        let right_hint = right.get("source_hint").is_some();
+        right_hint
+            .cmp(&left_hint)
+            .then_with(|| {
+                let left_amount = left
+                    .get("amount_raw")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| value.parse::<i128>().ok())
+                    .unwrap_or_default();
+                let right_amount = right
+                    .get("amount_raw")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| value.parse::<i128>().ok())
+                    .unwrap_or_default();
+                right_amount.cmp(&left_amount)
+            })
+    });
+    flows
+}
+
+fn infer_funding_source_hint(flow: &Value, call_path: &[Value]) -> Option<Value> {
+    let source_address = flow.get("from_address")?.as_str()?.to_lowercase();
+    for step in call_path {
+        let step_to = step
+            .get("to_address")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_lowercase());
+        let Some(step_to) = step_to else {
+            continue;
+        };
+        if step_to != source_address {
+            continue;
+        }
+        let selector = step
+            .get("selector")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if let Some((protocol, label)) = flashloan_protocol_hint(selector) {
+            return Some(json!({
+                "kind": "flashloan",
+                "protocol": protocol,
+                "label": label,
+                "source_address": source_address,
+            }));
+        }
+    }
+    None
+}
+
+fn flashloan_protocol_hint(selector: &str) -> Option<(&'static str, &'static str)> {
+    match selector {
+        AAVE_V3_FLASH_LOAN_SIMPLE_SELECTOR | AAVE_V3_FLASH_LOAN_SELECTOR => {
+            Some(("aave_v3", "Aave flash loan"))
+        }
+        BALANCER_VAULT_FLASH_LOAN_SELECTOR => {
+            Some(("balancer_vault", "Balancer flash loan"))
+        }
+        UNISWAP_V3_FLASH_SELECTOR => Some(("uniswap_v3", "Uniswap V3 flash")),
+        _ => None,
+    }
 }
 
 fn short_address(address: &str) -> String {

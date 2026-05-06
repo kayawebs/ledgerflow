@@ -37,7 +37,13 @@ impl Default for MockRpcClient {
 #[async_trait]
 impl RpcClient for MockRpcClient {
     async fn get_transaction(&self, chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
-        let (from_address, to_address, input) = if tx_hash.contains("morpho-liquidation") {
+        let (from_address, to_address, input) = if tx_hash.contains("flashloan-liquidation") {
+            (
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                format!("{}{}", "0x12345678", "00".repeat(32)),
+            )
+        } else if tx_hash.contains("morpho-liquidation") {
             (
                 "0x1111111111111111111111111111111111111111",
                 "0x2222222222222222222222222222222222222222",
@@ -82,6 +88,56 @@ impl RpcClient for MockRpcClient {
 
     async fn get_receipt(&self, _chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
         let status = if tx_hash.contains("fail") { "0x0" } else { "0x1" };
+        if tx_hash.contains("flashloan-liquidation") {
+            return Ok(json!({
+                "status": status,
+                "gasUsed": format!("0x{:x}", 21000u64),
+                "effectiveGasPrice": format!("0x{:x}", 1_000_000_000u64),
+                "logs": [
+                    {
+                        "logIndex": "0x0",
+                        "address": "0x4200000000000000000000000000000000000006",
+                        "topics": [
+                            TRANSFER_TOPIC,
+                            pad_address("0x9999999999999999999999999999999999999999"),
+                            pad_address("0x2222222222222222222222222222222222222222")
+                        ],
+                        "data": format!("0x{:x}", 43u64)
+                    },
+                    {
+                        "logIndex": "0x1",
+                        "address": "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb",
+                        "topics": [
+                            "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41",
+                            "0x090bb600c50dd50358b2b513eba567070b4f6f874a1cac2d7af7ff4da17be5a9",
+                            pad_address("0x2222222222222222222222222222222222222222"),
+                            pad_address("0xe7bc1ed115b368b946d97e45ee79f47a14ebf179")
+                        ],
+                        "data": "0x0"
+                    },
+                    {
+                        "logIndex": "0x2",
+                        "address": "0x4200000000000000000000000000000000000006",
+                        "topics": [
+                            TRANSFER_TOPIC,
+                            pad_address("0x2222222222222222222222222222222222222222"),
+                            pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb")
+                        ],
+                        "data": format!("0x{:x}", 2u64)
+                    },
+                    {
+                        "logIndex": "0x3",
+                        "address": "0x091a5abe6616e26268e5eecff256c2212fce2707",
+                        "topics": [
+                            TRANSFER_TOPIC,
+                            pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb"),
+                            pad_address("0x2222222222222222222222222222222222222222")
+                        ],
+                        "data": format!("0x{:x}", 1394u64)
+                    }
+                ]
+            }));
+        }
         if tx_hash.contains("morpho-liquidation") {
             return Ok(json!({
                 "status": status,
@@ -186,6 +242,33 @@ impl RpcClient for MockRpcClient {
         }
         if !self.include_trace {
             return Ok(None);
+        }
+        if tx_hash.contains("flashloan-liquidation") {
+            return Ok(Some(json!({
+                "from": "0x1111111111111111111111111111111111111111",
+                "to": "0x2222222222222222222222222222222222222222",
+                "value": "0x0",
+                "input": "0x12345678",
+                "type": "call",
+                "calls": [
+                    {
+                        "from": "0x2222222222222222222222222222222222222222",
+                        "to": "0x9999999999999999999999999999999999999999",
+                        "value": "0x0",
+                        "input": "0x42b0b77c",
+                        "type": "call",
+                        "calls": []
+                    },
+                    {
+                        "from": "0x2222222222222222222222222222222222222222",
+                        "to": "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb",
+                        "value": "0x0",
+                        "input": "0x267a47ca",
+                        "type": "call",
+                        "calls": []
+                    }
+                ]
+            })));
         }
         if tx_hash.contains("liquidation") {
             return Ok(Some(json!({

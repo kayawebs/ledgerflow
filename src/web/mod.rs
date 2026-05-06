@@ -3303,6 +3303,10 @@ fn render_storyline_steps(
                     .get("amount_raw")
                     .and_then(|value| value.as_str())
                     .unwrap_or("n/a");
+                let source_hint_label = item
+                    .get("source_hint")
+                    .and_then(|value| value.get("label"))
+                    .and_then(|value| value.as_str());
                 let from_raw = item
                     .get("from_address")
                     .and_then(|value| value.as_str())
@@ -3324,6 +3328,7 @@ fn render_storyline_steps(
     <div class="timeline-copy">
       <strong>{}</strong>
       <small>{} · {} · raw: {}</small>
+      {}
     </div>
   </div>
   <div class="timeline-flow">
@@ -3347,6 +3352,12 @@ fn render_storyline_steps(
                     escape_html(symbol),
                     escape_html(name),
                     escape_html(amount_raw),
+                    source_hint_label
+                        .map(|value| format!(
+                            "<span class=\"timeline-hint\">Likely source: {}</span>",
+                            escape_html(value)
+                        ))
+                        .unwrap_or_default(),
                     escape_html(&from_short),
                     from_roles,
                     escape_html(amount_display),
@@ -3553,6 +3564,10 @@ fn render_storyline_flow_chip(
         .get("amount_display")
         .and_then(|value| value.as_str())
         .unwrap_or(amount_raw);
+    let source_hint_label = item
+        .get("source_hint")
+        .and_then(|value| value.get("label"))
+        .and_then(|value| value.as_str());
     let from_raw = item
         .get("from_address")
         .and_then(|value| value.as_str())
@@ -3573,6 +3588,7 @@ fn render_storyline_flow_chip(
   <small>{} · <code>{}</code></small>
   <small><code>{}</code> {} → <code>{}</code> {}</small>
   <small>{}</small>
+  {}
 </article>"#,
         escape_html(lane_kind),
         escape_html(asset_type),
@@ -3584,7 +3600,13 @@ fn render_storyline_flow_chip(
         from_roles,
         escape_html(&to_address),
         to_roles,
-        escape_html(&format!("{} · raw: {}", amount_display, amount_raw))
+        escape_html(&format!("{} · raw: {}", amount_display, amount_raw)),
+        source_hint_label
+            .map(|value| format!(
+                "<small class=\"timeline-hint\">Likely source: {}</small>",
+                escape_html(value)
+            ))
+            .unwrap_or_default()
     )
 }
 
@@ -4884,6 +4906,7 @@ textarea { min-height: 140px; resize: vertical; }
 .timeline-index { width: 40px; height: 40px; border-radius: 999px; display: grid; place-items: center; background: rgba(13,110,99,.08); color: var(--accent); font-weight: 700; }
 .timeline-copy { display: grid; gap: 4px; min-width: 0; }
 .timeline-copy p, .timeline-copy small { margin: 0; color: var(--muted); line-height: 1.5; }
+.timeline-hint { width: fit-content; margin-top: 2px; padding: 4px 8px; border-radius: 999px; background: rgba(29,94,168,.08); color: #1d5ea8; font-size: .78rem; line-height: 1.3; }
 .timeline-flow { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr) minmax(220px, .9fr) minmax(0, 1fr); align-items: center; }
 .timeline-endpoint { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(255,255,255,.92); min-width: 0; }
 .timeline-endpoint code { overflow-wrap: anywhere; }

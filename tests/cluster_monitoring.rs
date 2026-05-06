@@ -306,6 +306,57 @@ async fn morpho_liquidation_case_derives_erc20_flows() {
 }
 
 #[tokio::test]
+async fn flashloan_funding_source_is_labeled_in_storyline() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository,
+        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+    ));
+
+    let (analysis, _) = analysis_service
+        .analyze_transaction(8453, "0xflashloan-liquidation-case")
+        .await
+        .unwrap();
+
+    let storyline = analysis
+        .scenario_outputs
+        .get("storyline")
+        .expect("storyline should exist");
+    let hinted_funding = storyline
+        .get("funding_sources")
+        .and_then(|value| value.as_array())
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("source_hint")
+                    .and_then(|value| value.get("protocol"))
+                    .and_then(|value| value.as_str())
+                    .is_some()
+            })
+        })
+        .expect("funding source should exist");
+    assert_eq!(
+        hinted_funding
+            .get("source_hint")
+            .and_then(|value| value.get("protocol"))
+            .and_then(|value| value.as_str()),
+        Some("aave_v3")
+    );
+    assert_eq!(
+        hinted_funding
+            .get("source_hint")
+            .and_then(|value| value.get("label"))
+            .and_then(|value| value.as_str()),
+        Some("Aave flash loan")
+    );
+}
+
+#[tokio::test]
 async fn metrics_and_alerts_are_computed_from_recent_classified_transactions() {
     let repository = Arc::new(InMemoryAnalysisRepository::default());
     let cluster_service = ClusterService::new(repository.clone());
