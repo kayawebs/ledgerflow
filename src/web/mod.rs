@@ -2941,17 +2941,21 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
   <div class="section-head"><h3>Execution storyline</h3></div>
   {}
   {}
-  <div class="section-head"><h3>Recognizer outputs</h3>{}</div>
-  <div class="split-fields tx-recognizer-grid">{}</div>
   <div class="section-head"><h3>Derived flows</h3>{}</div>
-  {}
-  <div class="section-head"><h3>Validation results</h3>{}</div>
   {}
   <div class="section-head"><h3>Unresolved points</h3></div>
   {}
   <details class="raw-json-shell">
     <summary>Raw analysis JSON</summary>
     <pre class="json-shell">{}</pre>
+  </details>
+  <details class="storyline-evidence-shell">
+    <summary><span>Recognizer outputs</span>{}</summary>
+    <div class="split-fields tx-recognizer-grid">{}</div>
+  </details>
+  <details class="storyline-evidence-shell">
+    <summary><span>Validation results</span>{}</summary>
+    {}
   </details>
 </div>"#,
         escape_html(&primary_activity),
@@ -2974,22 +2978,22 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
             .map(|message| format!(r#"<div class="notice info">{}</div>"#, escape_html(&message)))
             .unwrap_or_default(),
         render_info_popover(
+            "What are flows?",
+            "Derived flows are normalized asset movements reconstructed from logs, value transfer, and execution facts. They do not try to tell the story in step order by themselves. The timeline takes selected flows and arranges them into ordered steps between addresses."
+        ),
+        flow_rows,
+        unresolved_rows,
+        escape_html(&raw_json),
+        render_info_popover(
             "What am I looking at?",
             "Recognizers are rule-based detectors that classify the transaction into interpretable activities such as approve, swap, liquidation, arbitrage, or native transfer."
         ),
         recognizer_rows,
         render_info_popover(
-            "What are flows?",
-            "Derived flows are normalized asset movements reconstructed from logs, value transfer, and execution facts. They are the raw material used to explain where funds entered, moved, and exited."
-        ),
-        flow_rows,
-        render_info_popover(
             "What are validations?",
             "Validation results are internal checks that compare the inferred story against the available evidence and surface inconsistencies or missing information."
         ),
-        validation_rows,
-        unresolved_rows,
-        escape_html(&raw_json)
+        validation_rows
     )
 }
 
