@@ -9,3 +9,4 @@ pub mod discovery;
 pub mod indexer_client;
 pub mod metrics;
 pub mod portal;
+pub mod trace_monitor;

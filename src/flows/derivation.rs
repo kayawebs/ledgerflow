@@ -69,67 +69,71 @@ fn trace_native_flows(
 #[derive(Default)]
 pub struct BasicFlowDeriver;
 
+pub fn derive_basic_flows(bundle: &RawTransactionBundle) -> Vec<AssetFlow> {
+    let mut flows = Vec::new();
+    let tx_hash = &bundle.tx.tx_hash;
+    if bundle.tx.to_address.is_some()
+        && u128::from_str_radix(bundle.tx.value.trim_start_matches("0x"), 16).unwrap_or(0) > 0
+    {
+        flows.push(AssetFlow {
+            flow_id: format!("{tx_hash}:native:root"),
+            asset_type: AssetType::Native,
+            token_address: None,
+            from_address: bundle.tx.from_address.to_lowercase(),
+            to_address: bundle
+                .tx
+                .to_address
+                .clone()
+                .unwrap_or_default()
+                .to_lowercase(),
+            amount_raw: hex_amount_to_decimal(&bundle.tx.value),
+            direction_hint: None,
+            evidence_refs: vec![EvidenceRef {
+                kind: EvidenceKind::Tx,
+                reference: tx_hash.clone(),
+                tx_hash: Some(tx_hash.clone()),
+                metadata: json!({}),
+            }],
+            derivation_method: "tx_value".to_owned(),
+            confidence: 1.0,
+            metadata: json!({ "scope": "top_level" }),
+        });
+    }
+    flows.extend(trace_native_flows(tx_hash, bundle.trace.as_ref(), &[]));
+
+    for log in &bundle.receipt.logs {
+        if log.topics.len() < 3 || !log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC) {
+            continue;
+        }
+        flows.push(AssetFlow {
+            flow_id: format!("{tx_hash}:erc20:{}", log.log_index),
+            asset_type: AssetType::Erc20,
+            token_address: Some(log.address.to_lowercase()),
+            from_address: topic_to_address(&log.topics[1]),
+            to_address: topic_to_address(&log.topics[2]),
+            amount_raw: hex_amount_to_decimal(&log.data),
+            direction_hint: None,
+            evidence_refs: vec![EvidenceRef {
+                kind: EvidenceKind::Log,
+                reference: format!("{tx_hash}:log:{}", log.log_index),
+                tx_hash: Some(tx_hash.clone()),
+                metadata: json!({}),
+            }],
+            derivation_method: "erc20_transfer_log".to_owned(),
+            confidence: 0.98,
+            metadata: json!({ "scope": "event_log" }),
+        });
+    }
+
+    flows
+}
+
 impl FlowDeriver for BasicFlowDeriver {
     fn derive(
         &self,
         bundle: &RawTransactionBundle,
         _analysis: &TransactionAnalysis,
     ) -> Vec<AssetFlow> {
-        let mut flows = Vec::new();
-        let tx_hash = &bundle.tx.tx_hash;
-        if bundle.tx.to_address.is_some()
-            && u128::from_str_radix(bundle.tx.value.trim_start_matches("0x"), 16).unwrap_or(0) > 0
-        {
-            flows.push(AssetFlow {
-                flow_id: format!("{tx_hash}:native:root"),
-                asset_type: AssetType::Native,
-                token_address: None,
-                from_address: bundle.tx.from_address.to_lowercase(),
-                to_address: bundle
-                    .tx
-                    .to_address
-                    .clone()
-                    .unwrap_or_default()
-                    .to_lowercase(),
-                amount_raw: hex_amount_to_decimal(&bundle.tx.value),
-                direction_hint: None,
-                evidence_refs: vec![EvidenceRef {
-                    kind: EvidenceKind::Tx,
-                    reference: tx_hash.clone(),
-                    tx_hash: Some(tx_hash.clone()),
-                    metadata: json!({}),
-                }],
-                derivation_method: "tx_value".to_owned(),
-                confidence: 1.0,
-                metadata: json!({ "scope": "top_level" }),
-            });
-        }
-        flows.extend(trace_native_flows(tx_hash, bundle.trace.as_ref(), &[]));
-
-        for log in &bundle.receipt.logs {
-            if log.topics.len() < 3 || !log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC) {
-                continue;
-            }
-            flows.push(AssetFlow {
-                flow_id: format!("{tx_hash}:erc20:{}", log.log_index),
-                asset_type: AssetType::Erc20,
-                token_address: Some(log.address.to_lowercase()),
-                from_address: topic_to_address(&log.topics[1]),
-                to_address: topic_to_address(&log.topics[2]),
-                amount_raw: hex_amount_to_decimal(&log.data),
-                direction_hint: None,
-                evidence_refs: vec![EvidenceRef {
-                    kind: EvidenceKind::Log,
-                    reference: format!("{tx_hash}:log:{}", log.log_index),
-                    tx_hash: Some(tx_hash.clone()),
-                    metadata: json!({}),
-                }],
-                derivation_method: "erc20_transfer_log".to_owned(),
-                confidence: 0.98,
-                metadata: json!({ "scope": "event_log" }),
-            });
-        }
-
-        flows
+        derive_basic_flows(bundle)
     }
 }

@@ -16,6 +16,8 @@ It does not index:
 - ERC20 transfer participants
 - cluster semantics
 
+Large net asset-change monitoring lives outside the indexer in `ledgerflow_trace_monitor`. That process uses trace RPC and PostgreSQL because it is intentionally heavier than the top-level address index.
+
 ## What it stores
 
 The ClickHouse table is:

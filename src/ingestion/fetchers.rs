@@ -66,6 +66,23 @@ impl TransactionBundleFetcher {
     }
 
     pub async fn fetch(&self, chain_id: u64, tx_hash: &str) -> LedgerResult<RawTransactionBundle> {
+        self.fetch_inner(chain_id, tx_hash, true).await
+    }
+
+    pub async fn fetch_without_code(
+        &self,
+        chain_id: u64,
+        tx_hash: &str,
+    ) -> LedgerResult<RawTransactionBundle> {
+        self.fetch_inner(chain_id, tx_hash, false).await
+    }
+
+    async fn fetch_inner(
+        &self,
+        chain_id: u64,
+        tx_hash: &str,
+        include_target_code: bool,
+    ) -> LedgerResult<RawTransactionBundle> {
         let tx_payload = self.rpc_client.get_transaction(chain_id, tx_hash).await?;
         if tx_payload.is_null() {
             return Err(LedgerError::MalformedEvidence(format!(
@@ -160,15 +177,19 @@ impl TransactionBundleFetcher {
             ..tx
         };
 
-        let target_code = if let Some(address) = tx.to_address.as_deref() {
-            Some(RawCode {
-                address: address.to_owned(),
-                bytecode: self
-                    .rpc_client
-                    .get_code(chain_id, address, tx.block_number)
-                    .await?,
-                block_number: tx.block_number,
-            })
+        let target_code = if include_target_code {
+            if let Some(address) = tx.to_address.as_deref() {
+                Some(RawCode {
+                    address: address.to_owned(),
+                    bytecode: self
+                        .rpc_client
+                        .get_code(chain_id, address, tx.block_number)
+                        .await?,
+                    block_number: tx.block_number,
+                })
+            } else {
+                None
+            }
         } else {
             None
         };

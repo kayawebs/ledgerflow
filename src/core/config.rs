@@ -30,6 +30,13 @@ pub struct AppConfig {
     pub cluster_backfill_worker_poll_interval_ms: u64,
     pub cluster_continuous_watch_enabled: bool,
     pub cluster_continuous_watch_lookback_blocks: u64,
+    pub trace_monitor_enabled: bool,
+    pub trace_monitor_worker_id: String,
+    pub trace_monitor_start_block: Option<u64>,
+    pub trace_monitor_confirmations: u64,
+    pub trace_monitor_block_batch_size: u64,
+    pub trace_monitor_poll_interval_ms: u64,
+    pub trace_monitor_retention_days: i64,
     pub enabled_recognizers: Vec<String>,
     pub plugins: Vec<String>,
 }
@@ -79,6 +86,32 @@ impl AppConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(8),
+            trace_monitor_enabled: env::var("LEDGERFLOW_TRACE_MONITOR_ENABLED")
+                .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+                .unwrap_or(true),
+            trace_monitor_worker_id: env::var("LEDGERFLOW_TRACE_MONITOR_WORKER_ID")
+                .unwrap_or_else(|_| "base_mainnet_trace_monitor".to_owned()),
+            trace_monitor_start_block: env::var("LEDGERFLOW_TRACE_MONITOR_START_BLOCK")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok()),
+            trace_monitor_confirmations: env::var("LEDGERFLOW_TRACE_MONITOR_CONFIRMATIONS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(3),
+            trace_monitor_block_batch_size: env::var("LEDGERFLOW_TRACE_MONITOR_BLOCK_BATCH_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2),
+            trace_monitor_poll_interval_ms: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_POLL_INTERVAL_MS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30_000),
+            trace_monitor_retention_days: env::var("LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(7),
             enabled_recognizers: parse_enabled_recognizers(
                 env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").ok().as_deref(),
             ),

@@ -28,6 +28,7 @@ For operators using a self-hosted Base node that is bound only to `127.0.0.1:854
 - Computes address-cluster spend summaries over a time window, separating gas burn, external outflows, internal transfers, and incoming transfers.
 - Can queue cluster transaction discovery jobs from the standalone indexer, then analyze them into PostgreSQL-backed coverage and spend summaries.
 - Automatically enqueues a historical backfill when a new cluster is created. A separate worker process drains that queue without blocking the API.
+- Includes an optional trace monitor process that computes address-level and cluster-level net asset deltas from ERC20 logs plus trace native transfers, retaining only recent rows.
 - Provides email-code registration and login in the web process, with pluggable verification delivery.
 - Includes a pricing surface set to `0.5 ETH / month`, while the current private beta remains free.
 

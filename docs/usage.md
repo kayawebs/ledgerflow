@@ -300,6 +300,23 @@ Useful notes:
 - This endpoint now enqueues work. It does not synchronously analyze the whole cluster in the request path.
 - The worker recursively splits block ranges when the per-request limit is hit, so it can backfill large address histories without direct ClickHouse reads.
 
+## Trace net-delta monitor
+
+Run the trace monitor when you want automatic "who ended up with more assets" detection instead of top-level transfer monitoring:
+
+```bash
+cargo run --bin ledgerflow_trace_monitor
+```
+
+The monitor uses `debug_traceTransaction` for every transaction it processes, derives native trace transfers plus ERC20 transfer logs, and writes two PostgreSQL tables:
+
+| Table | Purpose |
+| --- | --- |
+| `trace_address_asset_deltas` | per tx, per address, per asset `in / out / net` |
+| `trace_cluster_asset_deltas` | the same deltas collapsed over existing cluster addresses |
+
+The default retention is 7 days. It is configured by `LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS`. Keep `LEDGERFLOW_TRACE_MONITOR_BLOCK_BATCH_SIZE` small at first because the bottleneck is the node's trace RPC CPU, not this process' memory.
+
 ## Check cluster coverage
 
 ```bash
