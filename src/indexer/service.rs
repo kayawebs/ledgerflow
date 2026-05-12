@@ -1,15 +1,19 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use chrono::Utc;
+use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::core::errors::{LedgerError, LedgerResult};
 use crate::indexer::clickhouse::ClickHouseClient;
 use crate::indexer::config::IndexerConfig;
 use crate::indexer::models::{
-    AddressTxDirection, AddressTxHashesResponse, AddressTxQueryResponse, extract_block_refs,
-    normalize_address,
+    AddressTxDirection, AddressTxHashesResponse, AddressTxQueryResponse,
+    CreateIndexerApiKeyRequest, CreateIndexerApiKeyResponse, IndexerApiKeyRecord,
+    IndexerApiKeyStatus, RevokeIndexerApiKeyRequest, extract_block_refs, normalize_address,
 };
 use crate::indexer::rpc::IndexerRpcClient;
 
@@ -139,6 +143,83 @@ impl IndexerService {
             )
             .await?;
         Ok(AddressTxHashesResponse { address, tx_hashes })
+    }
+
+    pub fn authorize_internal_token(&self, token: Option<&str>) -> bool {
+        match self.config.internal_api_token.as_deref() {
+            Some(expected) if !expected.is_empty() => token == Some(expected),
+            _ => true,
+        }
+    }
+
+    pub async fn authorize_public_token(&self, token: Option<&str>) -> LedgerResult<()> {
+        let token = match token {
+            Some(token) if !token.trim().is_empty() => token.trim(),
+            _ => {
+                if self.config.internal_api_token.is_some() {
+                    return Err(LedgerError::NotFound("missing api token".to_owned()));
+                }
+                return Ok(());
+            }
+        };
+        if self.authorize_internal_token(Some(token)) {
+            return Ok(());
+        }
+        let token_hash = hash_api_key(token);
+        let Some(record) = self
+            .clickhouse
+            .get_active_api_key_by_hash(&token_hash)
+            .await?
+        else {
+            return Err(LedgerError::NotFound("invalid api token".to_owned()));
+        };
+        self.clickhouse.touch_api_key_last_used(&record).await?;
+        Ok(())
+    }
+
+    pub async fn create_api_key(
+        &self,
+        request: CreateIndexerApiKeyRequest,
+    ) -> LedgerResult<CreateIndexerApiKeyResponse> {
+        let api_key = format!("lf_idx_{}_{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let now = Utc::now();
+        let record = IndexerApiKeyRecord {
+            key_id: Uuid::new_v4().to_string(),
+            token_hash: Some(hash_api_key(&api_key)),
+            owner_user_id: request.owner_user_id,
+            owner_email: request.owner_email,
+            label: request.label.trim().to_owned(),
+            token_prefix: api_key.chars().take(18).collect(),
+            status: IndexerApiKeyStatus::Active,
+            created_at: now,
+            updated_at: now,
+            last_used_at: None,
+        };
+        self.clickhouse
+            .insert_api_key(&record, record.token_hash.as_deref().unwrap_or_default())
+            .await?;
+        Ok(CreateIndexerApiKeyResponse { record, api_key })
+    }
+
+    pub async fn list_api_keys(&self, owner_user_id: &str) -> LedgerResult<Vec<IndexerApiKeyRecord>> {
+        self.clickhouse.list_api_keys(owner_user_id).await
+    }
+
+    pub async fn revoke_api_key(
+        &self,
+        key_id: &str,
+        request: RevokeIndexerApiKeyRequest,
+    ) -> LedgerResult<IndexerApiKeyRecord> {
+        let Some(mut record) = self.clickhouse.get_api_key_by_id(key_id).await? else {
+            return Err(LedgerError::NotFound("api key not found".to_owned()));
+        };
+        if record.owner_user_id != request.owner_user_id {
+            return Err(LedgerError::NotFound("api key not found".to_owned()));
+        }
+        record.status = IndexerApiKeyStatus::Revoked;
+        record.updated_at = Utc::now();
+        self.clickhouse.insert_api_key(&record, "").await?;
+        Ok(record)
     }
 
     async fn run_worker_once(&self) -> LedgerResult<()> {
@@ -281,6 +362,12 @@ impl IndexerService {
         }
     }
 
+}
+
+fn hash_api_key(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 async fn fetch_block_refs_with_retry(

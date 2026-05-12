@@ -1,7 +1,11 @@
+use chrono::Utc;
 use serde_json::Value;
 
 use crate::core::errors::{LedgerError, LedgerResult};
-use crate::indexer::models::{AddressTxDirection, AddressTxRef, normalize_address};
+use crate::indexer::models::{
+    AddressTxDirection, AddressTxRef, IndexerApiKeyRecord, IndexerApiKeyStatus,
+    normalize_address,
+};
 
 #[derive(Clone)]
 pub struct ClickHouseClient {
@@ -71,6 +75,26 @@ impl ClickHouseClient {
             )
             ENGINE = ReplacingMergeTree(updated_at)
             ORDER BY (chain_id, worker_id)
+            "#,
+            self.database
+        ))
+        .await?;
+        self.execute(&format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {}.api_keys (
+              key_id String,
+              token_hash String,
+              owner_user_id String,
+              owner_email String,
+              label String,
+              token_prefix String,
+              status Enum8('active' = 1, 'revoked' = 2),
+              created_at DateTime,
+              updated_at DateTime,
+              last_used_at Nullable(DateTime)
+            )
+            ENGINE = ReplacingMergeTree(updated_at)
+            ORDER BY (owner_user_id, key_id)
             "#,
             self.database
         ))
@@ -274,6 +298,123 @@ impl ClickHouseClient {
                     .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
             })
             .unwrap_or(0))
+    }
+
+    pub async fn insert_api_key(&self, record: &IndexerApiKeyRecord, token_hash: &str) -> LedgerResult<()> {
+        let token_hash = if token_hash.is_empty() {
+            record.token_hash.as_deref().unwrap_or_default()
+        } else {
+            token_hash
+        };
+        let body = format!(
+            "INSERT INTO {}.api_keys FORMAT JSONEachRow\n{}",
+            self.database,
+            serde_json::to_string(&serde_json::json!({
+                "key_id": record.key_id,
+                "token_hash": token_hash,
+                "owner_user_id": record.owner_user_id,
+                "owner_email": record.owner_email,
+                "label": record.label,
+                "token_prefix": record.token_prefix,
+                "status": match record.status {
+                    IndexerApiKeyStatus::Active => "active",
+                    IndexerApiKeyStatus::Revoked => "revoked",
+                },
+                "created_at": record.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                "updated_at": record.updated_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                "last_used_at": record
+                    .last_used_at
+                    .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string()),
+            }))
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+        );
+        self.raw_post(&body)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))
+    }
+
+    pub async fn list_api_keys(&self, owner_user_id: &str) -> LedgerResult<Vec<IndexerApiKeyRecord>> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT key_id, owner_user_id, owner_email, label, token_prefix, status, created_at, updated_at, last_used_at
+                     , token_hash
+                FROM {}.api_keys FINAL
+                WHERE owner_user_id = '{}'
+                ORDER BY created_at DESC
+                FORMAT JSON
+                "#,
+                self.database,
+                escape_sql(owner_user_id)
+            ))
+            .await?;
+        payload["data"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| {
+                serde_json::from_value(item)
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))
+            })
+            .collect()
+    }
+
+    pub async fn get_api_key_by_id(&self, key_id: &str) -> LedgerResult<Option<IndexerApiKeyRecord>> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT key_id, owner_user_id, owner_email, label, token_prefix, status, created_at, updated_at, last_used_at
+                     , token_hash
+                FROM {}.api_keys FINAL
+                WHERE key_id = '{}'
+                LIMIT 1
+                FORMAT JSON
+                "#,
+                self.database,
+                escape_sql(key_id)
+            ))
+            .await?;
+        payload["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .map(|item| serde_json::from_value(item).map_err(|err| LedgerError::Persistence(err.to_string())))
+            .transpose()
+    }
+
+    pub async fn get_active_api_key_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> LedgerResult<Option<IndexerApiKeyRecord>> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT key_id, owner_user_id, owner_email, label, token_prefix, status, created_at, updated_at, last_used_at
+                     , token_hash
+                FROM {}.api_keys FINAL
+                WHERE token_hash = '{}'
+                  AND status = 'active'
+                LIMIT 1
+                FORMAT JSON
+                "#,
+                self.database,
+                escape_sql(token_hash)
+            ))
+            .await?;
+        payload["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .map(|item| serde_json::from_value(item).map_err(|err| LedgerError::Persistence(err.to_string())))
+            .transpose()
+    }
+
+    pub async fn touch_api_key_last_used(&self, record: &IndexerApiKeyRecord) -> LedgerResult<()> {
+        let mut updated = record.clone();
+        updated.last_used_at = Some(Utc::now());
+        updated.updated_at = Utc::now();
+        self.insert_api_key(&updated, "").await
     }
 
     async fn execute(&self, sql: &str) -> LedgerResult<()> {

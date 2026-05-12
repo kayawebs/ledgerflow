@@ -183,6 +183,7 @@ struct DashboardQuery {
     tx_sort_by: Option<String>,
     tx_sort_dir: Option<String>,
     notice: Option<String>,
+    created_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -198,6 +199,7 @@ struct IndexerLookupQuery {
 #[derive(Debug, Deserialize, Clone)]
 struct PageNoticeQuery {
     notice: Option<String>,
+    created_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -310,6 +312,38 @@ struct IndexerAddressRef {
     direction: AddressHitDirection,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct IndexerApiKeyPayload {
+    key_id: String,
+    label: String,
+    token_prefix: String,
+    status: String,
+    created_at: String,
+    last_used_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatedIndexerApiKeyPayload {
+    api_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateIndexerApiKeyPayload {
+    owner_user_id: String,
+    owner_email: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RevokeIndexerApiKeyPayload {
+    owner_user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateIndexerApiKeyForm {
+    label: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ClassifiedTransactionsPagePayload {
     items: Vec<ClassifiedTransaction>,
@@ -383,6 +417,7 @@ enum DashboardTab {
     ClusterGraph,
     IndexerProgress,
     IndexerLookup,
+    IndexerApiKeys,
 }
 
 fn section_title(tab: &DashboardTab) -> &'static str {
@@ -394,6 +429,7 @@ fn section_title(tab: &DashboardTab) -> &'static str {
         DashboardTab::ClusterGraph => "Cluster graph",
         DashboardTab::IndexerProgress => "Indexer progress",
         DashboardTab::IndexerLookup => "Indexer address lookup",
+        DashboardTab::IndexerApiKeys => "Indexer API keys",
     }
 }
 
@@ -406,6 +442,7 @@ impl DashboardTab {
             Some("cluster-graph") => Self::ClusterGraph,
             Some("indexer-progress") => Self::IndexerProgress,
             Some("indexer-lookup") => Self::IndexerLookup,
+            Some("indexer-api-keys") => Self::IndexerApiKeys,
             _ => Self::Clusters,
         }
     }
@@ -555,6 +592,12 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/cluster-graph", get(cluster_graph_page))
         .route("/app/indexer/progress", get(indexer_progress_page))
         .route("/app/indexer/address-lookup", get(indexer_lookup_page))
+        .route("/app/indexer/api-keys", get(indexer_api_keys_page))
+        .route("/app/indexer/api-keys/create", post(create_indexer_api_key))
+        .route(
+            "/app/indexer/api-keys/{key_id}/revoke",
+            post(revoke_indexer_api_key),
+        )
         .route("/dashboard", get(dashboard))
         .route("/dashboard/cluster-status", get(cluster_status))
         .route("/dashboard/clusters/create", post(create_cluster))
@@ -755,6 +798,7 @@ async fn dashboard(
         DashboardTab::ClusterGraph => "/app/cluster-graph".to_owned(),
         DashboardTab::IndexerProgress => "/app/indexer/progress".to_owned(),
         DashboardTab::IndexerLookup => "/app/indexer/address-lookup".to_owned(),
+        DashboardTab::IndexerApiKeys => "/app/indexer/api-keys".to_owned(),
     };
     Ok(Redirect::to(&location).into_response())
 }
@@ -791,6 +835,7 @@ async fn clusters_page(
             tx_sort_by: None,
             tx_sort_dir: None,
             notice: query.notice,
+            created_key: None,
         },
         editable_cluster.as_ref(),
         None,
@@ -828,6 +873,7 @@ async fn cluster_analysis_page(
             tx_sort_by: query.tx_sort_by,
             tx_sort_dir: query.tx_sort_dir,
             notice: query.notice,
+            created_key: None,
         },
         None,
         None,
@@ -879,6 +925,7 @@ async fn cluster_discovery_page(
             tx_sort_by: None,
             tx_sort_dir: None,
             notice: query.notice.clone(),
+            created_key: None,
         },
         None,
         None,
@@ -915,6 +962,7 @@ async fn tx_analysis_page(
             tx_sort_by: None,
             tx_sort_dir: None,
             notice: query.notice,
+            created_key: query.created_key,
         },
         None,
         None,
@@ -951,6 +999,7 @@ async fn cluster_graph_page(
             tx_sort_by: None,
             tx_sort_dir: None,
             notice: query.notice,
+            created_key: query.created_key,
         },
         None,
         None,
@@ -987,6 +1036,7 @@ async fn indexer_progress_page(
             tx_sort_by: None,
             tx_sort_dir: None,
             notice: query.notice,
+            created_key: query.created_key,
         },
         None,
         None,
@@ -1032,6 +1082,7 @@ async fn indexer_lookup_page(
             tx_sort_by: None,
             tx_sort_dir: None,
             notice: query.notice.clone(),
+            created_key: None,
         },
         None,
         None,
@@ -1042,6 +1093,91 @@ async fn indexer_lookup_page(
         None,
     )
     .await
+}
+
+async fn indexer_api_keys_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<PageNoticeQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    render_dashboard_response(
+        &state,
+        user,
+        DashboardQuery {
+            tab: Some("indexer-api-keys".to_owned()),
+            cluster_id: None,
+            start: None,
+            end: None,
+            cluster_tab: None,
+            tx_page: None,
+            tx_page_size: None,
+            tx_behavior: None,
+            tx_protocol: None,
+            tx_sort_by: None,
+            tx_sort_dir: None,
+            notice: query.notice,
+            created_key: query.created_key,
+        },
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn create_indexer_api_key(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateIndexerApiKeyForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let label = form.label.trim();
+    if label.is_empty() {
+        return Ok(Redirect::to("/app/indexer/api-keys?notice=indexer-key-label-required").into_response());
+    }
+    let created: CreatedIndexerApiKeyPayload = indexer_post_json(
+        &state,
+        "/admin/api-keys",
+        &CreateIndexerApiKeyPayload {
+            owner_user_id: user.user_id.to_string(),
+            owner_email: user.email.clone(),
+            label: label.to_owned(),
+        },
+    )
+    .await?;
+    Ok(Redirect::to(&format!(
+        "/app/indexer/api-keys?notice=indexer-key-created&created_key={}",
+        urlencoding::encode(&created.api_key)
+    ))
+    .into_response())
+}
+
+async fn revoke_indexer_api_key(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(key_id): Path<String>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let _: IndexerApiKeyPayload = indexer_post_json(
+        &state,
+        &format!("/admin/api-keys/{}/revoke", urlencoding::encode(&key_id)),
+        &RevokeIndexerApiKeyPayload {
+            owner_user_id: user.user_id.to_string(),
+        },
+    )
+    .await?;
+    Ok(Redirect::to("/app/indexer/api-keys?notice=indexer-key-revoked").into_response())
 }
 
 async fn cluster_status(
@@ -1118,6 +1254,7 @@ async fn create_cluster(
                 tx_sort_by: None,
                 tx_sort_dir: None,
                 notice: None,
+                created_key: None,
             };
             render_dashboard_response(
                 &state,
@@ -1183,6 +1320,7 @@ async fn update_cluster(
                     tx_sort_by: None,
                     tx_sort_dir: None,
                     notice: None,
+                    created_key: None,
                 },
                 editable_cluster.as_ref(),
                 None,
@@ -1346,6 +1484,7 @@ async fn run_tx_analysis(
         tx_sort_by: None,
         tx_sort_dir: None,
         notice: None,
+        created_key: None,
     };
     match result {
         Ok(payload) => {
@@ -1510,6 +1649,19 @@ async fn render_dashboard_response(
     } else {
         (None, None)
     };
+    let (indexer_api_keys, indexer_api_keys_error) = if tab == DashboardTab::IndexerApiKeys {
+        match indexer_get_json::<Vec<IndexerApiKeyPayload>>(
+            state,
+            &format!("/admin/api-keys?owner_user_id={}", urlencoding::encode(&user.user_id.to_string())),
+        )
+        .await
+        {
+            Ok(payload) => (payload, None),
+            Err(err) => (Vec::new(), Some(err.to_string())),
+        }
+    } else {
+        (Vec::new(), None)
+    };
 
     let notice = query.notice.as_deref().and_then(render_notice_message);
     Ok(Html(render_dashboard_page(
@@ -1517,6 +1669,7 @@ async fn render_dashboard_response(
         &user,
         &tab,
         notice,
+        query.created_key.as_deref(),
         &clusters,
         editable_cluster,
         selected_cluster.as_ref(),
@@ -1534,13 +1687,15 @@ async fn render_dashboard_response(
         discovery_query.as_ref(),
         indexer_progress.as_ref(),
         indexer_lookup.as_ref(),
+        &indexer_api_keys,
         indexer_query.as_ref(),
         query.start.as_deref(),
         query.end.as_deref(),
         error
             .as_deref()
             .or(cluster_error.as_deref())
-            .or(indexer_error.as_deref()),
+            .or(indexer_error.as_deref())
+            .or(indexer_api_keys_error.as_deref()),
     ))
     .into_response())
 }
@@ -1790,6 +1945,27 @@ async fn indexer_get_json<T: DeserializeOwned>(state: &WebState, path: &str) -> 
     parse_indexer_response(response).await
 }
 
+async fn indexer_post_json<Req: Serialize, Res: DeserializeOwned>(
+    state: &WebState,
+    path: &str,
+    payload: &Req,
+) -> Result<Res, WebError> {
+    let Some(base_url) = state.indexer_api_base_url.as_deref() else {
+        return Err(WebError::bad_gateway(
+            "indexer api is not configured for the web portal".to_owned(),
+        ));
+    };
+    let mut request = state
+        .client
+        .post(format!("{}{}", base_url.trim_end_matches('/'), path))
+        .json(payload);
+    if let Some(token) = state.indexer_api_bearer_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(WebError::upstream)?;
+    parse_indexer_response(response).await
+}
+
 async fn api_post_json<Req: Serialize, Res: DeserializeOwned>(
     state: &WebState,
     path: &str,
@@ -1925,6 +2101,9 @@ fn render_notice_message(code: &str) -> Option<&'static str> {
         "tracking-error" => Some("Tracking action failed. Inspect the latest cluster state or server logs."),
         "alert-read" => Some("Alert marked as read."),
         "alert-error" => Some("Alert action failed. Refresh the cluster view and inspect server logs."),
+        "indexer-key-created" => Some("Indexer API key created. Copy the full token now; the portal only shows it once."),
+        "indexer-key-revoked" => Some("Indexer API key revoked."),
+        "indexer-key-label-required" => Some("Provide a label before creating an indexer API key."),
         "auth-required" => Some("Sign in to continue."),
         _ => None,
     }
@@ -2142,6 +2321,7 @@ fn render_dashboard_page(
     user: &AppUser,
     tab: &DashboardTab,
     notice: Option<&str>,
+    created_key: Option<&str>,
     clusters: &[DashboardClusterRecord],
     editable_cluster: Option<&AddressCluster>,
     selected_cluster: Option<&DashboardClusterRecord>,
@@ -2159,6 +2339,7 @@ fn render_dashboard_page(
     discovery_query: Option<&ClusterDiscoveryQuery>,
     indexer_progress: Option<&IndexerProgressPayload>,
     indexer_lookup: Option<&IndexerAddressRefsPayload>,
+    indexer_api_keys: &[IndexerApiKeyPayload],
     indexer_query: Option<&IndexerLookupQuery>,
     start: Option<&str>,
     end: Option<&str>,
@@ -2367,6 +2548,8 @@ fn render_dashboard_page(
     let graph_panel = render_cluster_graph_panel(clusters);
     let indexer_progress_panel = render_indexer_progress_panel(indexer_progress);
     let indexer_lookup_panel = render_indexer_lookup_panel(indexer_lookup, indexer_query);
+    let indexer_api_keys_panel =
+        render_indexer_api_keys_panel(user, indexer_api_keys, notice, created_key);
     let side_column = format!(
         r#"<section class="panel">
               <div class="panel-head"><h2>Your clusters</h2><span class="badge">{}</span></div>
@@ -2381,6 +2564,8 @@ fn render_dashboard_page(
         indexer_lookup_panel.clone()
     } else if *tab == DashboardTab::IndexerProgress {
         indexer_progress_panel.clone()
+    } else if *tab == DashboardTab::IndexerApiKeys {
+        indexer_api_keys_panel.clone()
     } else if *tab == DashboardTab::ClusterDiscovery {
         cluster_discovery_panel.clone()
     } else if *tab == DashboardTab::TxAnalysis {
@@ -2434,6 +2619,7 @@ fn render_dashboard_page(
           <a class="{}" href="/app/tx-analysis">Single tx analysis</a>
           <a class="{}" href="/app/indexer/progress">Indexer progress</a>
           <a class="{}" href="/app/indexer/address-lookup">Indexer address lookup</a>
+          <a class="{}" href="/app/indexer/api-keys">Indexer API keys</a>
           <a class="" href="/pricing">Pricing</a>
         </nav>
         <form method="post" action="/auth/logout">
@@ -2468,6 +2654,7 @@ fn render_dashboard_page(
         active_class(tab, DashboardTab::TxAnalysis),
         active_class(tab, DashboardTab::IndexerProgress),
         active_class(tab, DashboardTab::IndexerLookup),
+        active_class(tab, DashboardTab::IndexerApiKeys),
         escape_html(section_title(tab)),
         render_notice_block(notice),
         render_error_block(error),
@@ -4280,6 +4467,110 @@ fn render_indexer_progress_panel(progress: Option<&IndexerProgressPayload>) -> S
   <div class="panel-body">{}</div>
 </section>"#,
         body
+    )
+}
+
+fn render_indexer_api_keys_panel(
+    user: &AppUser,
+    indexer_api_keys: &[IndexerApiKeyPayload],
+    notice: Option<&str>,
+    created_key: Option<&str>,
+) -> String {
+    let one_time_key = created_key
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            format!(
+                r#"<div class="panel-copy success-copy">
+  <strong>New indexer API key</strong>
+  <p>Copy this token now. It will not be shown again.</p>
+  <code class="inline-code-block">{}</code>
+</div>"#,
+                escape_html(value)
+            )
+        })
+        .unwrap_or_default();
+
+    let list_body = if indexer_api_keys.is_empty() {
+        "<div class=\"empty-state\">No external indexer API keys yet. Create one for scripts, dashboards, or client integrations that should call the indexer directly.</div>".to_owned()
+    } else {
+        format!(
+            r#"<div class="table-shell">
+  <table>
+    <thead>
+      <tr>
+        <th>Label</th>
+        <th>Prefix</th>
+        <th>Status</th>
+        <th>Created</th>
+        <th>Last used</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {}
+    </tbody>
+  </table>
+</div>"#,
+            indexer_api_keys
+                .iter()
+                .map(|key| {
+                    let action = if key.status.eq_ignore_ascii_case("active") {
+                        format!(
+                            r#"<form method="post" action="/app/indexer/api-keys/{}/revoke" onsubmit="return confirm('Revoke this API key? Existing clients using it will stop working.');">
+  <button class="cta ghost tiny danger" type="submit">Revoke</button>
+</form>"#,
+                            escape_html(&key.key_id)
+                        )
+                    } else {
+                        "<span class=\"muted\">revoked</span>".to_owned()
+                    };
+                    format!(
+                        r#"<tr>
+  <td>{}</td>
+  <td><code>{}</code></td>
+  <td><span class="badge">{}</span></td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+</tr>"#,
+                        escape_html(&key.label),
+                        escape_html(&key.token_prefix),
+                        escape_html(&key.status),
+                        escape_html(&key.created_at.replace('T', " ").replace('Z', " UTC")),
+                        key.last_used_at
+                            .as_deref()
+                            .map(|value| escape_html(&value.replace('T', " ").replace('Z', " UTC")))
+                            .unwrap_or_else(|| "never".to_owned()),
+                        action
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        )
+    };
+
+    format!(
+        r#"<section class="panel">
+  <div class="panel-head"><h2>Indexer API keys</h2><span class="badge">external access</span></div>
+  <div class="panel-body">
+    <div class="panel-copy">
+      <p>These keys are for external clients that call the indexer API directly. The signed-in portal keeps using the internal service token and does not consume these keys.</p>
+      <p>Public indexer endpoints accept either <code>Authorization: Bearer &lt;api_key&gt;</code> or <code>x-api-key: &lt;api_key&gt;</code>.</p>
+      <p>Owner: <strong>{}</strong></p>
+    </div>
+    {}
+    {}
+    <form class="stack-form" method="post" action="/app/indexer/api-keys/create">
+      <label>Label<input type="text" name="label" placeholder="research dashboard / analytics bot / partner export" required></label>
+      <button class="cta secondary" type="submit">Create API key</button>
+    </form>
+    {}
+  </div>
+</section>"#,
+        escape_html(&user.email),
+        render_notice_block(notice),
+        one_time_key,
+        list_body
     )
 }
 

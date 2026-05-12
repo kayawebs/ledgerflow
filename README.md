@@ -12,6 +12,8 @@ The repository also ships a standalone `ledgerflow indexer` binary for top-level
 
 If the indexer API is protected, set `LEDGERFLOW_INDEXER_API_BEARER_TOKEN` in the analysis service so cluster backfill requests include `Authorization: Bearer <token>`.
 
+The web portal also exposes an `Indexer API keys` page for operators who want to issue external client keys. Configure `LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN` so the portal can call the indexer's admin endpoints, then create per-client keys from the dashboard.
+
 For operators using a self-hosted Base node that is bound only to `127.0.0.1:8545`, the recommended setup is a host-level nginx reverse proxy that exposes a Docker-only RPC entrypoint on `18545`. See [docs/node_rpc_proxy.md](docs/node_rpc_proxy.md).
 
 ## What v0 does

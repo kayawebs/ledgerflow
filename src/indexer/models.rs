@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use chrono::{DateTime, Utc};
 
 use crate::core::errors::{LedgerError, LedgerResult};
 
@@ -32,6 +33,46 @@ pub struct AddressTxQueryResponse {
 pub struct AddressTxHashesResponse {
     pub address: String,
     pub tx_hashes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexerApiKeyStatus {
+    Active,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexerApiKeyRecord {
+    pub key_id: String,
+    #[serde(skip_serializing, default)]
+    pub token_hash: Option<String>,
+    pub owner_user_id: String,
+    pub owner_email: String,
+    pub label: String,
+    pub token_prefix: String,
+    pub status: IndexerApiKeyStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateIndexerApiKeyRequest {
+    pub owner_user_id: String,
+    pub owner_email: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RevokeIndexerApiKeyRequest {
+    pub owner_user_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CreateIndexerApiKeyResponse {
+    pub record: IndexerApiKeyRecord,
+    pub api_key: String,
 }
 
 pub fn normalize_address(address: &str) -> LedgerResult<String> {

@@ -42,6 +42,13 @@ The indexer also keeps a tiny progress table:
 
 That table records the last fully indexed block for a named worker.
 
+It also keeps an `api_keys` table for externally issued client credentials. Public query endpoints accept either:
+
+- `Authorization: Bearer <api_key>`
+- `x-api-key: <api_key>`
+
+Administrative key issuance and revocation should stay behind the internal portal or an internal bearer token.
+
 ## Configuration
 
 | Variable | Purpose | Default |
@@ -66,6 +73,7 @@ That table records the last fully indexed block for a named worker.
 | `LEDGERFLOW_INDEXER_WORKER_ID` | progress row key | `base_mainnet_top_level` |
 | `LEDGERFLOW_INDEXER_QUERY_LIMIT_DEFAULT` | default query limit | `1000` |
 | `LEDGERFLOW_INDEXER_QUERY_LIMIT_MAX` | hard query limit cap | `10000` |
+| `LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN` | internal bearer token allowed to call admin API-key endpoints and portal lookups | unset |
 
 ## Run with Docker
 

@@ -3,6 +3,7 @@ use std::env;
 #[derive(Clone, Debug)]
 pub struct IndexerConfig {
     pub bind_addr: String,
+    pub internal_api_token: Option<String>,
     pub rpc_url: String,
     pub clickhouse_url: String,
     pub clickhouse_database: String,
@@ -31,6 +32,7 @@ impl IndexerConfig {
         Self {
             bind_addr: env::var("LEDGERFLOW_INDEXER_BIND_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:8090".to_owned()),
+            internal_api_token: env::var("LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN").ok(),
             rpc_url: env::var("LEDGERFLOW_INDEXER_RPC_URL")
                 .or_else(|_| env::var("LEDGERFLOW_RPC_URL"))
                 .unwrap_or_else(|_| "http://127.0.0.1:8545".to_owned()),
