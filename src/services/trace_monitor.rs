@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Row, types::Json};
 use tracing::{debug, warn};
@@ -60,11 +61,31 @@ struct ClusterDeltaKey {
     token_address: String,
 }
 
+#[derive(Clone)]
 pub struct TraceMonitorService {
     repository: SqlxAnalysisRepository,
     rpc_client: Arc<IndexerRpcClient>,
     fetcher: TransactionBundleFetcher,
     config: TraceMonitorConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TopAddressDeltasQuery {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub top_n: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TopAddressDelta {
+    pub address: String,
+    pub asset_type: String,
+    pub token_address: String,
+    pub net_raw: String,
+    pub amount_in_raw: String,
+    pub amount_out_raw: String,
+    pub tx_count: u64,
+    pub tx_hashes: Vec<String>,
 }
 
 impl TraceMonitorService {
@@ -169,6 +190,96 @@ impl TraceMonitorService {
             )
             .await?;
         Ok((address_rows, cluster_rows))
+    }
+
+    pub async fn top_address_deltas(
+        &self,
+        query: &TopAddressDeltasQuery,
+    ) -> LedgerResult<Vec<TopAddressDelta>> {
+        let top_n = query.top_n.unwrap_or(25).clamp(1, 200);
+        let rows = sqlx::query(
+            r#"
+            with top_addresses as (
+              select
+                address,
+                asset_type,
+                token_address,
+                sum(net_raw)::text as net_raw,
+                sum(amount_in_raw)::text as amount_in_raw,
+                sum(amount_out_raw)::text as amount_out_raw,
+                count(distinct tx_hash)::bigint as tx_count
+              from trace_address_asset_deltas
+              where chain_id = $1
+                and block_timestamp >= $2
+                and block_timestamp <= $3
+                and net_raw > 0
+              group by address, asset_type, token_address
+              order by sum(net_raw) desc
+              limit $4
+            )
+            select
+              top_addresses.address,
+              top_addresses.asset_type,
+              top_addresses.token_address,
+              top_addresses.net_raw,
+              top_addresses.amount_in_raw,
+              top_addresses.amount_out_raw,
+              top_addresses.tx_count,
+              array(
+                select d.tx_hash
+                from trace_address_asset_deltas d
+                where d.chain_id = $1
+                  and d.block_timestamp >= $2
+                  and d.block_timestamp <= $3
+                  and d.address = top_addresses.address
+                  and d.asset_type = top_addresses.asset_type
+                  and d.token_address = top_addresses.token_address
+                  and d.net_raw > 0
+                order by d.net_raw desc, d.block_number desc
+                limit 50
+              ) as tx_hashes
+            from top_addresses
+            "#,
+        )
+        .bind(self.config.chain_id as i64)
+        .bind(query.start)
+        .bind(query.end)
+        .bind(top_n as i64)
+        .fetch_all(self.repository.pool())
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(TopAddressDelta {
+                    address: row
+                        .try_get("address")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    asset_type: row
+                        .try_get("asset_type")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    token_address: row
+                        .try_get("token_address")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    net_raw: row
+                        .try_get("net_raw")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    amount_in_raw: row
+                        .try_get("amount_in_raw")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    amount_out_raw: row
+                        .try_get("amount_out_raw")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    tx_count: row
+                        .try_get::<i64, _>("tx_count")
+                        .map(|value| value as u64)
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    tx_hashes: row
+                        .try_get::<Vec<String>, _>("tx_hashes")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                })
+            })
+            .collect()
     }
 
     async fn block_tx_hashes(&self, block_number: u64) -> LedgerResult<Vec<String>> {

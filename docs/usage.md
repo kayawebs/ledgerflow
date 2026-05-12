@@ -308,6 +308,22 @@ Run the trace monitor when you want automatic "who ended up with more assets" de
 cargo run --bin ledgerflow_trace_monitor
 ```
 
+It also exposes a lightweight HTTP API on `LEDGERFLOW_TRACE_MONITOR_BIND_ADDR`, defaulting to `127.0.0.1:3010`.
+
+Health check:
+
+```bash
+curl http://127.0.0.1:3010/health
+```
+
+Top positive address net deltas for a time range:
+
+```bash
+curl "http://127.0.0.1:3010/top-address-deltas?start=2026-05-12T00:00:00Z&end=2026-05-12T01:00:00Z&top_n=20" | jq
+```
+
+The response is intentionally small. Each item contains the address, asset type, token address, raw `in / out / net` amounts, tx count, and up to 50 contributing tx hashes. It does not return full tx payloads; pass the tx hashes to the analysis API when you want interpretation.
+
 The monitor uses `debug_traceTransaction` for every transaction it processes, derives native trace transfers plus ERC20 transfer logs, and writes two PostgreSQL tables:
 
 | Table | Purpose |

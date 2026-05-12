@@ -37,6 +37,7 @@ pub struct AppConfig {
     pub trace_monitor_block_batch_size: u64,
     pub trace_monitor_poll_interval_ms: u64,
     pub trace_monitor_retention_days: i64,
+    pub trace_monitor_bind_addr: String,
     pub enabled_recognizers: Vec<String>,
     pub plugins: Vec<String>,
 }
@@ -112,6 +113,8 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(7),
+            trace_monitor_bind_addr: env::var("LEDGERFLOW_TRACE_MONITOR_BIND_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:3010".to_owned()),
             enabled_recognizers: parse_enabled_recognizers(
                 env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").ok().as_deref(),
             ),
