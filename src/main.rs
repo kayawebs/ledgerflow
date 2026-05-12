@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ledgerflow::{
     api,
-    core::{config::AppConfig, logging::init_logging},
+    core::{config::AppConfig, env::load_dotenv, logging::init_logging},
     domain::interfaces::ClusterTxSource,
     ingestion::{fetchers::TransactionBundleFetcher, rpc::HttpRpcClient},
     plugins::loader::load_plugins,
@@ -17,6 +17,7 @@ use std::sync::Arc as StdArc;
 
 #[tokio::main]
 async fn main() {
+    load_dotenv();
     init_logging();
     let config = AppConfig::from_env();
 

@@ -1,10 +1,11 @@
 use ledgerflow::{
-    core::logging::init_logging,
+    core::{env::load_dotenv, logging::init_logging},
     web::{self, WebConfig},
 };
 
 #[tokio::main]
 async fn main() {
+    load_dotenv();
     init_logging();
     let config = WebConfig::from_env();
     let bind_addr = config.bind_addr.clone();

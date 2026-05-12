@@ -9,7 +9,7 @@ use axum::{
 };
 use ledgerflow::{
     core::errors::LedgerError,
-    core::{config::AppConfig, logging::init_logging},
+    core::{config::AppConfig, env::load_dotenv, logging::init_logging},
     indexer::rpc::IndexerRpcClient,
     ingestion::{fetchers::TransactionBundleFetcher, rpc::HttpRpcClient},
     repositories::sqlx::SqlxAnalysisRepository,
@@ -20,6 +20,7 @@ use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {
+    load_dotenv();
     init_logging();
     let config = AppConfig::from_env();
 
