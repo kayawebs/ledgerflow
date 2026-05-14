@@ -38,6 +38,8 @@ pub struct AppConfig {
     pub trace_monitor_poll_interval_ms: u64,
     pub trace_monitor_retention_days: i64,
     pub trace_monitor_bind_addr: String,
+    pub trace_monitor_trace_candidates_enabled: bool,
+    pub trace_monitor_trace_candidate_limit_per_block: u32,
     pub enabled_recognizers: Vec<String>,
     pub plugins: Vec<String>,
 }
@@ -48,10 +50,9 @@ impl AppConfig {
             env: env::var("LEDGERFLOW_ENV").unwrap_or_else(|_| "local".to_owned()),
             bind_addr: env::var("LEDGERFLOW_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:3000".to_owned()),
-            database_url: env::var("LEDGERFLOW_DATABASE_URL")
-                .unwrap_or_else(|_| {
-                    "postgres://postgres:postgres@127.0.0.1:5532/ledgerflow".to_owned()
-                }),
+            database_url: env::var("LEDGERFLOW_DATABASE_URL").unwrap_or_else(|_| {
+                "postgres://postgres:postgres@127.0.0.1:5532/ledgerflow".to_owned()
+            }),
             rpc_url: env::var("LEDGERFLOW_RPC_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8545".to_owned()),
             indexer_api_base_url: env::var("LEDGERFLOW_INDEXER_API_BASE_URL").ok(),
@@ -103,22 +104,34 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(2),
-            trace_monitor_poll_interval_ms: env::var(
-                "LEDGERFLOW_TRACE_MONITOR_POLL_INTERVAL_MS",
-            )
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30_000),
+            trace_monitor_poll_interval_ms: env::var("LEDGERFLOW_TRACE_MONITOR_POLL_INTERVAL_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30_000),
             trace_monitor_retention_days: env::var("LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS")
                 .ok()
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(7),
             trace_monitor_bind_addr: env::var("LEDGERFLOW_TRACE_MONITOR_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:3010".to_owned()),
+            trace_monitor_trace_candidates_enabled: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATES_ENABLED",
+            )
+            .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+            .unwrap_or(true),
+            trace_monitor_trace_candidate_limit_per_block: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATE_LIMIT_PER_BLOCK",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(5),
             enabled_recognizers: parse_enabled_recognizers(
                 env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").ok().as_deref(),
             ),
-            plugins: parse_list(&env::var("LEDGERFLOW_PLUGINS").unwrap_or_else(|_| "sample_builtin_pack".to_owned())),
+            plugins: parse_list(
+                &env::var("LEDGERFLOW_PLUGINS")
+                    .unwrap_or_else(|_| "sample_builtin_pack".to_owned()),
+            ),
         }
     }
 }
@@ -139,7 +152,10 @@ fn parse_enabled_recognizers(input: Option<&str>) -> Vec<String> {
         .collect::<Vec<_>>();
     if let Some(input) = input {
         for recognizer_id in parse_list(input) {
-            if !recognizers.iter().any(|existing| existing == &recognizer_id) {
+            if !recognizers
+                .iter()
+                .any(|existing| existing == &recognizer_id)
+            {
                 recognizers.push(recognizer_id);
             }
         }

@@ -324,14 +324,23 @@ curl "http://127.0.0.1:3010/top-address-deltas?start=2026-05-12T00:00:00Z&end=20
 
 The response is intentionally small. Each item contains the address, asset type, token address, raw `in / out / net` amounts, tx count, and up to 50 contributing tx hashes. It does not return full tx payloads; pass the tx hashes to the analysis API when you want interpretation.
 
-The monitor uses `debug_traceTransaction` for every transaction it processes, derives native trace transfers plus ERC20 transfer logs, and writes two PostgreSQL tables:
+The monitor uses a two-stage pipeline. It first fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. It then runs `debug_traceTransaction` only for cluster-related transactions and the largest non-cluster candidates per block, so internal native movement is enriched without tracing the entire chain.
 
 | Table | Purpose |
 | --- | --- |
 | `trace_address_asset_deltas` | per tx, per address, per asset `in / out / net` |
 | `trace_cluster_asset_deltas` | the same deltas collapsed over existing cluster addresses |
 
-The default retention is 7 days. It is configured by `LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS`. Keep `LEDGERFLOW_TRACE_MONITOR_BLOCK_BATCH_SIZE` small at first because the bottleneck is the node's trace RPC CPU, not this process' memory.
+The default retention is 7 days. It is configured by `LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS`.
+
+Candidate tracing is controlled by:
+
+| Env | Meaning | Default |
+| --- | --- | --- |
+| `LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATES_ENABLED` | Whether to enrich candidates with `debug_traceTransaction` | `true` |
+| `LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATE_LIMIT_PER_BLOCK` | Maximum non-cluster candidate transactions to trace per block | `5` |
+
+Cluster-related transactions are always candidates when candidate tracing is enabled. Keep `LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATE_LIMIT_PER_BLOCK` low at first because trace RPC CPU is the bottleneck, not this process' memory.
 
 ## Check cluster coverage
 

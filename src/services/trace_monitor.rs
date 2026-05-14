@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Row, types::Json};
@@ -13,7 +13,7 @@ use crate::{
     domain::{enums::AssetType, interfaces::AnalysisRepository, value_objects::AssetFlow},
     flows::derivation::derive_basic_flows,
     indexer::rpc::IndexerRpcClient,
-    ingestion::fetchers::TransactionBundleFetcher,
+    ingestion::{fetchers::TransactionBundleFetcher, models::RawTransactionBundle},
     repositories::sqlx::SqlxAnalysisRepository,
 };
 
@@ -25,6 +25,8 @@ pub struct TraceMonitorConfig {
     pub confirmations: u64,
     pub block_batch_size: u64,
     pub retention_days: i64,
+    pub trace_candidates_enabled: bool,
+    pub trace_candidate_limit_per_block: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -35,6 +37,7 @@ pub struct TraceMonitorIteration {
     pub end_block: Option<u64>,
     pub processed_blocks: u64,
     pub processed_txs: u64,
+    pub traced_txs: u64,
     pub failed_txs: u64,
     pub address_delta_rows: u64,
     pub cluster_delta_rows: u64,
@@ -65,8 +68,23 @@ struct ClusterDeltaKey {
 pub struct TraceMonitorService {
     repository: SqlxAnalysisRepository,
     rpc_client: Arc<IndexerRpcClient>,
-    fetcher: TransactionBundleFetcher,
+    light_fetcher: TransactionBundleFetcher,
+    trace_fetcher: TransactionBundleFetcher,
     config: TraceMonitorConfig,
+}
+
+#[derive(Clone, Debug)]
+struct TraceCandidate {
+    tx_hash: String,
+    block_timestamp: Option<DateTime<Utc>>,
+    score: i128,
+    cluster_involved: bool,
+}
+
+#[derive(Clone, Debug)]
+struct BlockTxRef {
+    tx_hash: String,
+    block_timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -92,13 +110,15 @@ impl TraceMonitorService {
     pub fn new(
         repository: SqlxAnalysisRepository,
         rpc_client: Arc<IndexerRpcClient>,
-        fetcher: TransactionBundleFetcher,
+        light_fetcher: TransactionBundleFetcher,
+        trace_fetcher: TransactionBundleFetcher,
         config: TraceMonitorConfig,
     ) -> Self {
         Self {
             repository,
             rpc_client,
-            fetcher,
+            light_fetcher,
+            trace_fetcher,
             config,
         }
     }
@@ -134,17 +154,52 @@ impl TraceMonitorService {
 
         let clusters = self.load_cluster_scopes().await?;
         for block_number in start_block..=end_block {
-            let tx_hashes = self.block_tx_hashes(block_number).await?;
-            for tx_hash in tx_hashes {
-                match self.process_tx(&tx_hash, &clusters).await {
-                    Ok((address_rows, cluster_rows)) => {
+            let tx_refs = self.block_tx_refs(block_number).await?;
+            let mut candidates = Vec::new();
+            for tx_ref in tx_refs {
+                match self
+                    .process_light_tx(&tx_ref.tx_hash, tx_ref.block_timestamp, &clusters)
+                    .await
+                {
+                    Ok((address_rows, cluster_rows, candidate)) => {
                         iteration.processed_txs += 1;
                         iteration.address_delta_rows += address_rows;
                         iteration.cluster_delta_rows += cluster_rows;
+                        if let Some(candidate) = candidate {
+                            candidates.push(candidate);
+                        }
                     }
                     Err(err) => {
                         iteration.failed_txs += 1;
-                        warn!(tx_hash, error = %err, "trace monitor tx failed");
+                        warn!(
+                            tx_hash = tx_ref.tx_hash,
+                            error = %err,
+                            "trace monitor light tx failed"
+                        );
+                    }
+                }
+            }
+            if self.config.trace_candidates_enabled {
+                for candidate in
+                    select_trace_candidates(candidates, self.config.trace_candidate_limit_per_block)
+                {
+                    match self
+                        .process_trace_tx(&candidate.tx_hash, candidate.block_timestamp, &clusters)
+                        .await
+                    {
+                        Ok((address_rows, cluster_rows)) => {
+                            iteration.traced_txs += 1;
+                            iteration.address_delta_rows += address_rows;
+                            iteration.cluster_delta_rows += cluster_rows;
+                        }
+                        Err(err) => {
+                            iteration.failed_txs += 1;
+                            warn!(
+                                tx_hash = candidate.tx_hash,
+                                error = %err,
+                                "trace monitor candidate tx failed"
+                            );
+                        }
                     }
                 }
             }
@@ -156,14 +211,53 @@ impl TraceMonitorService {
         Ok(iteration)
     }
 
-    async fn process_tx(
+    async fn process_light_tx(
         &self,
         tx_hash: &str,
+        block_timestamp: Option<DateTime<Utc>>,
+        clusters: &[ClusterScope],
+    ) -> LedgerResult<(u64, u64, Option<TraceCandidate>)> {
+        let bundle = self
+            .light_fetcher
+            .fetch_without_code_with_timestamp(self.config.chain_id, tx_hash, block_timestamp)
+            .await?;
+        let flows = derive_basic_flows(&bundle);
+        let candidate = trace_candidate_from_flows(&bundle.tx.tx_hash, &bundle, &flows, clusters);
+        let address_deltas = aggregate_address_deltas(&flows);
+        let address_rows = self
+            .upsert_address_deltas(
+                &bundle.tx.tx_hash,
+                bundle.tx.block_number.unwrap_or_default(),
+                bundle.tx.block_timestamp,
+                &bundle.tx.from_address,
+                bundle.tx.to_address.as_deref(),
+                bundle.trace.is_some(),
+                &address_deltas,
+            )
+            .await?;
+
+        let cluster_deltas = aggregate_cluster_deltas(&flows, clusters);
+        let cluster_rows = self
+            .upsert_cluster_deltas(
+                &bundle.tx.tx_hash,
+                bundle.tx.block_number.unwrap_or_default(),
+                bundle.tx.block_timestamp,
+                bundle.trace.is_some(),
+                &cluster_deltas,
+            )
+            .await?;
+        Ok((address_rows, cluster_rows, candidate))
+    }
+
+    async fn process_trace_tx(
+        &self,
+        tx_hash: &str,
+        block_timestamp: Option<DateTime<Utc>>,
         clusters: &[ClusterScope],
     ) -> LedgerResult<(u64, u64)> {
         let bundle = self
-            .fetcher
-            .fetch_without_code(self.config.chain_id, tx_hash)
+            .trace_fetcher
+            .fetch_without_code_with_timestamp(self.config.chain_id, tx_hash, block_timestamp)
             .await?;
         let flows = derive_basic_flows(&bundle);
         let address_deltas = aggregate_address_deltas(&flows);
@@ -282,8 +376,16 @@ impl TraceMonitorService {
             .collect()
     }
 
-    async fn block_tx_hashes(&self, block_number: u64) -> LedgerResult<Vec<String>> {
-        let block = self.rpc_client.get_block_with_transactions(block_number).await?;
+    async fn block_tx_refs(&self, block_number: u64) -> LedgerResult<Vec<BlockTxRef>> {
+        let block = self
+            .rpc_client
+            .get_block_with_transactions(block_number)
+            .await?;
+        let block_timestamp = block
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
+            .and_then(|value| Utc.timestamp_opt(value as i64, 0).single());
         Ok(block
             .get("transactions")
             .and_then(Value::as_array)
@@ -291,9 +393,15 @@ impl TraceMonitorService {
                 items
                     .iter()
                     .filter_map(|item| {
-                        item.as_str()
-                            .map(ToOwned::to_owned)
-                            .or_else(|| item.get("hash").and_then(Value::as_str).map(ToOwned::to_owned))
+                        let tx_hash = item.as_str().map(ToOwned::to_owned).or_else(|| {
+                            item.get("hash")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })?;
+                        Some(BlockTxRef {
+                            tx_hash,
+                            block_timestamp,
+                        })
                     })
                     .collect::<Vec<_>>()
             })
@@ -339,6 +447,8 @@ impl TraceMonitorService {
             "confirmations": self.config.confirmations,
             "block_batch_size": self.config.block_batch_size,
             "retention_days": self.config.retention_days,
+            "trace_candidates_enabled": self.config.trace_candidates_enabled,
+            "trace_candidate_limit_per_block": self.config.trace_candidate_limit_per_block,
         })))
         .execute(self.repository.pool())
         .await
@@ -527,10 +637,14 @@ fn aggregate_address_deltas(flows: &[AssetFlow]) -> BTreeMap<AddressDeltaKey, De
             asset_type,
             token_address,
         };
-        let from_delta = deltas.entry(from_key).or_insert_with(DeltaAccumulator::default);
+        let from_delta = deltas
+            .entry(from_key)
+            .or_insert_with(DeltaAccumulator::default);
         from_delta.amount_out = from_delta.amount_out.saturating_add(amount);
         from_delta.flow_count += 1;
-        let to_delta = deltas.entry(to_key).or_insert_with(DeltaAccumulator::default);
+        let to_delta = deltas
+            .entry(to_key)
+            .or_insert_with(DeltaAccumulator::default);
         to_delta.amount_in = to_delta.amount_in.saturating_add(amount);
         to_delta.flow_count += 1;
     }
@@ -580,6 +694,92 @@ fn aggregate_cluster_deltas(
     deltas
 }
 
+fn trace_candidate_from_flows(
+    tx_hash: &str,
+    bundle: &RawTransactionBundle,
+    flows: &[AssetFlow],
+    clusters: &[ClusterScope],
+) -> Option<TraceCandidate> {
+    let score = flows
+        .iter()
+        .map(|flow| parse_amount_i128(&flow.amount_raw).abs())
+        .max()
+        .unwrap_or_default();
+    let cluster_involved = tx_involves_cluster(bundle, flows, clusters);
+    if score == 0 && !cluster_involved {
+        return None;
+    }
+    Some(TraceCandidate {
+        tx_hash: tx_hash.to_owned(),
+        block_timestamp: bundle.tx.block_timestamp,
+        score,
+        cluster_involved,
+    })
+}
+
+fn tx_involves_cluster(
+    bundle: &RawTransactionBundle,
+    flows: &[AssetFlow],
+    clusters: &[ClusterScope],
+) -> bool {
+    if clusters.is_empty() {
+        return false;
+    }
+    let tx_from = bundle.tx.from_address.to_ascii_lowercase();
+    let tx_to = bundle
+        .tx
+        .to_address
+        .as_ref()
+        .map(|value| value.to_ascii_lowercase());
+    clusters.iter().any(|cluster| {
+        cluster.addresses.contains(&tx_from)
+            || tx_to
+                .as_ref()
+                .is_some_and(|address| cluster.addresses.contains(address))
+            || flows.iter().any(|flow| {
+                cluster
+                    .addresses
+                    .contains(&flow.from_address.to_ascii_lowercase())
+                    || cluster
+                        .addresses
+                        .contains(&flow.to_address.to_ascii_lowercase())
+            })
+    })
+}
+
+fn select_trace_candidates(
+    candidates: Vec<TraceCandidate>,
+    non_cluster_limit_per_block: u32,
+) -> Vec<TraceCandidate> {
+    let mut cluster_candidates = Vec::new();
+    let mut non_cluster_candidates = Vec::new();
+    for candidate in candidates {
+        if candidate.cluster_involved {
+            cluster_candidates.push(candidate);
+        } else {
+            non_cluster_candidates.push(candidate);
+        }
+    }
+    cluster_candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.tx_hash.cmp(&right.tx_hash))
+    });
+    non_cluster_candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.tx_hash.cmp(&right.tx_hash))
+    });
+    cluster_candidates.extend(
+        non_cluster_candidates
+            .into_iter()
+            .take(non_cluster_limit_per_block as usize),
+    );
+    cluster_candidates
+}
+
 fn asset_type_key(value: &AssetType) -> String {
     match value {
         AssetType::Native => "native",
@@ -623,7 +823,9 @@ mod tests {
         let cluster_id = Uuid::new_v4();
         let cluster = ClusterScope {
             cluster_id,
-            addresses: ["0xaaa".to_owned(), "0xbbb".to_owned()].into_iter().collect(),
+            addresses: ["0xaaa".to_owned(), "0xbbb".to_owned()]
+                .into_iter()
+                .collect(),
         };
         let flows = vec![
             flow("0xaaa", "0xbbb", Some("0xtoken"), "10"),
@@ -636,5 +838,49 @@ mod tests {
         assert_eq!(delta.amount_in, 25);
         assert_eq!(delta.amount_out, 7);
         assert_eq!(delta.addresses.len(), 2);
+    }
+
+    #[test]
+    fn trace_candidate_selection_keeps_all_cluster_candidates_and_limits_others() {
+        let candidates = vec![
+            TraceCandidate {
+                tx_hash: "0xcluster_low".to_owned(),
+                block_timestamp: None,
+                score: 1,
+                cluster_involved: true,
+            },
+            TraceCandidate {
+                tx_hash: "0xnon_cluster_mid".to_owned(),
+                block_timestamp: None,
+                score: 50,
+                cluster_involved: false,
+            },
+            TraceCandidate {
+                tx_hash: "0xnon_cluster_high".to_owned(),
+                block_timestamp: None,
+                score: 100,
+                cluster_involved: false,
+            },
+            TraceCandidate {
+                tx_hash: "0xnon_cluster_low".to_owned(),
+                block_timestamp: None,
+                score: 10,
+                cluster_involved: false,
+            },
+        ];
+
+        let selected = select_trace_candidates(candidates, 2)
+            .into_iter()
+            .map(|candidate| candidate.tx_hash)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            selected,
+            vec![
+                "0xcluster_low".to_owned(),
+                "0xnon_cluster_high".to_owned(),
+                "0xnon_cluster_mid".to_owned(),
+            ]
+        );
     }
 }

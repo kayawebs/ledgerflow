@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 
 use crate::core::errors::{LedgerError, LedgerResult};
@@ -66,7 +66,7 @@ impl TransactionBundleFetcher {
     }
 
     pub async fn fetch(&self, chain_id: u64, tx_hash: &str) -> LedgerResult<RawTransactionBundle> {
-        self.fetch_inner(chain_id, tx_hash, true).await
+        self.fetch_inner(chain_id, tx_hash, true, None).await
     }
 
     pub async fn fetch_without_code(
@@ -74,7 +74,17 @@ impl TransactionBundleFetcher {
         chain_id: u64,
         tx_hash: &str,
     ) -> LedgerResult<RawTransactionBundle> {
-        self.fetch_inner(chain_id, tx_hash, false).await
+        self.fetch_inner(chain_id, tx_hash, false, None).await
+    }
+
+    pub async fn fetch_without_code_with_timestamp(
+        &self,
+        chain_id: u64,
+        tx_hash: &str,
+        block_timestamp: Option<DateTime<Utc>>,
+    ) -> LedgerResult<RawTransactionBundle> {
+        self.fetch_inner(chain_id, tx_hash, false, block_timestamp)
+            .await
     }
 
     async fn fetch_inner(
@@ -82,6 +92,7 @@ impl TransactionBundleFetcher {
         chain_id: u64,
         tx_hash: &str,
         include_target_code: bool,
+        block_timestamp_override: Option<DateTime<Utc>>,
     ) -> LedgerResult<RawTransactionBundle> {
         let tx_payload = self.rpc_client.get_transaction(chain_id, tx_hash).await?;
         if tx_payload.is_null() {
@@ -165,7 +176,9 @@ impl TransactionBundleFetcher {
                 .to_owned(),
             nonce: hex_to_u64(tx_payload.get("nonce").and_then(Value::as_str)),
         };
-        let block_timestamp = if let Some(block_number) = tx.block_number {
+        let block_timestamp = if block_timestamp_override.is_some() {
+            block_timestamp_override
+        } else if let Some(block_number) = tx.block_number {
             let block_payload = self.rpc_client.get_block(chain_id, block_number).await?;
             hex_to_u64(block_payload.get("timestamp").and_then(Value::as_str))
                 .and_then(|value| Utc.timestamp_opt(value as i64, 0).single())
