@@ -3290,28 +3290,27 @@ fn render_tx_analysis_result_with_share(
         )
     };
     let storyline_panel = render_tx_storyline_panel(&analysis.scenario_outputs);
+    let report_hero = render_tx_report_hero(
+        analysis,
+        &primary_activity,
+        &primary_activity_reason,
+        &primary_confidence,
+        &share_action,
+    );
 
     format!(
         r#"<div class="tx-analysis-shell">
-  <div class="mini-card">
-    <strong>Most likely activity: {}</strong>
-    <span>{}</span>
-    <small>Confidence: {}</small>
-    {}
-  </div>
-  <div class="field-hint">Tx {} · status {} · analysis {}.</div>
-  <div class="field-hint">Selector <code>{}</code> · {} recognizers · {} derived flows.</div>
-  <div class="field-hint">If the activity looks stale or obviously wrong, use <strong>Reanalyze</strong>. Analyze transaction may load a previously saved result first.</div>
-  <div class="section-head"><h3>Execution storyline</h3></div>
   {}
   {}
-  <div class="section-head"><h3>Derived flows</h3>{}</div>
   {}
-  <div class="section-head"><h3>Unresolved points</h3></div>
-  {}
-  <details class="raw-json-shell">
-    <summary>Raw analysis JSON</summary>
-    <pre class="json-shell">{}</pre>
+  <details class="storyline-evidence-shell">
+    <summary><span>Evidence and debug data</span>{}</summary>
+    <div class="evidence-stack">
+      <div class="section-head"><h3>Derived flows</h3></div>
+      {}
+      <div class="section-head"><h3>Unresolved points</h3></div>
+      {}
+    </div>
   </details>
   <details class="storyline-evidence-shell">
     <summary><span>Recognizer outputs</span>{}</summary>
@@ -3321,23 +3320,12 @@ fn render_tx_analysis_result_with_share(
     <summary><span>Validation results</span>{}</summary>
     {}
   </details>
+  <details class="raw-json-shell">
+    <summary>Raw analysis JSON</summary>
+    <pre class="json-shell">{}</pre>
+  </details>
 </div>"#,
-        escape_html(&primary_activity),
-        escape_html(&primary_activity_reason),
-        escape_html(&primary_confidence),
-        share_action,
-        render_copyable_code(&analysis.tx_hash, 12),
-        escape_html(&enum_label(&analysis.status)),
-        escape_html(&enum_label(&analysis.analysis_status)),
-        escape_html(
-            analysis
-                .normalized_execution_facts
-                .selector
-                .as_deref()
-                .unwrap_or("n/a")
-        ),
-        analysis.recognizer_results.len(),
-        analysis.derived_flows.len(),
+        report_hero,
         storyline_panel,
         render_storyline_gap_explanation(&analysis.scenario_outputs)
             .map(|message| format!(r#"<div class="notice info">{}</div>"#, escape_html(&message)))
@@ -3348,7 +3336,6 @@ fn render_tx_analysis_result_with_share(
         ),
         flow_rows,
         unresolved_rows,
-        escape_html(&raw_json),
         render_info_popover(
             "What am I looking at?",
             "Recognizers are rule-based detectors that classify the transaction into interpretable activities such as approve, swap, liquidation, arbitrage, or native transfer."
@@ -3358,7 +3345,8 @@ fn render_tx_analysis_result_with_share(
             "What are validations?",
             "Validation results are internal checks that compare the inferred story against the available evidence and surface inconsistencies or missing information."
         ),
-        validation_rows
+        validation_rows,
+        escape_html(&raw_json)
     )
 }
 
@@ -3398,6 +3386,196 @@ fn render_info_popover(label: &str, body: &str) -> String {
         escape_html(label),
         escape_html(body)
     )
+}
+
+struct TxReportVerdict {
+    tone: &'static str,
+    label: String,
+    result: String,
+    note: String,
+}
+
+fn render_tx_report_hero(
+    analysis: &TransactionAnalysis,
+    primary_activity: &str,
+    primary_activity_reason: &str,
+    primary_confidence: &str,
+    share_action: &str,
+) -> String {
+    let storyline = analysis.scenario_outputs.get("storyline");
+    let kind = storyline
+        .and_then(|value| value.get("kind"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(primary_activity);
+    let protocol = storyline
+        .and_then(|value| value.get("protocol"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let summary = storyline
+        .and_then(|value| value.get("summary"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(primary_activity_reason);
+    let verdict = build_tx_report_verdict(storyline);
+    let timestamp = analysis
+        .block_timestamp
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| "n/a".to_owned());
+    let to_address = analysis.to_address.as_deref().unwrap_or("n/a");
+
+    format!(
+        r#"<section class="tx-report-hero tx-report-{}">
+  <div class="tx-report-main">
+    <span class="storyline-kicker">LedgerFlow transaction report</span>
+    <h2>{}</h2>
+    <p>{}</p>
+    <div class="tx-report-meta">
+      <span>Activity<strong>{}</strong></span>
+      <span>Protocol<strong>{}</strong></span>
+      <span>Status<strong>{}</strong></span>
+      <span>Confidence<strong>{}</strong></span>
+    </div>
+    <div class="tx-report-address-grid">
+      <div><span>Tx hash</span>{}</div>
+      <div><span>From</span>{}</div>
+      <div><span>To</span>{}</div>
+      <div><span>Time</span><code>{}</code></div>
+    </div>
+  </div>
+  <aside class="tx-report-result-card">
+    <span>Strategy result</span>
+    <strong>{}</strong>
+    <small>{}</small>
+    {}
+  </aside>
+</section>"#,
+        verdict.tone,
+        escape_html(&verdict.label),
+        escape_html(summary),
+        escape_html(kind),
+        escape_html(protocol),
+        escape_html(&enum_label(&analysis.status)),
+        escape_html(primary_confidence),
+        render_copyable_code(&analysis.tx_hash, 12),
+        render_copyable_code(&analysis.from_address, 10),
+        render_copyable_code(to_address, 10),
+        escape_html(&timestamp),
+        escape_html(&verdict.result),
+        escape_html(&verdict.note),
+        share_action,
+    )
+}
+
+fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVerdict {
+    let Some(net_effect) = storyline
+        .and_then(|value| value.get("net_effect"))
+        .filter(|value| !value.is_null())
+    else {
+        return TxReportVerdict {
+            tone: "unknown",
+            label: "No clear profit view yet".to_owned(),
+            result: "PnL unavailable".to_owned(),
+            note: "No subject-scope net effect was generated for this transaction.".to_owned(),
+        };
+    };
+
+    let mut eth_equivalent_raw = 0i128;
+    let mut positive_assets = 0usize;
+    let mut negative_assets = 0usize;
+    if let Some(rows) = net_effect.get("rows").and_then(|value| value.as_array()) {
+        for row in rows {
+            let net_raw = row
+                .get("net_raw")
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<i128>().ok())
+                .unwrap_or(0);
+            if net_raw > 0 {
+                positive_assets += 1;
+            } else if net_raw < 0 {
+                negative_assets += 1;
+            }
+            if token_is_eth_equivalent(row.get("token")) {
+                eth_equivalent_raw += net_raw;
+            }
+        }
+    }
+    if let Some(gas_raw) = net_effect
+        .get("gas")
+        .and_then(|value| value.get("amount_raw"))
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<i128>().ok())
+    {
+        eth_equivalent_raw -= gas_raw;
+    }
+
+    if eth_equivalent_raw > 0 {
+        TxReportVerdict {
+            tone: "profit",
+            label: "Likely profitable transaction".to_owned(),
+            result: format_wei_eth(eth_equivalent_raw),
+            note: "ETH/WETH-equivalent net after native gas. Token-priced USD PnL is not assumed here.".to_owned(),
+        }
+    } else if eth_equivalent_raw < 0 {
+        TxReportVerdict {
+            tone: "loss",
+            label: "Likely loss after gas".to_owned(),
+            result: format_wei_eth(eth_equivalent_raw),
+            note: "ETH/WETH-equivalent net after native gas. Other token movements may still matter.".to_owned(),
+        }
+    } else if positive_assets > 0 && negative_assets > 0 {
+        TxReportVerdict {
+            tone: "mixed",
+            label: "Mixed asset result".to_owned(),
+            result: "Multi-asset net".to_owned(),
+            note: "The subject gained and spent different assets; pricing is needed for a single PnL number.".to_owned(),
+        }
+    } else if positive_assets > 0 {
+        TxReportVerdict {
+            tone: "profit",
+            label: "Net assets gained".to_owned(),
+            result: "Positive token net".to_owned(),
+            note: "The subject scope received assets, but a USD/ETH value is not available for every token.".to_owned(),
+        }
+    } else if negative_assets > 0 {
+        TxReportVerdict {
+            tone: "loss",
+            label: "Net assets spent".to_owned(),
+            result: "Negative token net".to_owned(),
+            note: "The subject scope spent assets, but a USD/ETH value is not available for every token.".to_owned(),
+        }
+    } else {
+        TxReportVerdict {
+            tone: "unknown",
+            label: "Break-even or no external asset change".to_owned(),
+            result: "0 net detected".to_owned(),
+            note: "No scope-crossing token delta was detected beyond available evidence.".to_owned(),
+        }
+    }
+}
+
+fn token_is_eth_equivalent(token: Option<&serde_json::Value>) -> bool {
+    let Some(token) = token else {
+        return false;
+    };
+    let symbol = token.get("symbol").and_then(|value| value.as_str()).unwrap_or("");
+    let address = token.get("address").and_then(|value| value.as_str()).unwrap_or("");
+    symbol.eq_ignore_ascii_case("ETH")
+        || symbol.eq_ignore_ascii_case("WETH")
+        || address.eq_ignore_ascii_case("0x4200000000000000000000000000000000000006")
+        || address.eq_ignore_ascii_case("native")
+}
+
+fn format_wei_eth(raw: i128) -> String {
+    let sign = if raw > 0 {
+        "+"
+    } else if raw < 0 {
+        "-"
+    } else {
+        ""
+    };
+    let abs = raw.abs();
+    let whole = abs / 1_000_000_000_000_000_000i128;
+    let fractional = (abs % 1_000_000_000_000_000_000i128) / 1_000_000_000_000i128;
+    format!("{sign}{whole}.{fractional:06} ETH")
 }
 
 fn tx_form_prefill(payload: Option<&serde_json::Value>, default_chain_id: u64) -> (String, String) {
@@ -3752,7 +3930,7 @@ fn render_storyline_steps(
   </div>
   <div class="timeline-flow compact">
     <div class="timeline-side">
-      <code>{}</code>
+      {}
       <div class="timeline-role-row">{}</div>
     </div>
     <div class="timeline-mid">
@@ -3761,7 +3939,7 @@ fn render_storyline_steps(
       <span class="timeline-arrow-inline">→</span>
     </div>
     <div class="timeline-side">
-      <code>{}</code>
+      {}
       <div class="timeline-role-row">{}</div>
     </div>
   </div>
@@ -5420,6 +5598,26 @@ textarea { min-height: 140px; resize: vertical; }
 .mini-card { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; min-width: 0; }
 .mini-card span, .mini-card small { color: var(--muted); line-height: 1.45; }
 .tx-analysis-shell { display: grid; gap: 14px; }
+.tx-report-hero { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(230px, .65fr); gap: 12px; padding: 14px; border: 1px solid var(--line); border-left-width: 4px; border-radius: 8px; background: #fff; min-width: 0; }
+.tx-report-profit { border-left-color: #0d6e63; }
+.tx-report-loss { border-left-color: #c55f0c; }
+.tx-report-mixed { border-left-color: #1d5ea8; }
+.tx-report-unknown { border-left-color: #6f5c40; }
+.tx-report-main { display: grid; gap: 10px; min-width: 0; }
+.tx-report-main h2 { margin: 0; font-size: clamp(1.35rem, 2.2vw, 2rem); line-height: 1.18; }
+.tx-report-main p { margin: 0; color: var(--muted); line-height: 1.5; }
+.tx-report-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.tx-report-meta span, .tx-report-result-card span, .tx-report-address-grid span { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+.tx-report-meta strong { display: block; margin-top: 3px; color: var(--ink); font-size: .9rem; line-height: 1.25; text-transform: none; letter-spacing: 0; }
+.tx-report-address-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; padding-top: 4px; }
+.tx-report-address-grid div { display: grid; gap: 4px; min-width: 0; }
+.tx-report-result-card { display: grid; gap: 8px; align-content: start; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #f8fbff; min-width: 0; }
+.tx-report-profit .tx-report-result-card { background: #f4fbf7; }
+.tx-report-loss .tx-report-result-card { background: #fff7ed; }
+.tx-report-mixed .tx-report-result-card { background: #eef5ff; }
+.tx-report-result-card strong { font-size: 1.35rem; line-height: 1.2; overflow-wrap: anywhere; }
+.tx-report-result-card small { color: var(--muted); line-height: 1.45; }
+.tx-report-result-card form { margin-top: 4px; }
 .storyline-summary-card { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
 .storyline-summary-card strong { font-size: clamp(1.1rem, 2vw, 1.4rem); line-height: 1.25; }
 .storyline-kicker { color: var(--accent); text-transform: uppercase; letter-spacing: .14em; font-size: .75rem; font-weight: 700; }
@@ -5460,6 +5658,7 @@ textarea { min-height: 140px; resize: vertical; }
 .storyline-evidence-shell[open] summary { border-bottom: 1px solid var(--line); margin-bottom: 14px; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .section-head h3 { margin: 0; }
+.evidence-stack { display: grid; gap: 12px; padding: 0 12px; }
 .help-popover { position: relative; }
 .help-popover summary { list-style: none; cursor: pointer; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 999px; border: 1px solid var(--line); background: #fff; color: var(--muted); font-weight: 700; font-size: .78rem; }
 .help-popover summary::-webkit-details-marker { display: none; }
@@ -5516,11 +5715,11 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line
 .alert-card.severity-high { border-color: rgba(197,95,12,.4); background: #fff6f0; }
 .empty-state { padding: 14px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); background: #fff; }
 @media (max-width: 960px) {
-  .hero, .dashboard-shell, .dashboard-grid { grid-template-columns: 1fr; }
+  .hero, .dashboard-shell, .dashboard-grid, .tx-report-hero { grid-template-columns: 1fr; }
   .sidebar { position: static; }
   .storyline-main-path { grid-template-columns: 1fr; }
   .story-arrow { transform: rotate(90deg); padding: 4px 0; }
-  .timeline-step { grid-template-columns: 1fr; }
+  .timeline-step, .timeline-flow { grid-template-columns: 1fr; }
 }
 "#
 }
