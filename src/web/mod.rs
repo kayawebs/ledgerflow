@@ -3277,7 +3277,7 @@ fn render_tx_analysis_result_with_share_url(
             .join("")
         )
     };
-    let storyline_panel = render_tx_storyline_panel(&analysis.scenario_outputs);
+    let storyline_panel = render_tx_storyline_panel(analysis);
     let report_hero = render_tx_report_hero(
         analysis,
         &primary_activity,
@@ -3772,9 +3772,14 @@ fn tx_form_prefill(payload: Option<&serde_json::Value>, default_chain_id: u64) -
     )
 }
 
-fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
+fn render_tx_storyline_panel(analysis: &TransactionAnalysis) -> String {
+    let scenario_outputs = &analysis.scenario_outputs;
     let Some(storyline) = scenario_outputs.get("storyline") else {
-        return "<div class=\"empty-state\">No execution storyline is available yet for this transaction.</div>".to_owned();
+        return render_flow_fallback_panel(
+            analysis,
+            2,
+            "未识别出完整交易意图，先展示可确认的资金流。",
+        );
     };
     let kind = storyline
         .get("kind")
@@ -3805,17 +3810,174 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
     let step_timeline =
         render_storyline_steps(storyline.get("steps"), initiator, executor, protocol_contract);
     let storyline_visual = render_storyline_visual(storyline, kind, protocol, initiator, executor);
+    let flow_fallback = if step_timeline.is_empty() && !analysis.derived_flows.is_empty() {
+        render_flow_fallback_panel(
+            analysis,
+            3,
+            "当前协议意图归因不完整，以下是从日志和 value transfer 重建出的资金流。",
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         r#"{}
+{}
 {}
 {}
 {}"#,
         subject_scope,
         net_effect,
         step_timeline,
+        flow_fallback,
         storyline_visual,
     )
+}
+
+fn render_flow_fallback_panel(
+    analysis: &TransactionAnalysis,
+    section_index: u32,
+    explanation: &str,
+) -> String {
+    let rows = if analysis.derived_flows.is_empty() {
+        "<tr><td colspan=\"5\">No asset flow could be reconstructed from the available receipt / execution evidence.</td></tr>"
+            .to_owned()
+    } else {
+        analysis
+            .derived_flows
+            .iter()
+            .take(80)
+            .map(render_flow_fallback_row)
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    format!(
+        r#"<section class="tx-section-card compact-section flow-fallback-panel">
+  <div class="tx-section-title">
+    <span class="tx-section-index">{}</span>
+    <h2>资金流摘要 <small>Confirmed Asset Flows</small></h2>
+    <span class="badge">fallback view</span>
+  </div>
+  <p class="panel-copy">{}</p>
+  <div class="table-shell compact-table-shell">
+    <table class="compact-table">
+      <thead>
+        <tr>
+          <th>From</th>
+          <th></th>
+          <th>To</th>
+          <th>Asset</th>
+          <th>Amount</th>
+        </tr>
+      </thead>
+      <tbody>{}</tbody>
+    </table>
+  </div>
+</section>"#,
+        section_index,
+        escape_html(explanation),
+        rows
+    )
+}
+
+fn render_flow_fallback_row(flow: &crate::domain::value_objects::AssetFlow) -> String {
+    let token = flow_token_descriptor(flow);
+    let symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("asset");
+    let name = token
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unlabeled");
+    let token_address = token
+        .get("address")
+        .and_then(|value| value.as_str())
+        .or(flow.token_address.as_deref())
+        .unwrap_or("native");
+    let amount_display = format_flow_amount_display(flow, &token);
+    format!(
+        "<tr><td>{}</td><td>→</td><td>{}</td><td><strong>{}</strong><small>{} · {}</small></td><td>{}</td></tr>",
+        render_copyable_code(&flow.from_address, 10),
+        render_copyable_code(&flow.to_address, 10),
+        escape_html(symbol),
+        escape_html(name),
+        render_copyable_code(token_address, 8),
+        render_amount_stack(&amount_display, &flow.amount_raw),
+    )
+}
+
+fn flow_token_descriptor(flow: &crate::domain::value_objects::AssetFlow) -> serde_json::Value {
+    if let Some(token) = flow.metadata.get("token").filter(|value| value.is_object()) {
+        return token.clone();
+    }
+    match flow.asset_type {
+        crate::domain::enums::AssetType::Native => serde_json::json!({
+            "symbol": "ETH",
+            "name": "Ether",
+            "address": "native",
+            "decimals": 18,
+        }),
+        crate::domain::enums::AssetType::Erc20 => {
+            let address = flow.token_address.as_deref().unwrap_or_default();
+            let (symbol, name, decimals) = match address.to_ascii_lowercase().as_str() {
+                "0x4200000000000000000000000000000000000006" => ("WETH", "Wrapped Ether", Some(18)),
+                "0x091a5abe6616e26268e5eecff256c2212fce2707" => ("BondETH", "Bond ETH", Some(18)),
+                _ => ("ERC20", "Unlabeled token", None),
+            };
+            serde_json::json!({
+                "symbol": symbol,
+                "name": name,
+                "address": address,
+                "decimals": decimals,
+            })
+        }
+    }
+}
+
+fn format_flow_amount_display(
+    flow: &crate::domain::value_objects::AssetFlow,
+    token: &serde_json::Value,
+) -> String {
+    let raw = flow.amount_raw.parse::<i128>().ok();
+    let symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("asset");
+    let decimals = token
+        .get("decimals")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32);
+    match (raw, decimals) {
+        (Some(raw), Some(decimals)) => {
+            format!("{} {}", format_unsigned_units_compact(raw, decimals), symbol)
+        }
+        _ => format!("{} raw units", flow.amount_raw),
+    }
+}
+
+fn format_unsigned_units_compact(raw: i128, decimals: u32) -> String {
+    let sign = if raw < 0 { "-" } else { "" };
+    let abs = raw.abs();
+    let scale = 10i128.saturating_pow(decimals);
+    if scale == 0 {
+        return format!("{sign}{abs}");
+    }
+    let whole = abs / scale;
+    let fraction = abs % scale;
+    if decimals == 0 || fraction == 0 {
+        return format!("{sign}{whole}");
+    }
+    let mut fraction_text = format!("{fraction:0width$}", width = decimals as usize);
+    fraction_text.truncate(6.min(fraction_text.len()));
+    while fraction_text.ends_with('0') {
+        fraction_text.pop();
+    }
+    if fraction_text.is_empty() {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{fraction_text}")
+    }
 }
 
 fn render_subject_scope(value: Option<&serde_json::Value>) -> String {
@@ -4120,6 +4282,9 @@ fn render_storyline_visual(
     let protocol_contract = storyline
         .get("protocol_contract")
         .and_then(|value| value.as_str());
+    if !protocol_path_is_meaningful(protocol, initiator, executor, protocol_contract) {
+        return String::new();
+    }
     let direct_protocol_call = storyline
         .get("protocol_call_mode")
         .and_then(|value| value.as_str())
@@ -4251,6 +4416,25 @@ fn render_storyline_visual(
         receipt_lane,
         exit_lane
     )
+}
+
+fn protocol_path_is_meaningful(
+    protocol: &str,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+) -> bool {
+    let has_known_protocol = !matches!(
+        protocol.to_ascii_lowercase().as_str(),
+        "" | "n/a" | "unknown" | "unknown protocol"
+    );
+    let has_initiator = !matches!(initiator.to_ascii_lowercase().as_str(), "" | "n/a");
+    let has_executor = !matches!(executor.to_ascii_lowercase().as_str(), "" | "n/a");
+    let has_protocol_contract = protocol_contract
+        .map(|value| !matches!(value.to_ascii_lowercase().as_str(), "" | "n/a"))
+        .unwrap_or(false);
+
+    has_initiator && has_executor && (has_known_protocol || has_protocol_contract)
 }
 
 fn render_storyline_lane(
