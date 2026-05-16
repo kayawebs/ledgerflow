@@ -309,8 +309,6 @@ struct AnalysisEnvelope {
 #[derive(Debug)]
 struct TxAnalysisShareRecord {
     share_id: Uuid,
-    title: String,
-    summary: String,
     snapshot: serde_json::Value,
 }
 
@@ -1607,26 +1605,10 @@ async fn public_tx_analysis_share(
         share.share_id
     );
     let content = format!(
-        r#"
-<section class="panel public-share-panel">
-  <div class="panel-head">
-    <div>
-      <span class="eyebrow">Public transaction analysis</span>
-      <h1>{}</h1>
-    </div>
-    <a class="cta ghost" href="/app/tx-analysis">Analyze another tx</a>
-  </div>
-  <div class="panel-body">
-    <p class="panel-copy">{}</p>
-    <div class="field-hint">Share URL {}</div>
-    {}
-  </div>
-</section>
-"#,
-        escape_html(&share.title),
-        escape_html(&share.summary),
-        render_copyable_code(&share_url, 18),
-        render_tx_analysis_result_with_share(&share.snapshot, false)
+        r#"<section class="tx-public-report">
+  {}
+</section>"#,
+        render_tx_analysis_result_with_share_url(&share.snapshot, false, Some(&share_url))
     );
     Ok(Html(render_marketing_page(
         &format!("LedgerFlow share {}", share.share_id),
@@ -1946,7 +1928,7 @@ async fn load_tx_analysis_share(
 ) -> Result<TxAnalysisShareRecord, WebError> {
     let row = sqlx::query(
         r#"
-        select share_id, title, summary, analysis_snapshot
+        select share_id, analysis_snapshot
         from tx_analysis_shares
         where share_id = $1
           and revoked_at is null
@@ -1968,12 +1950,6 @@ async fn load_tx_analysis_share(
         share_id: row
             .try_get("share_id")
             .map_err(|err| WebError::internal(format!("decode share id failed: {err}")))?,
-        title: row
-            .try_get("title")
-            .map_err(|err| WebError::internal(format!("decode share title failed: {err}")))?,
-        summary: row
-            .try_get("summary")
-            .map_err(|err| WebError::internal(format!("decode share summary failed: {err}")))?,
         snapshot: row
             .try_get::<SqlJson<serde_json::Value>, _>("analysis_snapshot")
             .map_err(|err| WebError::internal(format!("decode share snapshot failed: {err}")))?
@@ -2674,23 +2650,34 @@ fn render_dashboard_page(
     };
 
     let (tx_hash_prefill, chain_id_prefill) = tx_form_prefill(tx_result, state.default_chain_id);
+    let tx_status_badge = if tx_result.is_some() {
+        "分析完成"
+    } else {
+        "等待输入"
+    };
     let tx_panel = format!(
         r#"
-<section class="panel">
-  <div class="panel-head"><h2>Single transaction analysis</h2><span class="badge">debug layer</span></div>
+<section class="panel tx-workbench">
+  <div class="tx-workbench-head">
+    <div>
+      <h1>Tx 分析</h1>
+      <p>输入交易哈希，LedgerFlow 会加载已保存结果；需要重新抓证据时再点击重新分析。</p>
+    </div>
+    <span class="readonly-pill">{}</span>
+  </div>
   <div class="panel-body">
-    <form class="stack-form" method="post" action="/app/tx-analysis/run">
-      <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
-      <label>Transaction hash<input type="text" name="tx_hash" value="{}" placeholder="0x..." required></label>
-      <div class="button-row">
-        <button class="cta secondary" type="submit" name="mode" value="analyze">Analyze transaction</button>
-        <button class="cta ghost" type="submit" name="mode" value="reanalyze">Reanalyze</button>
-      </div>
+    <form class="tx-search-form" method="post" action="/app/tx-analysis/run">
+      <input type="hidden" name="chain_id" value="{}">
+      <label class="sr-only">Transaction hash</label>
+      <input type="text" name="tx_hash" value="{}" placeholder="0x transaction hash" required>
+      <button class="cta secondary" type="submit" name="mode" value="analyze">Analyze</button>
+      <button class="cta ghost" type="submit" name="mode" value="reanalyze">重新分析</button>
     </form>
     {}
   </div>
 </section>
 "#,
+        tx_status_badge,
         chain_id_prefill,
         escape_html(&tx_hash_prefill),
         tx_result
@@ -3112,12 +3099,13 @@ fn summarize_primary_activity(analysis: &TransactionAnalysis) -> (String, String
 }
 
 fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
-    render_tx_analysis_result_with_share(payload, true)
+    render_tx_analysis_result_with_share_url(payload, true, None)
 }
 
-fn render_tx_analysis_result_with_share(
+fn render_tx_analysis_result_with_share_url(
     payload: &serde_json::Value,
     show_share_action: bool,
+    share_url: Option<&str>,
 ) -> String {
     let raw_json = serde_json::to_string_pretty(payload).unwrap_or_default();
     let Ok(envelope) = serde_json::from_value::<AnalysisEnvelope>(payload.clone()) else {
@@ -3297,36 +3285,48 @@ fn render_tx_analysis_result_with_share(
         &primary_confidence,
         &share_action,
     );
+    let meta_strip = render_tx_report_meta_strip(analysis, share_url.is_some());
+    let utilities = render_tx_utilities_panel(analysis, &share_action, share_url);
 
     format!(
         r#"<div class="tx-analysis-shell">
   {}
   {}
   {}
-  <details class="storyline-evidence-shell">
-    <summary><span>Evidence and debug data</span>{}</summary>
-    <div class="evidence-stack">
-      <div class="section-head"><h3>Derived flows</h3></div>
-      {}
-      <div class="section-head"><h3>Unresolved points</h3></div>
-      {}
+  {}
+  {}
+  <section class="tx-section-card technical-evidence-panel">
+    <div class="tx-section-title">
+      <span class="tx-section-index">6</span>
+      <h2>技术证据区 <small>Technical Evidence</small></h2>
+      <span class="badge">默认折叠</span>
     </div>
-  </details>
-  <details class="storyline-evidence-shell">
-    <summary><span>Recognizer outputs</span>{}</summary>
-    <div class="split-fields tx-recognizer-grid">{}</div>
-  </details>
-  <details class="storyline-evidence-shell">
-    <summary><span>Validation results</span>{}</summary>
-    {}
-  </details>
-  <details class="raw-json-shell">
-    <summary>Raw analysis JSON</summary>
-    <pre class="json-shell">{}</pre>
-  </details>
+    <details class="storyline-evidence-shell">
+      <summary><span>Derived flows（派生资金流）</span>{}</summary>
+      <div class="evidence-stack">
+        {}
+        <div class="section-head"><h3>Unresolved points</h3></div>
+        {}
+      </div>
+    </details>
+    <details class="storyline-evidence-shell">
+      <summary><span>Recognizer outputs（识别器输出）</span>{}</summary>
+      <div class="split-fields tx-recognizer-grid">{}</div>
+    </details>
+    <details class="storyline-evidence-shell">
+      <summary><span>Validation results（验证结果）</span>{}</summary>
+      {}
+    </details>
+    <details class="raw-json-shell">
+      <summary>Raw JSON（原始数据）</summary>
+      <pre class="json-shell">{}</pre>
+    </details>
+  </section>
 </div>"#,
+        meta_strip,
         report_hero,
         storyline_panel,
+        utilities,
         render_storyline_gap_explanation(&analysis.scenario_outputs)
             .map(|message| format!(r#"<div class="notice info">{}</div>"#, escape_html(&message)))
             .unwrap_or_default(),
@@ -3388,6 +3388,123 @@ fn render_info_popover(label: &str, body: &str) -> String {
     )
 }
 
+fn render_tx_report_meta_strip(analysis: &TransactionAnalysis, public_share: bool) -> String {
+    let network = match analysis.chain_id {
+        1 => "Ethereum",
+        8453 => "Base",
+        10 => "Optimism",
+        42161 => "Arbitrum",
+        _ => "EVM chain",
+    };
+    let block = analysis
+        .block_number
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_owned());
+    let timestamp = analysis
+        .block_timestamp
+        .map(|value| value.to_rfc3339().replace('T', " ").replace('Z', " UTC"))
+        .unwrap_or_else(|| "n/a".to_owned());
+    let access_label = if public_share {
+        "公开分享页 · 只读"
+    } else {
+        "分析结果 · 可重新分析"
+    };
+    format!(
+        r#"<section class="tx-report-top">
+  <div class="tx-report-heading">
+    <span class="brand-lockup mini"><span class="brand-mark">{}</span><span>链上交易证据</span></span>
+    <div class="tx-report-actions">
+      <span class="readonly-pill">{}</span>
+    </div>
+  </div>
+  <div class="tx-report-title-row">
+    <div>
+      <h1>交易分析报告</h1>
+      <p>Tx Analysis Report</p>
+      <span>交易哈希（Tx Hash）</span>
+      {}
+    </div>
+  </div>
+  <div class="tx-meta-strip">
+    <div><span>网络</span><strong>{}</strong></div>
+    <div><span>区块高度</span><strong>{}</strong></div>
+    <div><span>时间</span><strong>{}</strong></div>
+    <div><span>状态</span><strong>{}</strong></div>
+  </div>
+</section>"#,
+        brand_mark_svg_source(),
+        escape_html(access_label),
+        render_copyable_code(&analysis.tx_hash, 16),
+        escape_html(network),
+        escape_html(&block),
+        escape_html(&timestamp),
+        escape_html(&enum_label(&analysis.status)),
+    )
+}
+
+fn render_tx_utilities_panel(
+    analysis: &TransactionAnalysis,
+    share_action: &str,
+    share_url: Option<&str>,
+) -> String {
+    let token_contract = first_report_token_address(&analysis.scenario_outputs)
+        .or_else(|| analysis.derived_flows.iter().find_map(|flow| flow.token_address.as_deref()))
+        .unwrap_or("native");
+    let share_card = if let Some(url) = share_url {
+        format!(
+            r#"<div class="utility-card"><span>复制分享链接</span>{}</div>"#,
+            render_copyable_code(url, 18)
+        )
+    } else if share_action.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="utility-card"><span>分享链接</span>{}</div>"#,
+            share_action
+        )
+    };
+    format!(
+        r#"<section class="tx-section-card tx-utilities-panel">
+  <div class="tx-section-title">
+    <span class="tx-section-index">5</span>
+    <h2>分享 / 复制工具 <small>Utilities</small></h2>
+  </div>
+  <div class="utility-grid">
+    <div class="utility-card"><span>复制 tx hash</span>{}</div>
+    <div class="utility-card"><span>复制 from address</span>{}</div>
+    <div class="utility-card"><span>复制 token contract</span>{}</div>
+    {}
+  </div>
+</section>"#,
+        render_copyable_code(&analysis.tx_hash, 12),
+        render_copyable_code(&analysis.from_address, 10),
+        render_copyable_code(token_contract, 10),
+        share_card,
+    )
+}
+
+fn first_report_token_address(scenario_outputs: &serde_json::Value) -> Option<&str> {
+    let rows = scenario_outputs
+        .get("storyline")?
+        .get("net_effect")?
+        .get("rows")?
+        .as_array()?;
+    rows.iter()
+        .find_map(|row| row.get("token")?.get("address")?.as_str())
+        .filter(|value| !value.eq_ignore_ascii_case("native"))
+}
+
+fn tx_activity_icon(kind: &str) -> &'static str {
+    match kind {
+        "liquidation" => "⚡",
+        "arbitrage" => "⇄",
+        "swap" => "⟲",
+        "approve" => "✓",
+        "native transfer" | "token transfer" => "→",
+        _ => "◇",
+    }
+}
+
 struct TxReportVerdict {
     tone: &'static str,
     label: String,
@@ -3400,7 +3517,7 @@ fn render_tx_report_hero(
     primary_activity: &str,
     primary_activity_reason: &str,
     primary_confidence: &str,
-    share_action: &str,
+    _share_action: &str,
 ) -> String {
     let storyline = analysis.scenario_outputs.get("storyline");
     let kind = storyline
@@ -3416,52 +3533,45 @@ fn render_tx_report_hero(
         .and_then(|value| value.as_str())
         .unwrap_or(primary_activity_reason);
     let verdict = build_tx_report_verdict(storyline);
-    let timestamp = analysis
-        .block_timestamp
-        .map(|value| value.to_rfc3339())
-        .unwrap_or_else(|| "n/a".to_owned());
-    let to_address = analysis.to_address.as_deref().unwrap_or("n/a");
 
     format!(
-        r#"<section class="tx-report-hero tx-report-{}">
-  <div class="tx-report-main">
-    <span class="storyline-kicker">LedgerFlow transaction report</span>
-    <h2>{}</h2>
-    <p>{}</p>
-    <div class="tx-report-meta">
-      <span>Activity<strong>{}</strong></span>
-      <span>Protocol<strong>{}</strong></span>
-      <span>Status<strong>{}</strong></span>
-      <span>Confidence<strong>{}</strong></span>
+        r#"<section class="tx-section-card tx-report-hero tx-report-{}">
+  <div class="tx-section-title">
+    <span class="tx-section-index">1</span>
+    <h2>交易结论 <small>Tx Conclusion</small></h2>
+    <span class="confidence-pill">{} confidence</span>
+  </div>
+  <div class="tx-conclusion-grid">
+    <div class="tx-conclusion-icon">{}</div>
+    <div class="tx-conclusion-cell">
+      <span>交易类型</span>
+      <strong class="activity-pill">{}</strong>
     </div>
-    <div class="tx-report-address-grid">
-      <div><span>Tx hash</span>{}</div>
-      <div><span>From</span>{}</div>
-      <div><span>To</span>{}</div>
-      <div><span>Time</span><code>{}</code></div>
+    <div class="tx-conclusion-cell">
+      <span>结论</span>
+      <strong class="verdict-pill verdict-{}">{}</strong>
+    </div>
+    <div class="tx-conclusion-cell">
+      <span>核心收益</span>
+      <strong class="profit-number">{}</strong>
+      <small>after gas</small>
+    </div>
+    <div class="tx-conclusion-cell wide">
+      <span>简短解释</span>
+      <p>{}</p>
+      <small>{}</small>
     </div>
   </div>
-  <aside class="tx-report-result-card">
-    <span>Strategy result</span>
-    <strong>{}</strong>
-    <small>{}</small>
-    {}
-  </aside>
 </section>"#,
         verdict.tone,
-        escape_html(&verdict.label),
-        escape_html(summary),
-        escape_html(kind),
-        escape_html(protocol),
-        escape_html(&enum_label(&analysis.status)),
         escape_html(primary_confidence),
-        render_copyable_code(&analysis.tx_hash, 12),
-        render_copyable_code(&analysis.from_address, 10),
-        render_copyable_code(to_address, 10),
-        escape_html(&timestamp),
+        tx_activity_icon(kind),
+        escape_html(kind),
+        verdict.tone,
+        escape_html(&verdict.label),
         escape_html(&verdict.result),
-        escape_html(&verdict.note),
-        share_action,
+        escape_html(summary),
+        escape_html(&format!("Protocol: {} · {}", protocol, verdict.note)),
     )
 }
 
@@ -3595,14 +3705,6 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
     let Some(storyline) = scenario_outputs.get("storyline") else {
         return "<div class=\"empty-state\">No execution storyline is available yet for this transaction.</div>".to_owned();
     };
-    let headline = storyline
-        .get("headline")
-        .and_then(|value| value.as_str())
-        .unwrap_or("No transaction headline is available yet.");
-    let summary = storyline
-        .get("summary")
-        .and_then(|value| value.as_str())
-        .unwrap_or("LedgerFlow did not derive a storyline summary.");
     let kind = storyline
         .get("kind")
         .and_then(|value| value.as_str())
@@ -3631,54 +3733,17 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
     let net_effect = render_net_effect_panel(storyline.get("net_effect"), subject_scope_label);
     let step_timeline =
         render_storyline_steps(storyline.get("steps"), initiator, executor, protocol_contract);
-    let call_path = render_storyline_call_path(storyline.get("call_path"));
     let storyline_visual = render_storyline_visual(storyline, kind, protocol, initiator, executor);
-    let funding_sources = render_storyline_flow_group("Funding into executor", storyline.get("funding_sources"));
-    let repay_legs = render_storyline_flow_group("Repay / protocol-facing legs", storyline.get("repay_legs"));
-    let collateral_receipts =
-        render_storyline_flow_group("Collateral / reward receipts", storyline.get("collateral_receipts"));
-    let disposition_legs =
-        render_storyline_flow_group("Disposition / settlement legs", storyline.get("disposition_legs"));
-    let cycle_legs = render_storyline_flow_group("Cycle legs", storyline.get("cycle_legs"));
-    let exit_legs = render_storyline_flow_group("Exit legs", storyline.get("exit_legs"));
 
     format!(
-        r#"<div class="storyline-summary-card">
-  <span class="storyline-kicker">{}</span>
-  <strong>{}</strong>
-  <span>{}</span>
-  <small>Protocol: {} · Initiator: <code>{}</code> · Executor: <code>{}</code></small>
-</div>
+        r#"{}
 {}
 {}
-{}
-<details class="storyline-evidence-shell">
-  <summary>Open execution evidence view</summary>
-  {}
-  {}
-  {}
-  {}
-  {}
-  {}
-  {}
-</details>
-"#,
-        escape_html(&format!("{} storyline", kind)),
-        escape_html(headline),
-        escape_html(summary),
-        escape_html(protocol),
-        render_copyable_code(initiator, 10),
-        render_copyable_code(executor, 10),
+{}"#,
         subject_scope,
         net_effect,
         step_timeline,
         storyline_visual,
-        call_path,
-        funding_sources,
-        repay_legs,
-        collateral_receipts,
-        disposition_legs,
-        if kind == "arbitrage" { format!("{}{}", cycle_legs, exit_legs) } else { String::new() },
     )
 }
 
@@ -3703,13 +3768,15 @@ fn render_subject_scope(value: Option<&serde_json::Value>) -> String {
         })
         .unwrap_or_default();
     format!(
-        r#"<div class="mini-card">
-  <strong>Subject scope</strong>
-  <span>{}</span>
-  <div class="address-pill-row">{}</div>
-</div>"#,
+        r#"<section class="tx-section-card tx-subject-panel">
+  <div class="tx-section-title">
+    <span class="tx-section-index">2</span>
+    <h2>主体视角 <small>Subject Perspective</small></h2>
+  </div>
+  <div class="subject-scope-line"><span>Subject scope</span><div class="address-pill-row">{}</div><small>{}</small></div>
+</section>"#,
+        addresses,
         escape_html(label),
-        addresses
     )
 }
 
@@ -3719,9 +3786,9 @@ fn render_net_effect_panel(value: Option<&serde_json::Value>, subject_scope_labe
     };
     let rows = render_net_effect_rows(effect);
     format!(
-        r#"<section class="storyline-net-effect">
-  <div class="panel-head"><h4>Net effect for strategy</h4><span class="badge">subject scope view</span></div>
-  <div class="panel-copy">Calculated across <strong>{}</strong>. Movements entirely inside this scope are ignored; only assets crossing this boundary show up here. <strong>In</strong> means assets entered the scope, <strong>Out</strong> means assets left it, and <strong>Net</strong> is <strong>In - Out</strong>.</div>
+        r#"<section class="storyline-net-effect tx-section-card compact-section">
+  <div class="panel-head"><h4>资产净变化</h4><span class="badge">subject scope view</span></div>
+  <div class="panel-copy">Calculated across <strong>{}</strong>. <strong>In</strong> means assets entered the subject scope, <strong>Out</strong> means assets left it, and <strong>Net</strong> is <strong>In - Out</strong>.</div>
   <div class="table-shell compact-table-shell">
     <table class="compact-table">
       <thead>
@@ -3877,8 +3944,12 @@ fn render_storyline_steps(
         return String::new();
     }
     format!(
-        r#"<section class="storyline-steps">
-  <div class="panel-head"><h4>What happened, step by step</h4><span class="badge">timeline</span></div>
+        r#"<section class="tx-section-card storyline-steps">
+  <div class="tx-section-title">
+    <span class="tx-section-index">3</span>
+    <h2>时间线 / 资金流 <small>Transaction Timeline</small></h2>
+    <span class="badge">ordered events</span>
+  </div>
   <div class="timeline-list">{}</div>
 </section>"#,
         items
@@ -4028,7 +4099,11 @@ fn render_storyline_visual(
     );
 
     format!(
-        r#"<div class="storyline-visual-shell">
+        r#"<section class="tx-section-card storyline-visual-shell">
+  <div class="tx-section-title">
+    <span class="tx-section-index">4</span>
+    <h2>协议路径 <small>Protocol Path</small></h2>
+  </div>
   <div class="storyline-main-path">
     <div class="story-node">
       <span class="story-node-label">Initiator</span>
@@ -4054,7 +4129,7 @@ fn render_storyline_visual(
     {}
     {}
   </div>
-</div>"#,
+</section>"#,
         render_copyable_code(initiator, 10),
         render_copyable_code(executor, 10),
         escape_html(protocol),
@@ -4220,90 +4295,6 @@ fn render_storyline_roles(
         tags.push("<span class=\"story-role-tag external\">external</span>".to_owned());
     }
     tags.join("")
-}
-
-fn render_storyline_call_path(value: Option<&serde_json::Value>) -> String {
-    let Some(items) = value.and_then(|value| value.as_array()) else {
-        return "<div class=\"empty-state\">No trace call path was recorded.</div>".to_owned();
-    };
-    if items.is_empty() {
-        return "<div class=\"empty-state\">No trace call path was recorded.</div>".to_owned();
-    }
-    format!(
-        r#"<div class="table-shell">
-  <table>
-    <thead>
-      <tr>
-        <th>Depth</th>
-        <th>From</th>
-        <th>To</th>
-        <th>Selector</th>
-        <th>Call type</th>
-        <th>Value</th>
-      </tr>
-    </thead>
-    <tbody>{}</tbody>
-  </table>
-</div>"#,
-        items
-            .iter()
-            .map(|item| {
-                format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    item.get("depth").and_then(|value| value.as_u64()).map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned()),
-                    render_copyable_code(item.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10),
-                    render_copyable_code(item.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10),
-                    escape_html(item.get("selector").and_then(|value| value.as_str()).unwrap_or("n/a")),
-                    escape_html(item.get("call_type").and_then(|value| value.as_str()).unwrap_or("n/a")),
-                    escape_html(item.get("value").and_then(|value| value.as_str()).unwrap_or("n/a")),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    )
-}
-
-fn render_storyline_flow_group(title: &str, value: Option<&serde_json::Value>) -> String {
-    let Some(items) = value.and_then(|value| value.as_array()) else {
-        return String::new();
-    };
-    if items.is_empty() {
-        return String::new();
-    }
-    format!(
-        r#"<h4>{}</h4>
-<div class="table-shell">
-  <table>
-    <thead>
-      <tr>
-        <th>Asset</th>
-        <th>Token</th>
-        <th>From</th>
-        <th>To</th>
-        <th>Amount raw</th>
-        <th>Method</th>
-      </tr>
-    </thead>
-    <tbody>{}</tbody>
-  </table>
-</div>"#,
-        escape_html(title),
-        items
-            .iter()
-            .map(|item| {
-                format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    escape_html(item.get("asset_type").and_then(|value| value.as_str()).unwrap_or("n/a")),
-                    render_copyable_code(item.get("token_address").and_then(|value| value.as_str()).unwrap_or("native"), 8),
-                    render_copyable_code(item.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10),
-                    render_copyable_code(item.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10),
-                    escape_html(item.get("amount_raw").and_then(|value| value.as_str()).unwrap_or("n/a")),
-                    escape_html(item.get("derivation_method").and_then(|value| value.as_str()).unwrap_or("n/a")),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    )
 }
 
 fn render_cluster_graph_panel(clusters: &[DashboardClusterRecord]) -> String {
@@ -5597,37 +5588,68 @@ textarea { min-height: 140px; resize: vertical; }
 .json-shell { margin: 0; padding: 14px; border-radius: 8px; background: #0f172a; color: #f8fafc; overflow: auto; font-size: 12px; line-height: 1.55; }
 .mini-card { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; min-width: 0; }
 .mini-card span, .mini-card small { color: var(--muted); line-height: 1.45; }
+.tx-workbench { overflow: hidden; }
+.tx-workbench-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 18px 10px; }
+.tx-workbench-head h1 { margin: 0; font-size: clamp(1.8rem, 2.4vw, 2.5rem); letter-spacing: -.03em; }
+.tx-workbench-head p { margin: 6px 0 0; color: var(--muted); line-height: 1.5; }
+.tx-search-form { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; gap: 10px; align-items: center; margin-bottom: 14px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.readonly-pill { display: inline-flex; align-items: center; gap: 6px; width: fit-content; padding: 6px 10px; border: 1px solid rgba(13,110,99,.18); border-radius: 999px; background: #ecfdf5; color: #047857; font-size: .78rem; font-weight: 700; white-space: nowrap; }
 .tx-analysis-shell { display: grid; gap: 14px; }
-.tx-report-hero { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(230px, .65fr); gap: 12px; padding: 14px; border: 1px solid var(--line); border-left-width: 4px; border-radius: 8px; background: #fff; min-width: 0; }
+.tx-section-card { border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 8px 22px rgba(15,23,42,.04); padding: 16px; min-width: 0; }
+.tx-section-title { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
+.tx-section-title h2 { margin: 0; font-size: 1.08rem; line-height: 1.25; }
+.tx-section-title h2 small { color: var(--muted); font-weight: 500; margin-left: 4px; }
+.tx-section-title .badge, .tx-section-title .confidence-pill { margin-left: auto; }
+.tx-section-index { width: 26px; height: 26px; border-radius: 999px; display: inline-grid; place-items: center; background: #2563eb; color: #fff; font-size: .9rem; font-weight: 800; flex: 0 0 auto; }
+.tx-report-top { display: grid; gap: 14px; padding: 2px 0 0; }
+.tx-report-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.brand-lockup.mini .brand-mark, .brand-lockup.mini .brand-mark svg { width: 28px; height: 28px; }
+.brand-lockup.mini { font-weight: 800; }
+.tx-report-title-row { display: flex; justify-content: space-between; gap: 16px; align-items: end; }
+.tx-report-title-row h1 { margin: 0; font-size: clamp(1.8rem, 2.6vw, 2.5rem); letter-spacing: -.03em; }
+.tx-report-title-row p { margin: 4px 0 12px; color: var(--muted); font-weight: 600; }
+.tx-report-title-row span { display: block; color: var(--muted); font-size: .84rem; margin-bottom: 4px; }
+.tx-meta-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 10px; background: #fff; box-shadow: 0 8px 22px rgba(15,23,42,.04); overflow: hidden; }
+.tx-meta-strip div { display: grid; gap: 5px; padding: 12px 18px; border-right: 1px solid var(--line); min-width: 0; }
+.tx-meta-strip div:last-child { border-right: 0; }
+.tx-meta-strip span { color: var(--muted); font-size: .78rem; }
+.tx-meta-strip strong { font-size: .92rem; overflow-wrap: anywhere; }
+.tx-report-hero { display: grid; gap: 0; padding: 16px; border-left-width: 1px; }
 .tx-report-profit { border-left-color: #0d6e63; }
 .tx-report-loss { border-left-color: #c55f0c; }
 .tx-report-mixed { border-left-color: #1d5ea8; }
 .tx-report-unknown { border-left-color: #6f5c40; }
-.tx-report-main { display: grid; gap: 10px; min-width: 0; }
-.tx-report-main h2 { margin: 0; font-size: clamp(1.35rem, 2.2vw, 2rem); line-height: 1.18; }
-.tx-report-main p { margin: 0; color: var(--muted); line-height: 1.5; }
-.tx-report-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
-.tx-report-meta span, .tx-report-result-card span, .tx-report-address-grid span { color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
-.tx-report-meta strong { display: block; margin-top: 3px; color: var(--ink); font-size: .9rem; line-height: 1.25; text-transform: none; letter-spacing: 0; }
-.tx-report-address-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; padding-top: 4px; }
-.tx-report-address-grid div { display: grid; gap: 4px; min-width: 0; }
-.tx-report-result-card { display: grid; gap: 8px; align-content: start; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #f8fbff; min-width: 0; }
-.tx-report-profit .tx-report-result-card { background: #f4fbf7; }
-.tx-report-loss .tx-report-result-card { background: #fff7ed; }
-.tx-report-mixed .tx-report-result-card { background: #eef5ff; }
-.tx-report-result-card strong { font-size: 1.35rem; line-height: 1.2; overflow-wrap: anywhere; }
-.tx-report-result-card small { color: var(--muted); line-height: 1.45; }
-.tx-report-result-card form { margin-top: 4px; }
+.tx-conclusion-grid { display: grid; grid-template-columns: 72px minmax(120px, .7fr) minmax(120px, .7fr) minmax(180px, 1fr) minmax(220px, 1.45fr); gap: 0; align-items: center; }
+.tx-conclusion-icon { width: 60px; height: 60px; border-radius: 999px; display: grid; place-items: center; color: #fff; background: linear-gradient(135deg, #2563eb, #7c3aed); font-size: 2rem; font-weight: 900; }
+.tx-conclusion-cell { display: grid; gap: 7px; min-height: 76px; padding: 4px 18px; border-left: 1px solid var(--line); align-content: center; min-width: 0; }
+.tx-conclusion-cell span { color: var(--muted); font-size: .78rem; }
+.tx-conclusion-cell p { margin: 0; color: var(--ink); line-height: 1.55; }
+.tx-conclusion-cell small { color: var(--muted); line-height: 1.45; }
+.tx-conclusion-cell.wide { align-content: start; }
+.activity-pill, .verdict-pill { width: fit-content; padding: 7px 12px; border-radius: 999px; font-size: .92rem; }
+.activity-pill { color: #6d28d9; background: #f5f3ff; border: 1px solid #ddd6fe; }
+.verdict-profit { color: #047857; background: #ecfdf5; border: 1px solid #bbf7d0; }
+.verdict-loss { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; }
+.verdict-mixed { color: #1d4ed8; background: #eff6ff; border: 1px solid #bfdbfe; }
+.verdict-unknown { color: #6f5c40; background: #f8fafc; border: 1px solid var(--line); }
+.profit-number { color: #059669; font-size: clamp(1.2rem, 2vw, 1.65rem); line-height: 1.15; overflow-wrap: anywhere; }
+.tx-report-loss .profit-number { color: #dc2626; }
+.confidence-pill { padding: 5px 9px; border-radius: 999px; background: #f1f5f9; color: var(--muted); font-size: .76rem; font-weight: 700; }
 .storyline-summary-card { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
 .storyline-summary-card strong { font-size: clamp(1.1rem, 2vw, 1.4rem); line-height: 1.25; }
 .storyline-kicker { color: var(--accent); text-transform: uppercase; letter-spacing: .14em; font-size: .75rem; font-weight: 700; }
 .address-pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .address-pill-row code { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.subject-scope-line { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.subject-scope-line > span { color: var(--muted); font-size: .85rem; font-weight: 700; }
+.subject-scope-line small { color: var(--muted); }
 .copy-code { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; vertical-align: middle; }
 .copy-code code { overflow-wrap: anywhere; }
 .copy-button { border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--muted); padding: 3px 6px; font: inherit; font-size: .7rem; line-height: 1.1; cursor: pointer; }
 .copy-button:hover { border-color: rgba(31,111,235,.35); color: var(--accent); }
 .storyline-net-effect, .storyline-steps { display: grid; gap: 12px; }
+.compact-section { padding-top: 8px; }
 .compact-table-shell { margin-top: 4px; }
 .compact-table td, .compact-table th { padding: 6px 8px; }
 .amount-stack { display: grid; gap: 2px; }
@@ -5636,22 +5658,24 @@ textarea { min-height: 140px; resize: vertical; }
 .table-badge { display: inline-flex; align-items: center; padding: 3px 6px; border-radius: 999px; font-size: .75rem; line-height: 1.2; border: 1px solid var(--line); background: #fff; color: var(--muted); }
 .table-badge.gained { border-color: rgba(13,110,99,.24); color: var(--accent); }
 .table-badge.spent, .table-badge.gas { border-color: rgba(197,95,12,.24); color: var(--accent-2); }
-.timeline-list { display: grid; gap: 10px; }
-.timeline-step { display: grid; gap: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
-.timeline-head { display: grid; gap: 10px; grid-template-columns: 28px minmax(0, 1fr); align-items: start; }
-.timeline-index { width: 28px; height: 28px; border-radius: 6px; display: grid; place-items: center; background: #eef5ff; color: var(--accent); font-weight: 700; font-size: .85rem; }
+.timeline-list { display: grid; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #fff; }
+.timeline-step { display: grid; gap: 0; padding: 0; border: 0; border-bottom: 1px solid var(--line); background: #fff; grid-template-columns: minmax(190px, .85fr) minmax(0, 1.5fr); }
+.timeline-step:last-child { border-bottom: 0; }
+.timeline-head { display: grid; gap: 10px; grid-template-columns: 28px minmax(0, 1fr); align-items: center; padding: 12px; border-right: 1px solid var(--line); }
+.timeline-index { width: 26px; height: 26px; border-radius: 999px; display: grid; place-items: center; background: #2563eb; color: #fff; font-weight: 800; font-size: .85rem; }
 .timeline-copy { display: grid; gap: 4px; min-width: 0; }
 .timeline-copy p, .timeline-copy small { margin: 0; color: var(--muted); line-height: 1.5; }
 .timeline-hint { width: fit-content; margin-top: 2px; padding: 3px 6px; border-radius: 999px; background: #eef5ff; color: #1d5ea8; font-size: .72rem; line-height: 1.3; }
-.timeline-flow { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) minmax(180px, .7fr) minmax(0, 1fr); align-items: center; }
-.timeline-flow.compact { gap: 8px; }
+.timeline-flow { display: grid; gap: 0; grid-template-columns: minmax(0, .95fr) minmax(190px, .85fr) minmax(0, .95fr); align-items: stretch; }
+.timeline-flow.compact { gap: 0; }
 .timeline-side { display: grid; gap: 6px; min-width: 0; }
-.timeline-side code { padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; overflow-wrap: anywhere; }
+.timeline-side { padding: 12px; align-content: center; }
+.timeline-side code { padding: 5px 7px; border: 1px solid var(--line); border-radius: 6px; background: #f8fafc; overflow-wrap: anywhere; }
 .timeline-role-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-.timeline-mid { display: grid; gap: 2px; justify-items: center; text-align: center; }
-.timeline-mid strong { font-size: 1rem; line-height: 1.2; }
+.timeline-mid { display: grid; gap: 3px; justify-items: start; text-align: left; padding: 12px; border-left: 1px solid var(--line); border-right: 1px solid var(--line); align-content: center; }
+.timeline-mid strong { font-size: 1rem; line-height: 1.2; color: var(--ink); }
 .timeline-mid span { color: var(--muted); line-height: 1.35; }
-.timeline-arrow-inline { font-size: 1.1rem; color: var(--muted); }
+.timeline-arrow-inline { font-size: 1rem; color: var(--accent); }
 .storyline-evidence-shell { border: 1px solid var(--line); border-radius: 8px; background: #fff; overflow: hidden; }
 .storyline-evidence-shell summary { cursor: pointer; padding: 10px 12px; font-weight: 700; }
 .storyline-evidence-shell[open] { padding-bottom: 14px; }
@@ -5663,11 +5687,11 @@ textarea { min-height: 140px; resize: vertical; }
 .help-popover summary { list-style: none; cursor: pointer; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 999px; border: 1px solid var(--line); background: #fff; color: var(--muted); font-weight: 700; font-size: .78rem; }
 .help-popover summary::-webkit-details-marker { display: none; }
 .help-popover-card { position: absolute; right: 0; top: calc(100% + 8px); width: min(320px, 75vw); padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; box-shadow: 0 8px 18px rgba(15,23,42,.08); color: var(--muted); line-height: 1.55; z-index: 4; }
-.storyline-visual-shell { display: grid; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: #fff; }
+.storyline-visual-shell { display: grid; gap: 12px; }
 .storyline-main-path { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr); align-items: stretch; }
-.story-node { display: grid; gap: 6px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; min-width: 0; }
+.story-node { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; min-width: 0; }
 .story-node.accent { border-color: rgba(31,111,235,.25); background: #f8fbff; }
-.story-node.protocol { border-color: rgba(180,83,9,.18); background: #fffaf5; }
+.story-node.protocol { border-color: rgba(13,110,99,.22); background: #f4fbf7; }
 .story-node-label { font-size: .75rem; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); }
 .story-node strong { font-size: 1rem; overflow-wrap: anywhere; }
 .story-node small { color: var(--muted); line-height: 1.45; }
@@ -5695,6 +5719,11 @@ textarea { min-height: 140px; resize: vertical; }
 .tx-action-guide { margin-top: 4px; }
 .tx-recognizer-grid { align-items: stretch; }
 .tx-recognizer-card strong { font-size: 1rem; }
+.tx-utilities-panel { display: grid; gap: 10px; }
+.utility-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.utility-card { display: grid; gap: 8px; border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: #fbfdff; min-width: 0; }
+.utility-card span { color: var(--muted); font-size: .78rem; font-weight: 700; }
+.technical-evidence-panel { display: grid; gap: 8px; }
 .raw-json-shell { border: 1px solid var(--line); border-radius: 8px; background: #fff; overflow: hidden; }
 .raw-json-shell summary { cursor: pointer; padding: 10px 12px; font-weight: 700; }
 .raw-json-shell[open] summary { border-bottom: 1px solid var(--line); }
@@ -5716,10 +5745,16 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line
 .empty-state { padding: 14px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); background: #fff; }
 @media (max-width: 960px) {
   .hero, .dashboard-shell, .dashboard-grid, .tx-report-hero { grid-template-columns: 1fr; }
+  .tx-search-form, .tx-meta-strip, .tx-conclusion-grid, .timeline-step, .timeline-flow { grid-template-columns: 1fr; }
+  .tx-meta-strip div, .timeline-head, .timeline-mid { border-right: 0; border-left: 0; }
+  .tx-meta-strip div { border-bottom: 1px solid var(--line); }
+  .tx-meta-strip div:last-child { border-bottom: 0; }
+  .tx-conclusion-cell { border-left: 0; border-top: 1px solid var(--line); padding: 12px 0; }
+  .tx-conclusion-icon { margin-bottom: 8px; }
   .sidebar { position: static; }
   .storyline-main-path { grid-template-columns: 1fr; }
   .story-arrow { transform: rotate(90deg); padding: 4px 0; }
-  .timeline-step, .timeline-flow { grid-template-columns: 1fr; }
+  .timeline-head { border-bottom: 1px solid var(--line); }
 }
 "#
 }
