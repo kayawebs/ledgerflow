@@ -100,60 +100,93 @@ fn decode_liquidation_actions(analysis: &TransactionAnalysis) -> Vec<DecodedActi
 
 fn decode_swap_actions(analysis: &TransactionAnalysis) -> Vec<DecodedAction> {
     let swap_signal = best_recognizer(analysis, &["approval_then_swap_like", "swap_like_activity"]);
-    if swap_signal.is_none() && !looks_like_asset_exchange(analysis) {
+    let Some(subject) = find_swap_subject(analysis) else {
         return Vec::new();
-    }
+    };
 
-    let subject = analysis.from_address.to_lowercase();
-    let outgoing = analysis
-        .derived_flows
+    let flow_ids = subject
+        .outgoing
         .iter()
-        .filter(|flow| flow.from_address.eq_ignore_ascii_case(&subject))
-        .collect::<Vec<_>>();
-    let incoming = analysis
-        .derived_flows
-        .iter()
-        .filter(|flow| flow.to_address.eq_ignore_ascii_case(&subject))
-        .collect::<Vec<_>>();
-    if outgoing.is_empty() || incoming.is_empty() {
-        return Vec::new();
-    }
-
-    let flow_ids = outgoing
-        .iter()
-        .chain(incoming.iter())
+        .chain(subject.incoming.iter())
         .map(|flow| flow.flow_id.clone())
         .collect::<Vec<_>>();
-    let evidence_refs = outgoing
+    let evidence_refs = subject
+        .outgoing
         .iter()
-        .chain(incoming.iter())
+        .chain(subject.incoming.iter())
         .flat_map(|flow| flow.evidence_refs.clone())
         .collect::<Vec<_>>();
     let source = swap_signal
         .map(|result| result.recognizer_id.clone())
         .unwrap_or_else(|| "asset_exchange_heuristic".to_owned());
     let confidence = swap_signal.map(|result| result.confidence).unwrap_or(0.55);
+    let protocol = swap_protocol_hint(analysis).or_else(|| analysis.to_address.clone());
 
     vec![DecodedAction {
         action_id: "swap:0".to_owned(),
         kind: DecodedActionKind::Swap,
-        protocol: analysis.to_address.clone(),
+        protocol,
         confidence,
         roles: json!({
-            "subject": subject,
-            "router_or_counterparty": analysis.to_address,
+            "subject": subject.address,
+            "subject_role": subject.role,
+            "initiator": analysis.from_address,
+            "executor": analysis.to_address,
+            "router_or_counterparty": swap_protocol_hint(analysis).or_else(|| analysis.to_address.clone()),
         }),
         assets: json!({
-            "token_in": outgoing.first().map(|flow| flow_to_json(flow)),
-            "token_out": incoming.first().map(|flow| flow_to_json(flow)),
-            "outgoing_count": outgoing.len(),
-            "incoming_count": incoming.len(),
+            "token_in": subject.outgoing.first().map(|flow| flow_to_json(flow)),
+            "token_out": subject.incoming.first().map(|flow| flow_to_json(flow)),
+            "outgoing_count": subject.outgoing.len(),
+            "incoming_count": subject.incoming.len(),
         }),
         flow_ids,
         evidence_refs,
         source,
         notes: vec!["Swap action is inferred from subject-scope token in/out; protocol-specific swap decoding is not attached yet.".to_owned()],
     }]
+}
+
+struct SwapSubject<'a> {
+    address: String,
+    role: &'static str,
+    outgoing: Vec<&'a AssetFlow>,
+    incoming: Vec<&'a AssetFlow>,
+}
+
+fn find_swap_subject(analysis: &TransactionAnalysis) -> Option<SwapSubject<'_>> {
+    let mut candidates = vec![("initiator", analysis.from_address.to_lowercase())];
+    if let Some(executor) = analysis.to_address.as_ref().map(|value| value.to_lowercase()) {
+        if !candidates
+            .iter()
+            .any(|(_, address)| address.eq_ignore_ascii_case(&executor))
+        {
+            candidates.push(("executor", executor));
+        }
+    }
+
+    candidates.into_iter().find_map(|(role, address)| {
+        let outgoing = analysis
+            .derived_flows
+            .iter()
+            .filter(|flow| flow.from_address.eq_ignore_ascii_case(&address))
+            .collect::<Vec<_>>();
+        let incoming = analysis
+            .derived_flows
+            .iter()
+            .filter(|flow| flow.to_address.eq_ignore_ascii_case(&address))
+            .collect::<Vec<_>>();
+        if outgoing.is_empty() || incoming.is_empty() {
+            None
+        } else {
+            Some(SwapSubject {
+                address,
+                role,
+                outgoing,
+                incoming,
+            })
+        }
+    })
 }
 
 fn decode_flashloan_actions(analysis: &TransactionAnalysis) -> Vec<DecodedAction> {
@@ -231,19 +264,17 @@ fn best_recognizer<'a>(
         .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
 }
 
-fn looks_like_asset_exchange(analysis: &TransactionAnalysis) -> bool {
-    let subject = analysis.from_address.to_lowercase();
-    let outgoing = analysis
-        .derived_flows
-        .iter()
-        .filter(|flow| flow.from_address.eq_ignore_ascii_case(&subject))
-        .count();
-    let incoming = analysis
-        .derived_flows
-        .iter()
-        .filter(|flow| flow.to_address.eq_ignore_ascii_case(&subject))
-        .count();
-    outgoing > 0 && incoming > 0
+fn swap_protocol_hint(analysis: &TransactionAnalysis) -> Option<String> {
+    analysis.recognizer_results.iter().find_map(|result| {
+        result
+            .attributes
+            .get("approvals")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("spender"))
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    })
 }
 
 fn flows_touching_address(analysis: &TransactionAnalysis, address: &str) -> Vec<String> {

@@ -43,6 +43,12 @@ impl RpcClient for MockRpcClient {
                 "0x2222222222222222222222222222222222222222",
                 format!("{}{}", "0x12345678", "00".repeat(32)),
             )
+        } else if tx_hash.contains("executor-swap") {
+            (
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "0x2222222222222222222222222222222222222222",
+                format!("{}{}", "0x181a8b99", "00".repeat(32)),
+            )
         } else if tx_hash.contains("morpho-liquidation") {
             (
                 "0x1111111111111111111111111111111111111111",
@@ -134,6 +140,45 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x2222222222222222222222222222222222222222")
                         ],
                         "data": format!("0x{:x}", 1394u64)
+                    }
+                ]
+            }));
+        }
+        if tx_hash.contains("executor-swap") {
+            return Ok(json!({
+                "status": status,
+                "gasUsed": format!("0x{:x}", 21000u64),
+                "effectiveGasPrice": format!("0x{:x}", 1_000_000_000u64),
+                "logs": [
+                    {
+                        "logIndex": "0x0",
+                        "address": "0x4200000000000000000000000000000000000006",
+                        "topics": [
+                            APPROVAL_TOPIC,
+                            pad_address("0x2222222222222222222222222222222222222222"),
+                            pad_address("0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24")
+                        ],
+                        "data": format!("0x{:x}", 5000u64)
+                    },
+                    {
+                        "logIndex": "0x1",
+                        "address": "0x4200000000000000000000000000000000000006",
+                        "topics": [
+                            TRANSFER_TOPIC,
+                            pad_address("0x2222222222222222222222222222222222222222"),
+                            pad_address("0x3333333333333333333333333333333333333333")
+                        ],
+                        "data": format!("0x{:x}", 100u64)
+                    },
+                    {
+                        "logIndex": "0x2",
+                        "address": "0xe9cb5734ece50867d9c7549313ae86ea6bfe35ef",
+                        "topics": [
+                            TRANSFER_TOPIC,
+                            pad_address("0x3333333333333333333333333333333333333333"),
+                            pad_address("0x2222222222222222222222222222222222222222")
+                        ],
+                        "data": format!("0x{:x}", 250u64)
                     }
                 ]
             }));

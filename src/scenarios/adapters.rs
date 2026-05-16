@@ -39,6 +39,15 @@ impl ScenarioAdapterService {
             .any(|label| label == "arbitrage_like_activity")
         {
             build_arbitrage_story(analysis, protocol.as_deref())
+        } else if labels.iter().any(|label| {
+            label == "approval_then_swap_like" || label == "swap_like_activity"
+        }) {
+            build_swap_story(
+                analysis,
+                swap_protocol_hint(analysis)
+                    .as_deref()
+                    .or(protocol.as_deref()),
+            )
         } else {
             None
         };
@@ -338,6 +347,90 @@ fn build_arbitrage_story(analysis: &TransactionAnalysis, protocol: Option<&str>)
     }))
 }
 
+fn build_swap_story(analysis: &TransactionAnalysis, protocol: Option<&str>) -> Option<Value> {
+    let token_lookup = TokenLookup::from_analysis(analysis);
+    let sender = analysis.from_address.to_lowercase();
+    let executor = analysis
+        .to_address
+        .as_ref()
+        .map(|value| value.to_lowercase())
+        .unwrap_or_else(|| sender.clone());
+    let (subject_role, subject_address) = swap_subject_address(analysis)?;
+    let outgoing = related_flows(analysis, &token_lookup, |flow| {
+        flow.from_address.eq_ignore_ascii_case(&subject_address)
+    });
+    let incoming = related_flows(analysis, &token_lookup, |flow| {
+        flow.to_address.eq_ignore_ascii_case(&subject_address)
+    });
+    if outgoing.is_empty() || incoming.is_empty() {
+        return None;
+    }
+
+    let subject_scope = build_subject_scope(&sender, std::slice::from_ref(&subject_address));
+    let net_effect = build_net_effect(analysis, &subject_scope.addresses, &token_lookup);
+    let steps = build_swap_steps(&outgoing, &incoming);
+    let headline = build_swap_headline(protocol.unwrap_or("swap route"), &outgoing, &incoming);
+
+    Some(json!({
+        "kind": "swap",
+        "headline": headline,
+        "summary": format!(
+            "{} {} swapped outgoing assets for incoming assets through {}. LedgerFlow could confirm the token movements even though the router method is not protocol-decoded yet.",
+            subject_role,
+            short_address(&subject_address),
+            protocol.unwrap_or("an unresolved router or executor")
+        ),
+        "executor_address": executor,
+        "initiator_address": sender,
+        "protocol": protocol,
+        "subject_scope": {
+            "mode": subject_scope.mode,
+            "label": subject_scope.label,
+            "addresses": subject_scope.addresses,
+        },
+        "net_effect": net_effect,
+        "steps": steps,
+        "swap_outgoing": outgoing,
+        "swap_incoming": incoming,
+    }))
+}
+
+fn swap_subject_address(analysis: &TransactionAnalysis) -> Option<(&'static str, String)> {
+    let mut candidates = vec![("initiator", analysis.from_address.to_lowercase())];
+    if let Some(executor) = analysis.to_address.as_ref().map(|value| value.to_lowercase()) {
+        if !candidates
+            .iter()
+            .any(|(_, address)| address.eq_ignore_ascii_case(&executor))
+        {
+            candidates.push(("executor", executor));
+        }
+    }
+    candidates.into_iter().find(|(_, address)| {
+        let has_outgoing = analysis
+            .derived_flows
+            .iter()
+            .any(|flow| flow.from_address.eq_ignore_ascii_case(address));
+        let has_incoming = analysis
+            .derived_flows
+            .iter()
+            .any(|flow| flow.to_address.eq_ignore_ascii_case(address));
+        has_outgoing && has_incoming
+    })
+}
+
+fn swap_protocol_hint(analysis: &TransactionAnalysis) -> Option<String> {
+    analysis.recognizer_results.iter().find_map(|result| {
+        result
+            .attributes
+            .get("approvals")
+            .and_then(|value| value.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("spender"))
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    })
+}
+
 #[derive(Clone)]
 struct SubjectScope {
     mode: &'static str,
@@ -560,6 +653,20 @@ fn build_arbitrage_steps(
     steps
 }
 
+fn build_swap_steps(outgoing: &[Value], incoming: &[Value]) -> Vec<Value> {
+    let mut steps = Vec::new();
+    let mut next_order = 1usize;
+    next_order = extend_steps(&mut steps, next_order, "Spend input asset", outgoing, "Sent");
+    let _ = extend_steps(
+        &mut steps,
+        next_order,
+        "Receive output asset",
+        incoming,
+        "Received",
+    );
+    steps
+}
+
 fn extend_steps(
     steps: &mut Vec<Value>,
     start_order: usize,
@@ -648,6 +755,20 @@ fn build_arbitrage_headline(protocol: &str, net_effect: &Value) -> String {
         .map(|items| items.len())
         .unwrap_or(0);
     format!("{protocol} arbitrage-like execution detected with {gained_count} incoming asset legs.")
+}
+
+fn build_swap_headline(protocol: &str, outgoing: &[Value], incoming: &[Value]) -> String {
+    let spent = outgoing
+        .first()
+        .and_then(|value| value.get("amount_display"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("an input asset");
+    let received = incoming
+        .first()
+        .and_then(|value| value.get("amount_display"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("an output asset");
+    format!("{protocol} swap: spent {spent} and received {received}.")
 }
 
 #[derive(Default)]

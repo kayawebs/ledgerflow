@@ -144,6 +144,47 @@ async fn liquidation_recognizer_does_not_label_plain_swap_flow() {
 }
 
 #[tokio::test]
+async fn executor_mediated_swap_produces_swap_action_and_storyline() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository,
+        vec![
+            "selector_presence".to_owned(),
+            "erc20_transfer_flow".to_owned(),
+            "approval_swap_scenario".to_owned(),
+        ],
+    ));
+
+    let (analysis, _) = analysis_service
+        .analyze_transaction(8453, "0xexecutor-swap-case")
+        .await
+        .unwrap();
+
+    assert_action_kind(&analysis.scenario_outputs, "swap");
+    let storyline = analysis
+        .scenario_outputs
+        .get("storyline")
+        .expect("swap storyline should exist");
+    assert_eq!(
+        storyline.get("kind").and_then(|value| value.as_str()),
+        Some("swap")
+    );
+    assert!(
+        storyline
+            .get("steps")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len() >= 2)
+            .unwrap_or(false)
+    );
+}
+
+#[tokio::test]
 async fn behavior_classifier_marks_morpho_liquidation_without_trace_when_event_matches() {
     let repository = Arc::new(InMemoryAnalysisRepository::default());
     let fetcher = TransactionBundleFetcher::new(
