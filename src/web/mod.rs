@@ -3302,7 +3302,7 @@ fn render_tx_analysis_result_with_share_url(
       <span class="badge">默认折叠</span>
     </div>
     <details class="storyline-evidence-shell">
-      <summary><span>Derived flows（派生资金流）</span>{}</summary>
+      <summary><span>Derived flows（派生资金流）</span></summary>
       <div class="evidence-stack">
         {}
         <div class="section-head"><h3>Unresolved points</h3></div>
@@ -3310,11 +3310,11 @@ fn render_tx_analysis_result_with_share_url(
       </div>
     </details>
     <details class="storyline-evidence-shell">
-      <summary><span>Recognizer outputs（识别器输出）</span>{}</summary>
+      <summary><span>Recognizer outputs（识别器输出）</span></summary>
       <div class="split-fields tx-recognizer-grid">{}</div>
     </details>
     <details class="storyline-evidence-shell">
-      <summary><span>Validation results（验证结果）</span>{}</summary>
+      <summary><span>Validation results（验证结果）</span></summary>
       {}
     </details>
     <details class="raw-json-shell">
@@ -3330,21 +3330,9 @@ fn render_tx_analysis_result_with_share_url(
         render_storyline_gap_explanation(&analysis.scenario_outputs)
             .map(|message| format!(r#"<div class="notice info">{}</div>"#, escape_html(&message)))
             .unwrap_or_default(),
-        render_info_popover(
-            "What are flows?",
-            "Derived flows are normalized asset movements reconstructed from logs, value transfer, and execution facts. They do not try to tell the story in step order by themselves. The timeline takes selected flows and arranges them into ordered steps between addresses."
-        ),
         flow_rows,
         unresolved_rows,
-        render_info_popover(
-            "What am I looking at?",
-            "Recognizers are rule-based detectors that classify the transaction into interpretable activities such as approve, swap, liquidation, arbitrage, or native transfer."
-        ),
         recognizer_rows,
-        render_info_popover(
-            "What are validations?",
-            "Validation results are internal checks that compare the inferred story against the available evidence and surface inconsistencies or missing information."
-        ),
         validation_rows,
         escape_html(&raw_json)
     )
@@ -3374,17 +3362,6 @@ fn render_storyline_gap_explanation(scenario_outputs: &serde_json::Value) -> Opt
     Some(
         "LedgerFlow matched the protocol or method pattern, but the current flow reconstruction did not confidently attach concrete funding, repay, reward, or settlement legs yet. In practice this means the protocol match is ahead of the asset-leg attribution."
             .to_owned(),
-    )
-}
-
-fn render_info_popover(label: &str, body: &str) -> String {
-    format!(
-        r#"<details class="help-popover">
-  <summary aria-label="{}">?</summary>
-  <div class="help-popover-card">{}</div>
-</details>"#,
-        escape_html(label),
-        escape_html(body)
     )
 }
 
@@ -3511,13 +3488,12 @@ struct TxReportVerdict {
     metric_label: String,
     result: String,
     result_caption: String,
-    note: String,
 }
 
 fn render_tx_report_hero(
     analysis: &TransactionAnalysis,
     primary_activity: &str,
-    primary_activity_reason: &str,
+    _primary_activity_reason: &str,
     primary_confidence: &str,
     _share_action: &str,
 ) -> String {
@@ -3526,14 +3502,6 @@ fn render_tx_report_hero(
         .and_then(|value| value.get("kind"))
         .and_then(|value| value.as_str())
         .unwrap_or(primary_activity);
-    let protocol = storyline
-        .and_then(|value| value.get("protocol"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("unknown");
-    let summary = storyline
-        .and_then(|value| value.get("summary"))
-        .and_then(|value| value.as_str())
-        .unwrap_or(primary_activity_reason);
     let verdict = build_tx_report_verdict(storyline);
 
     format!(
@@ -3558,11 +3526,6 @@ fn render_tx_report_hero(
       <strong class="profit-number">{}</strong>
       <small>{}</small>
     </div>
-    <div class="tx-conclusion-cell wide">
-      <span>简短解释</span>
-      <p>{}</p>
-      <small>{}</small>
-    </div>
   </div>
 </section>"#,
         verdict.tone,
@@ -3574,8 +3537,6 @@ fn render_tx_report_hero(
         escape_html(&verdict.metric_label),
         escape_html(&verdict.result),
         escape_html(&verdict.result_caption),
-        escape_html(summary),
-        escape_html(&format!("Protocol: {} · {}", protocol, verdict.note)),
     )
 }
 
@@ -3590,12 +3551,10 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
             metric_label: "收益判断".to_owned(),
             result: "PnL unavailable".to_owned(),
             result_caption: "missing net effect".to_owned(),
-            note: "No subject-scope net effect was generated for this transaction.".to_owned(),
         };
     };
 
     let mut eth_equivalent_raw = 0i128;
-    let mut gas_raw = 0i128;
     let mut positive_assets = 0usize;
     let mut negative_assets = 0usize;
     let mut positive_non_eth_assets = Vec::new();
@@ -3631,7 +3590,6 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         .and_then(|value| value.parse::<i128>().ok())
     {
         eth_equivalent_raw -= parsed_gas_raw;
-        gas_raw = parsed_gas_raw;
     }
 
     if eth_equivalent_raw < 0 && !positive_non_eth_assets.is_empty() {
@@ -3641,10 +3599,6 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
             metric_label: "现金流成本".to_owned(),
             result: format_wei_eth(eth_equivalent_raw),
             result_caption: "includes gas".to_owned(),
-            note: format!(
-                "Subject also received {}. This ETH outflow is payment/cost basis, not realized loss; token pricing is needed for PnL.",
-                positive_non_eth_assets.join(", ")
-            ),
         };
     }
 
@@ -3655,7 +3609,6 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
             metric_label: "核心收益".to_owned(),
             result: format_wei_eth(eth_equivalent_raw),
             result_caption: "after gas".to_owned(),
-            note: "ETH/WETH-equivalent net after native gas. Token-priced USD PnL is not assumed here.".to_owned(),
         }
     } else if eth_equivalent_raw < 0 {
         TxReportVerdict {
@@ -3664,11 +3617,6 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
             metric_label: "核心收益".to_owned(),
             result: format_wei_eth(eth_equivalent_raw),
             result_caption: "after gas".to_owned(),
-            note: if gas_raw > 0 {
-                "ETH/WETH-equivalent net after native gas; no offsetting non-ETH asset inflow was detected in the subject scope.".to_owned()
-            } else {
-                "ETH/WETH-equivalent net; no offsetting non-ETH asset inflow was detected in the subject scope.".to_owned()
-            },
         }
     } else if positive_assets > 0 && negative_assets > 0 {
         TxReportVerdict {
@@ -3677,7 +3625,6 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
             metric_label: "收益判断".to_owned(),
             result: "Multi-asset net".to_owned(),
             result_caption: "pricing required".to_owned(),
-            note: "The subject gained and spent different assets; pricing is needed for a single PnL number.".to_owned(),
         }
     } else if positive_assets > 0 {
         TxReportVerdict {
@@ -3689,7 +3636,6 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "token net".to_owned()),
-            note: "The subject scope received assets, but a USD/ETH value is not available for every token.".to_owned(),
         }
     } else if negative_assets > 0 {
         TxReportVerdict {
@@ -3701,7 +3647,6 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "token net".to_owned()),
-            note: "The subject scope spent assets, but a USD/ETH value is not available for every token.".to_owned(),
         }
     } else {
         TxReportVerdict {
@@ -3710,7 +3655,6 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
             metric_label: "收益判断".to_owned(),
             result: "0 net detected".to_owned(),
             result_caption: "no external delta".to_owned(),
-            note: "No scope-crossing token delta was detected beyond available evidence.".to_owned(),
         }
     }
 }
@@ -5910,19 +5854,19 @@ textarea { min-height: 140px; resize: vertical; }
 .tx-report-loss { border-left-color: #c55f0c; }
 .tx-report-mixed { border-left-color: #1d5ea8; }
 .tx-report-unknown { border-left-color: #6f5c40; }
-.tx-conclusion-grid { display: grid; grid-template-columns: 72px minmax(120px, .7fr) minmax(120px, .7fr) minmax(180px, 1fr) minmax(220px, 1.45fr); gap: 0; align-items: center; }
+.tx-conclusion-grid { display: grid; grid-template-columns: 72px minmax(120px, .7fr) minmax(180px, 1.05fr) minmax(180px, 1fr); gap: 0; align-items: center; }
 .tx-conclusion-icon { width: 60px; height: 60px; border-radius: 999px; display: grid; place-items: center; color: #fff; background: linear-gradient(135deg, #2563eb, #7c3aed); font-size: 2rem; font-weight: 900; }
 .tx-conclusion-cell { display: grid; gap: 7px; min-height: 76px; padding: 4px 18px; border-left: 1px solid var(--line); align-content: center; min-width: 0; }
 .tx-conclusion-cell span { color: var(--muted); font-size: .78rem; }
 .tx-conclusion-cell p { margin: 0; color: var(--ink); line-height: 1.55; }
 .tx-conclusion-cell small { color: var(--muted); line-height: 1.45; }
-.tx-conclusion-cell.wide { align-content: start; }
 .activity-pill, .verdict-pill { width: fit-content; padding: 7px 12px; border-radius: 999px; font-size: .92rem; }
 .activity-pill { color: #6d28d9; background: #f5f3ff; border: 1px solid #ddd6fe; }
-.verdict-profit { color: #047857; background: #ecfdf5; border: 1px solid #bbf7d0; }
-.verdict-loss { color: #b91c1c; background: #fef2f2; border: 1px solid #fecaca; }
-.verdict-mixed { color: #1d4ed8; background: #eff6ff; border: 1px solid #bfdbfe; }
-.verdict-unknown { color: #6f5c40; background: #f8fafc; border: 1px solid var(--line); }
+.verdict-pill { display: block; width: auto; max-width: 100%; padding: 0; border: 0; border-radius: 0; background: transparent; line-height: 1.25; overflow-wrap: anywhere; }
+.verdict-profit { color: #047857; }
+.verdict-loss { color: #b91c1c; }
+.verdict-mixed { color: #1d4ed8; }
+.verdict-unknown { color: #6f5c40; }
 .profit-number { color: #059669; font-size: clamp(1.2rem, 2vw, 1.65rem); line-height: 1.15; overflow-wrap: anywhere; }
 .tx-report-loss .profit-number { color: #dc2626; }
 .confidence-pill { padding: 5px 9px; border-radius: 999px; background: #f1f5f9; color: var(--muted); font-size: .76rem; font-weight: 700; }
@@ -5934,9 +5878,9 @@ textarea { min-height: 140px; resize: vertical; }
 .subject-scope-line { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .subject-scope-line > span { color: var(--muted); font-size: .85rem; font-weight: 700; }
 .subject-scope-line small { color: var(--muted); }
-.copy-code { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; vertical-align: middle; }
-.copy-code code { overflow-wrap: anywhere; }
-.copy-button { border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--muted); padding: 3px 6px; font: inherit; font-size: .7rem; line-height: 1.1; cursor: pointer; }
+.copy-code { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; min-width: 0; vertical-align: middle; white-space: nowrap; }
+.copy-code code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy-button { flex: 0 0 auto; white-space: nowrap; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--muted); padding: 3px 6px; font: inherit; font-size: .7rem; line-height: 1.1; cursor: pointer; }
 .copy-button:hover { border-color: rgba(31,111,235,.35); color: var(--accent); }
 .storyline-net-effect, .storyline-steps { display: grid; gap: 12px; }
 .compact-section { padding-top: 8px; }
@@ -5973,10 +5917,6 @@ textarea { min-height: 140px; resize: vertical; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .section-head h3 { margin: 0; }
 .evidence-stack { display: grid; gap: 12px; padding: 0 12px; }
-.help-popover { position: relative; }
-.help-popover summary { list-style: none; cursor: pointer; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 999px; border: 1px solid var(--line); background: #fff; color: var(--muted); font-weight: 700; font-size: .78rem; }
-.help-popover summary::-webkit-details-marker { display: none; }
-.help-popover-card { position: absolute; right: 0; top: calc(100% + 8px); width: min(320px, 75vw); padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; box-shadow: 0 8px 18px rgba(15,23,42,.08); color: var(--muted); line-height: 1.55; z-index: 4; }
 .storyline-visual-shell { display: grid; gap: 12px; }
 .storyline-main-path { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr); align-items: stretch; }
 .storyline-main-path.direct { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); }
