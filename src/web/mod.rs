@@ -1618,14 +1618,14 @@ async fn public_tx_analysis_share(
   </div>
   <div class="panel-body">
     <p class="panel-copy">{}</p>
-    <div class="field-hint">Share URL <code>{}</code></div>
+    <div class="field-hint">Share URL {}</div>
     {}
   </div>
 </section>
 "#,
         escape_html(&share.title),
         escape_html(&share.summary),
-        escape_html(&share_url),
+        render_copyable_code(&share_url, 18),
         render_tx_analysis_result_with_share(&share.snapshot, false)
     );
     Ok(Html(render_marketing_page(
@@ -3215,11 +3215,11 @@ fn render_tx_analysis_result_with_share(
                 .iter()
                 .map(|flow| {
                     format!(
-                        "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{:.2}</td></tr>",
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td></tr>",
                         escape_html(&enum_label(&flow.asset_type)),
-                        escape_html(&truncate_middle(flow.token_address.as_deref().unwrap_or("native"), 8)),
-                        escape_html(&truncate_middle(&flow.from_address, 8)),
-                        escape_html(&truncate_middle(&flow.to_address, 8)),
+                        render_copyable_code(flow.token_address.as_deref().unwrap_or("native"), 8),
+                        render_copyable_code(&flow.from_address, 8),
+                        render_copyable_code(&flow.to_address, 8),
                         escape_html(&flow.amount_raw),
                         escape_html(&flow.derivation_method),
                         flow.confidence
@@ -3299,7 +3299,7 @@ fn render_tx_analysis_result_with_share(
     <small>Confidence: {}</small>
     {}
   </div>
-  <div class="field-hint">Tx <code>{}</code> · status {} · analysis {}.</div>
+  <div class="field-hint">Tx {} · status {} · analysis {}.</div>
   <div class="field-hint">Selector <code>{}</code> · {} recognizers · {} derived flows.</div>
   <div class="field-hint">If the activity looks stale or obviously wrong, use <strong>Reanalyze</strong>. Analyze transaction may load a previously saved result first.</div>
   <div class="section-head"><h3>Execution storyline</h3></div>
@@ -3326,7 +3326,7 @@ fn render_tx_analysis_result_with_share(
         escape_html(&primary_activity_reason),
         escape_html(&primary_confidence),
         share_action,
-        escape_html(&truncate_middle(&analysis.tx_hash, 12)),
+        render_copyable_code(&analysis.tx_hash, 12),
         escape_html(&enum_label(&analysis.status)),
         escape_html(&enum_label(&analysis.analysis_status)),
         escape_html(
@@ -3489,8 +3489,8 @@ fn render_tx_storyline_panel(scenario_outputs: &serde_json::Value) -> String {
         escape_html(headline),
         escape_html(summary),
         escape_html(protocol),
-        escape_html(&truncate_middle(initiator, 10)),
-        escape_html(&truncate_middle(executor, 10)),
+        render_copyable_code(initiator, 10),
+        render_copyable_code(executor, 10),
         subject_scope,
         net_effect,
         step_timeline,
@@ -3519,7 +3519,7 @@ fn render_subject_scope(value: Option<&serde_json::Value>) -> String {
             items
                 .iter()
                 .filter_map(|value| value.as_str())
-                .map(|value| format!("<code>{}</code>", escape_html(&truncate_middle(value, 10))))
+                .map(|value| render_copyable_code(value, 10))
                 .collect::<Vec<_>>()
                 .join("")
         })
@@ -3599,8 +3599,7 @@ fn render_net_effect_asset_row(item: &serde_json::Value) -> String {
     let address = token
         .get("address")
         .and_then(|value| value.as_str())
-        .map(|value| truncate_middle(value, 8))
-        .unwrap_or_else(|| "native".to_owned());
+        .unwrap_or("native");
     let inflow_display = item
         .get("inflow_display")
         .and_then(|value| value.as_str())
@@ -3626,14 +3625,14 @@ fn render_net_effect_asset_row(item: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .unwrap_or("0");
     format!(
-        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} · {}</td><td><code>{}</code></td></tr>",
+        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} · {}</td><td>{}</td></tr>",
         escape_html(symbol),
         render_amount_stack(inflow_display, inflow_raw),
         render_amount_stack(outflow_display, outflow_raw),
         render_amount_stack(net_display, net_raw),
         escape_html(symbol),
         escape_html(name),
-        escape_html(&address),
+        render_copyable_code(address, 8),
     )
 }
 
@@ -3715,8 +3714,7 @@ fn render_storyline_steps(
                 let token_address = token
                     .get("address")
                     .and_then(|value| value.as_str())
-                    .map(|value| truncate_middle(value, 8))
-                    .unwrap_or_else(|| "native".to_owned());
+                    .unwrap_or("native");
                 let amount_display = item
                     .get("amount_display")
                     .and_then(|value| value.as_str())
@@ -3738,8 +3736,6 @@ fn render_storyline_steps(
                     .get("to_address")
                     .and_then(|value| value.as_str())
                     .unwrap_or("n/a");
-                let from_short = truncate_middle(from_raw, 10);
-                let to_short = truncate_middle(to_raw, 10);
                 let from_roles =
                     render_storyline_roles(from_raw, initiator, executor, protocol_contract);
                 let to_roles =
@@ -3781,11 +3777,11 @@ fn render_storyline_steps(
                             escape_html(value)
                         ))
                         .unwrap_or_default(),
-                    escape_html(&from_short),
+                    render_copyable_code(from_raw, 10),
                     from_roles,
                     escape_html(&amount_display),
-                    escape_html(&format!("{} · {}", name, token_address)),
-                    escape_html(&to_short),
+                    format!("{} · {}", escape_html(name), render_copyable_code(token_address, 8)),
+                    render_copyable_code(to_raw, 10),
                     to_roles,
                 )
             })
@@ -3881,8 +3877,8 @@ fn render_storyline_visual(
     {}
   </div>
 </div>"#,
-        escape_html(&truncate_middle(initiator, 10)),
-        escape_html(&truncate_middle(executor, 10)),
+        render_copyable_code(initiator, 10),
+        render_copyable_code(executor, 10),
         escape_html(protocol),
         escape_html(if kind == "liquidation" {
             "Detected liquidation target"
@@ -3967,18 +3963,7 @@ fn render_storyline_flow_chip(
     let token_address = token
         .get("address")
         .and_then(|value| value.as_str())
-        .map(|value| truncate_middle(value, 8))
-        .unwrap_or_else(|| "native".to_owned());
-    let from_address = item
-        .get("from_address")
-        .and_then(|value| value.as_str())
-        .map(|value| truncate_middle(value, 10))
-        .unwrap_or_else(|| "n/a".to_owned());
-    let to_address = item
-        .get("to_address")
-        .and_then(|value| value.as_str())
-        .map(|value| truncate_middle(value, 10))
-        .unwrap_or_else(|| "n/a".to_owned());
+        .unwrap_or("native");
     let amount_raw = item
         .get("amount_raw")
         .and_then(|value| value.as_str())
@@ -4009,8 +3994,8 @@ fn render_storyline_flow_chip(
     <span class="story-chip-lane-label">{}</span>
   </div>
   <strong>{}</strong>
-  <small>{} · <code>{}</code></small>
-  <small><code>{}</code> {} → <code>{}</code> {}</small>
+  <small>{} · {}</small>
+  <small>{} {} → {} {}</small>
   <small>{}</small>
   {}
 </article>"#,
@@ -4019,10 +4004,10 @@ fn render_storyline_flow_chip(
         escape_html(lane_kind),
         escape_html(token_symbol),
         escape_html(token_name),
-        escape_html(&token_address),
-        escape_html(&from_address),
+        render_copyable_code(token_address, 8),
+        render_copyable_code(from_raw, 10),
         from_roles,
-        escape_html(&to_address),
+        render_copyable_code(to_raw, 10),
         to_roles,
         escape_html(&format!("{} · raw: {}", amount_display, amount_raw)),
         source_hint_label
@@ -4086,10 +4071,10 @@ fn render_storyline_call_path(value: Option<&serde_json::Value>) -> String {
             .iter()
             .map(|item| {
                 format!(
-                    "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     item.get("depth").and_then(|value| value.as_u64()).map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned()),
-                    escape_html(&truncate_middle(item.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10)),
-                    escape_html(&truncate_middle(item.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10)),
+                    render_copyable_code(item.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10),
+                    render_copyable_code(item.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10),
                     escape_html(item.get("selector").and_then(|value| value.as_str()).unwrap_or("n/a")),
                     escape_html(item.get("call_type").and_then(|value| value.as_str()).unwrap_or("n/a")),
                     escape_html(item.get("value").and_then(|value| value.as_str()).unwrap_or("n/a")),
@@ -4129,11 +4114,11 @@ fn render_storyline_flow_group(title: &str, value: Option<&serde_json::Value>) -
             .iter()
             .map(|item| {
                 format!(
-                    "<tr><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                     escape_html(item.get("asset_type").and_then(|value| value.as_str()).unwrap_or("n/a")),
-                    escape_html(&truncate_middle(item.get("token_address").and_then(|value| value.as_str()).unwrap_or("native"), 8)),
-                    escape_html(&truncate_middle(item.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10)),
-                    escape_html(&truncate_middle(item.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10)),
+                    render_copyable_code(item.get("token_address").and_then(|value| value.as_str()).unwrap_or("native"), 8),
+                    render_copyable_code(item.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10),
+                    render_copyable_code(item.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a"), 10),
                     escape_html(item.get("amount_raw").and_then(|value| value.as_str()).unwrap_or("n/a")),
                     escape_html(item.get("derivation_method").and_then(|value| value.as_str()).unwrap_or("n/a")),
                 )
@@ -5321,6 +5306,23 @@ fn escape_html(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn render_copyable_code(value: &str, keep: usize) -> String {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("n/a") {
+        return "<code>n/a</code>".to_owned();
+    }
+    if value.eq_ignore_ascii_case("native") {
+        return "<code>native</code>".to_owned();
+    }
+    let label = truncate_middle(value, keep);
+    let escaped_value = escape_html(value);
+    format!(
+        r#"<span class="copy-code"><code title="{0}">{1}</code><button type="button" class="copy-button" data-copy="{0}" onclick="navigator.clipboard.writeText(this.dataset.copy).then(()=>{{const label=this.textContent;this.textContent='Copied';setTimeout(()=>this.textContent=label,900);}})">Copy</button></span>"#,
+        escaped_value,
+        escape_html(&label),
+    )
+}
+
 fn shared_styles() -> &'static str {
     r#"
 :root {
@@ -5423,6 +5425,10 @@ textarea { min-height: 140px; resize: vertical; }
 .storyline-kicker { color: var(--accent); text-transform: uppercase; letter-spacing: .14em; font-size: .75rem; font-weight: 700; }
 .address-pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .address-pill-row code { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.copy-code { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; vertical-align: middle; }
+.copy-code code { overflow-wrap: anywhere; }
+.copy-button { border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--muted); padding: 3px 6px; font: inherit; font-size: .7rem; line-height: 1.1; cursor: pointer; }
+.copy-button:hover { border-color: rgba(31,111,235,.35); color: var(--accent); }
 .storyline-net-effect, .storyline-steps { display: grid; gap: 12px; }
 .compact-table-shell { margin-top: 4px; }
 .compact-table td, .compact-table th { padding: 6px 8px; }
