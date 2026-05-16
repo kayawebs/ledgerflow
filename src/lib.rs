@@ -1,4 +1,5 @@
 pub mod accounting;
+pub mod actions;
 pub mod api;
 pub mod core;
 pub mod domain;

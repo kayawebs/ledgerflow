@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
+use crate::actions::decoder::ActionDecoderService;
 use crate::domain::{
     entities::{RecognizerResult, TransactionAnalysis},
     enums::AssetType,
@@ -17,6 +18,7 @@ pub struct ScenarioAdapterService;
 
 impl ScenarioAdapterService {
     pub fn adapt(&self, analysis: &TransactionAnalysis) -> Value {
+        let actions = ActionDecoderService::default().decode(analysis);
         let labels = analysis
             .recognizer_results
             .iter()
@@ -48,6 +50,7 @@ impl ScenarioAdapterService {
             "primary_activity": primary.map(|item| item.label.clone()),
             "protocol": protocol,
             "behavior_fingerprint": build_behavior_fingerprint(analysis, primary),
+            "actions": actions,
             "storyline": storyline,
         })
     }

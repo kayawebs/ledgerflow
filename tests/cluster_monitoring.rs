@@ -65,6 +65,7 @@ async fn behavior_classifier_marks_swap_like_activity_as_position() {
 
     assert_eq!(classified.behavior_tag, BehaviorTag::Position);
     assert!(classified.token_in.is_some() || classified.token_out.is_some());
+    assert_action_kind(&analysis.scenario_outputs, "swap");
 }
 
 #[tokio::test]
@@ -192,6 +193,7 @@ async fn behavior_classifier_marks_morpho_liquidation_without_trace_when_event_m
 
     assert_eq!(classified.behavior_tag, BehaviorTag::Liquidation);
     assert_eq!(classified.protocol.as_deref(), Some("morpho_blue"));
+    assert_action_kind(&analysis.scenario_outputs, "liquidation");
 }
 
 #[tokio::test]
@@ -383,6 +385,20 @@ async fn flashloan_funding_source_is_labeled_in_storyline() {
             .and_then(|value| value.get("label"))
             .and_then(|value| value.as_str()),
         Some("Aave flash loan")
+    );
+    assert_action_kind(&analysis.scenario_outputs, "flashloan");
+}
+
+fn assert_action_kind(scenario_outputs: &serde_json::Value, expected_kind: &str) {
+    let actions = scenario_outputs
+        .get("actions")
+        .and_then(|value| value.as_array())
+        .expect("actions should be present");
+    assert!(
+        actions.iter().any(|action| {
+            action.get("kind").and_then(|value| value.as_str()) == Some(expected_kind)
+        }),
+        "expected decoded action kind {expected_kind}, got {actions:?}"
     );
 }
 
