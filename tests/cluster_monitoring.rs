@@ -113,6 +113,36 @@ async fn behavior_classifier_marks_liquidation_when_trace_hits_known_selector() 
 }
 
 #[tokio::test]
+async fn liquidation_recognizer_does_not_label_plain_swap_flow() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository,
+        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+    ));
+
+    let (analysis, _) = analysis_service
+        .analyze_transaction(8453, "0xswap-position")
+        .await
+        .unwrap();
+
+    assert!(!analysis
+        .recognizer_results
+        .iter()
+        .any(|result| result.label == "liquidation_like_activity"));
+    assert!(analysis
+        .scenario_outputs
+        .get("storyline")
+        .map(|value| value.is_null())
+        .unwrap_or(true));
+}
+
+#[tokio::test]
 async fn behavior_classifier_marks_morpho_liquidation_without_trace_when_event_matches() {
     let repository = Arc::new(InMemoryAnalysisRepository::default());
     let fetcher = TransactionBundleFetcher::new(

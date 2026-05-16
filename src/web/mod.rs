@@ -4120,6 +4120,15 @@ fn render_storyline_visual(
     let protocol_contract = storyline
         .get("protocol_contract")
         .and_then(|value| value.as_str());
+    let direct_protocol_call = storyline
+        .get("protocol_call_mode")
+        .and_then(|value| value.as_str())
+        .map(|value| value == "direct")
+        .unwrap_or_else(|| {
+            protocol_contract
+                .map(|value| executor.eq_ignore_ascii_case(value))
+                .unwrap_or(false)
+        });
     let funding_lane = render_storyline_lane(
         "Funding",
         "Where the executor got assets or approvals before protocol interaction.",
@@ -4169,13 +4178,28 @@ fn render_storyline_visual(
         protocol_contract,
     );
 
-    format!(
-        r#"<section class="tx-section-card storyline-visual-shell">
-  <div class="tx-section-title">
-    <span class="tx-section-index">4</span>
-    <h2>协议路径 <small>Protocol Path</small></h2>
-  </div>
-  <div class="storyline-main-path">
+    let main_path = if direct_protocol_call {
+        format!(
+            r#"<div class="storyline-main-path direct">
+    <div class="story-node">
+      <span class="story-node-label">Initiator</span>
+      <strong>{}</strong>
+      <small>EOA or top-level caller</small>
+    </div>
+    <div class="story-arrow">→</div>
+    <div class="story-node protocol">
+      <span class="story-node-label">Protocol direct call</span>
+      <strong>{}</strong>
+      <small>{}</small>
+    </div>
+  </div>"#,
+            render_copyable_code(initiator, 10),
+            render_copyable_code(protocol_contract.unwrap_or(executor), 10),
+            escape_html(protocol),
+        )
+    } else {
+        format!(
+            r#"<div class="storyline-main-path">
     <div class="story-node">
       <span class="story-node-label">Initiator</span>
       <strong>{}</strong>
@@ -4193,7 +4217,27 @@ fn render_storyline_visual(
       <strong>{}</strong>
       <small>{}</small>
     </div>
+  </div>"#,
+            render_copyable_code(initiator, 10),
+            render_copyable_code(executor, 10),
+            escape_html(protocol),
+            escape_html(if kind == "liquidation" {
+                "Detected liquidation target"
+            } else if kind == "arbitrage" {
+                "Detected venue set"
+            } else {
+                "Resolved execution target"
+            }),
+        )
+    };
+
+    format!(
+        r#"<section class="tx-section-card storyline-visual-shell">
+  <div class="tx-section-title">
+    <span class="tx-section-index">4</span>
+    <h2>协议路径 <small>Protocol Path</small></h2>
   </div>
+  {}
   <div class="storyline-lanes">
     {}
     {}
@@ -4201,16 +4245,7 @@ fn render_storyline_visual(
     {}
   </div>
 </section>"#,
-        render_copyable_code(initiator, 10),
-        render_copyable_code(executor, 10),
-        escape_html(protocol),
-        escape_html(if kind == "liquidation" {
-            "Detected liquidation target"
-        } else if kind == "arbitrage" {
-            "Detected venue set"
-        } else {
-            "Resolved execution target"
-        }),
+        main_path,
         funding_lane,
         repay_lane,
         receipt_lane,
@@ -5760,6 +5795,7 @@ textarea { min-height: 140px; resize: vertical; }
 .help-popover-card { position: absolute; right: 0; top: calc(100% + 8px); width: min(320px, 75vw); padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; box-shadow: 0 8px 18px rgba(15,23,42,.08); color: var(--muted); line-height: 1.55; z-index: 4; }
 .storyline-visual-shell { display: grid; gap: 12px; }
 .storyline-main-path { display: grid; gap: 10px; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr); align-items: stretch; }
+.storyline-main-path.direct { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); }
 .story-node { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: #fff; min-width: 0; }
 .story-node.accent { border-color: rgba(31,111,235,.25); background: #f8fbff; }
 .story-node.protocol { border-color: rgba(13,110,99,.22); background: #f4fbf7; }

@@ -116,12 +116,22 @@ fn build_liquidation_story(
         .and_then(|value| value.as_str())
         .map(str::to_owned)
         .or_else(|| protocol_contract_from_recognizers(analysis));
+    let executor_is_protocol = protocol_contract
+        .as_deref()
+        .map(|value| executor.eq_ignore_ascii_case(value))
+        .unwrap_or(false);
     let liquidator = adapter_attributes
         .as_ref()
         .and_then(|value| value.get("liquidator"))
         .and_then(|value| value.as_str())
         .map(|value| value.to_lowercase())
-        .unwrap_or_else(|| executor.clone());
+        .unwrap_or_else(|| {
+            if executor_is_protocol {
+                sender.clone()
+            } else {
+                executor.clone()
+            }
+        });
     let borrower = adapter_attributes
         .as_ref()
         .and_then(|value| value.get("borrower"))
@@ -134,7 +144,12 @@ fn build_liquidation_story(
         &executor,
         borrower.as_deref(),
     );
-    let actor_addresses = vec![executor.clone(), liquidator.clone()];
+    let actor_addresses = liquidation_actor_addresses(
+        &sender,
+        &executor,
+        &liquidator,
+        protocol_contract.as_deref(),
+    );
 
     let funding_sources = sort_story_flows(enrich_funding_sources(
         related_flows(analysis, &token_lookup, |flow| {
@@ -184,11 +199,20 @@ fn build_liquidation_story(
         "kind": "liquidation",
         "headline": headline,
         "summary": format!(
-            "EOA {} called executor {}. LedgerFlow matched a liquidation path against {} and summarized how funds entered the executor, where debt repayment flowed, what collateral came back, and where the proceeds were routed next.",
-            short_address(&sender),
-            short_address(&executor),
+            "{}. LedgerFlow matched a liquidation path against {} and summarized how funds entered the strategy actor, where debt repayment flowed, what collateral came back, and where the proceeds were routed next.",
+            liquidation_call_summary(&sender, &executor, protocol_contract.as_deref()),
             protocol.unwrap_or("an unresolved liquidation protocol")
         ),
+        "executor_label": if executor_is_protocol {
+            "direct protocol call"
+        } else {
+            "executor"
+        },
+        "protocol_call_mode": if executor_is_protocol {
+            "direct"
+        } else {
+            "executor"
+        },
         "executor_address": executor,
         "liquidator_address": liquidator,
         "initiator_address": sender,
@@ -208,6 +232,47 @@ fn build_liquidation_story(
         "collateral_receipts": collateral_receipts,
         "disposition_legs": disposition_legs,
     }))
+}
+
+fn liquidation_call_summary(sender: &str, executor: &str, protocol_contract: Option<&str>) -> String {
+    if protocol_contract
+        .map(|value| executor.eq_ignore_ascii_case(value))
+        .unwrap_or(false)
+    {
+        format!(
+            "EOA {} called the protocol contract {} directly",
+            short_address(&sender),
+            short_address(executor)
+        )
+    } else {
+        format!(
+            "EOA {} called executor {}",
+            short_address(sender),
+            short_address(executor)
+        )
+    }
+}
+
+fn liquidation_actor_addresses(
+    sender: &str,
+    executor: &str,
+    liquidator: &str,
+    protocol_contract: Option<&str>,
+) -> Vec<String> {
+    let mut addresses = BTreeSet::new();
+    for address in [executor, liquidator] {
+        if protocol_contract
+            .map(|protocol| address.eq_ignore_ascii_case(protocol))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        addresses.insert(address.to_lowercase());
+    }
+    if addresses.is_empty() {
+        addresses.insert(sender.to_lowercase());
+    }
+    addresses.into_iter().collect()
 }
 
 fn build_arbitrage_story(analysis: &TransactionAnalysis, protocol: Option<&str>) -> Option<Value> {

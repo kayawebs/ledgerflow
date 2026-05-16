@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -114,16 +114,6 @@ fn topic_to_address(topic: &str) -> Option<String> {
     Some(format!("0x{}", &trimmed[trimmed.len() - 40..]).to_lowercase())
 }
 
-fn touched_contract_count(analysis: &TransactionAnalysis) -> usize {
-    analysis
-        .normalized_execution_facts
-        .derived_facts
-        .get("touched_contracts")
-        .and_then(|value| value.as_array())
-        .map(|value| value.len())
-        .unwrap_or_default()
-}
-
 fn is_known_liquidation_selector(selector: &str) -> bool {
     matches!(
         selector,
@@ -145,11 +135,8 @@ struct LiquidationSignals {
     selector: String,
     trace_selectors: BTreeSet<String>,
     internal_call_count: u32,
-    touched_contract_count: usize,
-    approval_count: usize,
     log_topic_zeroes: BTreeSet<String>,
     logs: Vec<LogSignal>,
-    token_deltas: Vec<(String, String, i128)>,
 }
 
 impl LiquidationSignals {
@@ -165,11 +152,8 @@ impl LiquidationSignals {
                 .to_lowercase(),
             trace_selectors: trace_selectors(analysis),
             internal_call_count: analysis.normalized_execution_facts.internal_call_count,
-            touched_contract_count: touched_contract_count(analysis),
-            approval_count: approval_edge_entries(analysis).len(),
             log_topic_zeroes: log_topic_zeroes(analysis),
             logs: log_signals(analysis),
-            token_deltas: token_net_delta_entries(analysis),
         }
     }
 
@@ -330,64 +314,6 @@ fn liquidation_adapters() -> [Box<dyn LiquidationProtocolAdapter>; 3] {
         Box::new(AaveLiquidationAdapter),
         Box::new(CompoundLiquidationAdapter),
     ]
-}
-
-fn heuristic_liquidation_detection(signals: &LiquidationSignals) -> Option<LiquidationDetection> {
-    if signals.internal_call_count < 2 {
-        return None;
-    }
-    let mut actor_candidates = vec![signals.sender.clone()];
-    if let Some(target) = signals.target.clone() {
-        if target != signals.sender {
-            actor_candidates.push(target);
-        }
-    }
-
-    let mut deltas_by_address = BTreeMap::<String, Vec<(String, i128)>>::new();
-    for (address, token_address, delta_raw) in &signals.token_deltas {
-        deltas_by_address
-            .entry(address.clone())
-            .or_default()
-            .push((token_address.clone(), *delta_raw));
-    }
-
-    for actor in actor_candidates {
-        let Some(entries) = deltas_by_address.get(&actor) else {
-            continue;
-        };
-        let outgoing = entries.iter().filter(|(_, delta)| *delta < 0).collect::<Vec<_>>();
-        let incoming = entries.iter().filter(|(_, delta)| *delta > 0).collect::<Vec<_>>();
-        let touched_tokens = entries
-            .iter()
-            .map(|(token_address, _)| token_address.clone())
-            .collect::<BTreeSet<_>>();
-        if outgoing.is_empty() || incoming.is_empty() || touched_tokens.len() < 2 {
-            continue;
-        }
-        if signals.approval_count == 0 && signals.touched_contract_count < 3 {
-            continue;
-        }
-
-        return Some(LiquidationDetection {
-            protocol: "unknown_liquidation_adapter",
-            confidence: if Some(actor.clone()) == signals.target { 0.68 } else { 0.61 },
-            matched_selectors: signals.matched_liquidation_selectors(),
-            matched_event_topic: None,
-            attributes: json!({
-                "actor": actor,
-                "repay_asset_count": outgoing.len(),
-                "seized_asset_count": incoming.len(),
-                "internal_call_count": signals.internal_call_count,
-                "approval_edge_count": signals.approval_count,
-                "touched_contract_count": signals.touched_contract_count,
-            }),
-            warnings: vec!["heuristic_executor_pattern".to_owned()],
-            unresolved_code: "liquidation_roles_unresolved",
-            unresolved_message: "Repay-and-seize executor pattern detected, but protocol roles and position health remain unresolved.",
-        });
-    }
-
-    None
 }
 
 pub struct SelectorPresenceRecognizer;
@@ -1003,32 +929,7 @@ impl Recognizer for LiquidationLikeScenarioRecognizer {
             }));
         }
 
-        let Some(detection) = heuristic_liquidation_detection(&signals) else {
-            return Ok(None);
-        };
-
-        Ok(Some(RecognizerResult {
-            recognizer_id: self.recognizer_id().to_owned(),
-            recognizer_version: self.version().to_owned(),
-            label: "liquidation_like_activity".to_owned(),
-            confidence: detection.confidence,
-            evidence_refs: analysis.raw_evidence_refs.clone(),
-            attributes: json!({
-                "protocol": detection.protocol,
-                "sender": signals.sender.clone(),
-                "target": signals.target.clone(),
-                "selector": signals.selector.clone(),
-                "matched_liquidation_selectors": detection.matched_selectors,
-                "internal_call_count": signals.internal_call_count,
-                "adapter_attributes": detection.attributes,
-            }),
-            unresolved_points: vec![UnresolvedItem {
-                code: detection.unresolved_code.to_owned(),
-                message: detection.unresolved_message.to_owned(),
-                evidence_refs: Vec::new(),
-            }],
-            warnings: detection.warnings,
-        }))
+        Ok(None)
     }
 }
 
