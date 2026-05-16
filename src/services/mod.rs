@@ -8,5 +8,6 @@ pub mod cluster_tracking;
 pub mod discovery;
 pub mod indexer_client;
 pub mod metrics;
+pub mod monitor_reporter;
 pub mod portal;
 pub mod trace_monitor;

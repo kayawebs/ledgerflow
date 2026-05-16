@@ -38,6 +38,18 @@ pub struct AppConfig {
     pub trace_monitor_poll_interval_ms: u64,
     pub trace_monitor_retention_days: i64,
     pub trace_monitor_bind_addr: String,
+    pub trace_monitor_report_enabled: bool,
+    pub trace_monitor_report_interval_ms: u64,
+    pub trace_monitor_report_window_minutes: i64,
+    pub trace_monitor_report_top_n: u32,
+    pub trace_monitor_report_min_raw_score: String,
+    pub trace_monitor_report_run_on_start: bool,
+    pub trace_monitor_report_email_to: String,
+    pub email_from: Option<String>,
+    pub email_delivery_mode: String,
+    pub postmark_server_token: Option<String>,
+    pub postmark_message_stream: String,
+    pub resend_api_key: Option<String>,
     pub enabled_recognizers: Vec<String>,
     pub plugins: Vec<String>,
 }
@@ -112,6 +124,47 @@ impl AppConfig {
                 .unwrap_or(7),
             trace_monitor_bind_addr: env::var("LEDGERFLOW_TRACE_MONITOR_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:3010".to_owned()),
+            trace_monitor_report_enabled: env::var("LEDGERFLOW_TRACE_MONITOR_REPORT_ENABLED")
+                .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+                .unwrap_or(true),
+            trace_monitor_report_interval_ms: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_REPORT_INTERVAL_MS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3_600_000),
+            trace_monitor_report_window_minutes: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_REPORT_WINDOW_MINUTES",
+            )
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(60),
+            trace_monitor_report_top_n: env::var("LEDGERFLOW_TRACE_MONITOR_REPORT_TOP_N")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(10),
+            trace_monitor_report_min_raw_score: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_REPORT_MIN_RAW_SCORE",
+            )
+            .unwrap_or_else(|_| "0".to_owned()),
+            trace_monitor_report_run_on_start: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_REPORT_RUN_ON_START",
+            )
+            .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+            .unwrap_or(true),
+            trace_monitor_report_email_to: env::var("LEDGERFLOW_TRACE_MONITOR_REPORT_EMAIL_TO")
+                .unwrap_or_else(|_| "wcy19960411@gmail.com".to_owned()),
+            email_from: env::var("LEDGERFLOW_EMAIL_FROM").ok(),
+            email_delivery_mode: env::var("LEDGERFLOW_EMAIL_DELIVERY_MODE")
+                .unwrap_or_else(|_| "auto".to_owned()),
+            postmark_server_token: env::var("LEDGERFLOW_POSTMARK_SERVER_TOKEN")
+                .or_else(|_| env::var("POSTMARK_SERVER_TOKEN"))
+                .ok(),
+            postmark_message_stream: env::var("LEDGERFLOW_POSTMARK_MESSAGE_STREAM")
+                .unwrap_or_else(|_| "outbound".to_owned()),
+            resend_api_key: env::var("LEDGERFLOW_RESEND_API_KEY")
+                .or_else(|_| env::var("RESEND_API_KEY"))
+                .ok(),
             enabled_recognizers: parse_enabled_recognizers(
                 env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").ok().as_deref(),
             ),

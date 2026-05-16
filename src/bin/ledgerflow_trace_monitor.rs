@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -13,7 +13,10 @@ use ledgerflow::{
     indexer::rpc::IndexerRpcClient,
     ingestion::{fetchers::TransactionBundleFetcher, rpc::HttpRpcClient},
     repositories::sqlx::SqlxAnalysisRepository,
-    services::trace_monitor::{TopAddressDeltasQuery, TraceMonitorConfig, TraceMonitorService},
+    services::{
+        monitor_reporter::{MonitorReporter, MonitorReporterConfig},
+        trace_monitor::{TopAddressDeltasQuery, TraceMonitorConfig, TraceMonitorService},
+    },
 };
 use serde_json::json;
 use tracing::{error, info};
@@ -31,6 +34,7 @@ async fn main() {
         .run(repository.pool())
         .await
         .expect("migrations should succeed");
+    let pool = repository.pool().clone();
 
     let rpc_client = Arc::new(HttpRpcClient::new(config.rpc_url.clone()));
     let block_rpc = Arc::new(IndexerRpcClient::new(config.rpc_url.clone()));
@@ -49,6 +53,34 @@ async fn main() {
         },
     );
     let service = Arc::new(service);
+    let analysis_api_base_url = local_http_base_url(&config.bind_addr);
+    let web_base_url = env::var("LEDGERFLOW_TRACE_DOMAIN")
+        .map(|value| public_http_base_url(&value))
+        .unwrap_or_else(|_| {
+            let web_bind_addr = env::var("LEDGERFLOW_WEB_BIND_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:3001".to_owned());
+            local_http_base_url(&web_bind_addr)
+        });
+    let reporter = MonitorReporter::new(
+        pool,
+        MonitorReporterConfig {
+            chain_id: config.default_chain_id,
+            enabled: config.trace_monitor_report_enabled,
+            interval_ms: config.trace_monitor_report_interval_ms,
+            window_minutes: config.trace_monitor_report_window_minutes,
+            top_n: config.trace_monitor_report_top_n,
+            min_raw_score: config.trace_monitor_report_min_raw_score.clone(),
+            run_on_start: config.trace_monitor_report_run_on_start,
+            analysis_api_base_url,
+            web_base_url,
+            email_to: config.trace_monitor_report_email_to.clone(),
+            email_from: config.email_from.clone(),
+            email_delivery_mode: config.email_delivery_mode.clone(),
+            postmark_server_token: config.postmark_server_token.clone(),
+            postmark_message_stream: config.postmark_message_stream.clone(),
+            resend_api_key: config.resend_api_key.clone(),
+        },
+    );
     let poll_interval = Duration::from_millis(config.trace_monitor_poll_interval_ms.max(1000));
     let bind_addr = config.trace_monitor_bind_addr.clone();
 
@@ -59,6 +91,10 @@ async fn main() {
         poll_interval_ms = poll_interval.as_millis(),
         block_batch_size = config.trace_monitor_block_batch_size,
         retention_days = config.trace_monitor_retention_days,
+        report_enabled = config.trace_monitor_report_enabled,
+        report_interval_ms = config.trace_monitor_report_interval_ms,
+        report_top_n = config.trace_monitor_report_top_n,
+        report_email_to = config.trace_monitor_report_email_to,
         "trace monitor started"
     );
 
@@ -70,6 +106,21 @@ async fn main() {
         axum::serve(listener, trace_monitor_router(http_service))
             .await
             .expect("trace monitor http server should run");
+    });
+
+    tokio::spawn(async move {
+        if reporter.run_on_start() {
+            if let Err(err) = reporter.run_once().await {
+                error!(error = %err, "trace monitor startup report failed");
+            }
+        }
+        let report_interval = Duration::from_millis(reporter.interval_ms().max(60_000));
+        loop {
+            tokio::time::sleep(report_interval).await;
+            if let Err(err) = reporter.run_once().await {
+                error!(error = %err, "trace monitor hourly report failed");
+            }
+        }
     });
 
     loop {
@@ -106,6 +157,37 @@ async fn main() {
                 tokio::time::sleep(poll_interval).await;
             }
         }
+    }
+}
+
+fn local_http_base_url(bind_addr: &str) -> String {
+    let bind_addr = bind_addr.trim();
+    if bind_addr.starts_with("http://") || bind_addr.starts_with("https://") {
+        return bind_addr.trim_end_matches('/').to_owned();
+    }
+    let normalized = bind_addr
+        .strip_prefix("0.0.0.0:")
+        .map(|port| format!("127.0.0.1:{port}"))
+        .or_else(|| {
+            bind_addr
+                .strip_prefix("[::]:")
+                .map(|port| format!("127.0.0.1:{port}"))
+        })
+        .or_else(|| {
+            bind_addr
+                .strip_prefix(":::")
+                .map(|port| format!("127.0.0.1:{port}"))
+        })
+        .unwrap_or_else(|| bind_addr.to_owned());
+    format!("http://{}", normalized.trim_end_matches('/'))
+}
+
+fn public_http_base_url(domain_or_url: &str) -> String {
+    let value = domain_or_url.trim().trim_end_matches('/');
+    if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_owned()
+    } else {
+        format!("https://{value}")
     }
 }
 
