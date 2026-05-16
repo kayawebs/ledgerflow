@@ -2651,17 +2651,17 @@ fn render_dashboard_page(
 
     let (tx_hash_prefill, chain_id_prefill) = tx_form_prefill(tx_result, state.default_chain_id);
     let tx_status_badge = if tx_result.is_some() {
-        "分析完成"
+        "Analysis complete"
     } else {
-        "等待输入"
+        "Waiting for input"
     };
     let tx_panel = format!(
         r#"
 <section class="panel tx-workbench">
   <div class="tx-workbench-head">
     <div>
-      <h1>Tx 分析</h1>
-      <p>输入交易哈希，LedgerFlow 会加载已保存结果；需要重新抓证据时再点击重新分析。</p>
+      <h1>Tx Analysis</h1>
+      <p>Enter a transaction hash. LedgerFlow loads a saved result when available; use Reanalyze only when you need fresh evidence.</p>
     </div>
     <span class="readonly-pill">{}</span>
   </div>
@@ -2671,7 +2671,7 @@ fn render_dashboard_page(
       <label class="sr-only">Transaction hash</label>
       <input type="text" name="tx_hash" value="{}" placeholder="0x transaction hash" required>
       <button class="cta secondary" type="submit" name="mode" value="analyze">Analyze</button>
-      <button class="cta ghost" type="submit" name="mode" value="reanalyze">重新分析</button>
+      <button class="cta ghost" type="submit" name="mode" value="reanalyze">Reanalyze</button>
     </form>
     {}
   </div>
@@ -3298,11 +3298,11 @@ fn render_tx_analysis_result_with_share_url(
   <section class="tx-section-card technical-evidence-panel">
     <div class="tx-section-title">
       <span class="tx-section-index">6</span>
-      <h2>技术证据区 <small>Technical Evidence</small></h2>
-      <span class="badge">默认折叠</span>
+      <h2>Technical Evidence</h2>
+      <span class="badge">Collapsed by default</span>
     </div>
     <details class="storyline-evidence-shell">
-      <summary><span>Derived flows（派生资金流）</span></summary>
+      <summary><span>Derived flows</span></summary>
       <div class="evidence-stack">
         {}
         <div class="section-head"><h3>Unresolved points</h3></div>
@@ -3310,15 +3310,15 @@ fn render_tx_analysis_result_with_share_url(
       </div>
     </details>
     <details class="storyline-evidence-shell">
-      <summary><span>Recognizer outputs（识别器输出）</span></summary>
+      <summary><span>Recognizer outputs</span></summary>
       <div class="split-fields tx-recognizer-grid">{}</div>
     </details>
     <details class="storyline-evidence-shell">
-      <summary><span>Validation results（验证结果）</span></summary>
+      <summary><span>Validation results</span></summary>
       {}
     </details>
     <details class="raw-json-shell">
-      <summary>Raw JSON（原始数据）</summary>
+      <summary>Raw JSON</summary>
       <pre class="json-shell">{}</pre>
     </details>
   </section>
@@ -3382,31 +3382,31 @@ fn render_tx_report_meta_strip(analysis: &TransactionAnalysis, public_share: boo
         .map(|value| value.to_rfc3339().replace('T', " ").replace('Z', " UTC"))
         .unwrap_or_else(|| "n/a".to_owned());
     let access_label = if public_share {
-        "公开分享页 · 只读"
+        "Public share · Read only"
     } else {
-        "分析结果 · 可重新分析"
+        "Analysis result · Reanalysis available"
     };
     format!(
         r#"<section class="tx-report-top">
   <div class="tx-report-heading">
-    <span class="brand-lockup mini"><span class="brand-mark">{}</span><span>链上交易证据</span></span>
+    <span class="brand-lockup mini"><span class="brand-mark">{}</span><span>On-chain Transaction Evidence</span></span>
     <div class="tx-report-actions">
       <span class="readonly-pill">{}</span>
     </div>
   </div>
   <div class="tx-report-title-row">
     <div>
-      <h1>交易分析报告</h1>
+      <h1>Transaction Analysis Report</h1>
       <p>Tx Analysis Report</p>
-      <span>交易哈希（Tx Hash）</span>
+      <span>Tx Hash</span>
       {}
     </div>
   </div>
   <div class="tx-meta-strip">
-    <div><span>网络</span><strong>{}</strong></div>
-    <div><span>区块高度</span><strong>{}</strong></div>
-    <div><span>时间</span><strong>{}</strong></div>
-    <div><span>状态</span><strong>{}</strong></div>
+    <div><span>Network</span><strong>{}</strong></div>
+    <div><span>Block</span><strong>{}</strong></div>
+    <div><span>Time</span><strong>{}</strong></div>
+    <div><span>Status</span><strong>{}</strong></div>
   </div>
 </section>"#,
         brand_mark_svg_source(),
@@ -3429,14 +3429,14 @@ fn render_tx_utilities_panel(
         .unwrap_or("native");
     let share_card = if let Some(url) = share_url {
         format!(
-            r#"<div class="utility-card"><span>复制分享链接</span>{}</div>"#,
+            r#"<div class="utility-card"><span>Copy share link</span>{}</div>"#,
             render_copyable_code(url, 18)
         )
     } else if share_action.is_empty() {
         String::new()
     } else {
         format!(
-            r#"<div class="utility-card"><span>分享链接</span>{}</div>"#,
+            r#"<div class="utility-card"><span>Share link</span>{}</div>"#,
             share_action
         )
     };
@@ -3444,12 +3444,12 @@ fn render_tx_utilities_panel(
         r#"<section class="tx-section-card tx-utilities-panel">
   <div class="tx-section-title">
     <span class="tx-section-index">5</span>
-    <h2>分享 / 复制工具 <small>Utilities</small></h2>
+    <h2>Share / Copy Tools <small>Utilities</small></h2>
   </div>
   <div class="utility-grid">
-    <div class="utility-card"><span>复制 tx hash</span>{}</div>
-    <div class="utility-card"><span>复制 from address</span>{}</div>
-    <div class="utility-card"><span>复制 token contract</span>{}</div>
+    <div class="utility-card"><span>Copy tx hash</span>{}</div>
+    <div class="utility-card"><span>Copy from address</span>{}</div>
+    <div class="utility-card"><span>Copy token contract</span>{}</div>
     {}
   </div>
 </section>"#,
@@ -3508,17 +3508,17 @@ fn render_tx_report_hero(
         r#"<section class="tx-section-card tx-report-hero tx-report-{}">
   <div class="tx-section-title">
     <span class="tx-section-index">1</span>
-    <h2>交易结论 <small>Tx Conclusion</small></h2>
+    <h2>Tx Conclusion</h2>
     <span class="confidence-pill">{} confidence</span>
   </div>
   <div class="tx-conclusion-grid">
     <div class="tx-conclusion-icon">{}</div>
     <div class="tx-conclusion-cell">
-      <span>交易类型</span>
+      <span>Activity</span>
       <strong class="activity-pill">{}</strong>
     </div>
     <div class="tx-conclusion-cell">
-      <span>结论</span>
+      <span>Verdict</span>
       <strong class="verdict-pill verdict-{}">{}</strong>
     </div>
     <div class="tx-conclusion-cell">
@@ -3548,7 +3548,7 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         return TxReportVerdict {
             tone: "unknown",
             label: "No clear profit view yet".to_owned(),
-            metric_label: "收益判断".to_owned(),
+            metric_label: "PnL view".to_owned(),
             result: "PnL unavailable".to_owned(),
             result_caption: "missing net effect".to_owned(),
         };
@@ -3596,7 +3596,7 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         return TxReportVerdict {
             tone: "mixed",
             label: "Asset acquired, PnL unresolved".to_owned(),
-            metric_label: "现金流成本".to_owned(),
+            metric_label: "Cash-flow cost".to_owned(),
             result: format_wei_eth(eth_equivalent_raw),
             result_caption: "includes gas".to_owned(),
         };
@@ -3606,7 +3606,7 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         TxReportVerdict {
             tone: "profit",
             label: "Likely profitable transaction".to_owned(),
-            metric_label: "核心收益".to_owned(),
+            metric_label: "Core PnL".to_owned(),
             result: format_wei_eth(eth_equivalent_raw),
             result_caption: "after gas".to_owned(),
         }
@@ -3614,7 +3614,7 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         TxReportVerdict {
             tone: "loss",
             label: "Likely loss after gas".to_owned(),
-            metric_label: "核心收益".to_owned(),
+            metric_label: "Core PnL".to_owned(),
             result: format_wei_eth(eth_equivalent_raw),
             result_caption: "after gas".to_owned(),
         }
@@ -3622,7 +3622,7 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         TxReportVerdict {
             tone: "mixed",
             label: "Mixed asset result".to_owned(),
-            metric_label: "收益判断".to_owned(),
+            metric_label: "PnL view".to_owned(),
             result: "Multi-asset net".to_owned(),
             result_caption: "pricing required".to_owned(),
         }
@@ -3630,7 +3630,7 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         TxReportVerdict {
             tone: "profit",
             label: "Net assets gained".to_owned(),
-            metric_label: "资产净变化".to_owned(),
+            metric_label: "Net asset change".to_owned(),
             result: "Positive token net".to_owned(),
             result_caption: positive_non_eth_assets
                 .first()
@@ -3641,7 +3641,7 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         TxReportVerdict {
             tone: "loss",
             label: "Net assets spent".to_owned(),
-            metric_label: "资产净变化".to_owned(),
+            metric_label: "Net asset change".to_owned(),
             result: "Negative token net".to_owned(),
             result_caption: negative_non_eth_assets
                 .first()
@@ -3652,7 +3652,7 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         TxReportVerdict {
             tone: "unknown",
             label: "Break-even or no external asset change".to_owned(),
-            metric_label: "收益判断".to_owned(),
+            metric_label: "PnL view".to_owned(),
             result: "0 net detected".to_owned(),
             result_caption: "no external delta".to_owned(),
         }
@@ -3722,7 +3722,7 @@ fn render_tx_storyline_panel(analysis: &TransactionAnalysis) -> String {
         return render_flow_fallback_panel(
             analysis,
             2,
-            "未识别出完整交易意图，先展示可确认的资金流。",
+            "No complete transaction intent was recognized yet. Showing confirmed asset flows first.",
         );
     };
     let kind = storyline
@@ -3758,7 +3758,7 @@ fn render_tx_storyline_panel(analysis: &TransactionAnalysis) -> String {
         render_flow_fallback_panel(
             analysis,
             3,
-            "当前协议意图归因不完整，以下是从日志和 value transfer 重建出的资金流。",
+            "Protocol intent attribution is incomplete. Below are asset flows reconstructed from logs and value transfers.",
         )
     } else {
         String::new()
@@ -3799,7 +3799,7 @@ fn render_flow_fallback_panel(
         r#"<section class="tx-section-card compact-section flow-fallback-panel">
   <div class="tx-section-title">
     <span class="tx-section-index">{}</span>
-    <h2>资金流摘要 <small>Confirmed Asset Flows</small></h2>
+    <h2>Confirmed Asset Flows</h2>
     <span class="badge">fallback view</span>
   </div>
   <p class="panel-copy">{}</p>
@@ -3948,7 +3948,7 @@ fn render_subject_scope(value: Option<&serde_json::Value>) -> String {
         r#"<section class="tx-section-card tx-subject-panel">
   <div class="tx-section-title">
     <span class="tx-section-index">2</span>
-    <h2>主体视角 <small>Subject Perspective</small></h2>
+    <h2>Subject Perspective</h2>
   </div>
   <div class="subject-scope-line"><span>Subject scope</span><div class="address-pill-row">{}</div><small>{}</small></div>
 </section>"#,
@@ -3964,7 +3964,7 @@ fn render_net_effect_panel(value: Option<&serde_json::Value>, subject_scope_labe
     let rows = render_net_effect_rows(effect);
     format!(
         r#"<section class="storyline-net-effect tx-section-card compact-section">
-  <div class="panel-head"><h4>资产净变化</h4><span class="badge">subject scope view</span></div>
+  <div class="panel-head"><h4>Net Asset Change</h4><span class="badge">subject scope view</span></div>
   <div class="panel-copy">Calculated across <strong>{}</strong>. <strong>In</strong> means assets entered the subject scope, <strong>Out</strong> means assets left it, and <strong>Net</strong> is <strong>In - Out</strong>.</div>
   <div class="table-shell compact-table-shell">
     <table class="compact-table">
@@ -4124,7 +4124,7 @@ fn render_storyline_steps(
         r#"<section class="tx-section-card storyline-steps">
   <div class="tx-section-title">
     <span class="tx-section-index">3</span>
-    <h2>时间线 / 资金流 <small>Transaction Timeline</small></h2>
+    <h2>Transaction Timeline</h2>
     <span class="badge">ordered events</span>
   </div>
   <div class="timeline-list">{}</div>
@@ -4344,7 +4344,7 @@ fn render_storyline_visual(
         r#"<section class="tx-section-card storyline-visual-shell">
   <div class="tx-section-title">
     <span class="tx-section-index">4</span>
-    <h2>协议路径 <small>Protocol Path</small></h2>
+    <h2>Protocol Path</h2>
   </div>
   {}
   <div class="storyline-lanes">
