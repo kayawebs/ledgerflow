@@ -1,5 +1,5 @@
-pub mod analysis;
 pub mod alerts;
+pub mod analysis;
 pub mod auth;
 pub mod behavior;
 pub mod cluster;
@@ -10,4 +10,5 @@ pub mod indexer_client;
 pub mod metrics;
 pub mod monitor_reporter;
 pub mod portal;
+pub mod token_metadata;
 pub mod trace_monitor;

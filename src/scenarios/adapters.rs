@@ -27,9 +27,15 @@ impl ScenarioAdapterService {
             .and_then(protocol_hint)
             .map(str::to_owned)
             .or_else(|| analysis.to_address.clone());
-        let storyline = if labels.iter().any(|label| label == "liquidation_like_activity") {
+        let storyline = if labels
+            .iter()
+            .any(|label| label == "liquidation_like_activity")
+        {
             build_liquidation_story(analysis, protocol.as_deref())
-        } else if labels.iter().any(|label| label == "arbitrage_like_activity") {
+        } else if labels
+            .iter()
+            .any(|label| label == "arbitrage_like_activity")
+        {
             build_arbitrage_story(analysis, protocol.as_deref())
         } else {
             None
@@ -66,7 +72,10 @@ fn build_behavior_fingerprint(
     analysis: &TransactionAnalysis,
     primary: Option<&RecognizerResult>,
 ) -> String {
-    let executor = analysis.to_address.as_deref().unwrap_or("contract_creation");
+    let executor = analysis
+        .to_address
+        .as_deref()
+        .unwrap_or("contract_creation");
     let selector = analysis
         .normalized_execution_facts
         .selector
@@ -88,7 +97,11 @@ fn build_behavior_fingerprint(
     )
 }
 
-fn build_liquidation_story(analysis: &TransactionAnalysis, protocol: Option<&str>) -> Option<Value> {
+fn build_liquidation_story(
+    analysis: &TransactionAnalysis,
+    protocol: Option<&str>,
+) -> Option<Value> {
+    let token_lookup = TokenLookup::from_analysis(analysis);
     let executor = analysis
         .to_address
         .as_ref()
@@ -123,23 +136,26 @@ fn build_liquidation_story(analysis: &TransactionAnalysis, protocol: Option<&str
     );
     let actor_addresses = vec![executor.clone(), liquidator.clone()];
 
-    let funding_sources = sort_story_flows(enrich_funding_sources(related_flows(analysis, |flow| {
-        address_in_set(&flow.to_address, &actor_addresses)
-            && !address_in_set(&flow.from_address, &actor_addresses)
-            && !protocol_contract
-                .as_deref()
-                .map(|value| flow.from_address.eq_ignore_ascii_case(value))
-                .unwrap_or(false)
-    }), &call_path));
-    let repay_legs = related_flows(analysis, |flow| {
+    let funding_sources = sort_story_flows(enrich_funding_sources(
+        related_flows(analysis, &token_lookup, |flow| {
+            address_in_set(&flow.to_address, &actor_addresses)
+                && !address_in_set(&flow.from_address, &actor_addresses)
+                && !protocol_contract
+                    .as_deref()
+                    .map(|value| flow.from_address.eq_ignore_ascii_case(value))
+                    .unwrap_or(false)
+        }),
+        &call_path,
+    ));
+    let repay_legs = related_flows(analysis, &token_lookup, |flow| {
         address_in_set(&flow.from_address, &actor_addresses)
             && address_in_set(&flow.to_address, &protocol_neighborhood)
     });
-    let collateral_receipts = related_flows(analysis, |flow| {
+    let collateral_receipts = related_flows(analysis, &token_lookup, |flow| {
         address_in_set(&flow.to_address, &actor_addresses)
             && address_in_set(&flow.from_address, &protocol_neighborhood)
     });
-    let disposition_legs = related_flows(analysis, |flow| {
+    let disposition_legs = related_flows(analysis, &token_lookup, |flow| {
         address_in_set(&flow.from_address, &actor_addresses)
             && !address_in_set(&flow.to_address, &actor_addresses)
             && !address_in_set(&flow.to_address, &protocol_neighborhood)
@@ -155,17 +171,14 @@ fn build_liquidation_story(analysis: &TransactionAnalysis, protocol: Option<&str
     }
 
     let subject_scope = build_subject_scope(&sender, &actor_addresses);
-    let net_effect = build_net_effect(analysis, &subject_scope.addresses);
+    let net_effect = build_net_effect(analysis, &subject_scope.addresses, &token_lookup);
     let steps = build_liquidation_steps(
         &funding_sources,
         &repay_legs,
         &collateral_receipts,
         &disposition_legs,
     );
-    let headline = build_liquidation_headline(
-        protocol.unwrap_or("unknown protocol"),
-        &net_effect,
-    );
+    let headline = build_liquidation_headline(protocol.unwrap_or("unknown protocol"), &net_effect);
 
     Some(json!({
         "kind": "liquidation",
@@ -198,6 +211,7 @@ fn build_liquidation_story(analysis: &TransactionAnalysis, protocol: Option<&str
 }
 
 fn build_arbitrage_story(analysis: &TransactionAnalysis, protocol: Option<&str>) -> Option<Value> {
+    let token_lookup = TokenLookup::from_analysis(analysis);
     let executor = analysis
         .to_address
         .as_ref()
@@ -205,15 +219,20 @@ fn build_arbitrage_story(analysis: &TransactionAnalysis, protocol: Option<&str>)
         .unwrap_or_else(|| analysis.from_address.to_lowercase());
     let sender = analysis.from_address.to_lowercase();
     let call_path = call_path_steps(&analysis.normalized_execution_facts.call_tree, 8);
-    let funding_sources = sort_story_flows(enrich_funding_sources(related_flows(analysis, |flow| {
-        flow.to_address.eq_ignore_ascii_case(&executor) && !flow.from_address.eq_ignore_ascii_case(&executor)
-    }), &call_path));
-    let exit_legs = related_flows(analysis, |flow| {
+    let funding_sources = sort_story_flows(enrich_funding_sources(
+        related_flows(analysis, &token_lookup, |flow| {
+            flow.to_address.eq_ignore_ascii_case(&executor)
+                && !flow.from_address.eq_ignore_ascii_case(&executor)
+        }),
+        &call_path,
+    ));
+    let exit_legs = related_flows(analysis, &token_lookup, |flow| {
         flow.from_address.eq_ignore_ascii_case(&executor)
             && !flow.to_address.eq_ignore_ascii_case(&executor)
     });
-    let cycle_legs = related_flows(analysis, |flow| {
-        flow.from_address.eq_ignore_ascii_case(&sender) || flow.to_address.eq_ignore_ascii_case(&sender)
+    let cycle_legs = related_flows(analysis, &token_lookup, |flow| {
+        flow.from_address.eq_ignore_ascii_case(&sender)
+            || flow.to_address.eq_ignore_ascii_case(&sender)
     });
 
     if funding_sources.is_empty() && exit_legs.is_empty() && call_path.is_empty() {
@@ -221,7 +240,7 @@ fn build_arbitrage_story(analysis: &TransactionAnalysis, protocol: Option<&str>)
     }
 
     let subject_scope = build_subject_scope(&sender, std::slice::from_ref(&executor));
-    let net_effect = build_net_effect(analysis, &subject_scope.addresses);
+    let net_effect = build_net_effect(analysis, &subject_scope.addresses, &token_lookup);
     let steps = build_arbitrage_steps(&funding_sources, &cycle_legs, &exit_legs);
     let headline = build_arbitrage_headline(protocol.unwrap_or("unknown venues"), &net_effect);
 
@@ -272,7 +291,11 @@ fn build_subject_scope(initiator: &str, actor_addresses: &[String]) -> SubjectSc
     }
 }
 
-fn build_net_effect(analysis: &TransactionAnalysis, subject_addresses: &[String]) -> Value {
+fn build_net_effect(
+    analysis: &TransactionAnalysis,
+    subject_addresses: &[String],
+    token_lookup: &TokenLookup,
+) -> Value {
     let mut inflows = BTreeMap::<(AssetType, Option<String>), i128>::new();
     let mut outflows = BTreeMap::<(AssetType, Option<String>), i128>::new();
     let mut deltas = BTreeMap::<(AssetType, Option<String>), i128>::new();
@@ -308,12 +331,28 @@ fn build_net_effect(analysis: &TransactionAnalysis, subject_addresses: &[String]
     let gained = deltas
         .iter()
         .filter(|(_, delta)| **delta > 0)
-        .map(|((asset_type, token_address), delta)| render_effect_entry(*delta, asset_type, token_address.as_deref(), "gained"))
+        .map(|((asset_type, token_address), delta)| {
+            render_effect_entry(
+                *delta,
+                asset_type,
+                token_address.as_deref(),
+                "gained",
+                token_lookup,
+            )
+        })
         .collect::<Vec<_>>();
     let spent = deltas
         .iter()
         .filter(|(_, delta)| **delta < 0)
-        .map(|((asset_type, token_address), delta)| render_effect_entry(delta.abs(), asset_type, token_address.as_deref(), "spent"))
+        .map(|((asset_type, token_address), delta)| {
+            render_effect_entry(
+                delta.abs(),
+                asset_type,
+                token_address.as_deref(),
+                "spent",
+                token_lookup,
+            )
+        })
         .collect::<Vec<_>>();
     let rows = deltas
         .iter()
@@ -332,6 +371,7 @@ fn build_net_effect(analysis: &TransactionAnalysis, subject_addresses: &[String]
                 inflow_raw,
                 outflow_raw,
                 *net_delta,
+                token_lookup,
             )
         })
         .collect::<Vec<_>>();
@@ -340,7 +380,7 @@ fn build_net_effect(analysis: &TransactionAnalysis, subject_addresses: &[String]
         "spent": spent,
         "rows": rows,
         "gas": if gas_cost_raw > 0 {
-            Some(render_effect_entry(gas_cost_raw, &AssetType::Native, None, "gas"))
+            Some(render_effect_entry(gas_cost_raw, &AssetType::Native, None, "gas", token_lookup))
         } else {
             None
         },
@@ -352,8 +392,9 @@ fn render_effect_entry(
     asset_type: &AssetType,
     token_address: Option<&str>,
     direction: &str,
+    token_lookup: &TokenLookup,
 ) -> Value {
-    let token = token_descriptor(asset_type, token_address);
+    let token = token_descriptor(asset_type, token_address, token_lookup);
     let amount_display = format_token_amount(amount_raw, &token);
     json!({
         "direction": direction,
@@ -373,8 +414,9 @@ fn render_effect_row(
     inflow_raw: i128,
     outflow_raw: i128,
     net_raw: i128,
+    token_lookup: &TokenLookup,
 ) -> Value {
-    let token = token_descriptor(&asset_type, token_address);
+    let token = token_descriptor(&asset_type, token_address, token_lookup);
     json!({
         "token": token,
         "inflow_raw": inflow_raw.to_string(),
@@ -394,10 +436,34 @@ fn build_liquidation_steps(
 ) -> Vec<Value> {
     let mut steps = Vec::new();
     let mut next_order = 1usize;
-    next_order = extend_steps(&mut steps, next_order, "Funding executor", funding_sources, "Executor received");
-    next_order = extend_steps(&mut steps, next_order, "Repay protocol debt", repay_legs, "Executor sent");
-    next_order = extend_steps(&mut steps, next_order, "Receive collateral", collateral_receipts, "Executor received");
-    let _ = extend_steps(&mut steps, next_order, "Route proceeds", disposition_legs, "Executor sent");
+    next_order = extend_steps(
+        &mut steps,
+        next_order,
+        "Funding executor",
+        funding_sources,
+        "Executor received",
+    );
+    next_order = extend_steps(
+        &mut steps,
+        next_order,
+        "Repay protocol debt",
+        repay_legs,
+        "Executor sent",
+    );
+    next_order = extend_steps(
+        &mut steps,
+        next_order,
+        "Receive collateral",
+        collateral_receipts,
+        "Executor received",
+    );
+    let _ = extend_steps(
+        &mut steps,
+        next_order,
+        "Route proceeds",
+        disposition_legs,
+        "Executor sent",
+    );
     steps
 }
 
@@ -408,9 +474,21 @@ fn build_arbitrage_steps(
 ) -> Vec<Value> {
     let mut steps = Vec::new();
     let mut next_order = 1usize;
-    next_order = extend_steps(&mut steps, next_order, "Funding executor", funding_sources, "Executor received");
+    next_order = extend_steps(
+        &mut steps,
+        next_order,
+        "Funding executor",
+        funding_sources,
+        "Executor received",
+    );
     next_order = extend_steps(&mut steps, next_order, "Run route", cycle_legs, "Route leg");
-    let _ = extend_steps(&mut steps, next_order, "Exit route", exit_legs, "Executor sent");
+    let _ = extend_steps(
+        &mut steps,
+        next_order,
+        "Exit route",
+        exit_legs,
+        "Executor sent",
+    );
     steps
 }
 
@@ -425,7 +503,7 @@ fn extend_steps(
         let token = flow
             .get("token")
             .cloned()
-            .unwrap_or_else(|| token_descriptor(&AssetType::Native, None));
+            .unwrap_or_else(|| token_descriptor(&AssetType::Native, None, &TokenLookup::default()));
         let amount_display = flow
             .get("amount_display")
             .and_then(|value| value.as_str())
@@ -436,9 +514,18 @@ fn extend_steps(
                     .map(str::to_owned)
                     .unwrap_or_else(|| "n/a".to_owned())
             });
-        let amount_raw = flow.get("amount_raw").and_then(|value| value.as_str()).unwrap_or("n/a");
-        let from_address = flow.get("from_address").and_then(|value| value.as_str()).unwrap_or("n/a");
-        let to_address = flow.get("to_address").and_then(|value| value.as_str()).unwrap_or("n/a");
+        let amount_raw = flow
+            .get("amount_raw")
+            .and_then(|value| value.as_str())
+            .unwrap_or("n/a");
+        let from_address = flow
+            .get("from_address")
+            .and_then(|value| value.as_str())
+            .unwrap_or("n/a");
+        let to_address = flow
+            .get("to_address")
+            .and_then(|value| value.as_str())
+            .unwrap_or("n/a");
         steps.push(json!({
             "order": start_order + index,
             "title": title,
@@ -495,7 +582,37 @@ fn build_arbitrage_headline(protocol: &str, net_effect: &Value) -> String {
     format!("{protocol} arbitrage-like execution detected with {gained_count} incoming asset legs.")
 }
 
-fn token_descriptor(asset_type: &AssetType, token_address: Option<&str>) -> Value {
+#[derive(Default)]
+struct TokenLookup {
+    by_address: BTreeMap<String, Value>,
+}
+
+impl TokenLookup {
+    fn from_analysis(analysis: &TransactionAnalysis) -> Self {
+        let mut by_address = BTreeMap::new();
+        for flow in &analysis.derived_flows {
+            let Some(address) = flow.token_address.as_deref().map(str::to_ascii_lowercase) else {
+                continue;
+            };
+            let Some(token) = flow.metadata.get("token").filter(|value| value.is_object()) else {
+                continue;
+            };
+            by_address.insert(address, token.clone());
+        }
+        Self { by_address }
+    }
+
+    fn get(&self, token_address: Option<&str>) -> Option<Value> {
+        let address = token_address?.to_ascii_lowercase();
+        self.by_address.get(&address).cloned()
+    }
+}
+
+fn token_descriptor(
+    asset_type: &AssetType,
+    token_address: Option<&str>,
+    token_lookup: &TokenLookup,
+) -> Value {
     match asset_type {
         AssetType::Native => json!({
             "symbol": "ETH",
@@ -504,11 +621,14 @@ fn token_descriptor(asset_type: &AssetType, token_address: Option<&str>) -> Valu
             "decimals": 18,
         }),
         AssetType::Erc20 => {
+            if let Some(token) = token_lookup.get(token_address) {
+                return token;
+            }
             let address = token_address.unwrap_or_default().to_lowercase();
             let (symbol, name, decimals) = match address.as_str() {
                 "0x4200000000000000000000000000000000000006" => ("WETH", "Wrapped Ether", Some(18)),
                 "0x091a5abe6616e26268e5eecff256c2212fce2707" => ("BondETH", "Bond ETH", Some(18)),
-                _ => ("ERC20", "Unlabeled token", None),
+                _ => ("Unknown ERC20", "Unlabeled token", None),
             };
             json!({
                 "symbol": symbol,
@@ -531,7 +651,7 @@ fn format_token_amount(amount_raw: i128, token: &Value) -> String {
         .unwrap_or("asset");
     match decimals {
         Some(decimals) => format!("{} {}", format_units_compact(amount_raw, decimals), symbol),
-        None => format!("{} raw {}", amount_raw, symbol),
+        None => format!("{amount_raw} raw units"),
     }
 }
 
@@ -541,7 +661,13 @@ fn format_signed_token_amount(amount_raw: i128, token: &Value) -> String {
     } else if amount_raw < 0 {
         format!("-{}", format_token_amount(amount_raw.abs(), token))
     } else {
-        format!("0 {}", token.get("symbol").and_then(|value| value.as_str()).unwrap_or("asset"))
+        format!(
+            "0 {}",
+            token
+                .get("symbol")
+                .and_then(|value| value.as_str())
+                .unwrap_or("asset")
+        )
     }
 }
 
@@ -560,16 +686,13 @@ fn format_units_compact(amount_raw: i128, decimals: u32) -> String {
 }
 
 fn protocol_contract_from_recognizers(analysis: &TransactionAnalysis) -> Option<String> {
-    analysis
-        .recognizer_results
-        .iter()
-        .find_map(|item| {
-            item.attributes
-                .get("adapter_attributes")
-                .and_then(|value| value.get("protocol_contract"))
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-        })
+    analysis.recognizer_results.iter().find_map(|item| {
+        item.attributes
+            .get("adapter_attributes")
+            .and_then(|value| value.get("protocol_contract"))
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    })
 }
 
 fn liquidation_adapter_attributes(analysis: &TransactionAnalysis) -> Option<Value> {
@@ -609,7 +732,9 @@ fn liquidation_protocol_neighborhood(
 }
 
 fn address_in_set(address: &str, values: &[String]) -> bool {
-    values.iter().any(|value| address.eq_ignore_ascii_case(value))
+    values
+        .iter()
+        .any(|value| address.eq_ignore_ascii_case(value))
 }
 
 fn call_path_steps(call_tree: &Value, limit: usize) -> Vec<Value> {
@@ -651,7 +776,11 @@ fn collect_call_path_steps(call_tree: &Value, depth: usize, limit: usize, steps:
     }
 }
 
-fn related_flows<F>(analysis: &TransactionAnalysis, predicate: F) -> Vec<Value>
+fn related_flows<F>(
+    analysis: &TransactionAnalysis,
+    token_lookup: &TokenLookup,
+    predicate: F,
+) -> Vec<Value>
 where
     F: Fn(&crate::domain::value_objects::AssetFlow) -> bool,
 {
@@ -660,7 +789,11 @@ where
         .iter()
         .filter(|flow| predicate(flow))
         .map(|flow| {
-            let token = token_descriptor(&flow.asset_type, flow.token_address.as_deref());
+            let token = token_descriptor(
+                &flow.asset_type,
+                flow.token_address.as_deref(),
+                token_lookup,
+            );
             let amount_raw_i128 = flow.amount_raw.parse::<i128>().unwrap_or_default();
             json!({
                 "asset_type": match flow.asset_type {
@@ -698,21 +831,19 @@ fn sort_story_flows(mut flows: Vec<Value>) -> Vec<Value> {
     flows.sort_by(|left, right| {
         let left_hint = left.get("source_hint").is_some();
         let right_hint = right.get("source_hint").is_some();
-        right_hint
-            .cmp(&left_hint)
-            .then_with(|| {
-                let left_amount = left
-                    .get("amount_raw")
-                    .and_then(|value| value.as_str())
-                    .and_then(|value| value.parse::<i128>().ok())
-                    .unwrap_or_default();
-                let right_amount = right
-                    .get("amount_raw")
-                    .and_then(|value| value.as_str())
-                    .and_then(|value| value.parse::<i128>().ok())
-                    .unwrap_or_default();
-                right_amount.cmp(&left_amount)
-            })
+        right_hint.cmp(&left_hint).then_with(|| {
+            let left_amount = left
+                .get("amount_raw")
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<i128>().ok())
+                .unwrap_or_default();
+            let right_amount = right
+                .get("amount_raw")
+                .and_then(|value| value.as_str())
+                .and_then(|value| value.parse::<i128>().ok())
+                .unwrap_or_default();
+            right_amount.cmp(&left_amount)
+        })
     });
     flows
 }
@@ -751,9 +882,7 @@ fn flashloan_protocol_hint(selector: &str) -> Option<(&'static str, &'static str
         AAVE_V3_FLASH_LOAN_SIMPLE_SELECTOR | AAVE_V3_FLASH_LOAN_SELECTOR => {
             Some(("aave_v3", "Aave flash loan"))
         }
-        BALANCER_VAULT_FLASH_LOAN_SELECTOR => {
-            Some(("balancer_vault", "Balancer flash loan"))
-        }
+        BALANCER_VAULT_FLASH_LOAN_SELECTOR => Some(("balancer_vault", "Balancer flash loan")),
         UNISWAP_V3_FLASH_SELECTOR => Some(("uniswap_v3", "Uniswap V3 flash")),
         _ => None,
     }

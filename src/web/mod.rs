@@ -101,8 +101,8 @@ impl WebConfig {
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(8453),
-            web_base_url: std::env::var("LEDGERFLOW_WEB_BASE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned()),
+            web_base_url: public_base_url_from_env()
+                .unwrap_or_else(|| "http://127.0.0.1:3001".to_owned()),
             session_cookie_name: std::env::var("LEDGERFLOW_SESSION_COOKIE_NAME")
                 .unwrap_or_else(|_| "ledgerflow_session".to_owned()),
             resend_api_key,
@@ -154,6 +154,17 @@ fn first_env(keys: &[&str]) -> Option<String> {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
+    })
+}
+
+fn public_base_url_from_env() -> Option<String> {
+    first_env(&["LEDGERFLOW_TRACE_DOMAIN", "LEDGERFLOW_WEB_BASE_URL"]).map(|value| {
+        let value = value.trim().trim_end_matches('/').to_owned();
+        if value.starts_with("http://") || value.starts_with("https://") {
+            value
+        } else {
+            format!("https://{value}")
+        }
     })
 }
 
@@ -3656,11 +3667,24 @@ fn render_net_effect_gas_row(item: &serde_json::Value) -> String {
 }
 
 fn render_amount_stack(display: &str, raw: &str) -> String {
+    let display = normalize_amount_display(display, raw);
     format!(
         "<div class=\"amount-stack\"><strong>{}</strong><small>raw: {}</small></div>",
-        escape_html(display),
+        escape_html(&display),
         escape_html(raw),
     )
+}
+
+fn normalize_amount_display(display: &str, raw: &str) -> String {
+    if display == format!("{raw} raw ERC20")
+        || display == format!("{raw} raw Unknown ERC20")
+        || display.ends_with(" raw ERC20")
+        || display.ends_with(" raw Unknown ERC20")
+    {
+        format!("{raw} raw units")
+    } else {
+        display.to_owned()
+    }
 }
 
 fn render_storyline_steps(
@@ -3701,6 +3725,7 @@ fn render_storyline_steps(
                     .get("amount_raw")
                     .and_then(|value| value.as_str())
                     .unwrap_or("n/a");
+                let amount_display = normalize_amount_display(amount_display, amount_raw);
                 let source_hint_label = item
                     .get("source_hint")
                     .and_then(|value| value.get("label"))
@@ -3758,7 +3783,7 @@ fn render_storyline_steps(
                         .unwrap_or_default(),
                     escape_html(&from_short),
                     from_roles,
-                    escape_html(amount_display),
+                    escape_html(&amount_display),
                     escape_html(&format!("{} · {}", name, token_address)),
                     escape_html(&to_short),
                     to_roles,
@@ -3962,6 +3987,7 @@ fn render_storyline_flow_chip(
         .get("amount_display")
         .and_then(|value| value.as_str())
         .unwrap_or(amount_raw);
+    let amount_display = normalize_amount_display(amount_display, amount_raw);
     let source_hint_label = item
         .get("source_hint")
         .and_then(|value| value.get("label"))

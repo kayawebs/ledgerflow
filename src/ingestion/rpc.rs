@@ -16,6 +16,17 @@ pub trait RpcClient: Send + Sync {
         address: &str,
         block_number: Option<u64>,
     ) -> LedgerResult<String>;
+    async fn eth_call(
+        &self,
+        _chain_id: u64,
+        _to: &str,
+        _data: &str,
+        _block_number: Option<u64>,
+    ) -> LedgerResult<String> {
+        Err(LedgerError::UnsupportedTrace(
+            "eth_call is not implemented for this rpc client".to_owned(),
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -108,6 +119,24 @@ impl RpcClient for HttpRpcClient {
             .await?;
         result.as_str().map(ToOwned::to_owned).ok_or_else(|| {
             LedgerError::MalformedEvidence("eth_getCode response was not a string".to_owned())
+        })
+    }
+
+    async fn eth_call(
+        &self,
+        _chain_id: u64,
+        to: &str,
+        data: &str,
+        block_number: Option<u64>,
+    ) -> LedgerResult<String> {
+        let block_ref = block_number
+            .map(|value| format!("0x{value:x}"))
+            .unwrap_or_else(|| "latest".to_owned());
+        let result = self
+            .call("eth_call", json!([{ "to": to, "data": data }, block_ref]))
+            .await?;
+        result.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+            LedgerError::MalformedEvidence("eth_call response was not a string".to_owned())
         })
     }
 }

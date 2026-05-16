@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::accounting::rollups::AccountingService;
 use crate::core::errors::{LedgerError, LedgerResult};
@@ -18,6 +18,7 @@ use crate::normalization::service::EvidenceNormalizer;
 use crate::plugins::loader::PluginContext;
 use crate::recognition::registry::RecognizerRegistry;
 use crate::scenarios::adapters::ScenarioAdapterService;
+use crate::services::token_metadata::TokenMetadataService;
 
 #[derive(Clone)]
 pub struct AnalysisService {
@@ -30,6 +31,7 @@ pub struct AnalysisService {
     pub scenario_service: Arc<ScenarioAdapterService>,
     pub accounting_service: Arc<AccountingService>,
     pub repository: Arc<dyn AnalysisRepository>,
+    pub token_metadata_service: Option<Arc<TokenMetadataService>>,
     pub enabled_recognizers: Vec<String>,
 }
 
@@ -51,8 +53,17 @@ impl AnalysisService {
             scenario_service: Arc::new(ScenarioAdapterService),
             accounting_service: Arc::new(AccountingService),
             repository,
+            token_metadata_service: None,
             enabled_recognizers,
         }
+    }
+
+    pub fn with_token_metadata_service(
+        mut self,
+        token_metadata_service: Arc<TokenMetadataService>,
+    ) -> Self {
+        self.token_metadata_service = Some(token_metadata_service);
+        self
     }
 
     pub async fn analyze_transaction(
@@ -96,6 +107,14 @@ impl AnalysisService {
 
         info!(stage = "flows", %tx_hash, "derive_flows");
         analysis.derived_flows = self.flow_deriver.derive(&bundle, &analysis);
+        if let Some(token_metadata_service) = self.token_metadata_service.as_ref() {
+            if let Err(err) = token_metadata_service
+                .enrich_flows(chain_id, analysis.block_number, &mut analysis.derived_flows)
+                .await
+            {
+                warn!(%tx_hash, error = %err, "token metadata enrichment failed");
+            }
+        }
 
         info!(stage = "recognition", %tx_hash, "run_recognizers");
         analysis.recognizer_results = self

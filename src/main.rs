@@ -11,6 +11,7 @@ use ledgerflow::{
     services::{
         analysis::AnalysisService, cluster_backfill::ClusterBackfillService,
         discovery::ClusterDiscoveryService, indexer_client::IndexerHttpClient,
+        token_metadata::TokenMetadataService,
     },
 };
 use std::sync::Arc as StdArc;
@@ -34,13 +35,20 @@ async fn main() {
 
     let rpc_client = StdArc::new(HttpRpcClient::new(config.rpc_url.clone()));
     let fetcher = TransactionBundleFetcher::new(rpc_client.clone(), config.trace_enabled);
-    let service = Arc::new(AnalysisService::new(
-        fetcher,
-        registry,
-        plugin_context,
-        Arc::new(repository),
-        config.enabled_recognizers.clone(),
+    let token_metadata_service = Arc::new(TokenMetadataService::new(
+        repository.pool().clone(),
+        rpc_client.clone(),
     ));
+    let service = Arc::new(
+        AnalysisService::new(
+            fetcher,
+            registry,
+            plugin_context,
+            Arc::new(repository),
+            config.enabled_recognizers.clone(),
+        )
+        .with_token_metadata_service(token_metadata_service),
+    );
     let tx_source = config.indexer_api_base_url.clone().map(|url| {
         Arc::new(IndexerHttpClient::new(
             url,
