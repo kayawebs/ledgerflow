@@ -3508,7 +3508,9 @@ fn tx_activity_icon(kind: &str) -> &'static str {
 struct TxReportVerdict {
     tone: &'static str,
     label: String,
+    metric_label: String,
     result: String,
+    result_caption: String,
     note: String,
 }
 
@@ -3552,9 +3554,9 @@ fn render_tx_report_hero(
       <strong class="verdict-pill verdict-{}">{}</strong>
     </div>
     <div class="tx-conclusion-cell">
-      <span>核心收益</span>
+      <span>{}</span>
       <strong class="profit-number">{}</strong>
-      <small>after gas</small>
+      <small>{}</small>
     </div>
     <div class="tx-conclusion-cell wide">
       <span>简短解释</span>
@@ -3569,7 +3571,9 @@ fn render_tx_report_hero(
         escape_html(kind),
         verdict.tone,
         escape_html(&verdict.label),
+        escape_html(&verdict.metric_label),
         escape_html(&verdict.result),
+        escape_html(&verdict.result_caption),
         escape_html(summary),
         escape_html(&format!("Protocol: {} · {}", protocol, verdict.note)),
     )
@@ -3583,14 +3587,19 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
         return TxReportVerdict {
             tone: "unknown",
             label: "No clear profit view yet".to_owned(),
+            metric_label: "收益判断".to_owned(),
             result: "PnL unavailable".to_owned(),
+            result_caption: "missing net effect".to_owned(),
             note: "No subject-scope net effect was generated for this transaction.".to_owned(),
         };
     };
 
     let mut eth_equivalent_raw = 0i128;
+    let mut gas_raw = 0i128;
     let mut positive_assets = 0usize;
     let mut negative_assets = 0usize;
+    let mut positive_non_eth_assets = Vec::new();
+    let mut negative_non_eth_assets = Vec::new();
     if let Some(rows) = net_effect.get("rows").and_then(|value| value.as_array()) {
         for row in rows {
             let net_raw = row
@@ -3598,68 +3607,130 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
                 .and_then(|value| value.as_str())
                 .and_then(|value| value.parse::<i128>().ok())
                 .unwrap_or(0);
+            let is_eth_equivalent = token_is_eth_equivalent(row.get("token"));
             if net_raw > 0 {
                 positive_assets += 1;
+                if !is_eth_equivalent {
+                    positive_non_eth_assets.push(describe_net_effect_row(row));
+                }
             } else if net_raw < 0 {
                 negative_assets += 1;
+                if !is_eth_equivalent {
+                    negative_non_eth_assets.push(describe_net_effect_row(row));
+                }
             }
-            if token_is_eth_equivalent(row.get("token")) {
+            if is_eth_equivalent {
                 eth_equivalent_raw += net_raw;
             }
         }
     }
-    if let Some(gas_raw) = net_effect
+    if let Some(parsed_gas_raw) = net_effect
         .get("gas")
         .and_then(|value| value.get("amount_raw"))
         .and_then(|value| value.as_str())
         .and_then(|value| value.parse::<i128>().ok())
     {
-        eth_equivalent_raw -= gas_raw;
+        eth_equivalent_raw -= parsed_gas_raw;
+        gas_raw = parsed_gas_raw;
+    }
+
+    if eth_equivalent_raw < 0 && !positive_non_eth_assets.is_empty() {
+        return TxReportVerdict {
+            tone: "mixed",
+            label: "Asset acquired, PnL unresolved".to_owned(),
+            metric_label: "现金流成本".to_owned(),
+            result: format_wei_eth(eth_equivalent_raw),
+            result_caption: "includes gas".to_owned(),
+            note: format!(
+                "Subject also received {}. This ETH outflow is payment/cost basis, not realized loss; token pricing is needed for PnL.",
+                positive_non_eth_assets.join(", ")
+            ),
+        };
     }
 
     if eth_equivalent_raw > 0 {
         TxReportVerdict {
             tone: "profit",
             label: "Likely profitable transaction".to_owned(),
+            metric_label: "核心收益".to_owned(),
             result: format_wei_eth(eth_equivalent_raw),
+            result_caption: "after gas".to_owned(),
             note: "ETH/WETH-equivalent net after native gas. Token-priced USD PnL is not assumed here.".to_owned(),
         }
     } else if eth_equivalent_raw < 0 {
         TxReportVerdict {
             tone: "loss",
             label: "Likely loss after gas".to_owned(),
+            metric_label: "核心收益".to_owned(),
             result: format_wei_eth(eth_equivalent_raw),
-            note: "ETH/WETH-equivalent net after native gas. Other token movements may still matter.".to_owned(),
+            result_caption: "after gas".to_owned(),
+            note: if gas_raw > 0 {
+                "ETH/WETH-equivalent net after native gas; no offsetting non-ETH asset inflow was detected in the subject scope.".to_owned()
+            } else {
+                "ETH/WETH-equivalent net; no offsetting non-ETH asset inflow was detected in the subject scope.".to_owned()
+            },
         }
     } else if positive_assets > 0 && negative_assets > 0 {
         TxReportVerdict {
             tone: "mixed",
             label: "Mixed asset result".to_owned(),
+            metric_label: "收益判断".to_owned(),
             result: "Multi-asset net".to_owned(),
+            result_caption: "pricing required".to_owned(),
             note: "The subject gained and spent different assets; pricing is needed for a single PnL number.".to_owned(),
         }
     } else if positive_assets > 0 {
         TxReportVerdict {
             tone: "profit",
             label: "Net assets gained".to_owned(),
+            metric_label: "资产净变化".to_owned(),
             result: "Positive token net".to_owned(),
+            result_caption: positive_non_eth_assets
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "token net".to_owned()),
             note: "The subject scope received assets, but a USD/ETH value is not available for every token.".to_owned(),
         }
     } else if negative_assets > 0 {
         TxReportVerdict {
             tone: "loss",
             label: "Net assets spent".to_owned(),
+            metric_label: "资产净变化".to_owned(),
             result: "Negative token net".to_owned(),
+            result_caption: negative_non_eth_assets
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "token net".to_owned()),
             note: "The subject scope spent assets, but a USD/ETH value is not available for every token.".to_owned(),
         }
     } else {
         TxReportVerdict {
             tone: "unknown",
             label: "Break-even or no external asset change".to_owned(),
+            metric_label: "收益判断".to_owned(),
             result: "0 net detected".to_owned(),
+            result_caption: "no external delta".to_owned(),
             note: "No scope-crossing token delta was detected beyond available evidence.".to_owned(),
         }
     }
+}
+
+fn describe_net_effect_row(row: &serde_json::Value) -> String {
+    row.get("net_display")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let symbol = row
+                .get("token")
+                .and_then(|value| value.get("symbol"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("asset");
+            let raw = row
+                .get("net_raw")
+                .and_then(|value| value.as_str())
+                .unwrap_or("0");
+            format!("{raw} raw {symbol}")
+        })
 }
 
 fn token_is_eth_equivalent(token: Option<&serde_json::Value>) -> bool {
