@@ -38,8 +38,6 @@ pub struct AppConfig {
     pub trace_monitor_poll_interval_ms: u64,
     pub trace_monitor_retention_days: i64,
     pub trace_monitor_bind_addr: String,
-    pub trace_monitor_trace_candidates_enabled: bool,
-    pub trace_monitor_trace_candidate_limit_per_block: u32,
     pub enabled_recognizers: Vec<String>,
     pub plugins: Vec<String>,
 }
@@ -114,17 +112,6 @@ impl AppConfig {
                 .unwrap_or(7),
             trace_monitor_bind_addr: env::var("LEDGERFLOW_TRACE_MONITOR_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:3010".to_owned()),
-            trace_monitor_trace_candidates_enabled: env::var(
-                "LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATES_ENABLED",
-            )
-            .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
-            .unwrap_or(true),
-            trace_monitor_trace_candidate_limit_per_block: env::var(
-                "LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATE_LIMIT_PER_BLOCK",
-            )
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(5),
             enabled_recognizers: parse_enabled_recognizers(
                 env::var("LEDGERFLOW_ENABLED_RECOGNIZERS").ok().as_deref(),
             ),

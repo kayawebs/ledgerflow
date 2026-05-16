@@ -10,7 +10,7 @@ use axum::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json as SqlJson};
 use tracing::info;
 use uuid::Uuid;
 
@@ -46,6 +46,7 @@ pub struct WebState {
     pub default_chain_id: u64,
     pub web_base_url: String,
     pub session_cookie_name: String,
+    pub pool: PgPool,
     pub client: Client,
     pub auth_service: Arc<AuthService>,
     pub portal_service: Arc<PortalService>,
@@ -282,10 +283,24 @@ struct AnalyzeTxRequest {
     tx_hash: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ShareTxForm {
+    chain_id: u64,
+    tx_hash: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct AnalysisEnvelope {
     analysis: TransactionAnalysis,
     evidence_pack: EvidencePack,
+}
+
+#[derive(Debug)]
+struct TxAnalysisShareRecord {
+    share_id: Uuid,
+    title: String,
+    summary: String,
+    snapshot: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -545,6 +560,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         default_chain_id: config.default_chain_id,
         web_base_url: config.web_base_url.clone(),
         session_cookie_name: config.session_cookie_name.clone(),
+        pool: pool.clone(),
         client: Client::new(),
         auth_service: Arc::new(AuthService::new(
             pool.clone(),
@@ -589,6 +605,8 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         )
         .route("/app/tx-analysis", get(tx_analysis_page))
         .route("/app/tx-analysis/run", post(run_tx_analysis))
+        .route("/app/tx-analysis/share", post(create_tx_analysis_share))
+        .route("/share/tx/{share_id}", get(public_tx_analysis_share))
         .route("/app/cluster-graph", get(cluster_graph_page))
         .route("/app/indexer/progress", get(indexer_progress_page))
         .route("/app/indexer/address-lookup", get(indexer_lookup_page))
@@ -1520,6 +1538,92 @@ async fn run_tx_analysis(
     }
 }
 
+async fn create_tx_analysis_share(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<ShareTxForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let tx_hash = form.tx_hash.trim().to_ascii_lowercase();
+    if !tx_hash.starts_with("0x") {
+        return Err(WebError::bad_request("invalid tx hash".to_owned()));
+    }
+    let payload = api_get_json::<AnalysisEnvelope>(
+        &state,
+        &format!("/analyses/{}?chain_id={}", tx_hash, form.chain_id),
+    )
+    .await?;
+    let snapshot = serde_json::to_value(&payload)
+        .map_err(|err| WebError::internal(format!("share snapshot encode failed: {err}")))?;
+    let (activity, reason, confidence) = summarize_primary_activity(&payload.analysis);
+    let title = format!("{} transaction {}", activity, truncate_middle(&tx_hash, 10));
+    let summary = format!("{reason} Confidence: {confidence}.");
+    let share_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        insert into tx_analysis_shares (
+          share_id, chain_id, tx_hash, title, summary, analysis_snapshot, created_by
+        )
+        values ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(share_id)
+    .bind(form.chain_id as i64)
+    .bind(&tx_hash)
+    .bind(&title)
+    .bind(&summary)
+    .bind(SqlJson(snapshot))
+    .bind(user.user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("create share failed: {err}")))?;
+
+    Ok(Redirect::to(&format!("/share/tx/{share_id}")).into_response())
+}
+
+async fn public_tx_analysis_share(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(share_id): Path<Uuid>,
+) -> Result<Html<String>, WebError> {
+    let user = current_user(&state, &headers).await?;
+    let share = load_tx_analysis_share(&state, share_id).await?;
+    let share_url = format!(
+        "{}/share/tx/{}",
+        state.web_base_url.trim_end_matches('/'),
+        share.share_id
+    );
+    let content = format!(
+        r#"
+<section class="panel public-share-panel">
+  <div class="panel-head">
+    <div>
+      <span class="eyebrow">Public transaction analysis</span>
+      <h1>{}</h1>
+    </div>
+    <a class="cta ghost" href="/app/tx-analysis">Analyze another tx</a>
+  </div>
+  <div class="panel-body">
+    <p class="panel-copy">{}</p>
+    <div class="field-hint">Share URL <code>{}</code></div>
+    {}
+  </div>
+</section>
+"#,
+        escape_html(&share.title),
+        escape_html(&share.summary),
+        escape_html(&share_url),
+        render_tx_analysis_result_with_share(&share.snapshot, false)
+    );
+    Ok(Html(render_marketing_page(
+        &format!("LedgerFlow share {}", share.share_id),
+        user.as_ref(),
+        content,
+    )))
+}
+
 async fn render_dashboard_response(
     state: &WebState,
     user: AppUser,
@@ -1823,6 +1927,47 @@ async fn current_user(state: &WebState, headers: &HeaderMap) -> Result<Option<Ap
         return Ok(None);
     };
     Ok(state.auth_service.get_user_by_session_token(&token).await?)
+}
+
+async fn load_tx_analysis_share(
+    state: &WebState,
+    share_id: Uuid,
+) -> Result<TxAnalysisShareRecord, WebError> {
+    let row = sqlx::query(
+        r#"
+        select share_id, title, summary, analysis_snapshot
+        from tx_analysis_shares
+        where share_id = $1
+          and revoked_at is null
+          and (expires_at is null or expires_at > now())
+        "#,
+    )
+    .bind(share_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load share failed: {err}")))?;
+
+    let Some(row) = row else {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "share link not found".to_owned(),
+        });
+    };
+    Ok(TxAnalysisShareRecord {
+        share_id: row
+            .try_get("share_id")
+            .map_err(|err| WebError::internal(format!("decode share id failed: {err}")))?,
+        title: row
+            .try_get("title")
+            .map_err(|err| WebError::internal(format!("decode share title failed: {err}")))?,
+        summary: row
+            .try_get("summary")
+            .map_err(|err| WebError::internal(format!("decode share summary failed: {err}")))?,
+        snapshot: row
+            .try_get::<SqlJson<serde_json::Value>, _>("analysis_snapshot")
+            .map_err(|err| WebError::internal(format!("decode share snapshot failed: {err}")))?
+            .0,
+    })
 }
 
 fn parse_cluster_addresses(raw: &str) -> LedgerResult<Vec<ClusterAddressInput>> {
@@ -2956,6 +3101,13 @@ fn summarize_primary_activity(analysis: &TransactionAnalysis) -> (String, String
 }
 
 fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
+    render_tx_analysis_result_with_share(payload, true)
+}
+
+fn render_tx_analysis_result_with_share(
+    payload: &serde_json::Value,
+    show_share_action: bool,
+) -> String {
     let raw_json = serde_json::to_string_pretty(payload).unwrap_or_default();
     let Ok(envelope) = serde_json::from_value::<AnalysisEnvelope>(payload.clone()) else {
         return format!(
@@ -2964,6 +3116,19 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
         );
     };
     let analysis = &envelope.analysis;
+    let share_action = if show_share_action {
+        format!(
+            r#"<form class="inline-action-form" method="post" action="/app/tx-analysis/share">
+  <input type="hidden" name="chain_id" value="{}">
+  <input type="hidden" name="tx_hash" value="{}">
+  <button class="cta ghost tiny" type="submit">Create public share link</button>
+</form>"#,
+            analysis.chain_id,
+            escape_html(&analysis.tx_hash)
+        )
+    } else {
+        String::new()
+    };
     let (primary_activity, primary_activity_reason, primary_confidence) =
         summarize_primary_activity(analysis);
     let recognizer_rows = if analysis.recognizer_results.is_empty() {
@@ -3121,6 +3286,7 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
     <strong>Most likely activity: {}</strong>
     <span>{}</span>
     <small>Confidence: {}</small>
+    {}
   </div>
   <div class="field-hint">Tx <code>{}</code> · status {} · analysis {}.</div>
   <div class="field-hint">Selector <code>{}</code> · {} recognizers · {} derived flows.</div>
@@ -3148,6 +3314,7 @@ fn render_tx_analysis_result(payload: &serde_json::Value) -> String {
         escape_html(&primary_activity),
         escape_html(&primary_activity_reason),
         escape_html(&primary_confidence),
+        share_action,
         escape_html(&truncate_middle(&analysis.tx_hash, 12)),
         escape_html(&enum_label(&analysis.status)),
         escape_html(&enum_label(&analysis.analysis_status)),

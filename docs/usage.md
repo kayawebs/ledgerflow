@@ -302,7 +302,7 @@ Useful notes:
 
 ## Trace net-delta monitor
 
-Run the trace monitor when you want automatic "who ended up with more assets" detection instead of top-level transfer monitoring:
+Run the monitor when you want automatic "who ended up with more assets" detection. By default this is a low-cost receipt/log scanner: it stores ERC20 transfer-log deltas and top-level native value deltas, then leaves transaction explanation to the analysis API.
 
 ```bash
 cargo run --bin ledgerflow_trace_monitor
@@ -324,7 +324,7 @@ curl "http://127.0.0.1:3010/top-address-deltas?start=2026-05-12T00:00:00Z&end=20
 
 The response is intentionally small. Each item contains the address, asset type, token address, raw `in / out / net` amounts, tx count, and up to 50 contributing tx hashes. It does not return full tx payloads; pass the tx hashes to the analysis API when you want interpretation.
 
-The monitor uses a two-stage pipeline. It first fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. It then runs `debug_traceTransaction` only for cluster-related transactions and the largest non-cluster candidates per block, so internal native movement is enriched without tracing the entire chain.
+The monitor fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. This keeps the monitor focused on detection rather than explanation.
 
 | Table | Purpose |
 | --- | --- |
@@ -333,14 +333,7 @@ The monitor uses a two-stage pipeline. It first fetches each transaction and rec
 
 The default retention is 7 days. It is configured by `LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS`.
 
-Candidate tracing is controlled by:
-
-| Env | Meaning | Default |
-| --- | --- | --- |
-| `LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATES_ENABLED` | Whether to enrich candidates with `debug_traceTransaction` | `true` |
-| `LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATE_LIMIT_PER_BLOCK` | Maximum non-cluster candidate transactions to trace per block | `5` |
-
-Cluster-related transactions are always candidates when candidate tracing is enabled. Keep `LEDGERFLOW_TRACE_MONITOR_TRACE_CANDIDATE_LIMIT_PER_BLOCK` low at first because trace RPC CPU is the bottleneck, not this process' memory.
+The monitor intentionally does not call trace RPC. When you need transaction interpretation or internal native movement, pass the returned tx hashes to the transaction analysis API.
 
 ## Check cluster coverage
 

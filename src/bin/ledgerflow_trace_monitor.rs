@@ -32,16 +32,13 @@ async fn main() {
         .await
         .expect("migrations should succeed");
 
-    let light_rpc_client = Arc::new(HttpRpcClient::new(config.rpc_url.clone()));
-    let trace_rpc_client = Arc::new(HttpRpcClient::new(config.rpc_url.clone()));
+    let rpc_client = Arc::new(HttpRpcClient::new(config.rpc_url.clone()));
     let block_rpc = Arc::new(IndexerRpcClient::new(config.rpc_url.clone()));
-    let light_fetcher = TransactionBundleFetcher::new(light_rpc_client, false);
-    let trace_fetcher = TransactionBundleFetcher::new(trace_rpc_client, true);
+    let fetcher = TransactionBundleFetcher::new(rpc_client, false);
     let service = TraceMonitorService::new(
         repository,
         block_rpc,
-        light_fetcher,
-        trace_fetcher,
+        fetcher,
         TraceMonitorConfig {
             chain_id: config.default_chain_id,
             worker_id: config.trace_monitor_worker_id.clone(),
@@ -49,8 +46,6 @@ async fn main() {
             confirmations: config.trace_monitor_confirmations,
             block_batch_size: config.trace_monitor_block_batch_size,
             retention_days: config.trace_monitor_retention_days,
-            trace_candidates_enabled: config.trace_monitor_trace_candidates_enabled,
-            trace_candidate_limit_per_block: config.trace_monitor_trace_candidate_limit_per_block,
         },
     );
     let service = Arc::new(service);
@@ -64,8 +59,6 @@ async fn main() {
         poll_interval_ms = poll_interval.as_millis(),
         block_batch_size = config.trace_monitor_block_batch_size,
         retention_days = config.trace_monitor_retention_days,
-        trace_candidates_enabled = config.trace_monitor_trace_candidates_enabled,
-        trace_candidate_limit_per_block = config.trace_monitor_trace_candidate_limit_per_block,
         "trace monitor started"
     );
 
@@ -94,7 +87,6 @@ async fn main() {
                     end_block = ?iteration.end_block,
                     processed_blocks = iteration.processed_blocks,
                     processed_txs = iteration.processed_txs,
-                    traced_txs = iteration.traced_txs,
                     failed_txs = iteration.failed_txs,
                     address_delta_rows = iteration.address_delta_rows,
                     cluster_delta_rows = iteration.cluster_delta_rows,
