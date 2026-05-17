@@ -18,9 +18,9 @@ use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{
         entities::{
-            AddressCluster, AppUser, ClassifiedTransaction, ClusterAlert,
-            ClusterCoverage, ClusterMetricsSnapshot, ClusterSpendSummary, ClusterTrackingState,
-            EvidencePack, TransactionAnalysis,
+            AddressCluster, AddressLabel, AddressProfile, AppUser, ClassifiedTransaction,
+            ClusterAlert, ClusterCoverage, ClusterMetricsSnapshot, ClusterSpendSummary,
+            ClusterTrackingState, EvidencePack, TransactionAnalysis,
         },
         enums::{AddressHitDirection, ClusterBackfillStatus, VerificationPurpose},
     },
@@ -304,6 +304,14 @@ struct ShareTxForm {
 struct AnalysisEnvelope {
     analysis: TransactionAnalysis,
     evidence_pack: EvidencePack,
+    #[serde(default)]
+    address_intelligence: AddressIntelligenceEnvelope,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct AddressIntelligenceEnvelope {
+    profiles: Vec<AddressProfile>,
+    labels: Vec<AddressLabel>,
 }
 
 #[derive(Debug)]
@@ -3306,6 +3314,7 @@ fn render_tx_analysis_result_with_share_url(
     );
     let meta_strip = render_tx_report_meta_strip(analysis, share_url.is_some());
     let utilities = render_tx_utilities_panel(analysis, &share_action, share_url);
+    let address_intelligence = render_address_intelligence_panel(&envelope.address_intelligence);
 
     format!(
         r#"<div class="tx-analysis-shell">
@@ -3314,9 +3323,10 @@ fn render_tx_analysis_result_with_share_url(
   {}
   {}
   {}
+  {}
   <section class="tx-section-card technical-evidence-panel">
     <div class="tx-section-title">
-      <span class="tx-section-index">6</span>
+      <span class="tx-section-index">7</span>
       <h2>Technical Evidence</h2>
       <span class="badge">Collapsed by default</span>
     </div>
@@ -3346,6 +3356,7 @@ fn render_tx_analysis_result_with_share_url(
         report_hero,
         storyline_panel,
         utilities,
+        address_intelligence,
         render_storyline_gap_explanation(&analysis.scenario_outputs)
             .map(|message| format!(r#"<div class="notice info">{}</div>"#, escape_html(&message)))
             .unwrap_or_default(),
@@ -3476,6 +3487,95 @@ fn render_tx_utilities_panel(
         render_copyable_code(&analysis.from_address, 10),
         render_copyable_code(token_contract, 10),
         share_card,
+    )
+}
+
+fn render_address_intelligence_panel(intelligence: &AddressIntelligenceEnvelope) -> String {
+    let mut labels_by_address = std::collections::BTreeMap::<String, Vec<&AddressLabel>>::new();
+    for label in &intelligence.labels {
+        labels_by_address
+            .entry(label.address.to_ascii_lowercase())
+            .or_default()
+            .push(label);
+    }
+
+    let rows = if intelligence.profiles.is_empty() {
+        "<tr><td colspan=\"5\">No address profile has been materialized yet. The address worker will fill this after it claims the queued addresses from recent analyses.</td></tr>"
+            .to_owned()
+    } else {
+        intelligence
+            .profiles
+            .iter()
+            .take(40)
+            .map(|profile| {
+                let labels = labels_by_address
+                    .get(&profile.address.to_ascii_lowercase())
+                    .map(|labels| {
+                        labels
+                            .iter()
+                            .take(6)
+                            .map(|label| {
+                                format!(
+                                    r#"<span class="address-label-chip">{}</span>"#,
+                                    escape_html(&label.label)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "<span class=\"muted\">unlabeled</span>".to_owned());
+                let analyzed_at = profile
+                    .last_analyzed_at
+                    .map(|value| value.to_rfc3339().replace('T', " ").replace('Z', " UTC"))
+                    .unwrap_or_else(|| "pending".to_owned());
+                let code_size = profile
+                    .bytecode_length
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "0".to_owned());
+                format!(
+                    r#"<tr>
+  <td>{}</td>
+  <td><span class="address-type-pill">{}</span></td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+</tr>"#,
+                    render_copyable_code(&profile.address, 10),
+                    escape_html(&profile.address_type),
+                    labels,
+                    escape_html(&code_size),
+                    escape_html(&analyzed_at),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    format!(
+        r#"<section class="tx-section-card compact-section address-intelligence-panel">
+  <div class="tx-section-title">
+    <span class="tx-section-index">6</span>
+    <h2>Address Intelligence</h2>
+    <span class="badge">Profiles and labels</span>
+  </div>
+  <p class="panel-copy">Addresses discovered during tx analysis are queued for a background profile pass. This table shows the profiles already materialized for this transaction.</p>
+  <div class="table-shell compact-table-shell">
+    <table class="compact-table">
+      <thead>
+        <tr>
+          <th>Address</th>
+          <th>Type</th>
+          <th>Labels</th>
+          <th>Code bytes</th>
+          <th>Analyzed at</th>
+        </tr>
+      </thead>
+      <tbody>{}</tbody>
+    </table>
+  </div>
+</section>"#,
+        rows
     )
 }
 
@@ -5905,6 +6005,8 @@ textarea { min-height: 140px; resize: vertical; }
 .compact-section { padding-top: 8px; }
 .compact-table-shell { margin-top: 4px; }
 .compact-table td, .compact-table th { padding: 6px 8px; }
+.address-label-chip, .address-type-pill { display: inline-flex; align-items: center; width: fit-content; margin: 2px 4px 2px 0; padding: 3px 7px; border: 1px solid var(--line); border-radius: 999px; background: #fff; color: var(--muted); font-size: .75rem; line-height: 1.2; }
+.address-type-pill { color: var(--accent); border-color: rgba(13,110,99,.2); background: rgba(13,110,99,.06); }
 .amount-stack { display: grid; gap: 2px; }
 .amount-stack strong { font-size: .96rem; line-height: 1.25; }
 .amount-stack small { color: var(--muted); line-height: 1.3; }

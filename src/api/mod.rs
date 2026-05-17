@@ -12,8 +12,9 @@ use uuid::Uuid;
 
 use crate::core::errors::LedgerError;
 use crate::domain::entities::{
-    AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterAlert,
-    ClusterMetricsSnapshot, ClusterSpendSummary, ClusterTrackingState,
+    AddressCluster, AddressLabel, AddressProfile, ClassifiedTransaction, ClusterAddress,
+    ClusterAlert, ClusterMetricsSnapshot, ClusterSpendSummary, ClusterTrackingState,
+    TransactionAnalysis,
 };
 use crate::plugins::loader::PluginManifest;
 use crate::services::analysis::AnalysisService;
@@ -101,6 +102,13 @@ pub struct ClusterBackfillRequest {
 pub struct AnalysisEnvelope {
     pub analysis: crate::domain::entities::TransactionAnalysis,
     pub evidence_pack: crate::domain::entities::EvidencePack,
+    pub address_intelligence: AddressIntelligenceEnvelope,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddressIntelligenceEnvelope {
+    pub profiles: Vec<AddressProfile>,
+    pub labels: Vec<AddressLabel>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +131,12 @@ pub struct ClusterDiscoveryQuery {
     pub max_hops: Option<u8>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AddressIntelligenceQuery {
+    pub chain_id: Option<u64>,
+    pub addresses: String,
+}
+
 pub fn router(
     service: Arc<AnalysisService>,
     backfill_service: Arc<ClusterBackfillService>,
@@ -139,6 +153,7 @@ pub fn router(
         .route("/analyses/{tx_hash}", get(get_analysis))
         .route("/evidence-packs/{pack_id}", get(get_evidence_pack))
         .route("/recognizers", get(list_recognizers))
+        .route("/addresses/intelligence", get(get_address_intelligence))
         .route("/replay/tx", post(replay_tx))
         .route("/discovery/cluster", get(discover_cluster))
         .route("/clusters", post(create_cluster))
@@ -199,10 +214,7 @@ async fn analyze_tx(
         .analyze_transaction(request.chain_id, &request.tx_hash)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(AnalysisEnvelope {
-        analysis,
-        evidence_pack,
-    }))
+    Ok(Json(build_analysis_envelope(&state, analysis, evidence_pack).await?))
 }
 
 async fn get_analysis(
@@ -221,10 +233,7 @@ async fn get_analysis(
         .get_evidence_pack_by_tx(chain_id, &tx_hash)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(AnalysisEnvelope {
-        analysis,
-        evidence_pack,
-    }))
+    Ok(Json(build_analysis_envelope(&state, analysis, evidence_pack).await?))
 }
 
 async fn get_evidence_pack(
@@ -245,6 +254,33 @@ async fn list_recognizers(State(state): State<ApiState>) -> Json<RecognizersResp
         enabled: state.service.enabled_recognizers.clone(),
         plugins: state.service.plugin_context.manifests.clone(),
     })
+}
+
+async fn get_address_intelligence(
+    State(state): State<ApiState>,
+    Query(query): Query<AddressIntelligenceQuery>,
+) -> Result<Json<AddressIntelligenceEnvelope>, ApiError> {
+    let chain_id = query.chain_id.unwrap_or(8453);
+    let addresses = query
+        .addresses
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let profiles = state
+        .service
+        .repository
+        .list_address_profiles(chain_id, &addresses)
+        .await
+        .map_err(ApiError::from)?;
+    let labels = state
+        .service
+        .repository
+        .list_address_labels(chain_id, &addresses)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(AddressIntelligenceEnvelope { profiles, labels }))
 }
 
 async fn replay_tx(
@@ -286,10 +322,63 @@ async fn replay_tx(
         )
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(AnalysisEnvelope {
+    Ok(Json(build_analysis_envelope(&state, analysis, evidence_pack).await?))
+}
+
+async fn build_analysis_envelope(
+    state: &ApiState,
+    analysis: TransactionAnalysis,
+    evidence_pack: crate::domain::entities::EvidencePack,
+) -> Result<AnalysisEnvelope, ApiError> {
+    let addresses = collect_analysis_addresses(&analysis);
+    let profiles = state
+        .service
+        .repository
+        .list_address_profiles(analysis.chain_id, &addresses)
+        .await
+        .map_err(ApiError::from)?;
+    let labels = state
+        .service
+        .repository
+        .list_address_labels(analysis.chain_id, &addresses)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(AnalysisEnvelope {
         analysis,
         evidence_pack,
-    }))
+        address_intelligence: AddressIntelligenceEnvelope { profiles, labels },
+    })
+}
+
+fn collect_analysis_addresses(analysis: &TransactionAnalysis) -> Vec<String> {
+    let mut addresses = std::collections::BTreeSet::new();
+    insert_analysis_address(&mut addresses, &analysis.from_address);
+    if let Some(address) = analysis.to_address.as_deref() {
+        insert_analysis_address(&mut addresses, address);
+    }
+    for address in &analysis.normalized_execution_facts.participants {
+        insert_analysis_address(&mut addresses, address);
+    }
+    for log in &analysis.normalized_execution_facts.log_summaries {
+        if let Some(address) = log.get("address").and_then(|value| value.as_str()) {
+            insert_analysis_address(&mut addresses, address);
+        }
+    }
+    for flow in &analysis.derived_flows {
+        insert_analysis_address(&mut addresses, &flow.from_address);
+        insert_analysis_address(&mut addresses, &flow.to_address);
+        if let Some(address) = flow.token_address.as_deref() {
+            insert_analysis_address(&mut addresses, address);
+        }
+    }
+    addresses.into_iter().collect()
+}
+
+fn insert_analysis_address(addresses: &mut std::collections::BTreeSet<String>, address: &str) {
+    let address = address.trim().to_ascii_lowercase();
+    if address.len() == 42 && address.starts_with("0x") {
+        addresses.insert(address);
+    }
 }
 
 async fn discover_cluster(
