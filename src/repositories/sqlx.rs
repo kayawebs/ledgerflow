@@ -1221,19 +1221,30 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                   priority = least(address_analysis_jobs.priority, excluded.priority),
                   status = case
                     when address_analysis_jobs.status = 'failed' then 'pending'
+                    when address_analysis_jobs.status = 'completed'
+                      and excluded.metadata->>'source' in ('address_summary', 'address_analysis_page') then 'pending'
                     else address_analysis_jobs.status
                   end,
                   last_error = case
-                    when address_analysis_jobs.status = 'failed' then null
+                    when address_analysis_jobs.status = 'failed'
+                      or (
+                        address_analysis_jobs.status = 'completed'
+                        and excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                      ) then null
                     else address_analysis_jobs.last_error
                   end,
                   available_at = case
-                    when address_analysis_jobs.status = 'failed' then now()
+                    when address_analysis_jobs.status = 'failed'
+                      or (
+                        address_analysis_jobs.status = 'completed'
+                        and excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                      ) then now()
                     else address_analysis_jobs.available_at
                   end,
                   metadata = address_analysis_jobs.metadata || excluded.metadata,
                   updated_at = now()
                 where address_analysis_jobs.status <> 'completed'
+                  or excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
                 "#,
             )
             .bind(chain_id as i64)

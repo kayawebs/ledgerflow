@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -8,15 +8,20 @@ use crate::{
     core::errors::LedgerResult,
     domain::{
         entities::{AddressAnalysisJob, AddressLabel, AddressProfile},
-        interfaces::DynRepository,
+        interfaces::{ClusterTxSource, DynRepository},
+        value_objects::AddressTxRef,
     },
     ingestion::rpc::RpcClient,
+    services::analysis::AnalysisService,
 };
 
 #[derive(Clone)]
 pub struct AddressIntelligenceService {
     repository: DynRepository,
     rpc_client: Arc<dyn RpcClient>,
+    analysis_service: Option<Arc<AnalysisService>>,
+    tx_source: Option<Arc<dyn ClusterTxSource>>,
+    history_query_limit: u32,
 }
 
 impl AddressIntelligenceService {
@@ -24,7 +29,22 @@ impl AddressIntelligenceService {
         Self {
             repository,
             rpc_client,
+            analysis_service: None,
+            tx_source: None,
+            history_query_limit: 1000,
         }
+    }
+
+    pub fn with_history_backfill(
+        mut self,
+        analysis_service: Arc<AnalysisService>,
+        tx_source: Arc<dyn ClusterTxSource>,
+        query_limit: u32,
+    ) -> Self {
+        self.analysis_service = Some(analysis_service);
+        self.tx_source = Some(tx_source);
+        self.history_query_limit = query_limit.max(1);
+        self
     }
 
     pub async fn process_next_job(&self) -> LedgerResult<Option<AddressProfile>> {
@@ -36,6 +56,7 @@ impl AddressIntelligenceService {
             Ok((profile, labels)) => {
                 self.repository.upsert_address_profile(&profile).await?;
                 self.repository.upsert_address_labels(&labels).await?;
+                self.backfill_address_history(&job).await?;
                 self.repository
                     .complete_address_analysis_job(job.chain_id, &job.address)
                     .await?;
@@ -136,6 +157,111 @@ impl AddressIntelligenceService {
         }
         Ok((profile, labels))
     }
+
+    async fn backfill_address_history(&self, job: &AddressAnalysisJob) -> LedgerResult<()> {
+        if !should_backfill_history(&job.metadata) {
+            return Ok(());
+        }
+        let (Some(analysis_service), Some(tx_source)) =
+            (self.analysis_service.as_ref(), self.tx_source.as_ref())
+        else {
+            return Ok(());
+        };
+        let end_block = tx_source.get_last_indexed_block(job.chain_id).await?;
+        let mut tx_map = BTreeMap::<String, AddressTxRef>::new();
+        collect_refs_for_range(
+            tx_source.as_ref(),
+            job.chain_id,
+            &job.address,
+            0,
+            end_block,
+            self.history_query_limit,
+            &mut tx_map,
+        )
+        .await?;
+
+        let mut txs = tx_map.into_values().collect::<Vec<_>>();
+        txs.sort_by(|left, right| {
+            (left.block_number, left.tx_index, left.tx_hash.as_str()).cmp(&(
+                right.block_number,
+                right.tx_index,
+                right.tx_hash.as_str(),
+            ))
+        });
+        for tx_ref in txs {
+            if self
+                .repository
+                .get_analysis(job.chain_id, &tx_ref.tx_hash)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            if analysis_service
+                .analyze_transaction(job.chain_id, &tx_ref.tx_hash)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn collect_refs_for_range(
+    tx_source: &dyn ClusterTxSource,
+    chain_id: u64,
+    address: &str,
+    start_block: u64,
+    end_block: u64,
+    query_limit: u32,
+    tx_map: &mut BTreeMap<String, AddressTxRef>,
+) -> LedgerResult<()> {
+    let mut ranges = vec![(start_block, end_block)];
+    while let Some((range_start, range_end)) = ranges.pop() {
+        let refs = tx_source
+            .query_address_refs(
+                chain_id,
+                address,
+                query_limit,
+                Some(range_start),
+                Some(range_end),
+            )
+            .await?;
+
+        if refs.len() as u32 >= query_limit && range_start < range_end {
+            let mid = range_start + ((range_end - range_start) / 2);
+            ranges.push((mid.saturating_add(1), range_end));
+            ranges.push((range_start, mid));
+            continue;
+        }
+
+        for item in refs {
+            tx_map
+                .entry(item.tx_hash.clone())
+                .and_modify(|existing| {
+                    if (item.block_number, item.tx_index)
+                        < (existing.block_number, existing.tx_index)
+                    {
+                        *existing = item.clone();
+                    }
+                })
+                .or_insert(item);
+        }
+    }
+    Ok(())
+}
+
+fn should_backfill_history(metadata: &Value) -> bool {
+    metadata
+        .get("source")
+        .and_then(|value| value.as_str())
+        .map(|value| matches!(value, "address_summary" | "address_analysis_page"))
+        .unwrap_or(false)
+        || role_labels_from_metadata(metadata)
+            .iter()
+            .any(|role| role == "manual_lookup")
 }
 
 struct KnownAddressLabel {

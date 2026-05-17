@@ -57,7 +57,7 @@ async fn main() {
     });
     let discovery_service = tx_source
         .clone()
-        .map(|source| Arc::new(ClusterDiscoveryService::new(source, rpc_client)));
+        .map(|source| Arc::new(ClusterDiscoveryService::new(source, rpc_client.clone())));
     let backfill_service = Arc::new(ClusterBackfillService::new(
         Arc::clone(&service),
         tx_source,
@@ -74,6 +74,7 @@ async fn main() {
             service,
             backfill_service,
             discovery_service,
+            rpc_client,
             config.cluster_auto_backfill_on_create,
         ),
     )

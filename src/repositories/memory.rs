@@ -559,14 +559,22 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
         for candidate in candidates {
             let address = candidate.address.to_ascii_lowercase();
             let key = (chain_id, address.clone());
+            let manual_lookup = candidate
+                .metadata
+                .get("source")
+                .and_then(|value| value.as_str())
+                .map(|value| matches!(value, "address_summary" | "address_analysis_page"))
+                .unwrap_or(false);
             match jobs.get_mut(&key) {
-                Some(existing) if existing.status != "completed" => {
+                Some(existing) if existing.status != "completed" || manual_lookup => {
                     existing.last_seen_at = now;
                     existing.updated_at = now;
                     existing.priority = existing.priority.min(candidate.priority);
                     existing.metadata =
                         merge_json(existing.metadata.clone(), candidate.metadata.clone());
-                    if existing.status == "failed" {
+                    if existing.status == "failed"
+                        || (existing.status == "completed" && manual_lookup)
+                    {
                         existing.status = "pending".to_owned();
                         existing.available_at = now;
                         existing.last_error = None;

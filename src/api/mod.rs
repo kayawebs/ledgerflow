@@ -12,10 +12,11 @@ use uuid::Uuid;
 
 use crate::core::errors::LedgerError;
 use crate::domain::entities::{
-    AddressCluster, AddressLabel, AddressProfile, ClassifiedTransaction, ClusterAddress,
-    ClusterAlert, ClusterMetricsSnapshot, ClusterSpendSummary, ClusterTrackingState,
-    TransactionAnalysis,
+    AddressAnalysisCandidate, AddressCluster, AddressLabel, AddressProfile, ClassifiedTransaction,
+    ClusterAddress, ClusterAlert, ClusterMetricsSnapshot, ClusterSpendSummary,
+    ClusterTrackingState, TransactionAnalysis,
 };
+use crate::ingestion::rpc::RpcClient;
 use crate::plugins::loader::PluginManifest;
 use crate::services::analysis::AnalysisService;
 use crate::services::alerts::ClusterAlertService;
@@ -33,6 +34,7 @@ pub struct ApiState {
     pub service: Arc<AnalysisService>,
     pub cluster_service: Arc<ClusterService>,
     pub backfill_service: Arc<ClusterBackfillService>,
+    pub rpc_client: Arc<dyn RpcClient>,
     pub tracking_service: Arc<ClusterTrackingService>,
     pub metrics_service: Arc<ClusterMetricsService>,
     pub alert_service: Arc<ClusterAlertService>,
@@ -111,6 +113,47 @@ pub struct AddressIntelligenceEnvelope {
     pub labels: Vec<AddressLabel>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AddressSummaryQuery {
+    pub chain_id: Option<u64>,
+    pub address: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EnqueueAddressIntelligenceRequest {
+    pub chain_id: u64,
+    pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddressSummaryEnvelope {
+    pub chain_id: u64,
+    pub address: String,
+    pub native_balance_raw: Option<String>,
+    pub profile: Option<AddressProfile>,
+    pub labels: Vec<AddressLabel>,
+    pub analyzed_tx_count: u64,
+    pub gas_spent_raw: String,
+    pub behavior_rows: Vec<AddressBehaviorSummaryRow>,
+    pub recent_txs: Vec<AddressRecentTxRow>,
+    pub queued: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddressBehaviorSummaryRow {
+    pub behavior: String,
+    pub tx_count: u64,
+    pub gas_spent_raw: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddressRecentTxRow {
+    pub tx_hash: String,
+    pub block_timestamp: Option<String>,
+    pub behavior: String,
+    pub gas_raw: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RecognizersResponse {
     pub recognizers: Vec<crate::recognition::registry::RecognizerMetadata>,
@@ -141,6 +184,7 @@ pub fn router(
     service: Arc<AnalysisService>,
     backfill_service: Arc<ClusterBackfillService>,
     discovery_service: Option<Arc<ClusterDiscoveryService>>,
+    rpc_client: Arc<dyn RpcClient>,
     auto_backfill_on_cluster_create: bool,
 ) -> Router {
     let cluster_service = Arc::new(ClusterService::new(service.repository.clone()));
@@ -154,6 +198,8 @@ pub fn router(
         .route("/evidence-packs/{pack_id}", get(get_evidence_pack))
         .route("/recognizers", get(list_recognizers))
         .route("/addresses/intelligence", get(get_address_intelligence))
+        .route("/addresses/intelligence/enqueue", post(enqueue_address_intelligence))
+        .route("/addresses/summary", get(get_address_summary))
         .route("/replay/tx", post(replay_tx))
         .route("/discovery/cluster", get(discover_cluster))
         .route("/clusters", post(create_cluster))
@@ -193,6 +239,7 @@ pub fn router(
             service,
             cluster_service,
             backfill_service,
+            rpc_client,
             tracking_service,
             metrics_service,
             alert_service,
@@ -281,6 +328,123 @@ async fn get_address_intelligence(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(AddressIntelligenceEnvelope { profiles, labels }))
+}
+
+async fn enqueue_address_intelligence(
+    State(state): State<ApiState>,
+    Json(request): Json<EnqueueAddressIntelligenceRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let candidates = request
+        .addresses
+        .into_iter()
+        .filter_map(|address| normalize_address(&address))
+        .map(|address| AddressAnalysisCandidate {
+            address,
+            priority: 30,
+            metadata: json!({ "source": "address_analysis_page", "roles": ["manual_lookup"] }),
+        })
+        .collect::<Vec<_>>();
+    let queued = state
+        .service
+        .repository
+        .enqueue_address_analysis_candidates(request.chain_id, &candidates)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "queued": queued })))
+}
+
+async fn get_address_summary(
+    State(state): State<ApiState>,
+    Query(query): Query<AddressSummaryQuery>,
+) -> Result<Json<AddressSummaryEnvelope>, ApiError> {
+    let chain_id = query.chain_id.unwrap_or(8453);
+    let address = normalize_address(&query.address)
+        .ok_or_else(|| ApiError::bad_request("invalid address".to_owned()))?;
+    let addresses = vec![address.clone()];
+    let profiles = state
+        .service
+        .repository
+        .list_address_profiles(chain_id, &addresses)
+        .await
+        .map_err(ApiError::from)?;
+    let labels = state
+        .service
+        .repository
+        .list_address_labels(chain_id, &addresses)
+        .await
+        .map_err(ApiError::from)?;
+    let native_balance_raw = state
+        .rpc_client
+        .get_balance(chain_id, &address, None)
+        .await
+        .ok()
+        .and_then(|value| hex_quantity_to_decimal(&value));
+    let analyses = state
+        .service
+        .repository
+        .list_analyses_for_cluster(chain_id, &addresses, None, None)
+        .await
+        .map_err(ApiError::from)?;
+    let queued = if profiles.is_empty() || analyses.is_empty() {
+        state
+            .service
+            .repository
+            .enqueue_address_analysis_candidates(
+                chain_id,
+                &[AddressAnalysisCandidate {
+                    address: address.clone(),
+                    priority: 25,
+                    metadata: json!({ "source": "address_summary", "roles": ["manual_lookup"] }),
+                }],
+            )
+            .await
+            .map_err(ApiError::from)?
+            > 0
+    } else {
+        false
+    };
+    let mut behavior = std::collections::BTreeMap::<String, (u64, i128)>::new();
+    let mut gas_total = 0i128;
+    let mut recent = analyses.clone();
+    recent.sort_by(|left, right| right.block_timestamp.cmp(&left.block_timestamp));
+    for analysis in &analyses {
+        let gas = analysis_gas_raw(analysis);
+        gas_total += gas;
+        let kind = analysis_kind(analysis);
+        let entry = behavior.entry(kind).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += gas;
+    }
+    let behavior_rows = behavior
+        .into_iter()
+        .map(|(behavior, (tx_count, gas))| AddressBehaviorSummaryRow {
+            behavior,
+            tx_count,
+            gas_spent_raw: gas.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let recent_txs = recent
+        .into_iter()
+        .take(25)
+        .map(|analysis| AddressRecentTxRow {
+            tx_hash: analysis.tx_hash.clone(),
+            block_timestamp: analysis.block_timestamp.map(|value| value.to_rfc3339()),
+            behavior: analysis_kind(&analysis),
+            gas_raw: analysis_gas_raw(&analysis).to_string(),
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(AddressSummaryEnvelope {
+        chain_id,
+        address,
+        native_balance_raw,
+        profile: profiles.into_iter().next(),
+        labels,
+        analyzed_tx_count: analyses.len() as u64,
+        gas_spent_raw: gas_total.to_string(),
+        behavior_rows,
+        recent_txs,
+        queued,
+    }))
 }
 
 async fn replay_tx(
@@ -379,6 +543,48 @@ fn insert_analysis_address(addresses: &mut std::collections::BTreeSet<String>, a
     if address.len() == 42 && address.starts_with("0x") {
         addresses.insert(address);
     }
+}
+
+fn normalize_address(address: &str) -> Option<String> {
+    let address = address.trim().to_ascii_lowercase();
+    if address.len() == 42 && address.starts_with("0x") {
+        Some(address)
+    } else {
+        None
+    }
+}
+
+fn hex_quantity_to_decimal(value: &str) -> Option<String> {
+    let hex = value.trim().strip_prefix("0x").unwrap_or(value.trim());
+    u128::from_str_radix(hex, 16).ok().map(|value| value.to_string())
+}
+
+fn analysis_kind(analysis: &TransactionAnalysis) -> String {
+    analysis
+        .scenario_outputs
+        .get("storyline")
+        .and_then(|value| value.get("kind"))
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            analysis
+                .recognizer_results
+                .first()
+                .map(|value| value.label.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn analysis_gas_raw(analysis: &TransactionAnalysis) -> i128 {
+    analysis
+        .scenario_outputs
+        .get("storyline")
+        .and_then(|value| value.get("net_effect"))
+        .and_then(|value| value.get("gas"))
+        .and_then(|value| value.get("amount_raw"))
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<i128>().ok())
+        .unwrap_or(0)
 }
 
 async fn discover_cluster(
@@ -747,6 +953,13 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    fn bad_request(message: String) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message,
+        }
+    }
+
     fn conflict(message: String) -> Self {
         Self {
             status: StatusCode::CONFLICT,

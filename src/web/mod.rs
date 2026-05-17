@@ -209,6 +209,12 @@ struct IndexerLookupQuery {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+struct AddressAnalysisQuery {
+    address: Option<String>,
+    chain_id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 struct PageNoticeQuery {
     notice: Option<String>,
     created_key: Option<String>,
@@ -306,6 +312,35 @@ struct AnalysisEnvelope {
     evidence_pack: EvidencePack,
     #[serde(default)]
     address_intelligence: AddressIntelligenceEnvelope,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct AddressSummaryEnvelope {
+    chain_id: u64,
+    address: String,
+    native_balance_raw: Option<String>,
+    profile: Option<AddressProfile>,
+    labels: Vec<AddressLabel>,
+    analyzed_tx_count: u64,
+    gas_spent_raw: String,
+    behavior_rows: Vec<AddressBehaviorSummaryRow>,
+    recent_txs: Vec<AddressRecentTxRow>,
+    queued: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct AddressBehaviorSummaryRow {
+    behavior: String,
+    tx_count: u64,
+    gas_spent_raw: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct AddressRecentTxRow {
+    tx_hash: String,
+    block_timestamp: Option<String>,
+    behavior: String,
+    gas_raw: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -445,6 +480,7 @@ enum DashboardTab {
     Clusters,
     ClusterAnalysis,
     ClusterDiscovery,
+    AddressAnalysis,
     TxAnalysis,
     ClusterGraph,
     IndexerProgress,
@@ -457,6 +493,7 @@ fn section_title(tab: &DashboardTab) -> &'static str {
         DashboardTab::Clusters => "Cluster management",
         DashboardTab::ClusterAnalysis => "Cluster analysis",
         DashboardTab::ClusterDiscovery => "Cluster discovery",
+        DashboardTab::AddressAnalysis => "Address analysis",
         DashboardTab::TxAnalysis => "Single tx analysis",
         DashboardTab::ClusterGraph => "Cluster graph",
         DashboardTab::IndexerProgress => "Indexer progress",
@@ -470,6 +507,7 @@ impl DashboardTab {
         match value {
             Some("cluster-analysis") => Self::ClusterAnalysis,
             Some("cluster-discovery") => Self::ClusterDiscovery,
+            Some("address-analysis") => Self::AddressAnalysis,
             Some("tx-analysis") => Self::TxAnalysis,
             Some("cluster-graph") => Self::ClusterGraph,
             Some("indexer-progress") => Self::IndexerProgress,
@@ -605,6 +643,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/clusters/status", get(cluster_status))
         .route("/app/clusters/{cluster_id}", get(cluster_analysis_page))
         .route("/app/cluster-discovery", get(cluster_discovery_page))
+        .route("/app/address-analysis", get(address_analysis_page))
         .route("/app/clusters/create", post(create_cluster))
         .route("/app/clusters/{cluster_id}/update", post(update_cluster))
         .route("/app/clusters/{cluster_id}/delete", post(delete_cluster))
@@ -829,6 +868,7 @@ async fn dashboard(
             }
         }
         DashboardTab::ClusterDiscovery => "/app/cluster-discovery".to_owned(),
+        DashboardTab::AddressAnalysis => "/app/address-analysis".to_owned(),
         DashboardTab::TxAnalysis => "/app/tx-analysis".to_owned(),
         DashboardTab::ClusterGraph => "/app/cluster-graph".to_owned(),
         DashboardTab::IndexerProgress => "/app/indexer/progress".to_owned(),
@@ -879,6 +919,7 @@ async fn clusters_page(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -910,6 +951,7 @@ async fn cluster_analysis_page(
             notice: query.notice,
             created_key: None,
         },
+        None,
         None,
         None,
         None,
@@ -969,6 +1011,65 @@ async fn cluster_discovery_page(
         None,
         payload,
         Some(query),
+        None,
+    )
+    .await
+}
+
+async fn address_analysis_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<AddressAnalysisQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let (payload, error) = if let Some(address) = query
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let chain_id = query.chain_id.unwrap_or(state.default_chain_id);
+        let path = format!(
+            "/addresses/summary?chain_id={}&address={}",
+            chain_id,
+            urlencoding::encode(address)
+        );
+        match api_get_json::<AddressSummaryEnvelope>(&state, &path).await {
+            Ok(payload) => (Some(payload), None),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    let dashboard_query = DashboardQuery {
+        tab: Some("address-analysis".to_owned()),
+        cluster_id: None,
+        start: None,
+        end: None,
+        cluster_tab: None,
+        tx_page: None,
+        tx_page_size: None,
+        tx_behavior: None,
+        tx_protocol: None,
+        tx_sort_by: None,
+        tx_sort_dir: None,
+        notice: None,
+        created_key: None,
+    };
+    render_dashboard_response(
+        &state,
+        user,
+        dashboard_query,
+        None,
+        None,
+        error,
+        None,
+        None,
+        None,
+        None,
+        payload,
     )
     .await
 }
@@ -999,6 +1100,7 @@ async fn tx_analysis_page(
             notice: query.notice,
             created_key: query.created_key,
         },
+        None,
         None,
         None,
         None,
@@ -1043,6 +1145,7 @@ async fn cluster_graph_page(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -1073,6 +1176,7 @@ async fn indexer_progress_page(
             notice: query.notice,
             created_key: query.created_key,
         },
+        None,
         None,
         None,
         None,
@@ -1126,6 +1230,7 @@ async fn indexer_lookup_page(
         Some(query),
         None,
         None,
+        None,
     )
     .await
 }
@@ -1156,6 +1261,7 @@ async fn indexer_api_keys_page(
             notice: query.notice,
             created_key: query.created_key,
         },
+        None,
         None,
         None,
         None,
@@ -1302,6 +1408,7 @@ async fn create_cluster(
                 None,
                 None,
                 None,
+                None,
             )
                 .await
         }
@@ -1360,6 +1467,7 @@ async fn update_cluster(
                 editable_cluster.as_ref(),
                 None,
                 Some(err.to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -1534,6 +1642,7 @@ async fn run_tx_analysis(
                 None,
                 None,
                 None,
+                None,
             )
             .await
         }
@@ -1545,6 +1654,7 @@ async fn run_tx_analysis(
                 None,
                 None,
                 Some(err.to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -1636,6 +1746,7 @@ async fn render_dashboard_response(
     indexer_query: Option<IndexerLookupQuery>,
     discovery_result: Option<ClusterDiscoveryResponse>,
     discovery_query: Option<ClusterDiscoveryQuery>,
+    address_summary: Option<AddressSummaryEnvelope>,
 ) -> Result<Response, WebError> {
     let tab = DashboardTab::from_query(query.tab.as_deref());
     let cluster_analysis_tab = ClusterAnalysisTab::from_query(query.cluster_tab.as_deref());
@@ -1801,6 +1912,7 @@ async fn render_dashboard_response(
             .or(cluster_error.as_deref())
             .or(indexer_error.as_deref())
             .or(indexer_api_keys_error.as_deref()),
+        address_summary.as_ref(),
     ))
     .into_response())
 }
@@ -2484,6 +2596,7 @@ fn render_dashboard_page(
     start: Option<&str>,
     end: Option<&str>,
     error: Option<&str>,
+    address_summary: Option<&AddressSummaryEnvelope>,
 ) -> String {
     let cluster_cards = if clusters.is_empty() {
         "<div class=\"empty-state\">No clusters yet. Create one in the Cluster Management tab.</div>".to_owned()
@@ -2697,6 +2810,7 @@ fn render_dashboard_page(
     let cluster_discovery_panel = render_cluster_discovery_panel(discovery_result, discovery_query);
 
     let graph_panel = render_cluster_graph_panel(clusters);
+    let address_analysis_panel = render_address_analysis_panel(address_summary, state.default_chain_id);
     let indexer_progress_panel = render_indexer_progress_panel(indexer_progress);
     let indexer_lookup_panel = render_indexer_lookup_panel(indexer_lookup, indexer_query);
     let indexer_api_keys_panel =
@@ -2723,6 +2837,8 @@ fn render_dashboard_page(
         tx_panel.clone()
     } else if *tab == DashboardTab::ClusterGraph {
         graph_panel.clone()
+    } else if *tab == DashboardTab::AddressAnalysis {
+        address_analysis_panel.clone()
     } else if *tab == DashboardTab::Clusters {
         format!(
             r#"<section class="dashboard-grid">
@@ -2767,6 +2883,7 @@ fn render_dashboard_page(
           <a class="{}" href="{}">Cluster analysis</a>
           <a class="{}" href="/app/cluster-discovery">Cluster discovery</a>
           <a class="{}" href="/app/cluster-graph">Cluster graph</a>
+          <a class="{}" href="/app/address-analysis">Address analysis</a>
           <a class="{}" href="/app/tx-analysis">Single tx analysis</a>
           <a class="{}" href="/app/indexer/progress">Indexer progress</a>
           <a class="{}" href="/app/indexer/address-lookup">Indexer address lookup</a>
@@ -2802,6 +2919,7 @@ fn render_dashboard_page(
             .unwrap_or_else(|| "/app/clusters".to_owned()),
         active_class(tab, DashboardTab::ClusterDiscovery),
         active_class(tab, DashboardTab::ClusterGraph),
+        active_class(tab, DashboardTab::AddressAnalysis),
         active_class(tab, DashboardTab::TxAnalysis),
         active_class(tab, DashboardTab::IndexerProgress),
         active_class(tab, DashboardTab::IndexerLookup),
@@ -3017,6 +3135,137 @@ fn render_cluster_discovery_panel(
     )
 }
 
+fn render_address_analysis_panel(
+    summary: Option<&AddressSummaryEnvelope>,
+    default_chain_id: u64,
+) -> String {
+    let address = summary.map(|value| value.address.as_str()).unwrap_or_default();
+    let chain_id = summary
+        .map(|value| value.chain_id)
+        .unwrap_or(default_chain_id);
+    let body = summary
+        .map(|summary| {
+            let profile = summary
+                .profile
+                .as_ref()
+                .map(|profile| {
+                    format!(
+                        r#"<div class="stat"><span>Type</span><strong>{}</strong></div>
+<div class="stat"><span>Code bytes</span><strong>{}</strong></div>"#,
+                        escape_html(&profile.address_type),
+                        profile.bytecode_length.unwrap_or_default()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "<div class=\"stat\"><span>Type</span><strong>pending</strong></div><div class=\"stat\"><span>Code bytes</span><strong>n/a</strong></div>".to_owned()
+                });
+            let labels = if summary.labels.is_empty() {
+                "<span class=\"muted\">No labels yet. Worker has been queued if this address was not analyzed.</span>".to_owned()
+            } else {
+                summary
+                    .labels
+                    .iter()
+                    .map(|label| {
+                        format!(
+                            r#"<span class="address-label-chip">{} · {}</span>"#,
+                            escape_html(&label.label),
+                            escape_html(&label.source)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            let behavior_rows = if summary.behavior_rows.is_empty() {
+                "<tr><td colspan=\"3\">No analyzed transactions for this address yet.</td></tr>".to_owned()
+            } else {
+                summary
+                    .behavior_rows
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            escape_html(&row.behavior),
+                            row.tx_count,
+                            render_amount_stack(&format_wei_eth_raw(&row.gas_spent_raw), &row.gas_spent_raw)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            let recent_rows = if summary.recent_txs.is_empty() {
+                "<tr><td colspan=\"4\">No recent analyzed txs found.</td></tr>".to_owned()
+            } else {
+                summary
+                    .recent_txs
+                    .iter()
+                    .map(|tx| {
+                        format!(
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            render_copyable_code(&tx.tx_hash, 8),
+                            escape_html(tx.block_timestamp.as_deref().unwrap_or("n/a")),
+                            escape_html(&tx.behavior),
+                            render_amount_stack(&format_wei_eth_raw(&tx.gas_raw), &tx.gas_raw)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            let queued = if summary.queued {
+                "<div class=\"notice info\">Address profile job is queued. Keep the address worker running and refresh later.</div>"
+            } else {
+                ""
+            };
+            format!(
+                r#"{}
+<div class="stats-grid">
+  <div class="stat"><span>Address</span><strong>{}</strong></div>
+  <div class="stat"><span>Native balance</span><strong>{}</strong></div>
+  <div class="stat"><span>Analyzed txs</span><strong>{}</strong></div>
+  <div class="stat"><span>Gas spent</span><strong>{}</strong></div>
+  {}
+</div>
+<section class="mini-card"><strong>Known labels</strong><div>{}</div></section>
+<div class="split-panels">
+  <div class="table-shell"><table><thead><tr><th>Behavior</th><th>Tx count</th><th>Gas spent</th></tr></thead><tbody>{}</tbody></table></div>
+  <div class="table-shell"><table><thead><tr><th>Tx</th><th>Time</th><th>Behavior</th><th>Gas</th></tr></thead><tbody>{}</tbody></table></div>
+</div>"#,
+                queued,
+                render_copyable_code(&summary.address, 10),
+                summary.native_balance_raw.as_deref().map(format_wei_eth_raw).unwrap_or_else(|| "n/a".to_owned()),
+                summary.analyzed_tx_count,
+                format_wei_eth_raw(&summary.gas_spent_raw),
+                profile,
+                labels,
+                behavior_rows,
+                recent_rows
+            )
+        })
+        .unwrap_or_else(|| {
+            "<div class=\"empty-state\">Enter an address to inspect known labels, native balance, previously analyzed txs, behavior breakdown, and gas spend.</div>".to_owned()
+        });
+    format!(
+        r#"<section class="panel">
+  <div class="panel-head"><h2>Address analysis</h2><span class="badge">address intelligence</span></div>
+  <div class="panel-body">
+    <p class="panel-copy">This page reads the accumulated address intelligence layer. If the address is new, it is queued for the background address worker.</p>
+    <form class="stack-form" method="get" action="/app/address-analysis">
+      <div class="split-fields">
+        <label>Address<input type="text" name="address" value="{}" placeholder="0x..." required></label>
+        <label>Chain ID<input type="number" name="chain_id" value="{}" min="1"></label>
+      </div>
+      <div class="button-row">
+        <button class="cta secondary" type="submit">Analyze address</button>
+      </div>
+    </form>
+    {}
+  </div>
+</section>"#,
+        escape_html(address),
+        chain_id,
+        body
+    )
+}
+
 fn summarize_primary_activity(analysis: &TransactionAnalysis) -> (String, String, String) {
     let mut best: Option<(&str, f32, &str)> = None;
     for result in &analysis.recognizer_results {
@@ -3142,6 +3391,7 @@ fn render_tx_analysis_result_with_share_url(
         );
     };
     let analysis = &envelope.analysis;
+    let address_book = AddressDisplayBook::new(&envelope.address_intelligence);
     let share_action = if show_share_action {
         format!(
             r#"<form class="inline-action-form" method="post" action="/app/tx-analysis/share">
@@ -3304,7 +3554,7 @@ fn render_tx_analysis_result_with_share_url(
             .join("")
         )
     };
-    let storyline_panel = render_tx_storyline_panel(analysis);
+    let storyline_panel = render_tx_storyline_panel(analysis, &address_book);
     let report_hero = render_tx_report_hero(
         analysis,
         &primary_activity,
@@ -3314,11 +3564,9 @@ fn render_tx_analysis_result_with_share_url(
     );
     let meta_strip = render_tx_report_meta_strip(analysis, share_url.is_some());
     let utilities = render_tx_utilities_panel(analysis, &share_action, share_url);
-    let address_intelligence = render_address_intelligence_panel(&envelope.address_intelligence);
 
     format!(
         r#"<div class="tx-analysis-shell">
-  {}
   {}
   {}
   {}
@@ -3356,7 +3604,6 @@ fn render_tx_analysis_result_with_share_url(
         report_hero,
         storyline_panel,
         utilities,
-        address_intelligence,
         render_storyline_gap_explanation(&analysis.scenario_outputs)
             .map(|message| format!(r#"<div class="notice info">{}</div>"#, escape_html(&message)))
             .unwrap_or_default(),
@@ -3487,95 +3734,6 @@ fn render_tx_utilities_panel(
         render_copyable_code(&analysis.from_address, 10),
         render_copyable_code(token_contract, 10),
         share_card,
-    )
-}
-
-fn render_address_intelligence_panel(intelligence: &AddressIntelligenceEnvelope) -> String {
-    let mut labels_by_address = std::collections::BTreeMap::<String, Vec<&AddressLabel>>::new();
-    for label in &intelligence.labels {
-        labels_by_address
-            .entry(label.address.to_ascii_lowercase())
-            .or_default()
-            .push(label);
-    }
-
-    let rows = if intelligence.profiles.is_empty() {
-        "<tr><td colspan=\"5\">No address profile has been materialized yet. The address worker will fill this after it claims the queued addresses from recent analyses.</td></tr>"
-            .to_owned()
-    } else {
-        intelligence
-            .profiles
-            .iter()
-            .take(40)
-            .map(|profile| {
-                let labels = labels_by_address
-                    .get(&profile.address.to_ascii_lowercase())
-                    .map(|labels| {
-                        labels
-                            .iter()
-                            .take(6)
-                            .map(|label| {
-                                format!(
-                                    r#"<span class="address-label-chip">{}</span>"#,
-                                    escape_html(&label.label)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("")
-                    })
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "<span class=\"muted\">unlabeled</span>".to_owned());
-                let analyzed_at = profile
-                    .last_analyzed_at
-                    .map(|value| value.to_rfc3339().replace('T', " ").replace('Z', " UTC"))
-                    .unwrap_or_else(|| "pending".to_owned());
-                let code_size = profile
-                    .bytecode_length
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "0".to_owned());
-                format!(
-                    r#"<tr>
-  <td>{}</td>
-  <td><span class="address-type-pill">{}</span></td>
-  <td>{}</td>
-  <td>{}</td>
-  <td>{}</td>
-</tr>"#,
-                    render_copyable_code(&profile.address, 10),
-                    escape_html(&profile.address_type),
-                    labels,
-                    escape_html(&code_size),
-                    escape_html(&analyzed_at),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    };
-
-    format!(
-        r#"<section class="tx-section-card compact-section address-intelligence-panel">
-  <div class="tx-section-title">
-    <span class="tx-section-index">6</span>
-    <h2>Address Intelligence</h2>
-    <span class="badge">Profiles and labels</span>
-  </div>
-  <p class="panel-copy">Addresses discovered during tx analysis are queued for a background profile pass. This table shows the profiles already materialized for this transaction.</p>
-  <div class="table-shell compact-table-shell">
-    <table class="compact-table">
-      <thead>
-        <tr>
-          <th>Address</th>
-          <th>Type</th>
-          <th>Labels</th>
-          <th>Code bytes</th>
-          <th>Analyzed at</th>
-        </tr>
-      </thead>
-      <tbody>{}</tbody>
-    </table>
-  </div>
-</section>"#,
-        rows
     )
 }
 
@@ -3822,6 +3980,12 @@ fn format_wei_eth(raw: i128) -> String {
     format!("{sign}{whole}.{fractional:06} ETH")
 }
 
+fn format_wei_eth_raw(raw: &str) -> String {
+    raw.parse::<i128>()
+        .map(format_wei_eth)
+        .unwrap_or_else(|_| "n/a".to_owned())
+}
+
 fn tx_form_prefill(payload: Option<&serde_json::Value>, default_chain_id: u64) -> (String, String) {
     let Some(payload) = payload else {
         return (String::new(), default_chain_id.to_string());
@@ -3835,13 +3999,59 @@ fn tx_form_prefill(payload: Option<&serde_json::Value>, default_chain_id: u64) -
     )
 }
 
-fn render_tx_storyline_panel(analysis: &TransactionAnalysis) -> String {
+struct AddressDisplayBook {
+    profiles: std::collections::BTreeMap<String, AddressProfile>,
+    labels: std::collections::BTreeMap<String, Vec<AddressLabel>>,
+}
+
+impl AddressDisplayBook {
+    fn new(intelligence: &AddressIntelligenceEnvelope) -> Self {
+        let profiles = intelligence
+            .profiles
+            .iter()
+            .map(|profile| (profile.address.to_ascii_lowercase(), profile.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut labels = std::collections::BTreeMap::<String, Vec<AddressLabel>>::new();
+        for label in &intelligence.labels {
+            labels
+                .entry(label.address.to_ascii_lowercase())
+                .or_default()
+                .push(label.clone());
+        }
+        Self { profiles, labels }
+    }
+
+    fn best_label(&self, address: &str) -> Option<String> {
+        let address = address.to_ascii_lowercase();
+        self.labels
+            .get(&address)
+            .and_then(|labels| labels.iter().max_by(|left, right| left.confidence.partial_cmp(&right.confidence).unwrap_or(std::cmp::Ordering::Equal)))
+            .map(|label| label.label.replace('_', " "))
+            .or_else(|| self.profiles.get(&address).map(|profile| profile.address_type.clone()))
+    }
+}
+
+fn render_known_address(address: &str, keep: usize, book: &AddressDisplayBook) -> String {
+    let code = render_copyable_code(address, keep);
+    book.best_label(address)
+        .map(|label| {
+            format!(
+                r#"<span class="known-address">{}<small>{}</small></span>"#,
+                code,
+                escape_html(&label)
+            )
+        })
+        .unwrap_or(code)
+}
+
+fn render_tx_storyline_panel(analysis: &TransactionAnalysis, book: &AddressDisplayBook) -> String {
     let scenario_outputs = &analysis.scenario_outputs;
     let Some(storyline) = scenario_outputs.get("storyline") else {
         return render_flow_fallback_panel(
             analysis,
             2,
             "No complete transaction intent was recognized yet. Showing confirmed asset flows first.",
+            book,
         );
     };
     let kind = storyline
@@ -3871,13 +4081,19 @@ fn render_tx_storyline_panel(analysis: &TransactionAnalysis) -> String {
         .unwrap_or("subject scope");
     let net_effect = render_net_effect_panel(storyline.get("net_effect"), subject_scope_label);
     let step_timeline =
-        render_storyline_steps(storyline.get("steps"), initiator, executor, protocol_contract);
-    let storyline_visual = render_storyline_visual(storyline, kind, protocol, initiator, executor);
-    let flow_fallback = if step_timeline.is_empty() && !analysis.derived_flows.is_empty() {
+        render_storyline_steps(storyline.get("steps"), initiator, executor, protocol_contract, book);
+    let step_timeline = if step_timeline.is_empty() {
+        render_generic_timeline_panel(analysis, initiator, executor, protocol_contract, book)
+    } else {
+        step_timeline
+    };
+    let storyline_visual = render_storyline_visual(storyline, kind, protocol, initiator, executor, book);
+    let flow_fallback = if !analysis.derived_flows.is_empty() {
         render_flow_fallback_panel(
             analysis,
             3,
             "Protocol intent attribution is incomplete. Below are asset flows reconstructed from logs and value transfers.",
+            book,
         )
     } else {
         String::new()
@@ -3901,6 +4117,7 @@ fn render_flow_fallback_panel(
     analysis: &TransactionAnalysis,
     section_index: u32,
     explanation: &str,
+    book: &AddressDisplayBook,
 ) -> String {
     let rows = if analysis.derived_flows.is_empty() {
         "<tr><td colspan=\"5\">No asset flow could be reconstructed from the available receipt / execution evidence.</td></tr>"
@@ -3910,7 +4127,7 @@ fn render_flow_fallback_panel(
             .derived_flows
             .iter()
             .take(80)
-            .map(render_flow_fallback_row)
+            .map(|flow| render_flow_fallback_row(flow, &analysis.from_address, book))
             .collect::<Vec<_>>()
             .join("")
     };
@@ -3921,7 +4138,7 @@ fn render_flow_fallback_panel(
     <h2>Confirmed Asset Flows</h2>
     <span class="badge">fallback view</span>
   </div>
-  <p class="panel-copy">{}</p>
+  <p class="panel-copy">{} Tx initiator: {}</p>
   <div class="table-shell compact-table-shell">
     <table class="compact-table">
       <thead>
@@ -3939,11 +4156,16 @@ fn render_flow_fallback_panel(
 </section>"#,
         section_index,
         escape_html(explanation),
+        render_known_address(&analysis.from_address, 10, book),
         rows
     )
 }
 
-fn render_flow_fallback_row(flow: &crate::domain::value_objects::AssetFlow) -> String {
+fn render_flow_fallback_row(
+    flow: &crate::domain::value_objects::AssetFlow,
+    initiator: &str,
+    book: &AddressDisplayBook,
+) -> String {
     let token = flow_token_descriptor(flow);
     let symbol = token
         .get("symbol")
@@ -3959,10 +4181,28 @@ fn render_flow_fallback_row(flow: &crate::domain::value_objects::AssetFlow) -> S
         .or(flow.token_address.as_deref())
         .unwrap_or("native");
     let amount_display = format_flow_amount_display(flow, &token);
+    let from = format!(
+        "{}{}",
+        render_known_address(&flow.from_address, 10, book),
+        if flow.from_address.eq_ignore_ascii_case(initiator) {
+            "<span class=\"story-role-tag initiator\">initiator</span>"
+        } else {
+            ""
+        }
+    );
+    let to = format!(
+        "{}{}",
+        render_known_address(&flow.to_address, 10, book),
+        if flow.to_address.eq_ignore_ascii_case(initiator) {
+            "<span class=\"story-role-tag initiator\">initiator</span>"
+        } else {
+            ""
+        }
+    );
     format!(
         "<tr><td>{}</td><td>→</td><td>{}</td><td><strong>{}</strong><small>{} · {}</small></td><td>{}</td></tr>",
-        render_copyable_code(&flow.from_address, 10),
-        render_copyable_code(&flow.to_address, 10),
+        from,
+        to,
         escape_html(symbol),
         escape_html(name),
         render_copyable_code(token_address, 8),
@@ -4232,6 +4472,7 @@ fn render_storyline_steps(
     initiator: &str,
     executor: &str,
     protocol_contract: Option<&str>,
+    book: &AddressDisplayBook,
 ) -> String {
     let Some(items) = value.and_then(|value| value.as_array()) else {
         return String::new();
@@ -4322,11 +4563,76 @@ fn render_storyline_steps(
                             escape_html(value)
                         ))
                         .unwrap_or_default(),
-                    render_copyable_code(from_raw, 10),
+                    render_known_address(from_raw, 10, book),
                     from_roles,
                     escape_html(&amount_display),
-                    format!("{} · {}", escape_html(name), render_copyable_code(token_address, 8)),
-                    render_copyable_code(to_raw, 10),
+                    format!("{} · {}", escape_html(name), render_copy_only_button(token_address)),
+                    render_known_address(to_raw, 10, book),
+                    to_roles,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    )
+}
+
+fn render_generic_timeline_panel(
+    analysis: &TransactionAnalysis,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+    book: &AddressDisplayBook,
+) -> String {
+    if analysis.derived_flows.is_empty() {
+        return String::new();
+    }
+    format!(
+        r#"<section class="tx-section-card storyline-steps">
+  <div class="tx-section-title">
+    <span class="tx-section-index">3</span>
+    <h2>Transaction Timeline</h2>
+    <span class="badge">derived from logs</span>
+  </div>
+  <div class="timeline-list">{}</div>
+</section>"#,
+        analysis
+            .derived_flows
+            .iter()
+            .take(80)
+            .enumerate()
+            .map(|(index, flow)| {
+                let token = flow_token_descriptor(flow);
+                let symbol = token.get("symbol").and_then(|value| value.as_str()).unwrap_or("asset");
+                let name = token.get("name").and_then(|value| value.as_str()).unwrap_or("unlabeled");
+                let token_address = token.get("address").and_then(|value| value.as_str()).or(flow.token_address.as_deref()).unwrap_or("native");
+                let amount_display = format_flow_amount_display(flow, &token);
+                let from_roles = render_storyline_roles(&flow.from_address, initiator, executor, protocol_contract);
+                let to_roles = render_storyline_roles(&flow.to_address, initiator, executor, protocol_contract);
+                format!(
+                    r#"<article class="timeline-step">
+  <div class="timeline-head">
+    <div class="timeline-index">{}</div>
+    <div class="timeline-copy">
+      <strong>Confirmed asset flow</strong>
+      <small>{} · {} · raw: {}</small>
+    </div>
+  </div>
+  <div class="timeline-flow compact">
+    <div class="timeline-side">{}<div class="timeline-role-row">{}</div></div>
+    <div class="timeline-mid"><strong>{}</strong><span>{} · {}</span><span class="timeline-arrow-inline">→</span></div>
+    <div class="timeline-side">{}<div class="timeline-role-row">{}</div></div>
+  </div>
+</article>"#,
+                    index + 1,
+                    escape_html(symbol),
+                    escape_html(name),
+                    escape_html(&flow.amount_raw),
+                    render_known_address(&flow.from_address, 10, book),
+                    from_roles,
+                    escape_html(&amount_display),
+                    escape_html(name),
+                    render_copy_only_button(token_address),
+                    render_known_address(&flow.to_address, 10, book),
                     to_roles,
                 )
             })
@@ -4341,6 +4647,7 @@ fn render_storyline_visual(
     protocol: &str,
     initiator: &str,
     executor: &str,
+    book: &AddressDisplayBook,
 ) -> String {
     let protocol_contract = storyline
         .get("protocol_contract")
@@ -4365,6 +4672,7 @@ fn render_storyline_visual(
         initiator,
         executor,
         protocol_contract,
+        book,
     );
     let repay_lane = render_storyline_lane(
         "Protocol-facing legs",
@@ -4378,6 +4686,7 @@ fn render_storyline_visual(
         initiator,
         executor,
         protocol_contract,
+        book,
     );
     let receipt_lane = render_storyline_lane(
         if kind == "liquidation" {
@@ -4391,6 +4700,7 @@ fn render_storyline_visual(
         initiator,
         executor,
         protocol_contract,
+        book,
     );
     let exit_lane = render_storyline_lane(
         if kind == "liquidation" {
@@ -4404,6 +4714,7 @@ fn render_storyline_visual(
         initiator,
         executor,
         protocol_contract,
+        book,
     );
 
     let main_path = if direct_protocol_call {
@@ -4421,8 +4732,8 @@ fn render_storyline_visual(
       <small>{}</small>
     </div>
   </div>"#,
-            render_copyable_code(initiator, 10),
-            render_copyable_code(protocol_contract.unwrap_or(executor), 10),
+            render_known_address(initiator, 10, book),
+            render_known_address(protocol_contract.unwrap_or(executor), 10, book),
             escape_html(protocol),
         )
     } else {
@@ -4446,8 +4757,8 @@ fn render_storyline_visual(
       <small>{}</small>
     </div>
   </div>"#,
-            render_copyable_code(initiator, 10),
-            render_copyable_code(executor, 10),
+            render_known_address(initiator, 10, book),
+            render_known_address(executor, 10, book),
             escape_html(protocol),
             escape_html(if kind == "liquidation" {
                 "Detected liquidation target"
@@ -4508,6 +4819,7 @@ fn render_storyline_lane(
     initiator: &str,
     executor: &str,
     protocol_contract: Option<&str>,
+    book: &AddressDisplayBook,
 ) -> String {
     let items = value
         .and_then(|value| value.as_array())
@@ -4522,6 +4834,7 @@ fn render_storyline_lane(
                         initiator,
                         executor,
                         protocol_contract,
+                        book,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -4552,6 +4865,7 @@ fn render_storyline_flow_chip(
     initiator: &str,
     executor: &str,
     protocol_contract: Option<&str>,
+    book: &AddressDisplayBook,
 ) -> String {
     let asset_type = item
         .get("asset_type")
@@ -4611,9 +4925,9 @@ fn render_storyline_flow_chip(
         escape_html(token_symbol),
         escape_html(token_name),
         render_copyable_code(token_address, 8),
-        render_copyable_code(from_raw, 10),
+        render_known_address(from_raw, 10, book),
         from_roles,
-        render_copyable_code(to_raw, 10),
+        render_known_address(to_raw, 10, book),
         to_roles,
         escape_html(&format!("{} · raw: {}", amount_display, amount_raw)),
         source_hint_label
@@ -5845,6 +6159,16 @@ fn render_copyable_code(value: &str, keep: usize) -> String {
     )
 }
 
+fn render_copy_only_button(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("n/a") || value.eq_ignore_ascii_case("native") {
+        return "<code>native</code>".to_owned();
+    }
+    let escaped_value = escape_html(value);
+    r#"<button type="button" class="copy-button copy-only" data-copy="" onclick="navigator.clipboard.writeText(this.dataset.copy).then(()=>{const label=this.textContent;this.textContent='Copied';setTimeout(()=>this.textContent=label,900);})">Copy contract</button>"#
+        .replacen("data-copy=\"\"", &format!("data-copy=\"{}\"", escaped_value), 1)
+}
+
 fn shared_styles() -> &'static str {
     r#"
 :root {
@@ -5948,13 +6272,14 @@ textarea { min-height: 140px; resize: vertical; }
 .tx-search-form { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; gap: 10px; align-items: center; margin-bottom: 14px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .readonly-pill { display: inline-flex; align-items: center; gap: 6px; width: fit-content; padding: 6px 10px; border: 1px solid rgba(13,110,99,.18); border-radius: 999px; background: #ecfdf5; color: #047857; font-size: .78rem; font-weight: 700; white-space: nowrap; }
-.tx-analysis-shell { display: grid; gap: 14px; }
+.tx-analysis-shell { display: grid; gap: 14px; counter-reset: tx-section; }
 .tx-section-card { border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 8px 22px rgba(15,23,42,.04); padding: 16px; min-width: 0; }
 .tx-section-title { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
 .tx-section-title h2 { margin: 0; font-size: 1.08rem; line-height: 1.25; }
 .tx-section-title h2 small { color: var(--muted); font-weight: 500; margin-left: 4px; }
 .tx-section-title .badge, .tx-section-title .confidence-pill { margin-left: auto; }
-.tx-section-index { width: 26px; height: 26px; border-radius: 999px; display: inline-grid; place-items: center; background: #2563eb; color: #fff; font-size: .9rem; font-weight: 800; flex: 0 0 auto; }
+.tx-section-index { width: 26px; height: 26px; border-radius: 999px; display: inline-grid; place-items: center; background: #2563eb; color: #fff; font-size: 0; font-weight: 800; flex: 0 0 auto; }
+.tx-section-index::before { counter-increment: tx-section; content: counter(tx-section); font-size: .9rem; }
 .tx-report-top { display: grid; gap: 14px; padding: 2px 0 0; }
 .tx-report-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
 .brand-lockup.mini .brand-mark, .brand-lockup.mini .brand-mark svg { width: 28px; height: 28px; }
@@ -6001,6 +6326,8 @@ textarea { min-height: 140px; resize: vertical; }
 .copy-code code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .copy-button { flex: 0 0 auto; white-space: nowrap; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--muted); padding: 3px 6px; font: inherit; font-size: .7rem; line-height: 1.1; cursor: pointer; }
 .copy-button:hover { border-color: rgba(31,111,235,.35); color: var(--accent); }
+.known-address { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%; vertical-align: middle; }
+.known-address small { flex: 0 1 auto; min-width: 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); border: 1px solid rgba(31,111,235,.18); background: #eef5ff; border-radius: 999px; padding: 2px 6px; font-size: .68rem; line-height: 1.2; }
 .storyline-net-effect, .storyline-steps { display: grid; gap: 12px; }
 .compact-section { padding-top: 8px; }
 .compact-table-shell { margin-top: 4px; }
