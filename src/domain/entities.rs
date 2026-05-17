@@ -67,6 +67,58 @@ pub struct TransactionAnalysis {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AddressAnalysisCandidate {
+    pub address: String,
+    pub priority: i32,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AddressProfile {
+    pub chain_id: u64,
+    pub address: String,
+    pub address_type: String,
+    pub code_hash: Option<String>,
+    pub bytecode_length: Option<u64>,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub last_analyzed_at: Option<DateTime<Utc>>,
+    pub confidence: f32,
+    pub metadata: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AddressLabel {
+    pub chain_id: u64,
+    pub address: String,
+    pub label: String,
+    pub source: String,
+    pub confidence: f32,
+    pub evidence_json: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AddressAnalysisJob {
+    pub chain_id: u64,
+    pub address: String,
+    pub status: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub priority: i32,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub available_at: DateTime<Utc>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EvidencePack {
     pub pack_id: Uuid,
     pub tx_hash: Option<String>,

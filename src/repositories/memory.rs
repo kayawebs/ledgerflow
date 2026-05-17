@@ -9,9 +9,10 @@ use uuid::Uuid;
 use crate::core::errors::LedgerResult;
 use crate::domain::{
     entities::{
-        AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun,
-        ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState,
-        EvidencePack, TransactionAnalysis,
+        AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
+        ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
+        ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState, EvidencePack,
+        TransactionAnalysis,
     },
     enums::{ClusterBackfillStatus, ClusterTrackingStatus, ClusterTxStatus},
     interfaces::AnalysisRepository,
@@ -30,6 +31,9 @@ pub struct InMemoryAnalysisRepository {
     classified_transactions: RwLock<HashMap<(Uuid, String), ClassifiedTransaction>>,
     cluster_metrics_snapshots: RwLock<HashMap<Uuid, Vec<ClusterMetricsSnapshot>>>,
     cluster_alerts: RwLock<HashMap<Uuid, Vec<ClusterAlert>>>,
+    address_profiles: RwLock<HashMap<(u64, String), AddressProfile>>,
+    address_labels: RwLock<HashMap<(u64, String, String, String), AddressLabel>>,
+    address_jobs: RwLock<HashMap<(u64, String), AddressAnalysisJob>>,
 }
 
 #[async_trait]
@@ -111,7 +115,10 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
     async fn delete_cluster(&self, cluster_id: Uuid) -> LedgerResult<()> {
         self.clusters.write().await.remove(&cluster_id);
         self.cluster_backfill_runs.write().await.remove(&cluster_id);
-        self.cluster_tracking_states.write().await.remove(&cluster_id);
+        self.cluster_tracking_states
+            .write()
+            .await
+            .remove(&cluster_id);
         self.cluster_metrics_snapshots
             .write()
             .await
@@ -493,7 +500,10 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
         let mut store = self.cluster_alerts.write().await;
         for alert in alerts {
             let entry = store.entry(alert.cluster_id).or_default();
-            if let Some(existing) = entry.iter_mut().find(|item| item.alert_id == alert.alert_id) {
+            if let Some(existing) = entry
+                .iter_mut()
+                .find(|item| item.alert_id == alert.alert_id)
+            {
                 *existing = alert.clone();
             } else {
                 entry.push(alert.clone());
@@ -537,6 +547,176 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
         alert.read_at = Some(Utc::now());
         Ok(Some(alert.clone()))
     }
+
+    async fn enqueue_address_analysis_candidates(
+        &self,
+        chain_id: u64,
+        candidates: &[AddressAnalysisCandidate],
+    ) -> LedgerResult<u64> {
+        let mut jobs = self.address_jobs.write().await;
+        let now = Utc::now();
+        let mut changed = 0;
+        for candidate in candidates {
+            let address = candidate.address.to_ascii_lowercase();
+            let key = (chain_id, address.clone());
+            match jobs.get_mut(&key) {
+                Some(existing) if existing.status != "completed" => {
+                    existing.last_seen_at = now;
+                    existing.updated_at = now;
+                    existing.priority = existing.priority.min(candidate.priority);
+                    existing.metadata =
+                        merge_json(existing.metadata.clone(), candidate.metadata.clone());
+                    if existing.status == "failed" {
+                        existing.status = "pending".to_owned();
+                        existing.available_at = now;
+                        existing.last_error = None;
+                    }
+                    changed += 1;
+                }
+                Some(_) => {}
+                None => {
+                    jobs.insert(
+                        key,
+                        AddressAnalysisJob {
+                            chain_id,
+                            address,
+                            status: "pending".to_owned(),
+                            attempts: 0,
+                            last_error: None,
+                            priority: candidate.priority,
+                            first_seen_at: now,
+                            last_seen_at: now,
+                            available_at: now,
+                            claimed_at: None,
+                            completed_at: None,
+                            updated_at: now,
+                            metadata: candidate.metadata.clone(),
+                        },
+                    );
+                    changed += 1;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn claim_next_address_analysis_job(&self) -> LedgerResult<Option<AddressAnalysisJob>> {
+        let mut jobs = self.address_jobs.write().await;
+        let now = Utc::now();
+        let selected = jobs
+            .iter()
+            .filter(|(_, job)| job.status == "pending" && job.available_at <= now)
+            .min_by(|(_, left), (_, right)| {
+                left.priority
+                    .cmp(&right.priority)
+                    .then_with(|| left.first_seen_at.cmp(&right.first_seen_at))
+            })
+            .map(|(key, _)| key.clone());
+        let Some(key) = selected else {
+            return Ok(None);
+        };
+        let Some(job) = jobs.get_mut(&key) else {
+            return Ok(None);
+        };
+        job.status = "running".to_owned();
+        job.attempts += 1;
+        job.claimed_at = Some(now);
+        job.updated_at = now;
+        Ok(Some(job.clone()))
+    }
+
+    async fn upsert_address_profile(&self, profile: &AddressProfile) -> LedgerResult<()> {
+        self.address_profiles.write().await.insert(
+            (profile.chain_id, profile.address.to_ascii_lowercase()),
+            profile.clone(),
+        );
+        Ok(())
+    }
+
+    async fn upsert_address_labels(&self, labels: &[AddressLabel]) -> LedgerResult<()> {
+        let mut store = self.address_labels.write().await;
+        for label in labels {
+            store.insert(
+                (
+                    label.chain_id,
+                    label.address.to_ascii_lowercase(),
+                    label.label.clone(),
+                    label.source.clone(),
+                ),
+                label.clone(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn complete_address_analysis_job(
+        &self,
+        chain_id: u64,
+        address: &str,
+    ) -> LedgerResult<()> {
+        let mut jobs = self.address_jobs.write().await;
+        if let Some(job) = jobs.get_mut(&(chain_id, address.to_ascii_lowercase())) {
+            let now = Utc::now();
+            job.status = "completed".to_owned();
+            job.completed_at = Some(now);
+            job.updated_at = now;
+            job.last_error = None;
+        }
+        Ok(())
+    }
+
+    async fn fail_address_analysis_job(
+        &self,
+        chain_id: u64,
+        address: &str,
+        error: &str,
+    ) -> LedgerResult<()> {
+        let mut jobs = self.address_jobs.write().await;
+        if let Some(job) = jobs.get_mut(&(chain_id, address.to_ascii_lowercase())) {
+            let now = Utc::now();
+            job.status = "failed".to_owned();
+            job.last_error = Some(error.to_owned());
+            job.available_at = now + chrono::Duration::minutes(10);
+            job.updated_at = now;
+        }
+        Ok(())
+    }
+
+    async fn list_address_profiles(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+    ) -> LedgerResult<Vec<AddressProfile>> {
+        let store = self.address_profiles.read().await;
+        Ok(addresses
+            .iter()
+            .filter_map(|address| {
+                store
+                    .get(&(chain_id, address.to_ascii_lowercase()))
+                    .cloned()
+            })
+            .collect())
+    }
+
+    async fn list_address_labels(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+    ) -> LedgerResult<Vec<AddressLabel>> {
+        let address_set = addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        Ok(self
+            .address_labels
+            .read()
+            .await
+            .values()
+            .filter(|label| label.chain_id == chain_id)
+            .filter(|label| address_set.contains(&label.address.to_ascii_lowercase()))
+            .cloned()
+            .collect())
+    }
 }
 
 fn within_range(
@@ -569,7 +749,9 @@ fn compare_classified_tx(
     let ordering = match sort_by {
         "value_usd" => partial_cmp_option_f64(left.value_usd, right.value_usd),
         "gas_cost_usd" => partial_cmp_option_f64(left.gas_cost_usd, right.gas_cost_usd),
-        "estimated_pnl_usd" => partial_cmp_option_f64(left.estimated_pnl_usd, right.estimated_pnl_usd),
+        "estimated_pnl_usd" => {
+            partial_cmp_option_f64(left.estimated_pnl_usd, right.estimated_pnl_usd)
+        }
         "block_number" => left.block_number.cmp(&right.block_number),
         _ => left
             .timestamp
@@ -591,5 +773,17 @@ fn partial_cmp_option_f64(left: Option<f64>, right: Option<f64>) -> std::cmp::Or
         (Some(_), None) => std::cmp::Ordering::Greater,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn merge_json(left: serde_json::Value, right: serde_json::Value) -> serde_json::Value {
+    match (left, right) {
+        (serde_json::Value::Object(mut left), serde_json::Value::Object(right)) => {
+            for (key, value) in right {
+                left.insert(key, value);
+            }
+            serde_json::Value::Object(left)
+        }
+        (_, right) => right,
     }
 }

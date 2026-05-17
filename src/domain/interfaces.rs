@@ -5,9 +5,10 @@ use chrono::{DateTime, Utc};
 
 use crate::core::errors::LedgerResult;
 use crate::domain::entities::{
-    AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun,
-    ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState,
-    EvidencePack, RecognizerResult, TransactionAnalysis,
+    AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
+    ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
+    ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState, EvidencePack,
+    RecognizerResult, TransactionAnalysis,
 };
 use crate::domain::enums::BehaviorTag;
 use crate::domain::value_objects::{AddressTxRef, AssetFlow, ValidationMessage};
@@ -68,10 +69,8 @@ pub trait AnalysisRepository: Send + Sync {
         &self,
         cluster_id: uuid::Uuid,
     ) -> LedgerResult<Option<ClusterCoverage>>;
-    async fn upsert_cluster_tracking_state(
-        &self,
-        state: &ClusterTrackingState,
-    ) -> LedgerResult<()>;
+    async fn upsert_cluster_tracking_state(&self, state: &ClusterTrackingState)
+    -> LedgerResult<()>;
     async fn get_cluster_tracking_state(
         &self,
         cluster_id: uuid::Uuid,
@@ -123,6 +122,32 @@ pub trait AnalysisRepository: Send + Sync {
         cluster_id: uuid::Uuid,
         alert_id: uuid::Uuid,
     ) -> LedgerResult<Option<ClusterAlert>>;
+    async fn enqueue_address_analysis_candidates(
+        &self,
+        chain_id: u64,
+        candidates: &[AddressAnalysisCandidate],
+    ) -> LedgerResult<u64>;
+    async fn claim_next_address_analysis_job(&self) -> LedgerResult<Option<AddressAnalysisJob>>;
+    async fn upsert_address_profile(&self, profile: &AddressProfile) -> LedgerResult<()>;
+    async fn upsert_address_labels(&self, labels: &[AddressLabel]) -> LedgerResult<()>;
+    async fn complete_address_analysis_job(&self, chain_id: u64, address: &str)
+    -> LedgerResult<()>;
+    async fn fail_address_analysis_job(
+        &self,
+        chain_id: u64,
+        address: &str,
+        error: &str,
+    ) -> LedgerResult<()>;
+    async fn list_address_profiles(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+    ) -> LedgerResult<Vec<AddressProfile>>;
+    async fn list_address_labels(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+    ) -> LedgerResult<Vec<AddressLabel>>;
 }
 
 pub type DynRepository = Arc<dyn AnalysisRepository>;

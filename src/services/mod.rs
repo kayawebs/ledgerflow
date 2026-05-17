@@ -1,3 +1,4 @@
+pub mod address_intelligence;
 pub mod alerts;
 pub mod analysis;
 pub mod auth;

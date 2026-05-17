@@ -7,9 +7,10 @@ use uuid::Uuid;
 use crate::core::errors::{LedgerError, LedgerResult};
 use crate::domain::{
     entities::{
-        AddressCluster, ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun,
-        ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState,
-        EvidencePack, TransactionAnalysis,
+        AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
+        ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
+        ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState, EvidencePack,
+        TransactionAnalysis,
     },
     enums::{
         AlertSeverity, AlertType, BehaviorTag, ClusterBackfillStatus, ClusterTrackingStatus,
@@ -962,7 +963,9 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
-        rows.into_iter().map(row_to_classified_transaction).collect()
+        rows.into_iter()
+            .map(row_to_classified_transaction)
+            .collect()
     }
 
     async fn list_classified_transactions_page(
@@ -983,7 +986,11 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             _ => "block_timestamp",
         };
         let direction = if descending { "desc" } else { "asc" };
-        let nulls = if descending { "nulls last" } else { "nulls first" };
+        let nulls = if descending {
+            "nulls last"
+        } else {
+            "nulls first"
+        };
         let behavior_tag = behavior_tag.map(|value| behavior_tag_to_str(&value).to_owned());
         let protocol_query = protocol_query
             .map(|value| value.trim().to_owned())
@@ -1058,7 +1065,9 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
-        rows.into_iter().map(row_to_classified_transaction).collect()
+        rows.into_iter()
+            .map(row_to_classified_transaction)
+            .collect()
     }
 
     async fn replace_cluster_metrics_snapshots(
@@ -1193,6 +1202,235 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         row.map(row_to_cluster_alert).transpose()
     }
+
+    async fn enqueue_address_analysis_candidates(
+        &self,
+        chain_id: u64,
+        candidates: &[AddressAnalysisCandidate],
+    ) -> LedgerResult<u64> {
+        let mut changed = 0;
+        for candidate in candidates {
+            let result = sqlx::query(
+                r#"
+                insert into address_analysis_jobs (
+                  chain_id, address, status, priority, first_seen_at, last_seen_at, available_at, updated_at, metadata
+                )
+                values ($1,$2,'pending',$3,now(),now(),now(),now(),$4)
+                on conflict (chain_id, address) do update set
+                  last_seen_at = now(),
+                  priority = least(address_analysis_jobs.priority, excluded.priority),
+                  status = case
+                    when address_analysis_jobs.status = 'failed' then 'pending'
+                    else address_analysis_jobs.status
+                  end,
+                  last_error = case
+                    when address_analysis_jobs.status = 'failed' then null
+                    else address_analysis_jobs.last_error
+                  end,
+                  available_at = case
+                    when address_analysis_jobs.status = 'failed' then now()
+                    else address_analysis_jobs.available_at
+                  end,
+                  metadata = address_analysis_jobs.metadata || excluded.metadata,
+                  updated_at = now()
+                where address_analysis_jobs.status <> 'completed'
+                "#,
+            )
+            .bind(chain_id as i64)
+            .bind(candidate.address.to_ascii_lowercase())
+            .bind(candidate.priority)
+            .bind(Json(candidate.metadata.clone()))
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            changed += result.rows_affected();
+        }
+        Ok(changed)
+    }
+
+    async fn claim_next_address_analysis_job(&self) -> LedgerResult<Option<AddressAnalysisJob>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let row = sqlx::query(
+            r#"
+            with candidate as (
+              select chain_id, address
+              from address_analysis_jobs
+              where status = 'pending' and available_at <= now()
+              order by priority asc, first_seen_at asc
+              limit 1
+              for update skip locked
+            )
+            update address_analysis_jobs jobs
+            set status = 'running',
+                attempts = jobs.attempts + 1,
+                claimed_at = now(),
+                updated_at = now()
+            from candidate
+            where jobs.chain_id = candidate.chain_id and jobs.address = candidate.address
+            returning jobs.*
+            "#,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        row.map(row_to_address_job).transpose()
+    }
+
+    async fn upsert_address_profile(&self, profile: &AddressProfile) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            insert into address_profiles (
+              chain_id, address, address_type, code_hash, bytecode_length, first_seen_at,
+              last_seen_at, last_analyzed_at, confidence, metadata, created_at, updated_at
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            on conflict (chain_id, address) do update set
+              address_type = excluded.address_type,
+              code_hash = excluded.code_hash,
+              bytecode_length = excluded.bytecode_length,
+              last_seen_at = greatest(address_profiles.last_seen_at, excluded.last_seen_at),
+              last_analyzed_at = excluded.last_analyzed_at,
+              confidence = excluded.confidence,
+              metadata = address_profiles.metadata || excluded.metadata,
+              updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(profile.chain_id as i64)
+        .bind(profile.address.to_ascii_lowercase())
+        .bind(&profile.address_type)
+        .bind(&profile.code_hash)
+        .bind(profile.bytecode_length.map(|value| value as i64))
+        .bind(profile.first_seen_at)
+        .bind(profile.last_seen_at)
+        .bind(profile.last_analyzed_at)
+        .bind(profile.confidence as f64)
+        .bind(Json(profile.metadata.clone()))
+        .bind(profile.created_at)
+        .bind(profile.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn upsert_address_labels(&self, labels: &[AddressLabel]) -> LedgerResult<()> {
+        for label in labels {
+            sqlx::query(
+                r#"
+                insert into address_labels (
+                  chain_id, address, label, source, confidence, evidence_json, created_at, updated_at
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8)
+                on conflict (chain_id, address, label, source) do update set
+                  confidence = greatest(address_labels.confidence, excluded.confidence),
+                  evidence_json = address_labels.evidence_json || excluded.evidence_json,
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(label.chain_id as i64)
+            .bind(label.address.to_ascii_lowercase())
+            .bind(&label.label)
+            .bind(&label.source)
+            .bind(label.confidence as f64)
+            .bind(Json(label.evidence_json.clone()))
+            .bind(label.created_at)
+            .bind(label.updated_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn complete_address_analysis_job(
+        &self,
+        chain_id: u64,
+        address: &str,
+    ) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            update address_analysis_jobs
+            set status = 'completed', completed_at = now(), last_error = null, updated_at = now()
+            where chain_id = $1 and address = $2
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(address.to_ascii_lowercase())
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn fail_address_analysis_job(
+        &self,
+        chain_id: u64,
+        address: &str,
+        error: &str,
+    ) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            update address_analysis_jobs
+            set status = 'failed',
+                last_error = $3,
+                available_at = now() + interval '10 minutes',
+                updated_at = now()
+            where chain_id = $1 and address = $2
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(address.to_ascii_lowercase())
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn list_address_profiles(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+    ) -> LedgerResult<Vec<AddressProfile>> {
+        let normalized = addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let rows =
+            sqlx::query("select * from address_profiles where chain_id = $1 and address = any($2)")
+                .bind(chain_id as i64)
+                .bind(&normalized)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter().map(row_to_address_profile).collect()
+    }
+
+    async fn list_address_labels(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+    ) -> LedgerResult<Vec<AddressLabel>> {
+        let normalized = addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let rows =
+            sqlx::query("select * from address_labels where chain_id = $1 and address = any($2)")
+                .bind(chain_id as i64)
+                .bind(&normalized)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter().map(row_to_address_label).collect()
+    }
 }
 
 fn row_to_pack(row: sqlx::postgres::PgRow) -> LedgerResult<EvidencePack> {
@@ -1242,6 +1480,124 @@ fn row_to_pack(row: sqlx::postgres::PgRow) -> LedgerResult<EvidencePack> {
         unresolved: unresolved.as_array().cloned().unwrap_or_default(),
         validation_results: validation_results.as_array().cloned().unwrap_or_default(),
         metadata,
+    })
+}
+
+fn row_to_address_job(row: sqlx::postgres::PgRow) -> LedgerResult<AddressAnalysisJob> {
+    let Json(metadata): Json<Value> = row
+        .try_get("metadata")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(AddressAnalysisJob {
+        chain_id: row
+            .try_get::<i64, _>("chain_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        address: row
+            .try_get("address")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        status: row
+            .try_get("status")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        attempts: row
+            .try_get::<i32, _>("attempts")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u32,
+        last_error: row
+            .try_get("last_error")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        priority: row
+            .try_get("priority")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        first_seen_at: row
+            .try_get("first_seen_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        last_seen_at: row
+            .try_get("last_seen_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        available_at: row
+            .try_get("available_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        claimed_at: row
+            .try_get("claimed_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        completed_at: row
+            .try_get("completed_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        metadata,
+    })
+}
+
+fn row_to_address_profile(row: sqlx::postgres::PgRow) -> LedgerResult<AddressProfile> {
+    let Json(metadata): Json<Value> = row
+        .try_get("metadata")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(AddressProfile {
+        chain_id: row
+            .try_get::<i64, _>("chain_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        address: row
+            .try_get("address")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        address_type: row
+            .try_get("address_type")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        code_hash: row
+            .try_get("code_hash")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        bytecode_length: row
+            .try_get::<Option<i64>, _>("bytecode_length")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            .map(|value| value as u64),
+        first_seen_at: row
+            .try_get("first_seen_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        last_seen_at: row
+            .try_get("last_seen_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        last_analyzed_at: row
+            .try_get("last_analyzed_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        confidence: row
+            .try_get::<f64, _>("confidence")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as f32,
+        metadata,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+    })
+}
+
+fn row_to_address_label(row: sqlx::postgres::PgRow) -> LedgerResult<AddressLabel> {
+    let Json(evidence_json): Json<Value> = row
+        .try_get("evidence_json")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(AddressLabel {
+        chain_id: row
+            .try_get::<i64, _>("chain_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        address: row
+            .try_get("address")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        label: row
+            .try_get("label")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        source: row
+            .try_get("source")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        confidence: row
+            .try_get::<f64, _>("confidence")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as f32,
+        evidence_json,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        updated_at: row
+            .try_get("updated_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
     })
 }
 
@@ -1330,7 +1686,8 @@ fn row_to_tracking_state(row: sqlx::postgres::PgRow) -> LedgerResult<ClusterTrac
             .map_err(|err| LedgerError::Persistence(err.to_string()))?,
         tracked_address_count: row
             .try_get::<i32, _>("tracked_address_count")
-            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u32,
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            as u32,
         created_at: row
             .try_get("created_at")
             .map_err(|err| LedgerError::Persistence(err.to_string()))?,
@@ -1445,7 +1802,8 @@ fn row_to_metrics_snapshot(row: sqlx::postgres::PgRow) -> LedgerResult<ClusterMe
             .map_err(|err| LedgerError::Persistence(err.to_string()))?,
         active_addresses_count: row
             .try_get::<i32, _>("active_addresses_count")
-            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u32,
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            as u32,
         behavior_breakdown,
         metadata,
     })

@@ -7,8 +7,8 @@ use tracing::{info, warn};
 use crate::accounting::rollups::AccountingService;
 use crate::core::errors::{LedgerError, LedgerResult};
 use crate::core::versioning::{RULESET_ID, VersionBundle};
-use crate::domain::entities::{EvidencePack, TransactionAnalysis};
-use crate::domain::enums::{AnalysisStatus, ValidationStatus};
+use crate::domain::entities::{AddressAnalysisCandidate, EvidencePack, TransactionAnalysis};
+use crate::domain::enums::{AnalysisStatus, AssetType, ValidationStatus};
 use crate::domain::interfaces::{AnalysisRepository, FlowDeriver};
 use crate::evidence_pack::builder::EvidencePackBuilder;
 use crate::evidence_pack::hashing::build_input_digest;
@@ -155,7 +155,24 @@ impl AnalysisService {
 
         self.repository.save_analysis(&analysis).await?;
         self.repository.save_evidence_pack(&pack).await?;
+        if let Err(err) = self.enqueue_address_intelligence(&analysis).await {
+            warn!(%tx_hash, error = %err, "address intelligence enqueue failed");
+        }
         Ok((analysis, pack))
+    }
+
+    async fn enqueue_address_intelligence(
+        &self,
+        analysis: &TransactionAnalysis,
+    ) -> LedgerResult<()> {
+        let candidates = collect_address_candidates(analysis);
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        self.repository
+            .enqueue_address_analysis_candidates(analysis.chain_id, &candidates)
+            .await?;
+        Ok(())
     }
 
     pub async fn get_analysis(
@@ -195,5 +212,113 @@ impl AnalysisService {
                 "ruleset {ruleset_id} is not installed"
             )))
         }
+    }
+}
+
+fn collect_address_candidates(analysis: &TransactionAnalysis) -> Vec<AddressAnalysisCandidate> {
+    let mut candidates = BTreeMap::<String, AddressAnalysisCandidate>::new();
+    insert_candidate(
+        &mut candidates,
+        &analysis.from_address,
+        20,
+        json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["tx_from"] }),
+    );
+    if let Some(to_address) = analysis.to_address.as_deref() {
+        insert_candidate(
+            &mut candidates,
+            to_address,
+            25,
+            json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["tx_to"] }),
+        );
+    }
+    for participant in &analysis.normalized_execution_facts.participants {
+        insert_candidate(
+            &mut candidates,
+            participant,
+            60,
+            json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["participant"] }),
+        );
+    }
+    for log in &analysis.normalized_execution_facts.log_summaries {
+        if let Some(address) = log.get("address").and_then(|value| value.as_str()) {
+            insert_candidate(
+                &mut candidates,
+                address,
+                55,
+                json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["log_emitter"] }),
+            );
+        }
+    }
+    for flow in &analysis.derived_flows {
+        insert_candidate(
+            &mut candidates,
+            &flow.from_address,
+            40,
+            json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["flow_from"] }),
+        );
+        insert_candidate(
+            &mut candidates,
+            &flow.to_address,
+            40,
+            json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["flow_to"] }),
+        );
+        if flow.asset_type == AssetType::Erc20 {
+            if let Some(token_address) = flow.token_address.as_deref() {
+                insert_candidate(
+                    &mut candidates,
+                    token_address,
+                    15,
+                    json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["erc20_token"] }),
+                );
+            }
+        }
+    }
+    candidates.into_values().collect()
+}
+
+fn insert_candidate(
+    candidates: &mut BTreeMap<String, AddressAnalysisCandidate>,
+    address: &str,
+    priority: i32,
+    metadata: serde_json::Value,
+) {
+    let Some(address) = normalize_address_candidate(address) else {
+        return;
+    };
+    candidates
+        .entry(address.clone())
+        .and_modify(|candidate| {
+            candidate.priority = candidate.priority.min(priority);
+            candidate.metadata =
+                merge_candidate_metadata(candidate.metadata.clone(), metadata.clone());
+        })
+        .or_insert(AddressAnalysisCandidate {
+            address,
+            priority,
+            metadata,
+        });
+}
+
+fn normalize_address_candidate(address: &str) -> Option<String> {
+    let address = address.trim().to_ascii_lowercase();
+    if address.len() == 42 && address.starts_with("0x") {
+        Some(address)
+    } else {
+        None
+    }
+}
+
+fn merge_candidate_metadata(
+    left: serde_json::Value,
+    right: serde_json::Value,
+) -> serde_json::Value {
+    match (left, right) {
+        (serde_json::Value::Object(mut left), serde_json::Value::Object(right)) => {
+            for (key, value) in right {
+                left.insert(key, value);
+            }
+            serde_json::Value::Object(left)
+        }
+        (_, right) => right,
     }
 }
