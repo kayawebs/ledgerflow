@@ -3061,9 +3061,14 @@ fn summarize_primary_activity(analysis: &TransactionAnalysis) -> (String, String
         let Some((activity, reason)) = mapped else {
             continue;
         };
+        let priority = activity_priority(activity);
         if best
             .as_ref()
-            .map(|(_, confidence, _)| result.confidence > *confidence)
+            .map(|(best_activity, confidence, _)| {
+                priority > activity_priority(best_activity)
+                    || (priority == activity_priority(best_activity)
+                        && result.confidence > *confidence)
+            })
             .unwrap_or(true)
         {
             best = Some((activity, result.confidence, reason));
@@ -3095,6 +3100,20 @@ fn summarize_primary_activity(analysis: &TransactionAnalysis) -> (String, String
             "The current recognizers could not confidently classify this transaction yet.".to_owned(),
             "n/a".to_owned(),
         )
+    }
+}
+
+fn activity_priority(activity: &str) -> u8 {
+    match activity {
+        "failed execution" => 100,
+        "liquidation" => 90,
+        "arbitrage" => 80,
+        "swap" => 70,
+        "batch router" => 60,
+        "deposit" | "withdraw" | "bridge-like transfer" => 50,
+        "approve" => 30,
+        "token transfer" | "native transfer" => 10,
+        _ => 0,
     }
 }
 

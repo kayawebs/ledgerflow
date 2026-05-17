@@ -812,6 +812,34 @@ impl Recognizer for DepositWithdrawPatternRecognizer {
 
 pub struct ArbitrageLikeScenarioRecognizer;
 
+fn arbitrage_subject_deltas(
+    analysis: &TransactionAnalysis,
+) -> Option<(&'static str, String, Vec<(String, String, i128)>)> {
+    let all_deltas = token_net_delta_entries(analysis);
+    let mut candidates = vec![("sender", analysis.from_address.to_lowercase())];
+    if let Some(target) = analysis.to_address.as_ref().map(|value| value.to_lowercase()) {
+        if !candidates
+            .iter()
+            .any(|(_, address)| address.eq_ignore_ascii_case(&target))
+        {
+            candidates.push(("executor", target));
+        }
+    }
+
+    candidates.into_iter().find_map(|(role, address)| {
+        let deltas = all_deltas
+            .iter()
+            .filter(|(entry_address, _, _)| entry_address.eq_ignore_ascii_case(&address))
+            .cloned()
+            .collect::<Vec<_>>();
+        if deltas.is_empty() {
+            None
+        } else {
+            Some((role, address, deltas))
+        }
+    })
+}
+
 impl Recognizer for ArbitrageLikeScenarioRecognizer {
     fn recognizer_id(&self) -> &str {
         "arbitrage_like_scenario"
@@ -827,21 +855,29 @@ impl Recognizer for ArbitrageLikeScenarioRecognizer {
     }
 
     fn recognize(&self, analysis: &TransactionAnalysis) -> LedgerResult<Option<RecognizerResult>> {
-        let sender = analysis.from_address.to_lowercase();
-        let deltas = token_net_delta_entries(analysis)
-            .into_iter()
-            .filter(|(address, _, _)| address == &sender)
-            .collect::<Vec<_>>();
+        let Some((subject_role, subject, deltas)) = arbitrage_subject_deltas(analysis) else {
+            return Ok(None);
+        };
         let outgoing_count = deltas.iter().filter(|(_, _, delta)| *delta < 0).count();
         let incoming_count = deltas.iter().filter(|(_, _, delta)| *delta > 0).count();
         let touched_tokens = deltas
             .iter()
             .map(|(_, token, _)| token.clone())
             .collect::<BTreeSet<_>>();
+        let subject_flow_count = analysis
+            .derived_flows
+            .iter()
+            .filter(|flow| {
+                flow.asset_type == AssetType::Erc20
+                    && (flow.from_address.eq_ignore_ascii_case(&subject)
+                        || flow.to_address.eq_ignore_ascii_case(&subject))
+            })
+            .count();
         if analysis.normalized_execution_facts.internal_call_count < 2
             || outgoing_count == 0
             || incoming_count == 0
             || touched_tokens.len() < 2
+            || (subject_flow_count < 4 && touched_tokens.len() < 3)
         {
             return Ok(None);
         }
@@ -853,8 +889,10 @@ impl Recognizer for ArbitrageLikeScenarioRecognizer {
             confidence: 0.67,
             evidence_refs: analysis.raw_evidence_refs.clone(),
             attributes: json!({
-                "sender": sender,
+                "subject": subject,
+                "subject_role": subject_role,
                 "token_touch_count": touched_tokens.len(),
+                "subject_flow_count": subject_flow_count,
                 "internal_call_count": analysis.normalized_execution_facts.internal_call_count,
             }),
             unresolved_points: vec![UnresolvedItem {

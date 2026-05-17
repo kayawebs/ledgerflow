@@ -185,6 +185,43 @@ async fn executor_mediated_swap_produces_swap_action_and_storyline() {
 }
 
 #[tokio::test]
+async fn executor_mediated_multi_leg_cycle_is_arbitrage_not_transfer() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository,
+        vec![
+            "selector_presence".to_owned(),
+            "erc20_transfer_flow".to_owned(),
+            "arbitrage_like_scenario".to_owned(),
+        ],
+    ));
+
+    let (analysis, _) = analysis_service
+        .analyze_transaction(8453, "0xexecutor-arbitrage-case")
+        .await
+        .unwrap();
+
+    assert!(analysis
+        .recognizer_results
+        .iter()
+        .any(|result| result.label == "arbitrage_like_activity"));
+    let storyline = analysis
+        .scenario_outputs
+        .get("storyline")
+        .expect("arbitrage storyline should exist");
+    assert_eq!(
+        storyline.get("kind").and_then(|value| value.as_str()),
+        Some("arbitrage")
+    );
+}
+
+#[tokio::test]
 async fn behavior_classifier_marks_morpho_liquidation_without_trace_when_event_matches() {
     let repository = Arc::new(InMemoryAnalysisRepository::default());
     let fetcher = TransactionBundleFetcher::new(
