@@ -53,10 +53,18 @@ impl AddressIntelligenceService {
         };
 
         match self.analyze_job(&job).await {
-            Ok((profile, labels)) => {
+            Ok((mut profile, labels)) => {
+                if self.backfill_address_history(&job).await? {
+                    profile.metadata = merge_metadata(
+                        profile.metadata,
+                        json!({
+                            "address_history_backfilled_at": Utc::now(),
+                            "address_history_backfill_source": "indexer",
+                        }),
+                    );
+                }
                 self.repository.upsert_address_profile(&profile).await?;
                 self.repository.upsert_address_labels(&labels).await?;
-                self.backfill_address_history(&job).await?;
                 self.repository
                     .complete_address_analysis_job(job.chain_id, &job.address)
                     .await?;
@@ -158,14 +166,14 @@ impl AddressIntelligenceService {
         Ok((profile, labels))
     }
 
-    async fn backfill_address_history(&self, job: &AddressAnalysisJob) -> LedgerResult<()> {
+    async fn backfill_address_history(&self, job: &AddressAnalysisJob) -> LedgerResult<bool> {
         if !should_backfill_history(&job.metadata) {
-            return Ok(());
+            return Ok(false);
         }
         let (Some(analysis_service), Some(tx_source)) =
             (self.analysis_service.as_ref(), self.tx_source.as_ref())
         else {
-            return Ok(());
+            return Ok(false);
         };
         let end_block = tx_source.get_last_indexed_block(job.chain_id).await?;
         let mut tx_map = BTreeMap::<String, AddressTxRef>::new();
@@ -205,7 +213,7 @@ impl AddressIntelligenceService {
                 continue;
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -262,6 +270,17 @@ fn should_backfill_history(metadata: &Value) -> bool {
         || role_labels_from_metadata(metadata)
             .iter()
             .any(|role| role == "manual_lookup")
+}
+
+fn merge_metadata(mut left: Value, right: Value) -> Value {
+    if let (Some(left_obj), Some(right_obj)) = (left.as_object_mut(), right.as_object()) {
+        for (key, value) in right_obj {
+            left_obj.insert(key.clone(), value.clone());
+        }
+        left
+    } else {
+        right
+    }
 }
 
 struct KnownAddressLabel {

@@ -1032,7 +1032,7 @@ async fn address_analysis_page(
     {
         let chain_id = query.chain_id.unwrap_or(state.default_chain_id);
         let path = format!(
-            "/addresses/summary?chain_id={}&address={}",
+            "/addresses/summary?chain_id={}&address={}&lite=true",
             chain_id,
             urlencoding::encode(address)
         );

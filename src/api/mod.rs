@@ -117,6 +117,7 @@ pub struct AddressIntelligenceEnvelope {
 pub struct AddressSummaryQuery {
     pub chain_id: Option<u64>,
     pub address: String,
+    pub lite: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,19 +374,18 @@ async fn get_address_summary(
         .list_address_labels(chain_id, &addresses)
         .await
         .map_err(ApiError::from)?;
+    let lite = query.lite.unwrap_or(false);
     let native_balance_raw = state
         .rpc_client
         .get_balance(chain_id, &address, None)
         .await
         .ok()
         .and_then(|value| hex_quantity_to_decimal(&value));
-    let analyses = state
-        .service
-        .repository
-        .list_analyses_for_cluster(chain_id, &addresses, None, None)
-        .await
-        .map_err(ApiError::from)?;
-    let queued = if profiles.is_empty() || analyses.is_empty() {
+    let should_enqueue_history = profiles
+        .first()
+        .map(|profile| !profile_history_backfilled(profile))
+        .unwrap_or(true);
+    let queued = if should_enqueue_history {
         state
             .service
             .repository
@@ -402,6 +402,16 @@ async fn get_address_summary(
             > 0
     } else {
         false
+    };
+    let analyses = if lite {
+        Vec::new()
+    } else {
+        state
+            .service
+            .repository
+            .list_analyses_for_cluster(chain_id, &addresses, None, None)
+            .await
+            .map_err(ApiError::from)?
     };
     let mut behavior = std::collections::BTreeMap::<String, (u64, i128)>::new();
     let mut gas_total = 0i128;
@@ -585,6 +595,13 @@ fn analysis_gas_raw(analysis: &TransactionAnalysis) -> i128 {
         .and_then(|value| value.as_str())
         .and_then(|value| value.parse::<i128>().ok())
         .unwrap_or(0)
+}
+
+fn profile_history_backfilled(profile: &AddressProfile) -> bool {
+    profile
+        .metadata
+        .get("address_history_backfilled_at")
+        .is_some()
 }
 
 async fn discover_cluster(
