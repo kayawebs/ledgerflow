@@ -212,6 +212,9 @@ Do not let one recognizer try to do all five.
 The current recognizers mostly look at selector, logs, and derived flows. Add richer normalized facts:
 
 - touched contracts with code identity
+- ordered call timeline derived from callTracer frames
+- per-call trace address, call type, selector, from, to, native value, and parent/child relationship
+- log and token-flow attachments to the nearest call frame when evidence allows it
 - top-level and internal call motifs
 - approval relationships
 - token in/out net deltas by address
@@ -220,6 +223,47 @@ The current recognizers mostly look at selector, logs, and derived flows. Add ri
 - counterparty role hints
 
 These facts should remain evidence-first and versioned.
+
+### 4.2.1 Call Timeline Projection
+
+The UI timeline should not be only an asset-flow list.
+
+Target model:
+
+1. Always start with the top-level execution entry:
+   - tx `from`
+   - tx `to`
+   - selector
+   - native value
+   - gas payer
+2. Render internal calls from `normalized_execution_facts.call_tree` when trace is available.
+3. Attach ERC20/native `derived_flows` to the relevant call step when possible.
+4. Show calls even when they do not emit token transfers, because these calls often explain router, pool, vault, or protocol state transitions.
+5. Fall back to the current flow-only timeline when trace is unavailable.
+
+Current data support:
+
+- supported when `LEDGERFLOW_TRACE_ENABLED=true` and the RPC returns `debug_traceTransaction` callTracer data
+- partially supported today because `call_tree` is already persisted in `TransactionAnalysis`
+- not enough for full diagnostics yet because the stored trace frame currently omits output data, revert reason, gas, and error fields
+
+Implementation tasks:
+
+1. Add a normalized `execution_timeline` projection from `call_tree`.
+2. Preserve stable ordering with `trace_address`.
+3. Add a lightweight call-frame DTO for web rendering.
+4. Add a flow-to-call attachment heuristic:
+   - exact `from/to` match first
+   - token log address / pool address match second
+   - fallback to nearest protocol/router frame
+5. Update web timeline to display:
+   - call step
+   - attached token/native transfers
+   - no-transfer call steps as compact rows
+6. Add tests for:
+   - top-level tx entry plus no-transfer internal call
+   - router call with attached ERC20 transfers
+   - trace-disabled fallback
 
 ### 4.3 Introduce Recognizer Families
 
@@ -255,6 +299,71 @@ Move static knowledge out of recognizer code over time:
 - protocol-specific address sets or code hashes
 
 These should be versioned data assets, not hardcoded everywhere.
+
+### 4.5.1 Protocol / Venue Intelligence Registry
+
+Add a general protocol intelligence layer before adding many protocol-specific recognizers.
+
+Do not build this as "DEX-only" infrastructure. DEX pools are the first target because they unlock swap and arbitrage explanations, but the same registry must support lending, vaults, bridges, routers, aggregators, liquidators, and future protocol families.
+
+Core concepts:
+
+- `address_profiles` remain the broad address-level identity store
+- add protocol-specific metadata records keyed by `chain_id + address`
+- classify addresses with `protocol_family`, `protocol_name`, `contract_role`, `confidence`, `source`, and `metadata`
+- keep adapter output versioned so a wrong adapter can be replayed and corrected
+
+Priority 1: DEX / Venue Intelligence
+
+- known router and aggregator addresses:
+  - Uniswap routers
+  - Aerodrome routers
+  - 0x / 1inch / OKX style routers when observed
+- pool probes:
+  - Uniswap V2-compatible pair: `token0()`, `token1()`, `getReserves()`, `factory()`
+  - Uniswap V3-compatible pool: `token0()`, `token1()`, `fee()`, `slot0()`, `factory()`
+  - Solidly/Aerodrome-style pool: `token0()`, `token1()`, `stable()`, `factory()`
+  - concentrated-liquidity variants where Base usage warrants it
+- event signatures:
+  - V2 `Swap`
+  - V3 `Swap`
+  - Mint/Burn/Sync where relevant
+- store pool metadata:
+  - pool type
+  - token0/token1
+  - fee or stable flag
+  - factory
+  - first seen / last seen
+
+Priority 2: Lending / Liquidation Intelligence
+
+- protocol contracts and market contracts
+- liquidation event signatures
+- borrow / repay / supply / withdraw event signatures
+- known protocol-specific market metadata where available
+
+Priority 3: Vault / Bridge / LP Intelligence
+
+- ERC4626-like vault probes
+- LP token mint/burn relationships
+- bridge escrow/router/message contracts
+- canonical token or wrapped asset mappings
+
+Implementation tasks:
+
+1. Add protocol metadata tables or extend address intelligence with a separate `address_protocol_metadata` table.
+2. Add protocol adapter trait:
+   - `probe(address) -> Option<ProtocolAddressMetadata>`
+   - `classify_log(log) -> Option<ProtocolEvent>`
+   - `classify_call(call_frame) -> Option<ProtocolCall>`
+3. Run adapters from the address worker when new contracts are discovered.
+4. Cache negative probe results with TTL to avoid repeatedly calling unsupported methods.
+5. Feed protocol metadata into:
+   - tx timeline labels
+   - scenario recognizers
+   - route reconstruction
+   - arbitrage/liquidation accounting
+6. Add replay support so existing analyses can be reinterpreted after the registry learns new addresses.
 
 ### 4.6 Add Concrete New Recognizers
 

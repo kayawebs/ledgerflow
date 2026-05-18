@@ -62,7 +62,33 @@ Current examples now include:
 These scenario recognizers depend on:
 
 - stronger trace facts
+- a call-stack timeline projection, not only an asset-flow timeline
+- event/token-flow attachment to call frames where evidence allows it
 - richer token delta summaries
 - touched-contract and protocol-family hints
+- protocol / venue intelligence registry
 - revert / failure location hints
 - scenario composition rather than one giant recognizer
+
+## Protocol Intelligence Priority
+
+The first implementation target should be DEX / venue intelligence because it directly improves swap and arbitrage interpretation.
+
+DEX coverage should include:
+
+- known routers and aggregators
+- V2-style pairs
+- V3-style pools
+- Aerodrome/Solidly-style pools
+- swap events and pool token metadata
+
+This should still be implemented as a general protocol intelligence system, not a DEX-specific shortcut. The same adapter pattern must later support lending markets, liquidation venues, vaults, bridges, LP positions, and other DeFi protocol families.
+
+## Timeline Semantics
+
+The transaction timeline should represent execution order.
+
+- A call step may have no token transfer.
+- A token transfer should be rendered as evidence attached to a call step when possible.
+- When trace is available, the first row should be the top-level transaction call from initiator to target/executor.
+- When trace is unavailable, the timeline can fall back to confirmed asset flows only and must label that limitation.
