@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -67,6 +70,7 @@ pub struct TraceMonitorService {
     rpc_client: Arc<IndexerRpcClient>,
     light_fetcher: TransactionBundleFetcher,
     config: TraceMonitorConfig,
+    startup_anchor_initialized: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,17 +110,25 @@ impl TraceMonitorService {
             rpc_client,
             light_fetcher,
             config,
+            startup_anchor_initialized: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub async fn process_once(&self) -> LedgerResult<TraceMonitorIteration> {
         let latest_block = self.rpc_client.get_latest_block_number().await?;
         let target_block = latest_block.saturating_sub(self.config.confirmations);
-        let last_processed = self.load_last_processed_block().await?;
-        let start_block = last_processed
-            .map(|block| block.saturating_add(1))
-            .or(self.config.start_block)
-            .unwrap_or(target_block);
+        let skip_history_on_startup = !self.startup_anchor_initialized.swap(true, Ordering::SeqCst);
+        let last_processed = if skip_history_on_startup {
+            None
+        } else {
+            self.load_last_processed_block().await?
+        };
+        let start_block = next_start_block(
+            skip_history_on_startup,
+            last_processed,
+            self.config.start_block,
+            target_block,
+        );
 
         let mut iteration = TraceMonitorIteration {
             latest_block,
@@ -624,6 +636,21 @@ fn parse_amount_i128(value: &str) -> i128 {
     value.parse::<i128>().unwrap_or_default()
 }
 
+fn next_start_block(
+    skip_history_on_startup: bool,
+    last_processed: Option<u64>,
+    configured_start_block: Option<u64>,
+    target_block: u64,
+) -> u64 {
+    if skip_history_on_startup {
+        return target_block;
+    }
+    last_processed
+        .map(|block| block.saturating_add(1))
+        .or(configured_start_block)
+        .unwrap_or(target_block)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::domain::value_objects::EvidenceRef;
@@ -670,5 +697,13 @@ mod tests {
         assert_eq!(delta.amount_in, 25);
         assert_eq!(delta.amount_out, 7);
         assert_eq!(delta.addresses.len(), 2);
+    }
+
+    #[test]
+    fn startup_start_block_ignores_persisted_history_once() {
+        assert_eq!(next_start_block(true, Some(100), Some(200), 500), 500);
+        assert_eq!(next_start_block(false, Some(100), Some(200), 500), 101);
+        assert_eq!(next_start_block(false, None, Some(200), 500), 200);
+        assert_eq!(next_start_block(false, None, None, 500), 500);
     }
 }
