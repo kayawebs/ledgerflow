@@ -575,9 +575,10 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
             )
         }
         EmailDeliveryMode::Auto => {
-            if let (Some(server_token), Some(from_email)) =
-                (config.postmark_server_token.clone(), config.email_from.clone())
-            {
+            if let (Some(server_token), Some(from_email)) = (
+                config.postmark_server_token.clone(),
+                config.email_from.clone(),
+            ) {
                 (
                     Arc::new(PostmarkVerificationSender::new(
                         server_token,
@@ -683,10 +684,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
 async fn health(State(state): State<WebState>) -> Html<String> {
     Html(format!(
         "{{\"status\":\"ok\",\"web_bind_addr\":\"{}\",\"api_base_url\":\"{}\",\"email_delivery_mode\":\"{}\",\"email_delivery_ready\":{}}}",
-        state.bind_addr,
-        state.api_base_url,
-        state.email_delivery_mode,
-        state.email_delivery_ready
+        state.bind_addr, state.api_base_url, state.email_delivery_mode, state.email_delivery_ready
     ))
 }
 
@@ -698,7 +696,10 @@ async fn brand_mark_svg() -> Response {
         .into_response()
 }
 
-async fn homepage(State(state): State<WebState>, headers: HeaderMap) -> Result<Html<String>, WebError> {
+async fn homepage(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, WebError> {
     let user = current_user(&state, &headers).await?;
     Ok(Html(render_marketing_page(
         "LedgerFlow",
@@ -707,7 +708,10 @@ async fn homepage(State(state): State<WebState>, headers: HeaderMap) -> Result<H
     )))
 }
 
-async fn pricing(State(state): State<WebState>, headers: HeaderMap) -> Result<Html<String>, WebError> {
+async fn pricing(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, WebError> {
     let user = current_user(&state, &headers).await?;
     Ok(Html(render_marketing_page(
         "Pricing",
@@ -841,9 +845,7 @@ async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Result<Res
     Ok(response)
 }
 
-async fn dashboard(
-    Query(query): Query<DashboardQuery>,
-) -> Result<Response, WebError> {
+async fn dashboard(Query(query): Query<DashboardQuery>) -> Result<Response, WebError> {
     let location = match DashboardTab::from_query(query.tab.as_deref()) {
         DashboardTab::Clusters => "/app/clusters".to_owned(),
         DashboardTab::ClusterAnalysis => {
@@ -971,7 +973,12 @@ async fn cluster_discovery_page(
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
-    let (payload, error) = if let Some(address) = query.address.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    let (payload, error) = if let Some(address) = query
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         let max_hops = query.max_hops.unwrap_or(1).clamp(1, 3);
         let path = format!(
             "/discovery/cluster?chain_id={}&seed_address={}&max_hops={}",
@@ -1283,7 +1290,9 @@ async fn create_indexer_api_key(
     };
     let label = form.label.trim();
     if label.is_empty() {
-        return Ok(Redirect::to("/app/indexer/api-keys?notice=indexer-key-label-required").into_response());
+        return Ok(
+            Redirect::to("/app/indexer/api-keys?notice=indexer-key-label-required").into_response(),
+        );
     }
     let created: CreatedIndexerApiKeyPayload = indexer_post_json(
         &state,
@@ -1338,7 +1347,10 @@ async fn cluster_status(
     };
     let cluster_id = Uuid::parse_str(cluster_id_raw)
         .map_err(|err| WebError::bad_request(format!("invalid cluster id: {err}")))?;
-    if !clusters.iter().any(|cluster| cluster.cluster_id == cluster_id) {
+    if !clusters
+        .iter()
+        .any(|cluster| cluster.cluster_id == cluster_id)
+    {
         return Err(WebError::bad_request(
             "cluster is not available for the current user".to_owned(),
         ));
@@ -1410,7 +1422,7 @@ async fn create_cluster(
                 None,
                 None,
             )
-                .await
+            .await
         }
     }
 }
@@ -1586,7 +1598,11 @@ async fn run_tx_analysis(
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
     let mode = form.mode.as_deref().unwrap_or("analyze");
-    let load_path = format!("/analyses/{}?chain_id={}", form.tx_hash.trim(), form.chain_id);
+    let load_path = format!(
+        "/analyses/{}?chain_id={}",
+        form.tx_hash.trim(),
+        form.chain_id
+    );
     let result = if mode == "reanalyze" {
         api_post_json::<_, AnalysisEnvelope>(
             &state,
@@ -1759,18 +1775,15 @@ async fn render_dashboard_response(
         .cluster_id
         .as_deref()
         .and_then(|value| Uuid::parse_str(value).ok())
-        .and_then(|cluster_id| clusters.iter().find(|item| item.cluster_id == cluster_id).cloned())
+        .and_then(|cluster_id| {
+            clusters
+                .iter()
+                .find(|item| item.cluster_id == cluster_id)
+                .cloned()
+        })
         .or_else(|| clusters.first().cloned());
 
-    let (
-        tracking,
-        coverage,
-        spend_summary,
-        metrics,
-        alerts,
-        cluster_status,
-        cluster_error,
-    ) =
+    let (tracking, coverage, spend_summary, metrics, alerts, cluster_status, cluster_error) =
         if tab == DashboardTab::ClusterAnalysis {
             if let Some(cluster) = selected_cluster.as_ref() {
                 match load_cluster_live_response(
@@ -1802,26 +1815,10 @@ async fn render_dashboard_response(
                     ),
                 }
             } else {
-                (
-                    None,
-                    None,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                    None,
-                )
+                (None, None, None, Vec::new(), Vec::new(), None, None)
             }
         } else {
-            (
-                None,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                None,
-                None,
-            )
+            (None, None, None, Vec::new(), Vec::new(), None, None)
         };
 
     let classified_page = if tab == DashboardTab::ClusterAnalysis
@@ -1832,10 +1829,16 @@ async fn render_dashboard_response(
                 format!("page={}", classified_query.page),
                 format!("page_size={}", classified_query.page_size),
                 format!("sort_by={}", urlencoding::encode(&classified_query.sort_by)),
-                format!("sort_dir={}", urlencoding::encode(&classified_query.sort_dir)),
+                format!(
+                    "sort_dir={}",
+                    urlencoding::encode(&classified_query.sort_dir)
+                ),
             ];
             if let Some(behavior_tag) = classified_query.behavior_tag.as_deref() {
-                params.push(format!("behavior_tag={}", urlencoding::encode(behavior_tag)));
+                params.push(format!(
+                    "behavior_tag={}",
+                    urlencoding::encode(behavior_tag)
+                ));
             }
             if let Some(protocol) = classified_query.protocol.as_deref() {
                 params.push(format!("protocol={}", urlencoding::encode(protocol)));
@@ -1868,7 +1871,10 @@ async fn render_dashboard_response(
     let (indexer_api_keys, indexer_api_keys_error) = if tab == DashboardTab::IndexerApiKeys {
         match indexer_get_json::<Vec<IndexerApiKeyPayload>>(
             state,
-            &format!("/admin/api-keys?owner_user_id={}", urlencoding::encode(&user.user_id.to_string())),
+            &format!(
+                "/admin/api-keys?owner_user_id={}",
+                urlencoding::encode(&user.user_id.to_string())
+            ),
         )
         .await
         {
@@ -1935,14 +1941,21 @@ async fn load_cluster_live_response(
             if let Some(end) = end {
                 params.push(format!("end={}", urlencoding::encode(end)));
             }
-            format!("/clusters/{}/spend-summary?{}", cluster_id, params.join("&"))
+            format!(
+                "/clusters/{}/spend-summary?{}",
+                cluster_id,
+                params.join("&")
+            )
         }
     };
     let (coverage, tracking, spend_summary, metrics, alerts) = match selected_tab {
         ClusterAnalysisTab::Overview => {
             let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
             let tracking_path = format!("/clusters/{}/tracking", cluster_id);
-            let alerts_path = format!("/clusters/{}/alerts?include_read=false&limit=12", cluster_id);
+            let alerts_path = format!(
+                "/clusters/{}/alerts?include_read=false&limit=12",
+                cluster_id
+            );
             let tracking_fut = api_get_json::<ClusterTrackingState>(state, &tracking_path);
             let alerts_fut = api_get_json::<Vec<ClusterAlert>>(state, &alerts_path);
             let (coverage, tracking, alerts) = tokio::join!(coverage_fut, tracking_fut, alerts_fut);
@@ -1980,7 +1993,9 @@ async fn load_cluster_live_response(
             )
         }
         ClusterAnalysisTab::Activity => (
-            api_get_json::<ClusterCoverage>(state, &coverage_path).await.ok(),
+            api_get_json::<ClusterCoverage>(state, &coverage_path)
+                .await
+                .ok(),
             None,
             None,
             Vec::new(),
@@ -2092,8 +2107,14 @@ fn parse_cluster_addresses(raw: &str) -> LedgerResult<Vec<ClusterAddressInput>> 
             }
             Ok(ClusterAddressInput {
                 address,
-                label: parts.next().filter(|value| !value.is_empty()).map(str::to_owned),
-                role: parts.next().filter(|value| !value.is_empty()).map(str::to_owned),
+                label: parts
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                role: parts
+                    .next()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
             })
         })
         .collect::<LedgerResult<Vec<_>>>()?;
@@ -2139,7 +2160,12 @@ fn cluster_tx_table_state_from_query(query: &DashboardQuery) -> ClusterTxTableSt
     let sort_by = query
         .tx_sort_by
         .as_deref()
-        .filter(|value| matches!(*value, "timestamp" | "block_number" | "value_usd" | "gas_cost_usd" | "estimated_pnl_usd"))
+        .filter(|value| {
+            matches!(
+                *value,
+                "timestamp" | "block_number" | "value_usd" | "gas_cost_usd" | "estimated_pnl_usd"
+            )
+        })
         .unwrap_or("timestamp")
         .to_owned();
     let sort_dir = match query.tx_sort_dir.as_deref() {
@@ -2174,14 +2200,21 @@ fn parse_purpose(value: &str) -> Result<VerificationPurpose, WebError> {
 async fn api_get_json<T: DeserializeOwned>(state: &WebState, path: &str) -> Result<T, WebError> {
     let response = state
         .client
-        .get(format!("{}{}", state.api_base_url.trim_end_matches('/'), path))
+        .get(format!(
+            "{}{}",
+            state.api_base_url.trim_end_matches('/'),
+            path
+        ))
         .send()
         .await
         .map_err(WebError::upstream)?;
     parse_api_response(response).await
 }
 
-async fn indexer_get_json<T: DeserializeOwned>(state: &WebState, path: &str) -> Result<T, WebError> {
+async fn indexer_get_json<T: DeserializeOwned>(
+    state: &WebState,
+    path: &str,
+) -> Result<T, WebError> {
     let Some(base_url) = state.indexer_api_base_url.as_deref() else {
         return Err(WebError::bad_gateway(
             "indexer api is not configured for the web portal".to_owned(),
@@ -2225,7 +2258,11 @@ async fn api_post_json<Req: Serialize, Res: DeserializeOwned>(
 ) -> Result<Res, WebError> {
     let response = state
         .client
-        .post(format!("{}{}", state.api_base_url.trim_end_matches('/'), path))
+        .post(format!(
+            "{}{}",
+            state.api_base_url.trim_end_matches('/'),
+            path
+        ))
         .json(payload)
         .send()
         .await
@@ -2233,14 +2270,15 @@ async fn api_post_json<Req: Serialize, Res: DeserializeOwned>(
     parse_api_response(response).await
 }
 
-async fn parse_api_response<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, WebError> {
+async fn parse_api_response<T: DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, WebError> {
     let status = response.status();
     let body = response.text().await.map_err(WebError::upstream)?;
     if !status.is_success() {
         return Err(WebError::bad_gateway(format!(
             "internal analysis api returned {}: {}",
-            status,
-            body
+            status, body
         )));
     }
     serde_json::from_str(&body).map_err(|err| WebError::internal(err.to_string()))
@@ -2254,15 +2292,19 @@ async fn parse_indexer_response<T: DeserializeOwned>(
     if !status.is_success() {
         return Err(WebError::bad_gateway(format!(
             "indexer api returned {}: {}",
-            status,
-            body
+            status, body
         )));
     }
     serde_json::from_str(&body).map_err(|err| WebError::internal(err.to_string()))
 }
 
 fn build_indexer_lookup_path(query: &IndexerLookupQuery) -> Result<Option<String>, WebError> {
-    let Some(address) = query.address.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(address) = query
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return Ok(None);
     };
     let mut params = Vec::new();
@@ -2347,13 +2389,21 @@ fn render_notice_message(code: &str) -> Option<&'static str> {
         "cluster-created" => Some("Cluster created and queued for historical backfill."),
         "cluster-updated" => Some("Cluster definition updated."),
         "cluster-deleted" => Some("Cluster deleted."),
-        "cluster-delete-error" => Some("Cluster delete failed. Inspect the latest server response or logs."),
+        "cluster-delete-error" => {
+            Some("Cluster delete failed. Inspect the latest server response or logs.")
+        }
         "tracking-enabled" => Some("Cluster tracking enabled."),
         "tracking-paused" => Some("Cluster tracking paused."),
-        "tracking-error" => Some("Tracking action failed. Inspect the latest cluster state or server logs."),
+        "tracking-error" => {
+            Some("Tracking action failed. Inspect the latest cluster state or server logs.")
+        }
         "alert-read" => Some("Alert marked as read."),
-        "alert-error" => Some("Alert action failed. Refresh the cluster view and inspect server logs."),
-        "indexer-key-created" => Some("Indexer API key created. Copy the full token now; the portal only shows it once."),
+        "alert-error" => {
+            Some("Alert action failed. Refresh the cluster view and inspect server logs.")
+        }
+        "indexer-key-created" => {
+            Some("Indexer API key created. Copy the full token now; the portal only shows it once.")
+        }
         "indexer-key-revoked" => Some("Indexer API key revoked."),
         "indexer-key-label-required" => Some("Provide a label before creating an indexer API key."),
         "auth-required" => Some("Sign in to continue."),
@@ -2440,8 +2490,16 @@ fn render_homepage_content(user: Option<&AppUser>) -> String {
   <a class="cta secondary" href="/pricing">Open pricing</a>
 </section>
 "#,
-        if user.is_some() { "/app/clusters" } else { "/auth" },
-        if user.is_some() { "Open dashboard" } else { "Request access" }
+        if user.is_some() {
+            "/app/clusters"
+        } else {
+            "/auth"
+        },
+        if user.is_some() {
+            "Open dashboard"
+        } else {
+            "Request access"
+        }
     )
 }
 
@@ -2469,8 +2527,7 @@ fn render_pricing_content() -> String {
   </article>
 </section>
 "#,
-        DEFAULT_PRICE_ETH,
-        DEFAULT_PRICE_ETH
+        DEFAULT_PRICE_ETH, DEFAULT_PRICE_ETH
     )
 }
 
@@ -2635,9 +2692,7 @@ fn render_dashboard_page(
         let status_label = cluster_status
             .map(|item| item.0.as_str())
             .unwrap_or("Waiting for backfill");
-        let status_tone = cluster_status
-            .map(|item| item.1.as_str())
-            .unwrap_or("info");
+        let status_tone = cluster_status.map(|item| item.1.as_str()).unwrap_or("info");
         let overview_active = if *cluster_analysis_tab == ClusterAnalysisTab::Overview {
             "active"
         } else {
@@ -2658,30 +2713,14 @@ fn render_dashboard_page(
         } else {
             ""
         };
-        let overview_href = cluster_analysis_tab_href(
-            cluster.cluster_id,
-            start,
-            end,
-            ClusterAnalysisTab::Overview,
-        );
-        let metrics_href = cluster_analysis_tab_href(
-            cluster.cluster_id,
-            start,
-            end,
-            ClusterAnalysisTab::Metrics,
-        );
-        let summary_href = cluster_analysis_tab_href(
-            cluster.cluster_id,
-            start,
-            end,
-            ClusterAnalysisTab::Summary,
-        );
-        let activity_href = cluster_analysis_tab_href(
-            cluster.cluster_id,
-            start,
-            end,
-            ClusterAnalysisTab::Activity,
-        );
+        let overview_href =
+            cluster_analysis_tab_href(cluster.cluster_id, start, end, ClusterAnalysisTab::Overview);
+        let metrics_href =
+            cluster_analysis_tab_href(cluster.cluster_id, start, end, ClusterAnalysisTab::Metrics);
+        let summary_href =
+            cluster_analysis_tab_href(cluster.cluster_id, start, end, ClusterAnalysisTab::Summary);
+        let activity_href =
+            cluster_analysis_tab_href(cluster.cluster_id, start, end, ClusterAnalysisTab::Activity);
         let tab_panel = match cluster_analysis_tab {
             ClusterAnalysisTab::Overview => format!(
                 r#"<section class="cluster-tab-panel active" data-cluster-tab-panel="overview">
@@ -2718,7 +2757,11 @@ fn render_dashboard_page(
       <h3>Recent classified transactions</h3>
       <div id="cluster-live-classified">{}</div>
     </section>"#,
-                render_recent_classified_transactions_panel(cluster, classified_page, classified_query),
+                render_recent_classified_transactions_panel(
+                    cluster,
+                    classified_page,
+                    classified_query
+                ),
             ),
         };
         format!(
@@ -2810,7 +2853,8 @@ fn render_dashboard_page(
     let cluster_discovery_panel = render_cluster_discovery_panel(discovery_result, discovery_query);
 
     let graph_panel = render_cluster_graph_panel(clusters);
-    let address_analysis_panel = render_address_analysis_panel(address_summary, state.default_chain_id);
+    let address_analysis_panel =
+        render_address_analysis_panel(address_summary, state.default_chain_id);
     let indexer_progress_panel = render_indexer_progress_panel(indexer_progress);
     let indexer_lookup_panel = render_indexer_lookup_panel(indexer_lookup, indexer_query);
     let indexer_api_keys_panel =
@@ -2850,7 +2894,8 @@ fn render_dashboard_page(
           </div>
         </section>"#,
             match tab {
-                DashboardTab::Clusters => render_cluster_management_panel(state.default_chain_id, editable_cluster),
+                DashboardTab::Clusters =>
+                    render_cluster_management_panel(state.default_chain_id, editable_cluster),
                 _ => String::new(),
             },
             side_column
@@ -2978,7 +3023,11 @@ fn render_cluster_management_panel(
   </div>
 </section>
 "#,
-        if is_editing { "Edit cluster" } else { "Create cluster" },
+        if is_editing {
+            "Edit cluster"
+        } else {
+            "Create cluster"
+        },
         if is_editing {
             "Update the cluster definition in place. Existing analyses stay in the database, while future tracking and backfill runs use the edited address set."
         } else {
@@ -2990,7 +3039,11 @@ fn render_cluster_management_panel(
         escape_html(name),
         escape_html(description),
         escape_html(&addresses),
-        if is_editing { "Save cluster changes" } else { "Create cluster" },
+        if is_editing {
+            "Save cluster changes"
+        } else {
+            "Create cluster"
+        },
         if is_editing {
             "<a class=\"cta ghost\" href=\"/app/clusters\">Cancel edit</a>".to_owned()
         } else {
@@ -3006,7 +3059,9 @@ fn render_cluster_discovery_panel(
     let address = discovery_query
         .and_then(|value| value.address.as_deref())
         .unwrap_or_default();
-    let max_hops = discovery_query.and_then(|value| value.max_hops).unwrap_or(1);
+    let max_hops = discovery_query
+        .and_then(|value| value.max_hops)
+        .unwrap_or(1);
     let result_panel = discovery_result
         .map(|payload| {
             let warnings = if payload.warnings.is_empty() {
@@ -3139,7 +3194,9 @@ fn render_address_analysis_panel(
     summary: Option<&AddressSummaryEnvelope>,
     default_chain_id: u64,
 ) -> String {
-    let address = summary.map(|value| value.address.as_str()).unwrap_or_default();
+    let address = summary
+        .map(|value| value.address.as_str())
+        .unwrap_or_default();
     let chain_id = summary
         .map(|value| value.chain_id)
         .unwrap_or(default_chain_id);
@@ -3274,9 +3331,10 @@ fn summarize_primary_activity(analysis: &TransactionAnalysis) -> (String, String
                 "liquidation",
                 "A liquidation-like recognizer fired on this tx.",
             )),
-            "swap_like_activity" | "approval_then_swap_like" => {
-                Some(("swap", "The tx shows token-in / token-out swap-like behavior."))
-            }
+            "swap_like_activity" | "approval_then_swap_like" => Some((
+                "swap",
+                "The tx shows token-in / token-out swap-like behavior.",
+            )),
             "erc20_approval_activity" => Some((
                 "approve",
                 "The tx granted ERC20 allowance to a spender contract.",
@@ -3354,7 +3412,8 @@ fn summarize_primary_activity(analysis: &TransactionAnalysis) -> (String, String
     } else {
         (
             "unknown".to_owned(),
-            "The current recognizers could not confidently classify this transaction yet.".to_owned(),
+            "The current recognizers could not confidently classify this transaction yet."
+                .to_owned(),
             "n/a".to_owned(),
         )
     }
@@ -3456,7 +3515,8 @@ fn render_tx_analysis_result_with_share_url(
             .join("")
     };
     let flow_rows = if analysis.derived_flows.is_empty() {
-        "<div class=\"empty-state\">No normalized asset flows were derived for this tx.</div>".to_owned()
+        "<div class=\"empty-state\">No normalized asset flows were derived for this tx.</div>"
+            .to_owned()
     } else {
         format!(
             r#"<div class="table-shell">
@@ -3495,7 +3555,8 @@ fn render_tx_analysis_result_with_share_url(
         )
     };
     let validation_rows = if analysis.validation_results.is_empty() {
-        "<div class=\"empty-state\">No validation messages were emitted for this tx.</div>".to_owned()
+        "<div class=\"empty-state\">No validation messages were emitted for this tx.</div>"
+            .to_owned()
     } else {
         format!(
             r#"<div class="table-shell">
@@ -3551,7 +3612,7 @@ fn render_tx_analysis_result_with_share_url(
                     )
                 })
                 .collect::<Vec<_>>()
-            .join("")
+                .join("")
         )
     };
     let storyline_panel = render_tx_storyline_panel(analysis, &address_book);
@@ -3605,7 +3666,10 @@ fn render_tx_analysis_result_with_share_url(
         storyline_panel,
         utilities,
         render_storyline_gap_explanation(&analysis.scenario_outputs)
-            .map(|message| format!(r#"<div class="notice info">{}</div>"#, escape_html(&message)))
+            .map(|message| format!(
+                r#"<div class="notice info">{}</div>"#,
+                escape_html(&message)
+            ))
             .unwrap_or_default(),
         flow_rows,
         unresolved_rows,
@@ -3702,7 +3766,12 @@ fn render_tx_utilities_panel(
     share_url: Option<&str>,
 ) -> String {
     let token_contract = first_report_token_address(&analysis.scenario_outputs)
-        .or_else(|| analysis.derived_flows.iter().find_map(|flow| flow.token_address.as_deref()))
+        .or_else(|| {
+            analysis
+                .derived_flows
+                .iter()
+                .find_map(|flow| flow.token_address.as_deref())
+        })
         .unwrap_or("native");
     let share_card = if let Some(url) = share_url {
         format!(
@@ -3958,8 +4027,14 @@ fn token_is_eth_equivalent(token: Option<&serde_json::Value>) -> bool {
     let Some(token) = token else {
         return false;
     };
-    let symbol = token.get("symbol").and_then(|value| value.as_str()).unwrap_or("");
-    let address = token.get("address").and_then(|value| value.as_str()).unwrap_or("");
+    let symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let address = token
+        .get("address")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     symbol.eq_ignore_ascii_case("ETH")
         || symbol.eq_ignore_ascii_case("WETH")
         || address.eq_ignore_ascii_case("0x4200000000000000000000000000000000000006")
@@ -4025,9 +4100,19 @@ impl AddressDisplayBook {
         let address = address.to_ascii_lowercase();
         self.labels
             .get(&address)
-            .and_then(|labels| labels.iter().max_by(|left, right| left.confidence.partial_cmp(&right.confidence).unwrap_or(std::cmp::Ordering::Equal)))
+            .and_then(|labels| {
+                labels.iter().max_by(|left, right| {
+                    left.confidence
+                        .partial_cmp(&right.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            })
             .map(|label| label.label.replace('_', " "))
-            .or_else(|| self.profiles.get(&address).map(|profile| profile.address_type.clone()))
+            .or_else(|| {
+                self.profiles
+                    .get(&address)
+                    .map(|profile| profile.address_type.clone())
+            })
     }
 }
 
@@ -4047,11 +4132,16 @@ fn render_known_address(address: &str, keep: usize, book: &AddressDisplayBook) -
 fn render_tx_storyline_panel(analysis: &TransactionAnalysis, book: &AddressDisplayBook) -> String {
     let scenario_outputs = &analysis.scenario_outputs;
     let Some(storyline) = scenario_outputs.get("storyline") else {
-        return render_flow_fallback_panel(
-            analysis,
-            2,
-            "No complete transaction intent was recognized yet. Showing confirmed asset flows first.",
-            book,
+        let executor = analysis.to_address.as_deref().unwrap_or("n/a");
+        return format!(
+            "{}{}",
+            render_execution_timeline_panel(analysis, &analysis.from_address, executor, None, book),
+            render_flow_fallback_panel(
+                analysis,
+                2,
+                "No complete transaction intent was recognized yet. Showing confirmed asset flows first.",
+                book,
+            )
         );
     };
     let kind = storyline
@@ -4080,14 +4170,26 @@ fn render_tx_storyline_panel(analysis: &TransactionAnalysis, book: &AddressDispl
         .and_then(|value| value.as_str())
         .unwrap_or("subject scope");
     let net_effect = render_net_effect_panel(storyline.get("net_effect"), subject_scope_label);
-    let step_timeline =
-        render_storyline_steps(storyline.get("steps"), initiator, executor, protocol_contract, book);
-    let step_timeline = if step_timeline.is_empty() {
-        render_generic_timeline_panel(analysis, initiator, executor, protocol_contract, book)
+    let execution_timeline =
+        render_execution_timeline_panel(analysis, initiator, executor, protocol_contract, book);
+    let step_timeline = if !execution_timeline.is_empty() {
+        execution_timeline
     } else {
-        step_timeline
+        let storyline_steps = render_storyline_steps(
+            storyline.get("steps"),
+            initiator,
+            executor,
+            protocol_contract,
+            book,
+        );
+        if storyline_steps.is_empty() {
+            render_generic_timeline_panel(analysis, initiator, executor, protocol_contract, book)
+        } else {
+            storyline_steps
+        }
     };
-    let storyline_visual = render_storyline_visual(storyline, kind, protocol, initiator, executor, book);
+    let storyline_visual =
+        render_storyline_visual(storyline, kind, protocol, initiator, executor, book);
     let flow_fallback = if !analysis.derived_flows.is_empty() {
         render_flow_fallback_panel(
             analysis,
@@ -4105,11 +4207,7 @@ fn render_tx_storyline_panel(analysis: &TransactionAnalysis, book: &AddressDispl
 {}
 {}
 {}"#,
-        subject_scope,
-        net_effect,
-        step_timeline,
-        flow_fallback,
-        storyline_visual,
+        subject_scope, net_effect, step_timeline, flow_fallback, storyline_visual,
     )
 }
 
@@ -4119,17 +4217,12 @@ fn render_flow_fallback_panel(
     explanation: &str,
     book: &AddressDisplayBook,
 ) -> String {
-    let rows = if analysis.derived_flows.is_empty() {
-        "<tr><td colspan=\"5\">No asset flow could be reconstructed from the available receipt / execution evidence.</td></tr>"
+    let rows = render_flow_balance_rows(analysis, book);
+    let rows = if rows.is_empty() {
+        "<tr><td colspan=\"3\">No asset flow could be reconstructed from the available receipt / execution evidence.</td></tr>"
             .to_owned()
     } else {
-        analysis
-            .derived_flows
-            .iter()
-            .take(80)
-            .map(|flow| render_flow_fallback_row(flow, &analysis.from_address, book))
-            .collect::<Vec<_>>()
-            .join("")
+        rows
     };
     format!(
         r#"<section class="tx-section-card compact-section flow-fallback-panel">
@@ -4143,11 +4236,9 @@ fn render_flow_fallback_panel(
     <table class="compact-table">
       <thead>
         <tr>
-          <th>From</th>
-          <th></th>
-          <th>To</th>
-          <th>Asset</th>
-          <th>Amount</th>
+          <th>Address</th>
+          <th>Token</th>
+          <th>Net balance change</th>
         </tr>
       </thead>
       <tbody>{}</tbody>
@@ -4161,12 +4252,64 @@ fn render_flow_fallback_panel(
     )
 }
 
-fn render_flow_fallback_row(
-    flow: &crate::domain::value_objects::AssetFlow,
-    initiator: &str,
+fn render_flow_balance_rows(analysis: &TransactionAnalysis, book: &AddressDisplayBook) -> String {
+    let mut rows = std::collections::BTreeMap::<(String, String), (serde_json::Value, i128)>::new();
+    for flow in &analysis.derived_flows {
+        let amount = flow.amount_raw.parse::<i128>().unwrap_or_default();
+        let token = flow_token_descriptor(flow);
+        let token_key = token
+            .get("address")
+            .and_then(|value| value.as_str())
+            .or(flow.token_address.as_deref())
+            .unwrap_or("native")
+            .to_ascii_lowercase();
+        let from_key = (flow.from_address.to_ascii_lowercase(), token_key.clone());
+        let to_key = (flow.to_address.to_ascii_lowercase(), token_key);
+        rows.entry(from_key)
+            .and_modify(|(_, value)| *value -= amount)
+            .or_insert((token.clone(), -amount));
+        rows.entry(to_key)
+            .and_modify(|(_, value)| *value += amount)
+            .or_insert((token, amount));
+    }
+    if let Some(gas_raw) = analysis
+        .normalized_execution_facts
+        .derived_facts
+        .get("gas_cost_raw")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<i128>().ok())
+        .filter(|value| *value > 0)
+    {
+        let token = serde_json::json!({
+            "symbol": "ETH",
+            "name": "Ether",
+            "address": "native",
+            "decimals": 18,
+        });
+        rows.entry((
+            analysis.from_address.to_ascii_lowercase(),
+            "native".to_owned(),
+        ))
+        .and_modify(|(_, value)| *value -= gas_raw)
+        .or_insert((token, -gas_raw));
+    }
+
+    rows.into_iter()
+        .filter(|(_, (_, amount))| *amount != 0)
+        .take(120)
+        .map(|((address, _), (token, amount))| {
+            render_flow_balance_row(&address, &token, amount, book)
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_flow_balance_row(
+    address: &str,
+    token: &serde_json::Value,
+    amount: i128,
     book: &AddressDisplayBook,
 ) -> String {
-    let token = flow_token_descriptor(flow);
     let symbol = token
         .get("symbol")
         .and_then(|value| value.as_str())
@@ -4178,35 +4321,18 @@ fn render_flow_fallback_row(
     let token_address = token
         .get("address")
         .and_then(|value| value.as_str())
-        .or(flow.token_address.as_deref())
         .unwrap_or("native");
-    let amount_display = format_flow_amount_display(flow, &token);
-    let from = format!(
-        "{}{}",
-        render_known_address(&flow.from_address, 10, book),
-        if flow.from_address.eq_ignore_ascii_case(initiator) {
-            "<span class=\"story-role-tag initiator\">initiator</span>"
-        } else {
-            ""
-        }
-    );
-    let to = format!(
-        "{}{}",
-        render_known_address(&flow.to_address, 10, book),
-        if flow.to_address.eq_ignore_ascii_case(initiator) {
-            "<span class=\"story-role-tag initiator\">initiator</span>"
-        } else {
-            ""
-        }
-    );
+    let amount_display = format_token_amount_display(amount, token);
+    let amount_class = if amount > 0 { "gained" } else { "spent" };
     format!(
-        "<tr><td>{}</td><td>→</td><td>{}</td><td><strong>{}</strong><small>{} · {}</small></td><td>{}</td></tr>",
-        from,
-        to,
+        "<tr><td>{}</td><td><strong>{}</strong><small>{} · {}</small></td><td><span class=\"table-badge {}\">{}</span><small>raw: {}</small></td></tr>",
+        render_known_address(address, 10, book),
         escape_html(symbol),
         escape_html(name),
         render_copyable_code(token_address, 8),
-        render_amount_stack(&amount_display, &flow.amount_raw),
+        amount_class,
+        escape_html(&amount_display),
+        escape_html(&amount.to_string()),
     )
 }
 
@@ -4253,9 +4379,34 @@ fn format_flow_amount_display(
         .map(|value| value as u32);
     match (raw, decimals) {
         (Some(raw), Some(decimals)) => {
-            format!("{} {}", format_unsigned_units_compact(raw, decimals), symbol)
+            format!(
+                "{} {}",
+                format_unsigned_units_compact(raw, decimals),
+                symbol
+            )
         }
         _ => format!("{} raw units", flow.amount_raw),
+    }
+}
+
+fn format_token_amount_display(raw: i128, token: &serde_json::Value) -> String {
+    let symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("asset");
+    let decimals = token
+        .get("decimals")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32);
+    let prefix = if raw > 0 { "+" } else { "" };
+    match decimals {
+        Some(decimals) => format!(
+            "{}{} {}",
+            prefix,
+            format_unsigned_units_compact(raw, decimals),
+            symbol
+        ),
+        None => format!("{}{} raw units", prefix, raw),
     }
 }
 
@@ -4446,6 +4597,213 @@ fn render_net_effect_gas_row(item: &serde_json::Value) -> String {
     )
 }
 
+fn render_execution_timeline_panel(
+    analysis: &TransactionAnalysis,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+    book: &AddressDisplayBook,
+) -> String {
+    let Some(items) = analysis
+        .normalized_execution_facts
+        .derived_facts
+        .get("execution_timeline")
+        .and_then(|value| value.as_array())
+    else {
+        return String::new();
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+    let trace_available = analysis
+        .normalized_execution_facts
+        .derived_facts
+        .get("trace_available")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let rows = items
+        .iter()
+        .take(120)
+        .map(|item| {
+            render_execution_timeline_row(
+                item,
+                analysis,
+                initiator,
+                executor,
+                protocol_contract,
+                book,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let badge = if trace_available {
+        "call stack"
+    } else {
+        "top-level only"
+    };
+    format!(
+        r#"<section class="tx-section-card storyline-steps">
+  <div class="tx-section-title">
+    <span class="tx-section-index">3</span>
+    <h2>Transaction Timeline</h2>
+    <span class="badge">{}</span>
+  </div>
+  <div class="timeline-list">{}</div>
+</section>"#,
+        badge, rows
+    )
+}
+
+fn render_execution_timeline_row(
+    item: &serde_json::Value,
+    analysis: &TransactionAnalysis,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+    book: &AddressDisplayBook,
+) -> String {
+    let order = item
+        .get("order")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let kind = item
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("call");
+    let call_type = item
+        .get("call_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("call");
+    let selector = item
+        .get("selector")
+        .and_then(|value| value.as_str())
+        .unwrap_or("no selector");
+    let from_raw = item
+        .get("from_address")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let to_raw = item
+        .get("to_address")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let value_raw = item
+        .get("value_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or("0");
+    let depth = item
+        .get("depth")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let trace_label = item
+        .get("trace_address_label")
+        .and_then(|value| value.as_str())
+        .unwrap_or("root");
+    let title = if kind == "tx_entry" {
+        "Transaction submitted"
+    } else {
+        "Contract call"
+    };
+    let from_roles = render_storyline_roles(from_raw, initiator, executor, protocol_contract);
+    let to_roles = render_storyline_roles(to_raw, initiator, executor, protocol_contract);
+    let attachments = render_call_attached_flows(analysis, from_raw, to_raw);
+    let value_line = value_raw
+        .parse::<i128>()
+        .ok()
+        .filter(|value| *value > 0)
+        .map(|value| {
+            format!(
+                "<span class=\"timeline-hint\">native value: {}</span>",
+                escape_html(&format_token_amount_display(
+                    value,
+                    &serde_json::json!({"symbol": "ETH", "name": "Ether", "address": "native", "decimals": 18})
+                ))
+            )
+        })
+        .unwrap_or_default();
+    let indent_px = depth.min(6) * 10;
+    format!(
+        r#"<article class="timeline-step">
+  <div class="timeline-head">
+    <div class="timeline-index">{}</div>
+    <div class="timeline-copy">
+      <strong>{}</strong>
+      <small>{} · {} · trace {}</small>
+      {}
+    </div>
+  </div>
+  <div class="timeline-flow compact" style="padding-left: {}px">
+    <div class="timeline-side">
+      {}
+      <div class="timeline-role-row">{}</div>
+    </div>
+    <div class="timeline-mid">
+      <strong>{}</strong>
+      <span>{}</span>
+      {}
+      <span class="timeline-arrow-inline">→</span>
+    </div>
+    <div class="timeline-side">
+      {}
+      <div class="timeline-role-row">{}</div>
+    </div>
+  </div>
+</article>"#,
+        order,
+        escape_html(title),
+        escape_html(call_type),
+        escape_html(selector),
+        escape_html(trace_label),
+        value_line,
+        indent_px,
+        render_known_address(from_raw, 10, book),
+        from_roles,
+        escape_html(if attachments.is_empty() {
+            "No token transfer"
+        } else {
+            "Attached transfers"
+        }),
+        escape_html(&format!("{} · value raw {}", call_type, value_raw)),
+        attachments,
+        render_known_address(to_raw, 10, book),
+        to_roles,
+    )
+}
+
+fn render_call_attached_flows(
+    analysis: &TransactionAnalysis,
+    from_raw: &str,
+    to_raw: &str,
+) -> String {
+    let rows = analysis
+        .derived_flows
+        .iter()
+        .filter(|flow| {
+            flow.from_address.eq_ignore_ascii_case(from_raw)
+                && flow.to_address.eq_ignore_ascii_case(to_raw)
+        })
+        .take(6)
+        .map(|flow| {
+            let token = flow_token_descriptor(flow);
+            let token_address = token
+                .get("address")
+                .and_then(|value| value.as_str())
+                .or(flow.token_address.as_deref())
+                .unwrap_or("native");
+            let name = token
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unlabeled");
+            format!(
+                "<span>{} · {} · {}</span>",
+                escape_html(&format_flow_amount_display(flow, &token)),
+                escape_html(name),
+                render_copy_only_button(token_address),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.join("")
+}
+
 fn render_amount_stack(display: &str, raw: &str) -> String {
     let display = normalize_amount_display(display, raw);
     format!(
@@ -4492,11 +4850,23 @@ fn render_storyline_steps(
         items
             .iter()
             .map(|item| {
-                let order = item.get("order").and_then(|value| value.as_u64()).unwrap_or(0);
-                let title = item.get("title").and_then(|value| value.as_str()).unwrap_or("Step");
+                let order = item
+                    .get("order")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                let title = item
+                    .get("title")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Step");
                 let token = item.get("token").unwrap_or(&serde_json::Value::Null);
-                let symbol = token.get("symbol").and_then(|value| value.as_str()).unwrap_or("asset");
-                let name = token.get("name").and_then(|value| value.as_str()).unwrap_or("unlabeled");
+                let symbol = token
+                    .get("symbol")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("asset");
+                let name = token
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unlabeled");
                 let token_address = token
                     .get("address")
                     .and_then(|value| value.as_str())
@@ -4566,7 +4936,11 @@ fn render_storyline_steps(
                     render_known_address(from_raw, 10, book),
                     from_roles,
                     escape_html(&amount_display),
-                    format!("{} · {}", escape_html(name), render_copy_only_button(token_address)),
+                    format!(
+                        "{} · {}",
+                        escape_html(name),
+                        render_copy_only_button(token_address)
+                    ),
                     render_known_address(to_raw, 10, book),
                     to_roles,
                 )
@@ -4681,7 +5055,9 @@ fn render_storyline_visual(
         } else {
             "Venue-facing execution legs."
         },
-        storyline.get("repay_legs").or_else(|| storyline.get("cycle_legs")),
+        storyline
+            .get("repay_legs")
+            .or_else(|| storyline.get("cycle_legs")),
         "protocol",
         initiator,
         executor,
@@ -4709,7 +5085,9 @@ fn render_storyline_visual(
             "Exit / settlement"
         },
         "Where assets moved next after the main action.",
-        storyline.get("disposition_legs").or_else(|| storyline.get("exit_legs")),
+        storyline
+            .get("disposition_legs")
+            .or_else(|| storyline.get("exit_legs")),
         "exit",
         initiator,
         executor,
@@ -4784,11 +5162,7 @@ fn render_storyline_visual(
     {}
   </div>
 </section>"#,
-        main_path,
-        funding_lane,
-        repay_lane,
-        receipt_lane,
-        exit_lane
+        main_path, funding_lane, repay_lane, receipt_lane, exit_lane
     )
 }
 
@@ -5187,7 +5561,12 @@ fn render_cluster_alerts_panel(
                     escape_html(&alert.title),
                     escape_html(&format!("{:?}", alert.severity).to_lowercase()),
                     escape_html(&alert.message),
-                    escape_html(&alert.triggered_at.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
+                    escape_html(
+                        &alert
+                            .triggered_at
+                            .format("%Y-%m-%d %H:%M:%S UTC")
+                            .to_string()
+                    ),
                     cluster.cluster_id,
                     alert.alert_id
                 )
@@ -5381,23 +5760,87 @@ fn render_classified_transaction_filters(query: &ClusterTxTableState) -> String 
   </label>
 </div>
 <input type="hidden" name="tx_page" value="1">"#,
-        if query.behavior_tag.is_none() { "selected" } else { "" },
-        if query.behavior_tag.as_deref() == Some("arbitrage") { "selected" } else { "" },
-        if query.behavior_tag.as_deref() == Some("position") { "selected" } else { "" },
-        if query.behavior_tag.as_deref() == Some("lp") { "selected" } else { "" },
-        if query.behavior_tag.as_deref() == Some("liquidation") { "selected" } else { "" },
-        if query.behavior_tag.as_deref() == Some("unknown") { "selected" } else { "" },
+        if query.behavior_tag.is_none() {
+            "selected"
+        } else {
+            ""
+        },
+        if query.behavior_tag.as_deref() == Some("arbitrage") {
+            "selected"
+        } else {
+            ""
+        },
+        if query.behavior_tag.as_deref() == Some("position") {
+            "selected"
+        } else {
+            ""
+        },
+        if query.behavior_tag.as_deref() == Some("lp") {
+            "selected"
+        } else {
+            ""
+        },
+        if query.behavior_tag.as_deref() == Some("liquidation") {
+            "selected"
+        } else {
+            ""
+        },
+        if query.behavior_tag.as_deref() == Some("unknown") {
+            "selected"
+        } else {
+            ""
+        },
         escape_html(query.protocol.as_deref().unwrap_or_default()),
-        if query.sort_by == "timestamp" { "selected" } else { "" },
-        if query.sort_by == "block_number" { "selected" } else { "" },
-        if query.sort_by == "value_usd" { "selected" } else { "" },
-        if query.sort_by == "gas_cost_usd" { "selected" } else { "" },
-        if query.sort_by == "estimated_pnl_usd" { "selected" } else { "" },
-        if query.sort_dir == "desc" { "selected" } else { "" },
-        if query.sort_dir == "asc" { "selected" } else { "" },
-        if query.page_size == 10 { "selected" } else { "" },
-        if query.page_size == 25 { "selected" } else { "" },
-        if query.page_size == 50 { "selected" } else { "" },
+        if query.sort_by == "timestamp" {
+            "selected"
+        } else {
+            ""
+        },
+        if query.sort_by == "block_number" {
+            "selected"
+        } else {
+            ""
+        },
+        if query.sort_by == "value_usd" {
+            "selected"
+        } else {
+            ""
+        },
+        if query.sort_by == "gas_cost_usd" {
+            "selected"
+        } else {
+            ""
+        },
+        if query.sort_by == "estimated_pnl_usd" {
+            "selected"
+        } else {
+            ""
+        },
+        if query.sort_dir == "desc" {
+            "selected"
+        } else {
+            ""
+        },
+        if query.sort_dir == "asc" {
+            "selected"
+        } else {
+            ""
+        },
+        if query.page_size == 10 {
+            "selected"
+        } else {
+            ""
+        },
+        if query.page_size == 25 {
+            "selected"
+        } else {
+            ""
+        },
+        if query.page_size == 50 {
+            "selected"
+        } else {
+            ""
+        },
     )
 }
 
@@ -5598,9 +6041,7 @@ fn render_indexer_lookup_panel(
     let direction = query
         .and_then(|value| value.direction.as_deref())
         .unwrap_or_default();
-    let limit = query
-        .and_then(|value| value.limit)
-        .unwrap_or(100);
+    let limit = query.and_then(|value| value.limit).unwrap_or(100);
     let from_block = query
         .and_then(|value| value.from_block)
         .map(|value| value.to_string())
@@ -5726,12 +6167,18 @@ fn derive_cluster_status(coverage: Option<&ClusterCoverage>) -> (String, String)
             return if coverage.discovered_tx_count > 0 {
                 ("Incremental sync queued".to_owned(), "info".to_owned())
             } else {
-                ("Waiting for first historical sync".to_owned(), "info".to_owned())
+                (
+                    "Waiting for first historical sync".to_owned(),
+                    "info".to_owned(),
+                )
             };
         }
     }
 
-    ("Waiting for first historical sync".to_owned(), "info".to_owned())
+    (
+        "Waiting for first historical sync".to_owned(),
+        "info".to_owned(),
+    )
 }
 
 fn render_cluster_coverage_cards(coverage: Option<&ClusterCoverage>) -> String {
@@ -6088,7 +6535,12 @@ fn active_class(current: &DashboardTab, expected: DashboardTab) -> &'static str 
 
 fn render_notice_block(message: Option<&str>) -> String {
     message
-        .map(|message| format!("<div class=\"notice success\">{}</div>", escape_html(message)))
+        .map(|message| {
+            format!(
+                "<div class=\"notice success\">{}</div>",
+                escape_html(message)
+            )
+        })
         .unwrap_or_default()
 }
 
@@ -6161,7 +6613,8 @@ fn render_copyable_code(value: &str, keep: usize) -> String {
 
 fn render_copy_only_button(value: &str) -> String {
     let value = value.trim();
-    if value.is_empty() || value.eq_ignore_ascii_case("n/a") || value.eq_ignore_ascii_case("native") {
+    if value.is_empty() || value.eq_ignore_ascii_case("n/a") || value.eq_ignore_ascii_case("native")
+    {
         return "<code>native</code>".to_owned();
     }
     let escaped_value = escape_html(value);

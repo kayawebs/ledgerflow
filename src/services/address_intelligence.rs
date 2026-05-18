@@ -15,6 +15,12 @@ use crate::{
     services::analysis::AnalysisService,
 };
 
+const TOKEN0_SELECTOR: &str = "0x0dfe1681";
+const TOKEN1_SELECTOR: &str = "0xd21220a7";
+const FEE_SELECTOR: &str = "0xddca3f43";
+const FACTORY_SELECTOR: &str = "0xc45a0155";
+const STABLE_SELECTOR: &str = "0x5f6e283f";
+
 #[derive(Clone)]
 pub struct AddressIntelligenceService {
     repository: DynRepository,
@@ -97,6 +103,12 @@ impl AddressIntelligenceService {
         });
         let has_code = bytecode_length.unwrap_or_default() > 0;
         let known = known_address_label(job.chain_id, &job.address);
+        let protocol_probe = if known.is_none() && has_code {
+            self.probe_protocol_address(job.chain_id, &job.address)
+                .await
+        } else {
+            None
+        };
         let role_labels = role_labels_from_metadata(&job.metadata);
         let address_type = if known
             .as_ref()
@@ -104,6 +116,8 @@ impl AddressIntelligenceService {
             .unwrap_or(false)
         {
             known.as_ref().unwrap().address_type.clone()
+        } else if let Some(probe) = protocol_probe.as_ref() {
+            probe.contract_role.clone()
         } else if role_labels.iter().any(|label| label == "erc20_token") {
             "token".to_owned()
         } else if has_code {
@@ -130,6 +144,7 @@ impl AddressIntelligenceService {
             metadata: json!({
                 "analyzed_by": "ledgerflow_address_worker",
                 "job_metadata": job.metadata,
+                "protocol_intelligence": protocol_probe.as_ref().map(ProtocolProbe::to_json),
             }),
             created_at: now,
             updated_at: now,
@@ -163,7 +178,88 @@ impl AddressIntelligenceService {
                 now,
             ));
         }
+        if let Some(probe) = protocol_probe {
+            labels.push(label_for(
+                job,
+                &probe.protocol_family,
+                "protocol_probe",
+                probe.confidence,
+                probe.to_json(),
+                now,
+            ));
+            labels.push(label_for(
+                job,
+                &probe.protocol_name,
+                "protocol_probe",
+                probe.confidence,
+                probe.to_json(),
+                now,
+            ));
+            labels.push(label_for(
+                job,
+                &probe.contract_role,
+                "protocol_probe",
+                probe.confidence,
+                probe.to_json(),
+                now,
+            ));
+        }
         Ok((profile, labels))
+    }
+
+    async fn probe_protocol_address(&self, chain_id: u64, address: &str) -> Option<ProtocolProbe> {
+        let token0 = self
+            .fetch_address(chain_id, address, TOKEN0_SELECTOR)
+            .await?;
+        let token1 = self
+            .fetch_address(chain_id, address, TOKEN1_SELECTOR)
+            .await?;
+        let factory = self
+            .fetch_address(chain_id, address, FACTORY_SELECTOR)
+            .await;
+        let fee = self.fetch_uint(chain_id, address, FEE_SELECTOR).await;
+        let stable = self.fetch_bool(chain_id, address, STABLE_SELECTOR).await;
+        let protocol_name = if fee.is_some() {
+            "uniswap_v3_compatible_pool"
+        } else if stable.is_some() {
+            "solidly_compatible_pool"
+        } else {
+            "uniswap_v2_compatible_pool"
+        }
+        .to_owned();
+        Some(ProtocolProbe {
+            protocol_family: "dex".to_owned(),
+            protocol_name,
+            contract_role: "dex_pool".to_owned(),
+            token0,
+            token1,
+            factory,
+            fee,
+            stable,
+            confidence: 0.82,
+        })
+    }
+
+    async fn fetch_address(&self, chain_id: u64, address: &str, selector: &str) -> Option<String> {
+        self.rpc_client
+            .eth_call(chain_id, address, selector, None)
+            .await
+            .ok()
+            .and_then(|value| decode_address_word(&value))
+    }
+
+    async fn fetch_uint(&self, chain_id: u64, address: &str, selector: &str) -> Option<u128> {
+        self.rpc_client
+            .eth_call(chain_id, address, selector, None)
+            .await
+            .ok()
+            .and_then(|value| parse_uint_hex(&value))
+    }
+
+    async fn fetch_bool(&self, chain_id: u64, address: &str, selector: &str) -> Option<bool> {
+        self.fetch_uint(chain_id, address, selector)
+            .await
+            .map(|value| value != 0)
     }
 
     async fn backfill_address_history(&self, job: &AddressAnalysisJob) -> LedgerResult<bool> {
@@ -215,6 +311,50 @@ impl AddressIntelligenceService {
         }
         Ok(true)
     }
+}
+
+struct ProtocolProbe {
+    protocol_family: String,
+    protocol_name: String,
+    contract_role: String,
+    token0: String,
+    token1: String,
+    factory: Option<String>,
+    fee: Option<u128>,
+    stable: Option<bool>,
+    confidence: f32,
+}
+
+impl ProtocolProbe {
+    fn to_json(&self) -> Value {
+        json!({
+            "protocol_family": self.protocol_family,
+            "protocol_name": self.protocol_name,
+            "contract_role": self.contract_role,
+            "token0": self.token0,
+            "token1": self.token1,
+            "factory": self.factory,
+            "fee": self.fee.map(|value| value.to_string()),
+            "stable": self.stable,
+            "confidence": self.confidence,
+        })
+    }
+}
+
+fn decode_address_word(value: &str) -> Option<String> {
+    let raw = value.trim().strip_prefix("0x").unwrap_or(value.trim());
+    if raw.len() < 64 {
+        return None;
+    }
+    let address = &raw[raw.len().saturating_sub(40)..];
+    if address.chars().all(|ch| ch == '0') {
+        return None;
+    }
+    Some(format!("0x{}", address.to_ascii_lowercase()))
+}
+
+fn parse_uint_hex(value: &str) -> Option<u128> {
+    u128::from_str_radix(value.trim().strip_prefix("0x").unwrap_or(value.trim()), 16).ok()
 }
 
 async fn collect_refs_for_range(

@@ -50,6 +50,11 @@ async fn end_to_end_analysis_happy_path() {
     );
     assert!(analysis.normalized_execution_facts.derived_facts["trace_selectors"].is_array());
     assert!(analysis.normalized_execution_facts.derived_facts["token_net_deltas"].is_array());
+    let timeline = analysis.normalized_execution_facts.derived_facts["execution_timeline"]
+        .as_array()
+        .expect("execution timeline should be projected");
+    assert_eq!(timeline.first().unwrap()["kind"], "tx_entry");
+    assert!(timeline.iter().any(|row| row["kind"] == "internal_call"));
 }
 
 #[tokio::test]

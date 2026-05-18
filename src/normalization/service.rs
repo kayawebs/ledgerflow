@@ -1,7 +1,7 @@
 use chrono::Utc;
-use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 use crate::core::versioning::VersionBundle;
@@ -50,7 +50,9 @@ fn collect_trace_details(
     let Some(frame) = frame else {
         return;
     };
-    *call_type_counts.entry(frame.call_type.to_lowercase()).or_default() += 1;
+    *call_type_counts
+        .entry(frame.call_type.to_lowercase())
+        .or_default() += 1;
     if let Some(to_address) = frame.to_address.as_ref() {
         touched_contracts.insert(to_address.to_lowercase());
     }
@@ -71,16 +73,88 @@ fn collect_trace_details(
     }
 }
 
+fn selector_from_input(input: &str) -> Option<String> {
+    if input.len() >= 10 {
+        Some(input[..10].to_lowercase())
+    } else {
+        None
+    }
+}
+
+fn trace_address_label(trace_address: &[u64]) -> String {
+    if trace_address.is_empty() {
+        "root".to_owned()
+    } else {
+        trace_address
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+}
+
+fn collect_execution_timeline(
+    tx_hash: &str,
+    frame: &RawTraceFrame,
+    trace_address: &[u64],
+    depth: u32,
+    rows: &mut Vec<Value>,
+) {
+    let parent_trace_address = if trace_address.is_empty() {
+        Value::Null
+    } else {
+        json!(trace_address[..trace_address.len().saturating_sub(1)].to_vec())
+    };
+    rows.push(json!({
+        "order": rows.len() + 1,
+        "kind": if trace_address.is_empty() { "tx_entry" } else { "internal_call" },
+        "trace_address": trace_address,
+        "trace_address_label": trace_address_label(trace_address),
+        "parent_trace_address": parent_trace_address,
+        "depth": depth,
+        "from_address": frame.from_address.to_lowercase(),
+        "to_address": frame.to_address.as_ref().map(|value| value.to_lowercase()),
+        "call_type": frame.call_type.to_lowercase(),
+        "selector": selector_from_input(&frame.input_data),
+        "value_raw": hex_to_u128(Some(&frame.value)).to_string(),
+        "evidence_ref": format!("{}:trace:{}", tx_hash, trace_address_label(trace_address)),
+    }));
+    for (index, child) in frame.children.iter().enumerate() {
+        let mut child_trace_address = trace_address.to_vec();
+        child_trace_address.push(index as u64);
+        collect_execution_timeline(tx_hash, child, &child_trace_address, depth + 1, rows);
+    }
+}
+
+fn execution_timeline(bundle: &RawTransactionBundle) -> Vec<Value> {
+    if let Some(trace) = bundle.trace.as_ref() {
+        let mut rows = Vec::new();
+        collect_execution_timeline(&bundle.tx.tx_hash, trace, &[], 0, &mut rows);
+        return rows;
+    }
+    vec![json!({
+        "order": 1,
+        "kind": "tx_entry",
+        "trace_address": [],
+        "trace_address_label": "root",
+        "parent_trace_address": Value::Null,
+        "depth": 0,
+        "from_address": bundle.tx.from_address.to_lowercase(),
+        "to_address": bundle.tx.to_address.as_ref().map(|value| value.to_lowercase()),
+        "call_type": "transaction",
+        "selector": selector_from_input(&bundle.tx.input_data),
+        "value_raw": hex_to_u128(Some(&bundle.tx.value)).to_string(),
+        "evidence_ref": bundle.tx.tx_hash,
+        "trace_limited": true,
+    })]
+}
+
 #[derive(Default)]
 pub struct EvidenceNormalizer;
 
 impl EvidenceNormalizer {
     pub fn normalize(&self, bundle: &RawTransactionBundle) -> TransactionAnalysis {
-        let selector = if bundle.tx.input_data.len() >= 10 {
-            Some(bundle.tx.input_data[..10].to_owned())
-        } else {
-            None
-        };
+        let selector = selector_from_input(&bundle.tx.input_data);
         let (call_count, internal_call_count) = count_trace(bundle.trace.as_ref());
         let mut participants = vec![bundle.tx.from_address.to_lowercase()];
         if let Some(target) = bundle.tx.to_address.as_ref() {
@@ -188,6 +262,7 @@ impl EvidenceNormalizer {
             derived_facts: json!({
                 "receipt_status": bundle.receipt.status,
                 "trace_available": bundle.trace.is_some(),
+                "execution_timeline": execution_timeline(bundle),
                 "has_token_transfer_logs": bundle.receipt.logs.iter().any(|log| log.topics.first().map(|v| v.eq_ignore_ascii_case(TRANSFER_TOPIC)).unwrap_or(false)),
                 "has_approval_logs": bundle.receipt.logs.iter().any(|log| log.topics.first().map(|v| v.eq_ignore_ascii_case(APPROVAL_TOPIC)).unwrap_or(false)),
                 "touched_contracts": touched_contracts.into_iter().collect::<Vec<_>>(),
