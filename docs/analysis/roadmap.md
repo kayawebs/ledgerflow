@@ -414,6 +414,96 @@ Acceptance criteria:
 - once a cluster is onboarded, coverage can continue without manual re-import
 - historical backfill and forward monitoring use the same consumer model
 
+## Phase 6: Monitor-Driven Opportunity Detection
+
+Goal: turn the live monitor into a practical "large liquidation / arbitrage candidate" detector without waiting for perfect protocol coverage.
+
+### 6.1 Reduce Alert False Negatives
+
+Current reporter behavior only sends email when a tx is already recognized as liquidation/arbitrage and has positive strategy net. That is too strict while protocol adapters are still incomplete.
+
+Tasks:
+
+1. Split monitor findings into levels:
+   - `confirmed`: recognized liquidation/arbitrage with positive strategy net
+   - `probable`: recognized liquidation/arbitrage or strong multi-leg route, but PnL is unknown or partially unresolved
+   - `interesting`: high-volume complex value movement worth human review
+2. Send email for all three levels, with the level clearly shown in subject/body.
+3. Keep the existing top-N and min score gates to avoid unlimited spam.
+
+### 6.2 Feed Address Intelligence From Monitor Candidates
+
+The monitor sees fresh high-volume txs before a user manually opens them. Those txs should enrich the address knowledge base automatically.
+
+Tasks:
+
+1. For every inspected top tx, enqueue address intelligence candidates for:
+   - tx sender
+   - tx recipient/executor
+   - net delta addresses
+   - ERC20 token contracts
+2. Store metadata with `source=trace_monitor`, `tx_hash`, `block_number`, and observed roles.
+3. Let `ledgerflow_address_worker` classify these asynchronously; do not block monitor reporting on address analysis.
+
+### 6.3 Protocol / Venue Intelligence Growth Loop
+
+DEX is the first priority, but the mechanism must support other protocol families.
+
+Tasks:
+
+1. Continue using `address_profiles` and address labels as the broad identity layer.
+2. Add a protocol metadata table or versioned metadata record for:
+   - `protocol_family`
+   - `protocol_name`
+   - `contract_role`
+   - adapter version
+   - confidence
+   - raw probe metadata
+3. Start with DEX pool/router probes:
+   - V2-compatible pool
+   - V3-compatible pool
+   - Solidly/Aerodrome-compatible pool
+   - known routers and aggregators
+4. Add later protocol families:
+   - lending/liquidation
+   - vaults
+   - bridges
+   - LP managers
+
+### 6.4 Intent Recognition Without Full Protocol Decode
+
+Do not require full protocol identification before surfacing useful findings.
+
+Tasks:
+
+1. Add intermediate labels:
+   - `swap_like`
+   - `route_like`
+   - `arbitrage_like`
+   - `liquidation_like`
+   - `complex_value_movement`
+2. Use derived flows and execution timeline to detect:
+   - multi-token routes
+   - repeated pool/venue touches
+   - subject net gain with price unknown
+   - protocol repayment + collateral receipt patterns
+3. Keep unknown PnL explicit instead of converting missing price into loss.
+
+### 6.5 Monitor Email Quality
+
+Tasks:
+
+1. Include share link for every reportable tx.
+2. Include level, candidate kind, volume score, block, and short reason.
+3. Include prepared X post text, but do not auto-post until API credentials and approval flow are explicit.
+
+Acceptance criteria:
+
+- the monitor sends emails for high-value probable candidates even when exact profit is unresolved
+- top txs automatically seed address intelligence
+- DEX/pool/router labels improve over time without manual per-address analysis
+- confirmed liquidation/arbitrage still appears as the strongest signal, not the only signal
+
 ## Suggested Execution Order
 
 Build in this order:

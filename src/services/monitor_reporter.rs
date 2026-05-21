@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -11,7 +11,11 @@ use uuid::Uuid;
 
 use crate::{
     core::errors::{LedgerError, LedgerResult},
-    domain::entities::{EvidencePack, TransactionAnalysis},
+    domain::{
+        entities::{AddressAnalysisCandidate, EvidencePack, TransactionAnalysis},
+        interfaces::AnalysisRepository,
+    },
+    repositories::sqlx::SqlxAnalysisRepository,
 };
 
 #[derive(Clone, Debug)]
@@ -36,6 +40,7 @@ pub struct MonitorReporterConfig {
 #[derive(Clone)]
 pub struct MonitorReporter {
     pool: PgPool,
+    repository: SqlxAnalysisRepository,
     client: Client,
     sender: Arc<dyn ReportEmailSender>,
     config: MonitorReporterConfig,
@@ -69,7 +74,26 @@ struct ReportableTx {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TxSignal {
     activity_kind: String,
+    level: SignalLevel,
     reason: String,
+    positive_strategy_net: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignalLevel {
+    Confirmed,
+    Probable,
+    Interesting,
+}
+
+impl SignalLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            SignalLevel::Confirmed => "confirmed",
+            SignalLevel::Probable => "probable",
+            SignalLevel::Interesting => "interesting",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -82,6 +106,7 @@ impl MonitorReporter {
     pub fn new(pool: PgPool, config: MonitorReporterConfig) -> Self {
         let sender = build_report_sender(&config);
         Self {
+            repository: SqlxAnalysisRepository::from_pool(pool.clone()),
             pool,
             client: Client::new(),
             sender,
@@ -107,6 +132,13 @@ impl MonitorReporter {
         let mut reportable = Vec::new();
 
         for tx in candidates.iter().cloned() {
+            if let Err(err) = self.enqueue_candidate_addresses(&tx).await {
+                warn!(
+                    tx_hash = tx.tx_hash,
+                    error = %err,
+                    "monitor address intelligence enqueue failed"
+                );
+            }
             match self.analyze_tx(&tx.tx_hash).await {
                 Ok(envelope) => {
                     let Some(signal) = detect_signal(&envelope.analysis) else {
@@ -270,12 +302,15 @@ impl MonitorReporter {
             .map_err(|err| LedgerError::MalformedEvidence(err.to_string()))?;
         let title = format!(
             "{} signal {}",
-            signal.activity_kind,
+            signal_title(signal),
             truncate_middle(&tx.tx_hash, 10)
         );
         let summary = format!(
-            "{} Top monitor volume score(raw): {}.",
-            signal.reason, tx.volume_score_raw
+            "{} level={} positive_strategy_net={} Top monitor volume score(raw): {}.",
+            signal.reason,
+            signal.level.as_str(),
+            signal.positive_strategy_net,
+            tx.volume_score_raw
         );
         sqlx::query(
             r#"
@@ -330,11 +365,104 @@ impl MonitorReporter {
             "block_timestamp": tx.block_timestamp,
             "address_count": tx.address_count,
             "reason": signal.reason,
+            "signal_level": signal.level.as_str(),
+            "positive_strategy_net": signal.positive_strategy_net,
         })))
         .execute(&self.pool)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         Ok(())
+    }
+
+    async fn enqueue_candidate_addresses(&self, tx: &TopTxCandidate) -> LedgerResult<u64> {
+        let rows = sqlx::query(
+            r#"
+            select address, asset_type, token_address, metadata
+            from trace_address_asset_deltas
+            where chain_id = $1 and tx_hash = $2
+            limit 500
+            "#,
+        )
+        .bind(self.config.chain_id as i64)
+        .bind(&tx.tx_hash)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        let mut candidates = BTreeMap::<String, AddressAnalysisCandidate>::new();
+        for row in rows {
+            let address = row
+                .try_get::<String, _>("address")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            let asset_type = row
+                .try_get::<String, _>("asset_type")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            let token_address = row
+                .try_get::<String, _>("token_address")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            let metadata = row
+                .try_get::<SqlJson<Value>, _>("metadata")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                .0;
+            insert_monitor_candidate(
+                &mut candidates,
+                &address,
+                30,
+                json!({
+                    "source": "trace_monitor",
+                    "tx_hash": tx.tx_hash,
+                    "block_number": tx.block_number,
+                    "roles": ["monitor_delta_address"],
+                }),
+            );
+            if asset_type == "erc20" {
+                insert_monitor_candidate(
+                    &mut candidates,
+                    &token_address,
+                    15,
+                    json!({
+                        "source": "trace_monitor",
+                        "tx_hash": tx.tx_hash,
+                        "block_number": tx.block_number,
+                        "roles": ["erc20_token"],
+                    }),
+                );
+            }
+            if let Some(tx_from) = metadata.get("tx_from").and_then(Value::as_str) {
+                insert_monitor_candidate(
+                    &mut candidates,
+                    tx_from,
+                    20,
+                    json!({
+                        "source": "trace_monitor",
+                        "tx_hash": tx.tx_hash,
+                        "block_number": tx.block_number,
+                        "roles": ["tx_from"],
+                    }),
+                );
+            }
+            if let Some(tx_to) = metadata.get("tx_to").and_then(Value::as_str) {
+                insert_monitor_candidate(
+                    &mut candidates,
+                    tx_to,
+                    25,
+                    json!({
+                        "source": "trace_monitor",
+                        "tx_hash": tx.tx_hash,
+                        "block_number": tx.block_number,
+                        "roles": ["tx_to"],
+                    }),
+                );
+            }
+        }
+
+        let candidates = candidates.into_values().collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        self.repository
+            .enqueue_address_analysis_candidates(self.config.chain_id, &candidates)
+            .await
     }
 }
 
@@ -514,18 +642,50 @@ fn detect_signal(analysis: &TransactionAnalysis) -> Option<TxSignal> {
             None
         }
     });
-    let activity_kind = scenario_kind
+    let positive_strategy_net = has_positive_strategy_net(analysis);
+    if let Some(activity_kind) = scenario_kind
         .or(recognizer_kind)
-        .filter(|kind| kind == "liquidation" || kind == "arbitrage")?;
-    if !has_positive_strategy_net(analysis) {
-        return None;
-    }
-    Some(TxSignal {
-        activity_kind,
-        reason:
+        .filter(|kind| kind == "liquidation" || kind == "arbitrage")
+    {
+        let level = if positive_strategy_net {
+            SignalLevel::Confirmed
+        } else {
+            SignalLevel::Probable
+        };
+        let reason = if positive_strategy_net {
             "LedgerFlow detected liquidation/arbitrage behavior with positive strategy net effect."
+        } else {
+            "LedgerFlow detected liquidation/arbitrage behavior, but strategy net effect is unresolved or not positive yet."
+        };
+        return Some(TxSignal {
+            activity_kind,
+            level,
+            reason: reason.to_owned(),
+            positive_strategy_net,
+        });
+    }
+
+    if is_probable_arbitrage_route(analysis) {
+        return Some(TxSignal {
+            activity_kind: "arbitrage".to_owned(),
+            level: SignalLevel::Probable,
+            reason: "Large multi-token route looks arbitrage-like, but protocol/PnL attribution is still unresolved."
                 .to_owned(),
-    })
+            positive_strategy_net,
+        });
+    }
+
+    if is_interesting_value_movement(analysis) {
+        return Some(TxSignal {
+            activity_kind: "complex-flow".to_owned(),
+            level: SignalLevel::Interesting,
+            reason: "High-volume tx has complex multi-address or multi-asset movement worth review."
+                .to_owned(),
+            positive_strategy_net,
+        });
+    }
+
+    None
 }
 
 fn has_positive_strategy_net(analysis: &TransactionAnalysis) -> bool {
@@ -555,11 +715,112 @@ fn has_positive_strategy_net(analysis: &TransactionAnalysis) -> bool {
         .unwrap_or(false)
 }
 
+fn is_probable_arbitrage_route(analysis: &TransactionAnalysis) -> bool {
+    let labels = analysis
+        .recognizer_results
+        .iter()
+        .map(|result| result.label.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let has_route_label = labels.iter().any(|label| {
+        matches!(
+            label.as_str(),
+            "arbitrage_like_activity" | "swap_like_activity" | "approval_then_swap_like"
+        )
+    });
+    let token_count = distinct_token_count(analysis);
+    let address_count = distinct_flow_address_count(analysis);
+    has_route_label && analysis.derived_flows.len() >= 2 && token_count >= 2 && address_count >= 3
+}
+
+fn is_interesting_value_movement(analysis: &TransactionAnalysis) -> bool {
+    analysis.derived_flows.len() >= 3
+        || distinct_token_count(analysis) >= 2
+        || distinct_flow_address_count(analysis) >= 4
+}
+
+fn distinct_token_count(analysis: &TransactionAnalysis) -> usize {
+    analysis
+        .derived_flows
+        .iter()
+        .map(|flow| {
+            flow.token_address
+                .clone()
+                .unwrap_or_else(|| "native".to_owned())
+                .to_ascii_lowercase()
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+fn distinct_flow_address_count(analysis: &TransactionAnalysis) -> usize {
+    analysis
+        .derived_flows
+        .iter()
+        .flat_map(|flow| {
+            [
+                flow.from_address.to_ascii_lowercase(),
+                flow.to_address.to_ascii_lowercase(),
+            ]
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+fn signal_title(signal: &TxSignal) -> String {
+    format!("{} {}", signal.level.as_str(), signal.activity_kind)
+}
+
+fn insert_monitor_candidate(
+    candidates: &mut BTreeMap<String, AddressAnalysisCandidate>,
+    address: &str,
+    priority: i32,
+    metadata: Value,
+) {
+    let Some(address) = normalize_monitor_address(address) else {
+        return;
+    };
+    candidates
+        .entry(address.clone())
+        .and_modify(|candidate| {
+            candidate.priority = candidate.priority.min(priority);
+            candidate.metadata =
+                merge_monitor_metadata(candidate.metadata.clone(), metadata.clone());
+        })
+        .or_insert(AddressAnalysisCandidate {
+            address,
+            priority,
+            metadata,
+        });
+}
+
+fn normalize_monitor_address(address: &str) -> Option<String> {
+    let address = address.trim().to_ascii_lowercase();
+    if address.len() == 42 && address.starts_with("0x") {
+        Some(address)
+    } else {
+        None
+    }
+}
+
+fn merge_monitor_metadata(left: Value, right: Value) -> Value {
+    match (left, right) {
+        (Value::Object(mut left), Value::Object(right)) => {
+            for (key, value) in right {
+                left.insert(key, value);
+            }
+            Value::Object(left)
+        }
+        (_, right) => right,
+    }
+}
+
 fn build_tweet_text(tx: &TopTxCandidate, signal: &TxSignal, share_url: &str) -> String {
     let base = format!(
-        "LedgerFlow Base signal: {} candidate. tx {}. Positive strategy net detected; monitor volume score(raw) {}. Analysis: {}",
+        "LedgerFlow Base signal: {} {} candidate. tx {}. positive_net={}. monitor volume score(raw) {}. Analysis: {}",
+        signal.level.as_str(),
         signal.activity_kind,
         truncate_middle(&tx.tx_hash, 8),
+        signal.positive_strategy_net,
         tx.volume_score_raw,
         share_url
     );
@@ -567,10 +828,25 @@ fn build_tweet_text(tx: &TopTxCandidate, signal: &TxSignal, share_url: &str) -> 
 }
 
 fn report_subject(reportable: &[ReportableTx]) -> String {
+    let confirmed = reportable
+        .iter()
+        .filter(|item| item.signal.level == SignalLevel::Confirmed)
+        .count();
+    let probable = reportable
+        .iter()
+        .filter(|item| item.signal.level == SignalLevel::Probable)
+        .count();
+    let interesting = reportable
+        .iter()
+        .filter(|item| item.signal.level == SignalLevel::Interesting)
+        .count();
     format!(
-        "LedgerFlow monitor: {} liquidation/arbitrage signal{}",
+        "LedgerFlow monitor: {} signal{} ({} confirmed, {} probable, {} interesting)",
         reportable.len(),
-        if reportable.len() == 1 { "" } else { "s" }
+        if reportable.len() == 1 { "" } else { "s" },
+        confirmed,
+        probable,
+        interesting
     )
 }
 
@@ -587,17 +863,21 @@ fn report_bodies(
     );
     for item in reportable {
         text.push_str(&format!(
-            "- {} {}\n  tx: {}\n  share: {}\n  tweet:\n{}\n\n",
+            "- [{}] {} {}\n  reason: {}\n  tx: {}\n  share: {}\n  tweet:\n{}\n\n",
+            item.signal.level.as_str(),
             item.signal.activity_kind,
             item.tx.volume_score_raw,
+            item.signal.reason,
             item.tx.tx_hash,
             item.share_url,
             item.tweet_text
         ));
         html.push_str(&format!(
-            "<hr><p><strong>{}</strong> volume score(raw): {}</p><p>tx: <code>{}</code></p><p><a href=\"{}\">Open share</a></p><pre>{}</pre>",
+            "<hr><p><strong>[{}] {}</strong> volume score(raw): {}</p><p>{}</p><p>tx: <code>{}</code></p><p><a href=\"{}\">Open share</a></p><pre>{}</pre>",
+            html_escape(item.signal.level.as_str()),
             html_escape(&item.signal.activity_kind),
             html_escape(&item.tx.volume_score_raw),
+            html_escape(&item.signal.reason),
             html_escape(&item.tx.tx_hash),
             html_escape(&item.share_url),
             html_escape(&item.tweet_text)
@@ -657,7 +937,9 @@ mod tests {
         };
         let signal = TxSignal {
             activity_kind: "liquidation".to_owned(),
+            level: SignalLevel::Confirmed,
             reason: "test".to_owned(),
+            positive_strategy_net: true,
         };
         let text = build_tweet_text(&tx, &signal, "https://ledgerflow.top/share/tx/123");
         assert!(text.chars().count() <= 280);
