@@ -12,7 +12,7 @@ use crate::domain::{
         AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
         ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
         ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState, EvidencePack,
-        TransactionAnalysis,
+        ProtocolAddressMetadata, TransactionAnalysis,
     },
     enums::{ClusterBackfillStatus, ClusterTrackingStatus, ClusterTxStatus},
     interfaces::AnalysisRepository,
@@ -33,6 +33,7 @@ pub struct InMemoryAnalysisRepository {
     cluster_alerts: RwLock<HashMap<Uuid, Vec<ClusterAlert>>>,
     address_profiles: RwLock<HashMap<(u64, String), AddressProfile>>,
     address_labels: RwLock<HashMap<(u64, String, String, String), AddressLabel>>,
+    protocol_metadata: RwLock<HashMap<(u64, String, String, String, String), ProtocolAddressMetadata>>,
     address_jobs: RwLock<HashMap<(u64, String), AddressAnalysisJob>>,
 }
 
@@ -652,6 +653,26 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
                     label.source.clone(),
                 ),
                 label.clone(),
+            );
+        }
+        Ok(())
+    }
+
+    async fn upsert_protocol_address_metadata(
+        &self,
+        metadata: &[ProtocolAddressMetadata],
+    ) -> LedgerResult<()> {
+        let mut store = self.protocol_metadata.write().await;
+        for item in metadata {
+            store.insert(
+                (
+                    item.chain_id,
+                    item.address.to_ascii_lowercase(),
+                    item.protocol_family.clone(),
+                    item.protocol_name.clone(),
+                    item.contract_role.clone(),
+                ),
+                item.clone(),
             );
         }
         Ok(())

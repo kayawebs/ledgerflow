@@ -10,7 +10,7 @@ use crate::domain::{
         AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
         ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
         ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState, EvidencePack,
-        TransactionAnalysis,
+        ProtocolAddressMetadata, TransactionAnalysis,
     },
     enums::{
         AlertSeverity, AlertType, BehaviorTag, ClusterBackfillStatus, ClusterTrackingStatus,
@@ -1357,6 +1357,46 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             .bind(Json(label.evidence_json.clone()))
             .bind(label.created_at)
             .bind(label.updated_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn upsert_protocol_address_metadata(
+        &self,
+        metadata: &[ProtocolAddressMetadata],
+    ) -> LedgerResult<()> {
+        for item in metadata {
+            sqlx::query(
+                r#"
+                insert into address_protocol_metadata (
+                  chain_id, address, protocol_family, protocol_name, contract_role, source,
+                  adapter_version, confidence, metadata, first_seen_at, last_seen_at, updated_at
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                on conflict (chain_id, address, protocol_family, protocol_name, contract_role) do update set
+                  source = excluded.source,
+                  adapter_version = excluded.adapter_version,
+                  confidence = greatest(address_protocol_metadata.confidence, excluded.confidence),
+                  metadata = address_protocol_metadata.metadata || excluded.metadata,
+                  last_seen_at = greatest(address_protocol_metadata.last_seen_at, excluded.last_seen_at),
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(item.chain_id as i64)
+            .bind(item.address.to_ascii_lowercase())
+            .bind(&item.protocol_family)
+            .bind(&item.protocol_name)
+            .bind(&item.contract_role)
+            .bind(&item.source)
+            .bind(&item.adapter_version)
+            .bind(item.confidence as f64)
+            .bind(Json(item.metadata.clone()))
+            .bind(item.first_seen_at)
+            .bind(item.last_seen_at)
+            .bind(item.updated_at)
             .execute(&self.pool)
             .await
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;

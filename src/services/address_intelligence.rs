@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     core::errors::LedgerResult,
     domain::{
-        entities::{AddressAnalysisJob, AddressLabel, AddressProfile},
+        entities::{AddressAnalysisJob, AddressLabel, AddressProfile, ProtocolAddressMetadata},
         interfaces::{ClusterTxSource, DynRepository},
         value_objects::AddressTxRef,
     },
@@ -20,6 +20,8 @@ const TOKEN1_SELECTOR: &str = "0xd21220a7";
 const FEE_SELECTOR: &str = "0xddca3f43";
 const FACTORY_SELECTOR: &str = "0xc45a0155";
 const STABLE_SELECTOR: &str = "0x5f6e283f";
+const GET_RESERVES_SELECTOR: &str = "0x0902f1ac";
+const SLOT0_SELECTOR: &str = "0x3850c7bd";
 
 #[derive(Clone)]
 pub struct AddressIntelligenceService {
@@ -59,7 +61,7 @@ impl AddressIntelligenceService {
         };
 
         match self.analyze_job(&job).await {
-            Ok((mut profile, labels)) => {
+            Ok((mut profile, labels, protocol_metadata)) => {
                 if self.backfill_address_history(&job).await? {
                     profile.metadata = merge_metadata(
                         profile.metadata,
@@ -71,6 +73,11 @@ impl AddressIntelligenceService {
                 }
                 self.repository.upsert_address_profile(&profile).await?;
                 self.repository.upsert_address_labels(&labels).await?;
+                if !protocol_metadata.is_empty() {
+                    self.repository
+                        .upsert_protocol_address_metadata(&protocol_metadata)
+                        .await?;
+                }
                 self.repository
                     .complete_address_analysis_job(job.chain_id, &job.address)
                     .await?;
@@ -88,7 +95,11 @@ impl AddressIntelligenceService {
     async fn analyze_job(
         &self,
         job: &AddressAnalysisJob,
-    ) -> LedgerResult<(AddressProfile, Vec<AddressLabel>)> {
+    ) -> LedgerResult<(
+        AddressProfile,
+        Vec<AddressLabel>,
+        Vec<ProtocolAddressMetadata>,
+    )> {
         let code = self
             .rpc_client
             .get_code(job.chain_id, &job.address, None)
@@ -120,6 +131,18 @@ impl AddressIntelligenceService {
             probe.contract_role.clone()
         } else if role_labels.iter().any(|label| label == "erc20_token") {
             "token".to_owned()
+        } else if has_code
+            && role_labels
+                .iter()
+                .any(|label| matches!(label.as_str(), "approval_spender" | "suspected_router" | "suspected_router_or_protocol"))
+        {
+            "router_candidate".to_owned()
+        } else if has_code
+            && role_labels
+                .iter()
+                .any(|label| matches!(label.as_str(), "suspected_protocol" | "touched_contract"))
+        {
+            "protocol_candidate".to_owned()
         } else if has_code {
             "contract".to_owned()
         } else {
@@ -127,6 +150,7 @@ impl AddressIntelligenceService {
         };
         let confidence = match address_type.as_str() {
             "token" | "router" | "protocol" => 0.9,
+            "router_candidate" | "protocol_candidate" => 0.68,
             "contract" => 0.7,
             "eoa" => 0.8,
             _ => 0.4,
@@ -168,7 +192,7 @@ impl AddressIntelligenceService {
                 now,
             ));
         }
-        if let Some(known) = known {
+        if let Some(known) = known.as_ref() {
             labels.push(label_for(
                 job,
                 &known.label,
@@ -177,6 +201,17 @@ impl AddressIntelligenceService {
                 json!({ "reason": "known_address" }),
                 now,
             ));
+        }
+        let mut protocol_metadata = protocol_probe
+            .as_ref()
+            .map(|probe| probe.to_metadata(job, now))
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(known_metadata) = known
+            .as_ref()
+            .and_then(|known| known.to_protocol_metadata(job, now))
+        {
+            protocol_metadata.push(known_metadata);
         }
         if let Some(probe) = protocol_probe {
             labels.push(label_for(
@@ -204,7 +239,7 @@ impl AddressIntelligenceService {
                 now,
             ));
         }
-        Ok((profile, labels))
+        Ok((profile, labels, protocol_metadata))
     }
 
     async fn probe_protocol_address(&self, chain_id: u64, address: &str) -> Option<ProtocolProbe> {
@@ -219,8 +254,24 @@ impl AddressIntelligenceService {
             .await;
         let fee = self.fetch_uint(chain_id, address, FEE_SELECTOR).await;
         let stable = self.fetch_bool(chain_id, address, STABLE_SELECTOR).await;
-        let protocol_name = if fee.is_some() {
+        let get_reserves_supported = self
+            .rpc_client
+            .eth_call(chain_id, address, GET_RESERVES_SELECTOR, None)
+            .await
+            .ok()
+            .filter(|value| value.trim_start_matches("0x").len() >= 192)
+            .is_some();
+        let slot0_supported = self
+            .rpc_client
+            .eth_call(chain_id, address, SLOT0_SELECTOR, None)
+            .await
+            .ok()
+            .filter(|value| value.trim_start_matches("0x").len() >= 224)
+            .is_some();
+        let protocol_name = if slot0_supported || fee.is_some() {
             "uniswap_v3_compatible_pool"
+        } else if get_reserves_supported {
+            "uniswap_v2_compatible_pool"
         } else if stable.is_some() {
             "solidly_compatible_pool"
         } else {
@@ -236,7 +287,9 @@ impl AddressIntelligenceService {
             factory,
             fee,
             stable,
-            confidence: 0.82,
+            get_reserves_supported,
+            slot0_supported,
+            confidence: if slot0_supported || get_reserves_supported { 0.9 } else { 0.82 },
         })
     }
 
@@ -322,6 +375,8 @@ struct ProtocolProbe {
     factory: Option<String>,
     fee: Option<u128>,
     stable: Option<bool>,
+    get_reserves_supported: bool,
+    slot0_supported: bool,
     confidence: f32,
 }
 
@@ -336,8 +391,31 @@ impl ProtocolProbe {
             "factory": self.factory,
             "fee": self.fee.map(|value| value.to_string()),
             "stable": self.stable,
+            "get_reserves_supported": self.get_reserves_supported,
+            "slot0_supported": self.slot0_supported,
             "confidence": self.confidence,
         })
+    }
+
+    fn to_metadata(
+        &self,
+        job: &AddressAnalysisJob,
+        now: chrono::DateTime<Utc>,
+    ) -> ProtocolAddressMetadata {
+        ProtocolAddressMetadata {
+            chain_id: job.chain_id,
+            address: job.address.to_ascii_lowercase(),
+            protocol_family: self.protocol_family.clone(),
+            protocol_name: self.protocol_name.clone(),
+            contract_role: self.contract_role.clone(),
+            source: "protocol_probe".to_owned(),
+            adapter_version: "dex_probe_v1".to_owned(),
+            confidence: self.confidence,
+            metadata: self.to_json(),
+            first_seen_at: job.first_seen_at,
+            last_seen_at: now,
+            updated_at: now,
+        }
     }
 }
 
@@ -429,6 +507,42 @@ struct KnownAddressLabel {
     confidence: f32,
 }
 
+impl KnownAddressLabel {
+    fn to_protocol_metadata(
+        &self,
+        job: &AddressAnalysisJob,
+        now: chrono::DateTime<Utc>,
+    ) -> Option<ProtocolAddressMetadata> {
+        let (protocol_family, protocol_name, contract_role) =
+            if self.label.starts_with("uniswap_") {
+                ("dex", "uniswap", self.address_type.as_str())
+            } else if self.label.starts_with("aerodrome_") {
+                ("dex", "aerodrome", self.address_type.as_str())
+            } else if self.label == "morpho_blue" {
+                ("lending", "morpho_blue", self.address_type.as_str())
+            } else {
+                return None;
+            };
+        Some(ProtocolAddressMetadata {
+            chain_id: job.chain_id,
+            address: job.address.to_ascii_lowercase(),
+            protocol_family: protocol_family.to_owned(),
+            protocol_name: protocol_name.to_owned(),
+            contract_role: contract_role.to_owned(),
+            source: "builtin".to_owned(),
+            adapter_version: "known_address_v1".to_owned(),
+            confidence: self.confidence,
+            metadata: json!({
+                "label": self.label,
+                "address_type": self.address_type,
+            }),
+            first_seen_at: job.first_seen_at,
+            last_seen_at: now,
+            updated_at: now,
+        })
+    }
+}
+
 fn known_address_label(chain_id: u64, address: &str) -> Option<KnownAddressLabel> {
     if chain_id != 8453 {
         return None;
@@ -443,6 +557,21 @@ fn known_address_label(chain_id: u64, address: &str) -> Option<KnownAddressLabel
             label: "uniswap_v2_router".to_owned(),
             address_type: "router".to_owned(),
             confidence: 0.95,
+        }),
+        "0x2626664c2603336e57b271c5c0b26f421741e481" => Some(KnownAddressLabel {
+            label: "uniswap_v3_swaprouter02".to_owned(),
+            address_type: "router".to_owned(),
+            confidence: 0.95,
+        }),
+        "0x6ff5693b99212da76ad316178a184ab56d299b43" => Some(KnownAddressLabel {
+            label: "uniswap_universal_router".to_owned(),
+            address_type: "router".to_owned(),
+            confidence: 0.9,
+        }),
+        "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf" => Some(KnownAddressLabel {
+            label: "aerodrome_router".to_owned(),
+            address_type: "router".to_owned(),
+            confidence: 0.9,
         }),
         "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb" => Some(KnownAddressLabel {
             label: "morpho_blue".to_owned(),

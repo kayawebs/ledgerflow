@@ -102,6 +102,22 @@ pub struct AddressLabel {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProtocolAddressMetadata {
+    pub chain_id: u64,
+    pub address: String,
+    pub protocol_family: String,
+    pub protocol_name: String,
+    pub contract_role: String,
+    pub source: String,
+    pub adapter_version: String,
+    pub confidence: f32,
+    pub metadata: Value,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AddressAnalysisJob {
     pub chain_id: u64,
     pub address: String,

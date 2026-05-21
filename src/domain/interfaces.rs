@@ -8,7 +8,7 @@ use crate::domain::entities::{
     AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
     ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
     ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState, EvidencePack,
-    RecognizerResult, TransactionAnalysis,
+    ProtocolAddressMetadata, RecognizerResult, TransactionAnalysis,
 };
 use crate::domain::enums::BehaviorTag;
 use crate::domain::value_objects::{AddressTxRef, AssetFlow, ValidationMessage};
@@ -130,6 +130,10 @@ pub trait AnalysisRepository: Send + Sync {
     async fn claim_next_address_analysis_job(&self) -> LedgerResult<Option<AddressAnalysisJob>>;
     async fn upsert_address_profile(&self, profile: &AddressProfile) -> LedgerResult<()>;
     async fn upsert_address_labels(&self, labels: &[AddressLabel]) -> LedgerResult<()>;
+    async fn upsert_protocol_address_metadata(
+        &self,
+        metadata: &[ProtocolAddressMetadata],
+    ) -> LedgerResult<()>;
     async fn complete_address_analysis_job(&self, chain_id: u64, address: &str)
     -> LedgerResult<()>;
     async fn fail_address_analysis_job(

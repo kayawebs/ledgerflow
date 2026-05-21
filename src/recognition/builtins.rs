@@ -127,6 +127,8 @@ fn is_known_liquidation_selector(selector: &str) -> bool {
 const MORPHO_BLUE_CORE: &str = "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb";
 const MORPHO_BLUE_LIQUIDATE_TOPIC: &str =
     "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41";
+const AAVE_LIQUIDATION_CALL_TOPIC: &str =
+    "0xe413a321e8681d83188be0d2364605a8f594ac97918daee13129e6b4f89b8f3";
 
 #[derive(Clone, Debug)]
 struct LiquidationSignals {
@@ -253,18 +255,34 @@ impl LiquidationProtocolAdapter for AaveLiquidationAdapter {
         signals
             .matched_liquidation_selectors()
             .contains("0x00a718a9")
+            || signals
+                .log_topic_zeroes
+                .contains(AAVE_LIQUIDATION_CALL_TOPIC)
     }
 
     fn detect(&self, signals: &LiquidationSignals) -> Option<LiquidationDetection> {
         let matched_selectors = signals.matched_liquidation_selectors();
-        if !matched_selectors.contains("0x00a718a9") {
+        let matched_event = signals
+            .log_topic_zeroes
+            .contains(AAVE_LIQUIDATION_CALL_TOPIC);
+        if !matched_selectors.contains("0x00a718a9") && !matched_event {
             return None;
         }
         Some(LiquidationDetection {
             protocol: self.protocol_id(),
-            confidence: if signals.selector == "0x00a718a9" { 0.94 } else { 0.86 },
+            confidence: if matched_event {
+                0.96
+            } else if signals.selector == "0x00a718a9" {
+                0.94
+            } else {
+                0.86
+            },
             matched_selectors,
-            matched_event_topic: None,
+            matched_event_topic: if matched_event {
+                Some(AAVE_LIQUIDATION_CALL_TOPIC)
+            } else {
+                None
+            },
             attributes: json!({
                 "internal_call_count": signals.internal_call_count,
             }),
@@ -308,11 +326,45 @@ impl LiquidationProtocolAdapter for CompoundLiquidationAdapter {
     }
 }
 
-fn liquidation_adapters() -> [Box<dyn LiquidationProtocolAdapter>; 3] {
+struct EulerLiquidationAdapter;
+
+impl LiquidationProtocolAdapter for EulerLiquidationAdapter {
+    fn protocol_id(&self) -> &'static str {
+        "euler"
+    }
+
+    fn prefilter(&self, signals: &LiquidationSignals) -> bool {
+        signals
+            .matched_liquidation_selectors()
+            .contains("0xc1342574")
+    }
+
+    fn detect(&self, signals: &LiquidationSignals) -> Option<LiquidationDetection> {
+        let matched_selectors = signals.matched_liquidation_selectors();
+        if !matched_selectors.contains("0xc1342574") {
+            return None;
+        }
+        Some(LiquidationDetection {
+            protocol: self.protocol_id(),
+            confidence: if signals.selector == "0xc1342574" { 0.93 } else { 0.84 },
+            matched_selectors,
+            matched_event_topic: None,
+            attributes: json!({
+                "internal_call_count": signals.internal_call_count,
+            }),
+            warnings: vec!["selector_matched_without_protocol_event_adapter".to_owned()],
+            unresolved_code: "euler_liquidation_roles_partial",
+            unresolved_message: "Euler liquidation selector matched, but account and collateral/debt roles are only partially decoded.",
+        })
+    }
+}
+
+fn liquidation_adapters() -> [Box<dyn LiquidationProtocolAdapter>; 4] {
     [
         Box::new(MorphoBlueLiquidationAdapter),
         Box::new(AaveLiquidationAdapter),
         Box::new(CompoundLiquidationAdapter),
+        Box::new(EulerLiquidationAdapter),
     ]
 }
 
@@ -840,6 +892,19 @@ fn arbitrage_subject_deltas(
     })
 }
 
+fn distinct_flow_counterparties(analysis: &TransactionAnalysis) -> BTreeSet<String> {
+    analysis
+        .derived_flows
+        .iter()
+        .flat_map(|flow| {
+            [
+                flow.from_address.to_ascii_lowercase(),
+                flow.to_address.to_ascii_lowercase(),
+            ]
+        })
+        .collect()
+}
+
 impl Recognizer for ArbitrageLikeScenarioRecognizer {
     fn recognizer_id(&self) -> &str {
         "arbitrage_like_scenario"
@@ -873,26 +938,40 @@ impl Recognizer for ArbitrageLikeScenarioRecognizer {
                         || flow.to_address.eq_ignore_ascii_case(&subject))
             })
             .count();
-        if analysis.normalized_execution_facts.internal_call_count < 2
+        let counterparty_count = distinct_flow_counterparties(analysis).len();
+        let route_like_shape = subject_flow_count >= 2
+            && counterparty_count >= 3
+            && analysis.normalized_execution_facts.event_count >= 2;
+        if analysis.normalized_execution_facts.internal_call_count < 1
             || outgoing_count == 0
             || incoming_count == 0
             || touched_tokens.len() < 2
-            || (subject_flow_count < 4 && touched_tokens.len() < 3)
+            || (!route_like_shape && subject_flow_count < 4 && touched_tokens.len() < 3)
         {
             return Ok(None);
         }
+
+        let confidence = if analysis.normalized_execution_facts.internal_call_count >= 2
+            && subject_flow_count >= 4
+        {
+            0.67
+        } else {
+            0.58
+        };
 
         Ok(Some(RecognizerResult {
             recognizer_id: self.recognizer_id().to_owned(),
             recognizer_version: self.version().to_owned(),
             label: "arbitrage_like_activity".to_owned(),
-            confidence: 0.67,
+            confidence,
             evidence_refs: analysis.raw_evidence_refs.clone(),
             attributes: json!({
                 "subject": subject,
                 "subject_role": subject_role,
                 "token_touch_count": touched_tokens.len(),
                 "subject_flow_count": subject_flow_count,
+                "counterparty_count": counterparty_count,
+                "route_like_shape": route_like_shape,
                 "internal_call_count": analysis.normalized_execution_facts.internal_call_count,
             }),
             unresolved_points: vec![UnresolvedItem {
@@ -927,7 +1006,10 @@ impl Recognizer for LiquidationLikeScenarioRecognizer {
         let matched_liquidation_selectors = signals.matched_liquidation_selectors();
         let has_liquidation_event_signal = signals
             .log_topic_zeroes
-            .contains(MORPHO_BLUE_LIQUIDATE_TOPIC);
+            .contains(MORPHO_BLUE_LIQUIDATE_TOPIC)
+            || signals
+                .log_topic_zeroes
+                .contains(AAVE_LIQUIDATION_CALL_TOPIC);
         if matched_liquidation_selectors.is_empty()
             && !has_liquidation_event_signal
             && signals.internal_call_count < 2
