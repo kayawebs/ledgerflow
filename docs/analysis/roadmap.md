@@ -504,6 +504,30 @@ Acceptance criteria:
 - DEX/pool/router labels improve over time without manual per-address analysis
 - confirmed liquidation/arbitrage still appears as the strongest signal, not the only signal
 
+### 6.6 Lazy Pricing System
+
+Goal: convert transaction and cluster flows into USDC/USDT-denominated estimates without building a full-chain price index.
+
+Tasks:
+
+1. Store raw price facts in `price_observations`.
+2. Store query-ready bucketed prices in `token_price_cache`.
+3. Store unresolved work in `price_requests`.
+4. Extract high-confidence `tx_execution` prices only when a token flow is paired with USDC/USDT/USDbC in the same transaction.
+5. Queue missing token prices instead of blocking user-facing analysis.
+6. Later add a worker that resolves `price_requests` from:
+   - nearby DEX swap observations
+   - pool spot prices
+   - WETH/USDC route composition
+   - optional external APIs as a fallback
+
+Performance constraints:
+
+1. Never scan all tokens.
+2. Deduplicate requests by token + quote + block bucket.
+3. Use block buckets instead of per-block cache rows.
+4. Prefer tx-local facts over external market APIs.
+
 ## Suggested Execution Order
 
 Build in this order:

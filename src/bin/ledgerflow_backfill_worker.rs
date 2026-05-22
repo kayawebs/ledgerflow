@@ -9,7 +9,8 @@ use ledgerflow::{
     repositories::sqlx::SqlxAnalysisRepository,
     services::{
         analysis::AnalysisService, cluster_backfill::ClusterBackfillService,
-        indexer_client::IndexerHttpClient,
+        indexer_client::IndexerHttpClient, pricing::PriceService,
+        token_metadata::TokenMetadataService,
     },
 };
 use tracing::{error, info};
@@ -32,14 +33,23 @@ async fn main() {
         .expect("migrations should succeed");
 
     let rpc_client = Arc::new(HttpRpcClient::new(config.rpc_url.clone()));
-    let fetcher = TransactionBundleFetcher::new(rpc_client, config.trace_enabled);
-    let service = Arc::new(AnalysisService::new(
-        fetcher,
-        registry,
-        plugin_context,
-        Arc::new(repository),
-        config.enabled_recognizers.clone(),
+    let token_metadata_service = Arc::new(TokenMetadataService::new(
+        repository.pool().clone(),
+        rpc_client.clone(),
     ));
+    let price_service = Arc::new(PriceService::new(repository.pool().clone()));
+    let fetcher = TransactionBundleFetcher::new(rpc_client, config.trace_enabled);
+    let service = Arc::new(
+        AnalysisService::new(
+            fetcher,
+            registry,
+            plugin_context,
+            Arc::new(repository),
+            config.enabled_recognizers.clone(),
+        )
+        .with_token_metadata_service(token_metadata_service)
+        .with_price_service(price_service),
+    );
     let tx_source = config.indexer_api_base_url.clone().map(|url| {
         Arc::new(IndexerHttpClient::new(
             url,

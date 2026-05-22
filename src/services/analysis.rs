@@ -18,6 +18,7 @@ use crate::normalization::service::EvidenceNormalizer;
 use crate::plugins::loader::PluginContext;
 use crate::recognition::registry::RecognizerRegistry;
 use crate::scenarios::adapters::ScenarioAdapterService;
+use crate::services::pricing::PriceService;
 use crate::services::token_metadata::TokenMetadataService;
 
 #[derive(Clone)]
@@ -32,6 +33,7 @@ pub struct AnalysisService {
     pub accounting_service: Arc<AccountingService>,
     pub repository: Arc<dyn AnalysisRepository>,
     pub token_metadata_service: Option<Arc<TokenMetadataService>>,
+    pub price_service: Option<Arc<PriceService>>,
     pub enabled_recognizers: Vec<String>,
 }
 
@@ -54,6 +56,7 @@ impl AnalysisService {
             accounting_service: Arc::new(AccountingService),
             repository,
             token_metadata_service: None,
+            price_service: None,
             enabled_recognizers,
         }
     }
@@ -63,6 +66,11 @@ impl AnalysisService {
         token_metadata_service: Arc<TokenMetadataService>,
     ) -> Self {
         self.token_metadata_service = Some(token_metadata_service);
+        self
+    }
+
+    pub fn with_price_service(mut self, price_service: Arc<PriceService>) -> Self {
+        self.price_service = Some(price_service);
         self
     }
 
@@ -122,6 +130,11 @@ impl AnalysisService {
             .execute(&mut analysis, &selected_recognizers)?;
         analysis.scenario_outputs = self.scenario_service.adapt(&analysis);
         analysis.accounting_outputs = self.accounting_service.summarize(&analysis);
+        if let Some(price_service) = self.price_service.as_ref() {
+            if let Err(err) = price_service.observe_analysis(&mut analysis).await {
+                warn!(%tx_hash, error = %err, "price observation failed");
+            }
+        }
 
         let mut pack = self.evidence_pack_builder.build(&analysis);
         let mut validations = Vec::new();

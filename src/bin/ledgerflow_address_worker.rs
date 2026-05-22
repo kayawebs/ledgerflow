@@ -9,7 +9,8 @@ use ledgerflow::{
     repositories::sqlx::SqlxAnalysisRepository,
     services::{
         address_intelligence::AddressIntelligenceService, analysis::AnalysisService,
-        indexer_client::IndexerHttpClient, token_metadata::TokenMetadataService,
+        indexer_client::IndexerHttpClient, pricing::PriceService,
+        token_metadata::TokenMetadataService,
     },
 };
 use tracing::{error, info};
@@ -39,6 +40,7 @@ async fn main() {
         repository.pool().clone(),
         rpc_client.clone(),
     ));
+    let price_service = Arc::new(PriceService::new(repository.pool().clone()));
     let fetcher = TransactionBundleFetcher::new(rpc_client.clone(), config.trace_enabled);
     let repository = Arc::new(repository);
     let analysis_service = Arc::new(
@@ -49,7 +51,8 @@ async fn main() {
             repository.clone(),
             config.enabled_recognizers.clone(),
         )
-        .with_token_metadata_service(token_metadata_service),
+        .with_token_metadata_service(token_metadata_service)
+        .with_price_service(price_service),
     );
     let service = if let Some(indexer_url) = config.indexer_api_base_url.clone() {
         let tx_source = Arc::new(IndexerHttpClient::new(

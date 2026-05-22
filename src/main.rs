@@ -11,6 +11,7 @@ use ledgerflow::{
     services::{
         analysis::AnalysisService, cluster_backfill::ClusterBackfillService,
         discovery::ClusterDiscoveryService, indexer_client::IndexerHttpClient,
+        pricing::PriceService,
         token_metadata::TokenMetadataService,
     },
 };
@@ -39,6 +40,7 @@ async fn main() {
         repository.pool().clone(),
         rpc_client.clone(),
     ));
+    let price_service = Arc::new(PriceService::new(repository.pool().clone()));
     let service = Arc::new(
         AnalysisService::new(
             fetcher,
@@ -47,7 +49,8 @@ async fn main() {
             Arc::new(repository),
             config.enabled_recognizers.clone(),
         )
-        .with_token_metadata_service(token_metadata_service),
+        .with_token_metadata_service(token_metadata_service)
+        .with_price_service(price_service),
     );
     let tx_source = config.indexer_api_base_url.clone().map(|url| {
         Arc::new(IndexerHttpClient::new(
