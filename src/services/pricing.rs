@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row, types::Json};
@@ -17,6 +18,8 @@ use crate::{
 const PRICE_BLOCK_BUCKET_SIZE: u64 = 150;
 const DEFAULT_QUOTE_SYMBOL: &str = "USD";
 const SOURCE_TX_EXECUTION: &str = "tx_execution";
+const SOURCE_STABLE_ANCHOR: &str = "stable_anchor";
+const SOURCE_COMPOSED_CACHE: &str = "composed_cache";
 
 #[derive(Clone)]
 pub struct PriceService {
@@ -58,6 +61,26 @@ pub struct PriceQuote {
     pub source: String,
     pub observed_block: Option<u64>,
     pub block_bucket: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PriceWorkerResult {
+    pub processed: bool,
+    pub completed: bool,
+    pub request_id: Option<Uuid>,
+    pub token_address: Option<String>,
+    pub method: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PriceRequest {
+    request_id: Uuid,
+    chain_id: u64,
+    token_address: String,
+    quote_symbol: String,
+    target_block: Option<u64>,
+    block_bucket: Option<u64>,
+    target_timestamp: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]
@@ -108,11 +131,12 @@ impl PriceService {
             observations_written += 1;
         }
 
-        let priced_tokens = observations
+        let usd_priced_tokens = observations
             .iter()
+            .filter(|observation| observation.quote_symbol == DEFAULT_QUOTE_SYMBOL)
             .map(|observation| observation.token_address.clone())
             .collect::<BTreeSet<_>>();
-        let requested_tokens = collect_price_request_tokens(analysis, &priced_tokens);
+        let requested_tokens = collect_price_request_tokens(analysis, &usd_priced_tokens);
         let mut requests_enqueued = 0usize;
         for token_address in &requested_tokens {
             requests_enqueued += self.enqueue_request(analysis, token_address).await? as usize;
@@ -206,10 +230,306 @@ impl PriceService {
         }))
     }
 
+    pub async fn process_next_price_request(&self) -> LedgerResult<PriceWorkerResult> {
+        let Some(request) = self.claim_next_price_request().await? else {
+            return Ok(PriceWorkerResult::default());
+        };
+        let request_id = request.request_id;
+        let token_address = request.token_address.clone();
+        match self.resolve_price_request(&request).await {
+            Ok(Some(method)) => {
+                self.complete_request(request_id, json!({ "method": method })).await?;
+                Ok(PriceWorkerResult {
+                    processed: true,
+                    completed: true,
+                    request_id: Some(request_id),
+                    token_address: Some(token_address),
+                    method: Some(method),
+                })
+            }
+            Ok(None) => {
+                self.release_request(request_id, "price source not available yet").await?;
+                Ok(PriceWorkerResult {
+                    processed: true,
+                    completed: false,
+                    request_id: Some(request_id),
+                    token_address: Some(token_address),
+                    method: None,
+                })
+            }
+            Err(err) => {
+                self.release_request(request_id, &err.to_string()).await?;
+                Err(err)
+            }
+        }
+    }
+
+    async fn resolve_price_request(&self, request: &PriceRequest) -> LedgerResult<Option<String>> {
+        if request.quote_symbol != DEFAULT_QUOTE_SYMBOL {
+            return Ok(None);
+        }
+        if stable_token(&request.token_address).is_some() {
+            let observation = PriceObservation {
+                chain_id: request.chain_id,
+                token_address: request.token_address.clone(),
+                quote_token: request.token_address.clone(),
+                quote_symbol: DEFAULT_QUOTE_SYMBOL.to_owned(),
+                block_number: request.target_block,
+                block_bucket: request.block_bucket,
+                price_decimal: "1".to_owned(),
+                source: SOURCE_STABLE_ANCHOR.to_owned(),
+                confidence: 0.99,
+                tx_hash: None,
+                metadata: json!({
+                    "method": "known_stable_anchor",
+                    "request_id": request.request_id,
+                    "target_timestamp": request.target_timestamp,
+                }),
+            };
+            self.insert_observation_parts(&observation, request.target_timestamp)
+                .await?;
+            self.upsert_cache_parts(&observation, request.target_timestamp)
+                .await?;
+            return Ok(Some("stable_anchor".to_owned()));
+        }
+        if self.has_usd_cache(request).await? {
+            return Ok(Some("existing_cache".to_owned()));
+        }
+        if self.compose_cached_price(request).await? {
+            return Ok(Some("composed_cache".to_owned()));
+        }
+        Ok(None)
+    }
+
+    async fn claim_next_price_request(&self) -> LedgerResult<Option<PriceRequest>> {
+        let row = sqlx::query(
+            r#"
+            update price_requests
+            set status = 'processing',
+                attempts = attempts + 1,
+                updated_at = now()
+            where request_id = (
+                select request_id
+                from price_requests
+                where status = 'pending'
+                  and quote_symbol = $1
+                  and (attempts = 0 or updated_at < now() - interval '5 minutes')
+                order by priority asc, created_at asc
+                for update skip locked
+                limit 1
+            )
+            returning request_id, chain_id, token_address, quote_symbol, target_block,
+                      block_bucket, target_timestamp
+            "#,
+        )
+        .bind(DEFAULT_QUOTE_SYMBOL)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        row.map(|row| {
+            Ok(PriceRequest {
+                request_id: row
+                    .try_get("request_id")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                chain_id: row
+                    .try_get::<i64, _>("chain_id")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                    as u64,
+                token_address: row
+                    .try_get::<String, _>("token_address")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                    .to_ascii_lowercase(),
+                quote_symbol: row
+                    .try_get("quote_symbol")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                target_block: row
+                    .try_get::<Option<i64>, _>("target_block")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                    .map(|value| value as u64),
+                block_bucket: row
+                    .try_get::<Option<i64>, _>("block_bucket")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                    .map(|value| value as u64),
+                target_timestamp: row
+                    .try_get("target_timestamp")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn has_usd_cache(&self, request: &PriceRequest) -> LedgerResult<bool> {
+        let Some(block_bucket) = request.block_bucket else {
+            return Ok(false);
+        };
+        let row = sqlx::query(
+            r#"
+            select 1
+            from token_price_cache
+            where chain_id = $1
+              and token_address = $2
+              and quote_symbol = $3
+              and block_bucket between $4 - 2 and $4 + 2
+              and (expires_at is null or expires_at > now())
+            limit 1
+            "#,
+        )
+        .bind(request.chain_id as i64)
+        .bind(&request.token_address)
+        .bind(DEFAULT_QUOTE_SYMBOL)
+        .bind(block_bucket as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(row.is_some())
+    }
+
+    async fn compose_cached_price(&self, request: &PriceRequest) -> LedgerResult<bool> {
+        let Some(block_bucket) = request.block_bucket else {
+            return Ok(false);
+        };
+        let row = sqlx::query(
+            r#"
+            select
+              rel.quote_token,
+              rel.quote_symbol,
+              rel.price_decimal::text as relative_price_decimal,
+              rel.confidence as relative_confidence,
+              rel.source as relative_source,
+              rel.block_number as relative_block_number,
+              rel.metadata as relative_metadata,
+              usd.price_decimal::text as quote_usd_price_decimal,
+              usd.confidence as quote_usd_confidence,
+              usd.source as quote_usd_source,
+              usd.observed_block as quote_usd_observed_block
+            from price_observations rel
+            join token_price_cache usd
+              on usd.chain_id = rel.chain_id
+             and usd.token_address = rel.quote_token
+             and usd.quote_symbol = $3
+             and usd.block_bucket between $4 - 2 and $4 + 2
+             and (usd.expires_at is null or usd.expires_at > now())
+            where rel.chain_id = $1
+              and rel.token_address = $2
+              and rel.quote_symbol <> $3
+              and rel.block_bucket between $4 - 10 and $4 + 10
+            order by
+              (rel.confidence * usd.confidence) desc,
+              abs(rel.block_bucket - $4) asc,
+              rel.created_at desc
+            limit 1
+            "#,
+        )
+        .bind(request.chain_id as i64)
+        .bind(&request.token_address)
+        .bind(DEFAULT_QUOTE_SYMBOL)
+        .bind(block_bucket as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let relative_price = row
+            .try_get::<String, _>("relative_price_decimal")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            .parse::<f64>()
+            .map_err(|err| LedgerError::MalformedEvidence(err.to_string()))?;
+        let quote_usd_price = row
+            .try_get::<String, _>("quote_usd_price_decimal")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?
+            .parse::<f64>()
+            .map_err(|err| LedgerError::MalformedEvidence(err.to_string()))?;
+        let composed_price = relative_price * quote_usd_price;
+        if !composed_price.is_finite() || composed_price <= 0.0 {
+            return Ok(false);
+        }
+        let relative_confidence = row
+            .try_get::<f32, _>("relative_confidence")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let quote_usd_confidence = row
+            .try_get::<f32, _>("quote_usd_confidence")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let observation = PriceObservation {
+            chain_id: request.chain_id,
+            token_address: request.token_address.clone(),
+            quote_token: row
+                .try_get("quote_token")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            quote_symbol: DEFAULT_QUOTE_SYMBOL.to_owned(),
+            block_number: request.target_block,
+            block_bucket: request.block_bucket,
+            price_decimal: format_decimal(composed_price),
+            source: SOURCE_COMPOSED_CACHE.to_owned(),
+            confidence: (relative_confidence * quote_usd_confidence * 0.9).min(0.95),
+            tx_hash: None,
+            metadata: json!({
+                "method": "relative_observation_times_quote_usd_cache",
+                "request_id": request.request_id,
+                "relative_quote_symbol": row.try_get::<String, _>("quote_symbol").unwrap_or_default(),
+                "relative_source": row.try_get::<String, _>("relative_source").unwrap_or_default(),
+                "quote_usd_source": row.try_get::<String, _>("quote_usd_source").unwrap_or_default(),
+                "relative_block_number": row.try_get::<Option<i64>, _>("relative_block_number").ok().flatten(),
+                "quote_usd_observed_block": row.try_get::<Option<i64>, _>("quote_usd_observed_block").ok().flatten(),
+                "relative_metadata": row.try_get::<Json<Value>, _>("relative_metadata").ok().map(|json| json.0),
+            }),
+        };
+        self.insert_observation_parts(&observation, request.target_timestamp)
+            .await?;
+        self.upsert_cache_parts(&observation, request.target_timestamp)
+            .await?;
+        Ok(true)
+    }
+
+    async fn complete_request(&self, request_id: Uuid, metadata: Value) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            update price_requests
+            set status = 'completed',
+                metadata = metadata || $2::jsonb,
+                updated_at = now()
+            where request_id = $1
+            "#,
+        )
+        .bind(request_id)
+        .bind(Json(metadata))
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn release_request(&self, request_id: Uuid, error: &str) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            update price_requests
+            set status = case when attempts >= 5 then 'error' else 'pending' end,
+                last_error = $2,
+                updated_at = now()
+            where request_id = $1
+            "#,
+        )
+        .bind(request_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
     async fn insert_observation(
         &self,
         analysis: &TransactionAnalysis,
         observation: &PriceObservation,
+    ) -> LedgerResult<()> {
+        self.insert_observation_parts(observation, analysis.block_timestamp)
+            .await
+    }
+
+    async fn insert_observation_parts(
+        &self,
+        observation: &PriceObservation,
+        block_timestamp: Option<DateTime<Utc>>,
     ) -> LedgerResult<()> {
         sqlx::query(
             r#"
@@ -227,7 +547,7 @@ impl PriceService {
         .bind(&observation.quote_token)
         .bind(&observation.quote_symbol)
         .bind(observation.block_number.map(|value| value as i64))
-        .bind(analysis.block_timestamp)
+        .bind(block_timestamp)
         .bind(observation.block_bucket.map(|value| value as i64))
         .bind(&observation.price_decimal)
         .bind(&observation.source)
@@ -245,6 +565,15 @@ impl PriceService {
         &self,
         analysis: &TransactionAnalysis,
         observation: &PriceObservation,
+    ) -> LedgerResult<()> {
+        self.upsert_cache_parts(observation, analysis.block_timestamp)
+            .await
+    }
+
+    async fn upsert_cache_parts(
+        &self,
+        observation: &PriceObservation,
+        observed_at: Option<DateTime<Utc>>,
     ) -> LedgerResult<()> {
         let Some(block_bucket) = observation.block_bucket else {
             return Ok(());
@@ -290,7 +619,7 @@ impl PriceService {
         .bind(observation.confidence as f64)
         .bind(&observation.source)
         .bind(observation.block_number.map(|value| value as i64))
-        .bind(analysis.block_timestamp)
+        .bind(observed_at)
         .bind(Json(observation.metadata.clone()))
         .execute(&self.pool)
         .await
@@ -346,12 +675,60 @@ pub fn derive_tx_execution_observations(
     let block_bucket = analysis.block_number.map(block_bucket);
     let mut observations = BTreeMap::<String, PriceObservation>::new();
 
+    for token in &flows {
+        for quote in &flows {
+            if token.token_address == quote.token_address || token.amount_decimal <= 0.0 {
+                continue;
+            }
+            let Some(confidence) = pair_confidence(quote, token) else {
+                continue;
+            };
+            let price = quote.amount_decimal / token.amount_decimal;
+            if !price.is_finite() || price <= 0.0 {
+                continue;
+            }
+            let quote_symbol = quote
+                .symbol
+                .clone()
+                .unwrap_or_else(|| truncate_middle(&quote.token_address, 6));
+            observations
+                .entry(observation_key(&token.token_address, &quote.token_address, &quote_symbol))
+                .or_insert_with(|| PriceObservation {
+                    chain_id: analysis.chain_id,
+                    token_address: token.token_address.clone(),
+                    quote_token: quote.token_address.clone(),
+                    quote_symbol,
+                    block_number: analysis.block_number,
+                    block_bucket,
+                    price_decimal: format_decimal(price),
+                    source: SOURCE_TX_EXECUTION.to_owned(),
+                    confidence,
+                    tx_hash: Some(analysis.tx_hash.clone()),
+                    metadata: json!({
+                        "method": "paired_erc20_relative_transfer",
+                        "quote_flow_id": quote.flow.flow_id,
+                        "token_flow_id": token.flow.flow_id,
+                        "token_symbol": token.symbol,
+                        "token_decimals": token.decimals,
+                        "quote_symbol": quote.symbol,
+                        "quote_decimals": quote.decimals,
+                        "quote_amount_decimal": quote.amount_decimal,
+                        "token_amount_decimal": token.amount_decimal,
+                    }),
+                });
+        }
+    }
+
     for stable in flows.iter().filter(|item| item.stable.is_some()) {
         let Some(stable_token) = stable.stable else {
             continue;
         };
         observations
-            .entry(stable.token_address.clone())
+            .entry(observation_key(
+                &stable.token_address,
+                &stable.token_address,
+                DEFAULT_QUOTE_SYMBOL,
+            ))
             .or_insert_with(|| PriceObservation {
                 chain_id: analysis.chain_id,
                 token_address: stable.token_address.clone(),
@@ -385,7 +762,11 @@ pub fn derive_tx_execution_observations(
                 continue;
             }
             observations
-                .entry(token.token_address.clone())
+                .entry(observation_key(
+                    &token.token_address,
+                    &stable.token_address,
+                    DEFAULT_QUOTE_SYMBOL,
+                ))
                 .or_insert_with(|| PriceObservation {
                     chain_id: analysis.chain_id,
                     token_address: token.token_address.clone(),
@@ -504,11 +885,26 @@ fn block_bucket(block_number: u64) -> u64 {
     block_number / PRICE_BLOCK_BUCKET_SIZE
 }
 
+fn observation_key(token_address: &str, quote_token: &str, quote_symbol: &str) -> String {
+    format!("{token_address}:{quote_token}:{quote_symbol}")
+}
+
 fn parse_amount_decimal(amount_raw: &str, decimals: u8) -> LedgerResult<f64> {
     let raw = amount_raw
         .parse::<f64>()
         .map_err(|err| LedgerError::MalformedEvidence(err.to_string()))?;
     Ok(raw / 10f64.powi(i32::from(decimals)))
+}
+
+fn truncate_middle(value: &str, keep_each_side: usize) -> String {
+    if value.len() <= keep_each_side.saturating_mul(2).saturating_add(3) {
+        return value.to_owned();
+    }
+    format!(
+        "{}...{}",
+        &value[..keep_each_side],
+        &value[value.len().saturating_sub(keep_each_side)..]
+    )
 }
 
 fn format_decimal(value: f64) -> String {
@@ -582,7 +978,17 @@ mod tests {
             ),
         ]);
 
-        assert!(derive_tx_execution_observations(&analysis).is_empty());
+        let observations = derive_tx_execution_observations(&analysis);
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.quote_symbol != DEFAULT_QUOTE_SYMBOL)
+        );
+        assert!(
+            observations
+                .iter()
+                .any(|observation| observation.quote_symbol == "WETH")
+        );
     }
 
     fn test_analysis(flows: Vec<AssetFlow>) -> TransactionAnalysis {

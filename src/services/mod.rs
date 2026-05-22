@@ -12,5 +12,6 @@ pub mod metrics;
 pub mod monitor_reporter;
 pub mod portal;
 pub mod pricing;
+pub mod seeds;
 pub mod token_metadata;
 pub mod trace_monitor;

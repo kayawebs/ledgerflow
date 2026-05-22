@@ -10,6 +10,7 @@ use ledgerflow::{
     services::{
         analysis::AnalysisService, cluster_backfill::ClusterBackfillService,
         indexer_client::IndexerHttpClient, pricing::PriceService,
+        seeds::seed_known_metadata,
         token_metadata::TokenMetadataService,
     },
 };
@@ -31,6 +32,9 @@ async fn main() {
         .run(repository.pool())
         .await
         .expect("migrations should succeed");
+    seed_known_metadata(repository.pool(), config.default_chain_id)
+        .await
+        .expect("seed metadata should succeed");
 
     let rpc_client = Arc::new(HttpRpcClient::new(config.rpc_url.clone()));
     let token_metadata_service = Arc::new(TokenMetadataService::new(
