@@ -148,9 +148,8 @@ impl MonitorReporter {
                             "monitor analyzed address intelligence enqueue failed"
                         );
                     }
-                    let Some(signal) = detect_signal(&envelope.analysis) else {
-                        continue;
-                    };
+                    let signal =
+                        detect_signal(&envelope.analysis).unwrap_or_else(|| top_volume_signal(&envelope.analysis));
                     let share_id = self.create_share(&envelope, &tx, &signal).await?;
                     let share_url = format!(
                         "{}/share/tx/{}",
@@ -833,6 +832,19 @@ fn detect_signal(analysis: &TransactionAnalysis) -> Option<TxSignal> {
     None
 }
 
+fn top_volume_signal(analysis: &TransactionAnalysis) -> TxSignal {
+    TxSignal {
+        activity_kind: "top-volume".to_owned(),
+        level: SignalLevel::Interesting,
+        reason: format!(
+            "Top monitor transaction did not match liquidation/arbitrage rules yet; included for review because it ranked in the high-volume window. derived_flows={}, recognizers={}.",
+            analysis.derived_flows.len(),
+            analysis.recognizer_results.len()
+        ),
+        positive_strategy_net: has_positive_strategy_net(analysis),
+    }
+}
+
 fn has_positive_strategy_net(analysis: &TransactionAnalysis) -> bool {
     let Some(net_effect) = analysis.scenario_outputs.pointer("/storyline/net_effect") else {
         return false;
@@ -1027,7 +1039,7 @@ fn report_subject(reportable: &[ReportableTx]) -> String {
         .filter(|item| item.signal.level == SignalLevel::Interesting)
         .count();
     format!(
-        "LedgerFlow monitor: {} signal{} ({} confirmed, {} probable, {} interesting)",
+        "LedgerFlow monitor: {} top tx report{} ({} confirmed, {} probable, {} review)",
         reportable.len(),
         if reportable.len() == 1 { "" } else { "s" },
         confirmed,
