@@ -3623,7 +3623,8 @@ fn render_tx_analysis_result_with_share_url(
         &primary_confidence,
         &share_action,
     );
-    let meta_strip = render_tx_report_meta_strip(analysis, share_url.is_some());
+    let meta_strip =
+        render_tx_report_meta_strip(analysis, share_url.is_some(), &share_action, share_url);
     let utilities = render_tx_utilities_panel(analysis, &share_action, share_url);
 
     format!(
@@ -3706,7 +3707,12 @@ fn render_storyline_gap_explanation(scenario_outputs: &serde_json::Value) -> Opt
     )
 }
 
-fn render_tx_report_meta_strip(analysis: &TransactionAnalysis, public_share: bool) -> String {
+fn render_tx_report_meta_strip(
+    analysis: &TransactionAnalysis,
+    public_share: bool,
+    share_action: &str,
+    share_url: Option<&str>,
+) -> String {
     let network = match analysis.chain_id {
         1 => "Ethereum",
         8453 => "Base",
@@ -3727,12 +3733,26 @@ fn render_tx_report_meta_strip(analysis: &TransactionAnalysis, public_share: boo
     } else {
         "Analysis result · Reanalysis available"
     };
+    let share_top_action = if let Some(url) = share_url {
+        format!(
+            r#"<div class="tx-report-share-action">{}</div>"#,
+            render_copyable_code(url, 16)
+        )
+    } else if share_action.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="tx-report-share-action">{}</div>"#,
+            share_action
+        )
+    };
     format!(
         r#"<section class="tx-report-top">
   <div class="tx-report-heading">
     <span class="brand-lockup mini"><span class="brand-mark">{}</span><span>On-chain Transaction Evidence</span></span>
     <div class="tx-report-actions">
       <span class="readonly-pill">{}</span>
+      {}
     </div>
   </div>
   <div class="tx-report-title-row">
@@ -3752,6 +3772,7 @@ fn render_tx_report_meta_strip(analysis: &TransactionAnalysis, public_share: boo
 </section>"#,
         brand_mark_svg_source(),
         escape_html(access_label),
+        share_top_action,
         render_copyable_code(&analysis.tx_hash, 16),
         escape_html(network),
         escape_html(&block),
@@ -4621,6 +4642,7 @@ fn render_execution_timeline_panel(
         .get("trace_available")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let mut attached_flow_ids = std::collections::BTreeSet::<String>::new();
     let rows = items
         .iter()
         .take(120)
@@ -4632,6 +4654,7 @@ fn render_execution_timeline_panel(
                 executor,
                 protocol_contract,
                 book,
+                &mut attached_flow_ids,
             )
         })
         .collect::<Vec<_>>()
@@ -4661,6 +4684,7 @@ fn render_execution_timeline_row(
     executor: &str,
     protocol_contract: Option<&str>,
     book: &AddressDisplayBook,
+    attached_flow_ids: &mut std::collections::BTreeSet<String>,
 ) -> String {
     let order = item
         .get("order")
@@ -4705,7 +4729,13 @@ fn render_execution_timeline_row(
     };
     let from_roles = render_storyline_roles(from_raw, initiator, executor, protocol_contract);
     let to_roles = render_storyline_roles(to_raw, initiator, executor, protocol_contract);
-    let attachments = render_call_attached_flows(analysis, from_raw, to_raw);
+    let attachments = render_call_attached_flows(
+        analysis,
+        from_raw,
+        to_raw,
+        call_type,
+        attached_flow_ids,
+    );
     let value_line = value_raw
         .parse::<i128>()
         .ok()
@@ -4773,16 +4803,24 @@ fn render_call_attached_flows(
     analysis: &TransactionAnalysis,
     from_raw: &str,
     to_raw: &str,
+    call_type: &str,
+    attached_flow_ids: &mut std::collections::BTreeSet<String>,
 ) -> String {
-    let rows = analysis
-        .derived_flows
-        .iter()
-        .filter(|flow| {
-            flow.from_address.eq_ignore_ascii_case(from_raw)
-                && flow.to_address.eq_ignore_ascii_case(to_raw)
-        })
-        .take(6)
-        .map(|flow| {
+    if call_type.eq_ignore_ascii_case("staticcall") {
+        return String::new();
+    }
+    let mut rows = Vec::new();
+    for flow in &analysis.derived_flows {
+        if rows.len() >= 6 {
+            break;
+        }
+        if attached_flow_ids.contains(&flow.flow_id) {
+            continue;
+        }
+        if flow.from_address.eq_ignore_ascii_case(from_raw)
+            && flow.to_address.eq_ignore_ascii_case(to_raw)
+        {
+            attached_flow_ids.insert(flow.flow_id.clone());
             let token = flow_token_descriptor(flow);
             let token_address = token
                 .get("address")
@@ -4793,14 +4831,14 @@ fn render_call_attached_flows(
                 .get("name")
                 .and_then(|value| value.as_str())
                 .unwrap_or("unlabeled");
-            format!(
+            rows.push(format!(
                 "<span>{} · {} · {}</span>",
                 escape_html(&format_flow_amount_display(flow, &token)),
                 escape_html(name),
                 render_copy_only_button(token_address),
-            )
-        })
-        .collect::<Vec<_>>();
+            ));
+        }
+    }
     rows.join("")
 }
 
@@ -6735,6 +6773,8 @@ textarea { min-height: 140px; resize: vertical; }
 .tx-section-index::before { counter-increment: tx-section; content: counter(tx-section); font-size: .9rem; }
 .tx-report-top { display: grid; gap: 14px; padding: 2px 0 0; }
 .tx-report-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.tx-report-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.tx-report-share-action, .inline-action-form { display: inline-flex; align-items: center; gap: 8px; }
 .brand-lockup.mini .brand-mark, .brand-lockup.mini .brand-mark svg { width: 28px; height: 28px; }
 .brand-lockup.mini { font-weight: 800; }
 .tx-report-title-row { display: flex; justify-content: space-between; gap: 16px; align-items: end; }
