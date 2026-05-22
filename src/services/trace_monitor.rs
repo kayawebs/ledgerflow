@@ -17,6 +17,7 @@ use crate::{
     flows::derivation::derive_basic_flows,
     indexer::rpc::IndexerRpcClient,
     ingestion::fetchers::TransactionBundleFetcher,
+    ingestion::rpc::HttpRpcClient,
     repositories::sqlx::SqlxAnalysisRepository,
 };
 
@@ -41,6 +42,7 @@ pub struct TraceMonitorIteration {
     pub failed_txs: u64,
     pub address_delta_rows: u64,
     pub cluster_delta_rows: u64,
+    pub skipped_blocks: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,6 +70,7 @@ struct ClusterDeltaKey {
 pub struct TraceMonitorService {
     repository: SqlxAnalysisRepository,
     rpc_client: Arc<IndexerRpcClient>,
+    block_receipt_rpc: Arc<HttpRpcClient>,
     light_fetcher: TransactionBundleFetcher,
     config: TraceMonitorConfig,
     startup_anchor_initialized: Arc<AtomicBool>,
@@ -76,6 +79,8 @@ pub struct TraceMonitorService {
 #[derive(Clone, Debug)]
 struct BlockTxRef {
     tx_hash: String,
+    tx_payload: Option<Value>,
+    receipt_payload: Option<Value>,
     block_timestamp: Option<DateTime<Utc>>,
 }
 
@@ -102,12 +107,14 @@ impl TraceMonitorService {
     pub fn new(
         repository: SqlxAnalysisRepository,
         rpc_client: Arc<IndexerRpcClient>,
+        block_receipt_rpc: Arc<HttpRpcClient>,
         light_fetcher: TransactionBundleFetcher,
         config: TraceMonitorConfig,
     ) -> Self {
         Self {
             repository,
             rpc_client,
+            block_receipt_rpc,
             light_fetcher,
             config,
             startup_anchor_initialized: Arc::new(AtomicBool::new(false)),
@@ -123,17 +130,19 @@ impl TraceMonitorService {
         } else {
             self.load_last_processed_block().await?
         };
-        let start_block = next_start_block(
+        let (start_block, skipped_blocks) = next_start_block(
             skip_history_on_startup,
             last_processed,
             self.config.start_block,
             target_block,
+            self.config.block_batch_size.max(1),
         );
 
         let mut iteration = TraceMonitorIteration {
             latest_block,
             target_block,
             start_block: Some(start_block),
+            skipped_blocks,
             ..Default::default()
         };
 
@@ -154,10 +163,8 @@ impl TraceMonitorService {
         for block_number in start_block..=end_block {
             let tx_refs = self.block_tx_refs(block_number).await?;
             for tx_ref in tx_refs {
-                match self
-                    .process_light_tx(&tx_ref.tx_hash, tx_ref.block_timestamp, &clusters)
-                    .await
-                {
+                let tx_hash = tx_ref.tx_hash.clone();
+                match self.process_light_tx(tx_ref, &clusters).await {
                     Ok((address_rows, cluster_rows)) => {
                         iteration.processed_txs += 1;
                         iteration.address_delta_rows += address_rows;
@@ -166,7 +173,7 @@ impl TraceMonitorService {
                     Err(err) => {
                         iteration.failed_txs += 1;
                         warn!(
-                            tx_hash = tx_ref.tx_hash,
+                            tx_hash,
                             error = %err,
                             "trace monitor light tx failed"
                         );
@@ -183,14 +190,39 @@ impl TraceMonitorService {
 
     async fn process_light_tx(
         &self,
-        tx_hash: &str,
-        block_timestamp: Option<DateTime<Utc>>,
+        tx_ref: BlockTxRef,
         clusters: &[ClusterScope],
     ) -> LedgerResult<(u64, u64)> {
-        let bundle = self
-            .light_fetcher
-            .fetch_without_code_with_timestamp(self.config.chain_id, tx_hash, block_timestamp)
-            .await?;
+        let bundle = match (tx_ref.tx_payload, tx_ref.receipt_payload) {
+            (Some(tx_payload), Some(receipt_payload)) => {
+                self.light_fetcher
+                    .fetch_without_code_from_payloads_with_timestamp(
+                        self.config.chain_id,
+                        tx_payload,
+                        receipt_payload,
+                        tx_ref.block_timestamp,
+                    )
+                    .await?
+            }
+            (Some(tx_payload), None) => {
+                self.light_fetcher
+                    .fetch_without_code_from_tx_payload_with_timestamp(
+                        self.config.chain_id,
+                        tx_payload,
+                        tx_ref.block_timestamp,
+                    )
+                    .await?
+            }
+            (None, _) => {
+                self.light_fetcher
+                    .fetch_without_code_with_timestamp(
+                        self.config.chain_id,
+                        &tx_ref.tx_hash,
+                        tx_ref.block_timestamp,
+                    )
+                    .await?
+            }
+        };
         let flows = derive_basic_flows(&bundle);
         let address_deltas = aggregate_address_deltas(&flows);
         let address_rows = self
@@ -318,6 +350,26 @@ impl TraceMonitorService {
             .and_then(Value::as_str)
             .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
             .and_then(|value| Utc.timestamp_opt(value as i64, 0).single());
+        let receipts_by_hash = match self.block_receipt_rpc.get_block_receipts(block_number).await {
+            Ok(receipts) => receipts
+                .into_iter()
+                .filter_map(|receipt| {
+                    let tx_hash = receipt
+                        .get("transactionHash")
+                        .and_then(Value::as_str)?
+                        .to_ascii_lowercase();
+                    Some((tx_hash, receipt))
+                })
+                .collect::<BTreeMap<_, _>>(),
+            Err(err) => {
+                debug!(
+                    block_number,
+                    error = %err,
+                    "block receipts unavailable; falling back to per-transaction receipts"
+                );
+                BTreeMap::new()
+            }
+        };
         Ok(block
             .get("transactions")
             .and_then(Value::as_array)
@@ -330,8 +382,13 @@ impl TraceMonitorService {
                                 .and_then(Value::as_str)
                                 .map(ToOwned::to_owned)
                         })?;
+                        let tx_payload = item.as_object().map(|_| item.clone());
+                        let receipt_payload =
+                            receipts_by_hash.get(&tx_hash.to_ascii_lowercase()).cloned();
                         Some(BlockTxRef {
                             tx_hash,
+                            tx_payload,
+                            receipt_payload,
                             block_timestamp,
                         })
                     })
@@ -641,14 +698,26 @@ fn next_start_block(
     last_processed: Option<u64>,
     configured_start_block: Option<u64>,
     target_block: u64,
-) -> u64 {
+    block_batch_size: u64,
+) -> (u64, u64) {
     if skip_history_on_startup {
-        return target_block;
+        return (target_block, 0);
     }
-    last_processed
+    let requested_start = last_processed
         .map(|block| block.saturating_add(1))
         .or(configured_start_block)
-        .unwrap_or(target_block)
+        .unwrap_or(target_block);
+    let live_window_start = target_block
+        .saturating_sub(block_batch_size.max(1))
+        .saturating_add(1);
+    if requested_start < live_window_start {
+        (
+            live_window_start,
+            live_window_start.saturating_sub(requested_start),
+        )
+    } else {
+        (requested_start, 0)
+    }
 }
 
 #[cfg(test)]
@@ -701,9 +770,18 @@ mod tests {
 
     #[test]
     fn startup_start_block_ignores_persisted_history_once() {
-        assert_eq!(next_start_block(true, Some(100), Some(200), 500), 500);
-        assert_eq!(next_start_block(false, Some(100), Some(200), 500), 101);
-        assert_eq!(next_start_block(false, None, Some(200), 500), 200);
-        assert_eq!(next_start_block(false, None, None, 500), 500);
+        assert_eq!(
+            next_start_block(true, Some(100), Some(200), 500, 30),
+            (500, 0)
+        );
+        assert_eq!(
+            next_start_block(false, Some(100), Some(200), 500, 30),
+            (471, 370)
+        );
+        assert_eq!(
+            next_start_block(false, None, Some(490), 500, 30),
+            (490, 0)
+        );
+        assert_eq!(next_start_block(false, None, None, 500, 30), (500, 0));
     }
 }

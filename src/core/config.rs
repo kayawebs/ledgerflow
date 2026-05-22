@@ -113,11 +113,11 @@ impl AppConfig {
             trace_monitor_block_batch_size: env::var("LEDGERFLOW_TRACE_MONITOR_BLOCK_BATCH_SIZE")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(2),
+                .unwrap_or(30),
             trace_monitor_poll_interval_ms: env::var("LEDGERFLOW_TRACE_MONITOR_POLL_INTERVAL_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(30_000),
+                .unwrap_or(10_000),
             trace_monitor_retention_days: env::var("LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS")
                 .ok()
                 .and_then(|v| v.parse::<i64>().ok())

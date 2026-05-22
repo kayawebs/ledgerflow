@@ -87,6 +87,33 @@ impl TransactionBundleFetcher {
             .await
     }
 
+    pub async fn fetch_without_code_from_tx_payload_with_timestamp(
+        &self,
+        chain_id: u64,
+        tx_payload: Value,
+        block_timestamp: Option<DateTime<Utc>>,
+    ) -> LedgerResult<RawTransactionBundle> {
+        self.fetch_inner_from_tx_payload(chain_id, tx_payload, None, false, block_timestamp)
+            .await
+    }
+
+    pub async fn fetch_without_code_from_payloads_with_timestamp(
+        &self,
+        chain_id: u64,
+        tx_payload: Value,
+        receipt_payload: Value,
+        block_timestamp: Option<DateTime<Utc>>,
+    ) -> LedgerResult<RawTransactionBundle> {
+        self.fetch_inner_from_tx_payload(
+            chain_id,
+            tx_payload,
+            Some(receipt_payload),
+            false,
+            block_timestamp,
+        )
+        .await
+    }
+
     async fn fetch_inner(
         &self,
         chain_id: u64,
@@ -100,8 +127,33 @@ impl TransactionBundleFetcher {
                 "missing tx payload for {tx_hash}"
             )));
         }
+        self.fetch_inner_from_tx_payload(
+            chain_id,
+            tx_payload,
+            None,
+            include_target_code,
+            block_timestamp_override,
+        )
+        .await
+    }
 
-        let receipt_payload = self.rpc_client.get_receipt(chain_id, tx_hash).await?;
+    async fn fetch_inner_from_tx_payload(
+        &self,
+        chain_id: u64,
+        tx_payload: Value,
+        receipt_payload: Option<Value>,
+        include_target_code: bool,
+        block_timestamp_override: Option<DateTime<Utc>>,
+    ) -> LedgerResult<RawTransactionBundle> {
+        let tx_hash = tx_payload
+            .get("hash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LedgerError::MalformedEvidence("missing tx hash".to_owned()))?
+            .to_owned();
+        let receipt_payload = match receipt_payload {
+            Some(payload) => payload,
+            None => self.rpc_client.get_receipt(chain_id, &tx_hash).await?,
+        };
         let logs = receipt_payload
             .get("logs")
             .and_then(Value::as_array)
@@ -136,7 +188,7 @@ impl TransactionBundleFetcher {
             .collect::<Vec<_>>();
 
         let receipt = RawReceipt {
-            tx_hash: tx_hash.to_owned(),
+            tx_hash: tx_hash.clone(),
             status: hex_to_u64(receipt_payload.get("status").and_then(Value::as_str))
                 .unwrap_or_default(),
             gas_used: receipt_payload
@@ -152,7 +204,7 @@ impl TransactionBundleFetcher {
 
         let tx = RawTransaction {
             chain_id,
-            tx_hash: tx_hash.to_owned(),
+            tx_hash,
             block_number: hex_to_u64(tx_payload.get("blockNumber").and_then(Value::as_str)),
             block_timestamp: None,
             from_address: tx_payload
@@ -208,7 +260,7 @@ impl TransactionBundleFetcher {
         };
 
         let trace = if self.trace_enabled {
-            match self.rpc_client.get_trace(chain_id, tx_hash).await {
+            match self.rpc_client.get_trace(chain_id, &tx.tx_hash).await {
                 Ok(Some(value)) => Some(parse_trace(&value)),
                 Ok(None) | Err(LedgerError::UnsupportedTrace(_)) => None,
                 Err(error) => return Err(error),

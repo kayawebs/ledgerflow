@@ -53,6 +53,17 @@ impl HttpRpcClient {
         }
     }
 
+    pub async fn get_block_receipts(&self, block_number: u64) -> LedgerResult<Vec<Value>> {
+        let result = self
+            .call("eth_getBlockReceipts", json!([format!("0x{block_number:x}")]))
+            .await?;
+        result.as_array().cloned().ok_or_else(|| {
+            LedgerError::MalformedEvidence(
+                "eth_getBlockReceipts response was not an array".to_owned(),
+            )
+        })
+    }
+
     async fn call(&self, method: &str, params: Value) -> LedgerResult<Value> {
         let response = self
             .client

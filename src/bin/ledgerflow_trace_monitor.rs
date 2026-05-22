@@ -38,10 +38,11 @@ async fn main() {
 
     let rpc_client = Arc::new(HttpRpcClient::new(config.rpc_url.clone()));
     let block_rpc = Arc::new(IndexerRpcClient::new(config.rpc_url.clone()));
-    let fetcher = TransactionBundleFetcher::new(rpc_client, false);
+    let fetcher = TransactionBundleFetcher::new(rpc_client.clone(), false);
     let service = TraceMonitorService::new(
         repository,
         block_rpc,
+        rpc_client,
         fetcher,
         TraceMonitorConfig {
             chain_id: config.default_chain_id,
@@ -141,6 +142,7 @@ async fn main() {
                     failed_txs = iteration.failed_txs,
                     address_delta_rows = iteration.address_delta_rows,
                     cluster_delta_rows = iteration.cluster_delta_rows,
+                    skipped_blocks = iteration.skipped_blocks,
                     "trace monitor iteration completed"
                 );
             }
