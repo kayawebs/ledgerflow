@@ -3466,155 +3466,6 @@ fn render_tx_analysis_result_with_share_url(
     };
     let (primary_activity, primary_activity_reason, primary_confidence) =
         summarize_primary_activity(analysis);
-    let recognizer_rows = if analysis.recognizer_results.is_empty() {
-        "<div class=\"empty-state\">No recognizers fired. The tx may still be analyzable, but the current recognizer set did not produce a label.</div>".to_owned()
-    } else {
-        analysis
-            .recognizer_results
-            .iter()
-            .map(|result| {
-                format!(
-                    r#"<article class="mini-card tx-recognizer-card">
-  <strong>{}</strong>
-  <span>{} · confidence {:.2}</span>
-  <small>id: {} · version: {}</small>
-  {}
-  {}
-</article>"#,
-                    escape_html(&result.label),
-                    escape_html(&result.recognizer_id),
-                    result.confidence,
-                    escape_html(&result.recognizer_id),
-                    escape_html(&result.recognizer_version),
-                    if result.warnings.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "<small>warnings: {}</small>",
-                            escape_html(&result.warnings.join(" | "))
-                        )
-                    },
-                    if result.unresolved_points.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "<small>unresolved: {}</small>",
-                            escape_html(
-                                &result
-                                    .unresolved_points
-                                    .iter()
-                                    .map(|item| item.code.clone())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        )
-                    }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    };
-    let flow_rows = if analysis.derived_flows.is_empty() {
-        "<div class=\"empty-state\">No normalized asset flows were derived for this tx.</div>"
-            .to_owned()
-    } else {
-        format!(
-            r#"<div class="table-shell">
-  <table>
-    <thead>
-      <tr>
-        <th>Asset</th>
-        <th>Token</th>
-        <th>From</th>
-        <th>To</th>
-        <th>Amount raw</th>
-        <th>Method</th>
-        <th>Confidence</th>
-      </tr>
-    </thead>
-    <tbody>{}</tbody>
-  </table>
-</div>"#,
-            analysis
-                .derived_flows
-                .iter()
-                .map(|flow| {
-                    format!(
-                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{:.2}</td></tr>",
-                        escape_html(&enum_label(&flow.asset_type)),
-                        render_copyable_code(flow.token_address.as_deref().unwrap_or("native"), 8),
-                        render_copyable_code(&flow.from_address, 8),
-                        render_copyable_code(&flow.to_address, 8),
-                        escape_html(&flow.amount_raw),
-                        escape_html(&flow.derivation_method),
-                        flow.confidence
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        )
-    };
-    let validation_rows = if analysis.validation_results.is_empty() {
-        "<div class=\"empty-state\">No validation messages were emitted for this tx.</div>"
-            .to_owned()
-    } else {
-        format!(
-            r#"<div class="table-shell">
-  <table>
-    <thead>
-      <tr>
-        <th>Validator</th>
-        <th>Status</th>
-        <th>Message</th>
-      </tr>
-    </thead>
-    <tbody>{}</tbody>
-  </table>
-</div>"#,
-            analysis
-                .validation_results
-                .iter()
-                .map(|message| {
-                    format!(
-                        "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                        escape_html(&message.validator_id),
-                        escape_html(&enum_label(&message.status)),
-                        escape_html(&message.message)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        )
-    };
-    let unresolved_rows = if analysis.unresolved_items.is_empty() {
-        "<div class=\"empty-state\">No unresolved points were recorded.</div>".to_owned()
-    } else {
-        format!(
-            r#"<div class="table-shell">
-  <table>
-    <thead>
-      <tr>
-        <th>Code</th>
-        <th>Message</th>
-      </tr>
-    </thead>
-    <tbody>{}</tbody>
-  </table>
-</div>"#,
-            analysis
-                .unresolved_items
-                .iter()
-                .map(|item| {
-                    format!(
-                        "<tr><td>{}</td><td>{}</td></tr>",
-                        escape_html(&item.code),
-                        escape_html(&item.message)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        )
-    };
     let storyline_panel = render_tx_storyline_panel(analysis, &address_book);
     let report_hero = render_tx_report_hero(
         analysis,
@@ -3625,7 +3476,7 @@ fn render_tx_analysis_result_with_share_url(
     );
     let meta_strip =
         render_tx_report_meta_strip(analysis, share_url.is_some(), &share_action, share_url);
-    let utilities = render_tx_utilities_panel(analysis, &share_action, share_url);
+    let gas_profile = render_gas_profile_panel(analysis);
 
     format!(
         r#"<div class="tx-analysis-shell">
@@ -3634,49 +3485,17 @@ fn render_tx_analysis_result_with_share_url(
   {}
   {}
   {}
-  <section class="tx-section-card technical-evidence-panel">
-    <div class="tx-section-title">
-      <span class="tx-section-index">7</span>
-      <h2>Technical Evidence</h2>
-      <span class="badge">Collapsed by default</span>
-    </div>
-    <details class="storyline-evidence-shell">
-      <summary><span>Derived flows</span></summary>
-      <div class="evidence-stack">
-        {}
-        <div class="section-head"><h3>Unresolved points</h3></div>
-        {}
-      </div>
-    </details>
-    <details class="storyline-evidence-shell">
-      <summary><span>Recognizer outputs</span></summary>
-      <div class="split-fields tx-recognizer-grid">{}</div>
-    </details>
-    <details class="storyline-evidence-shell">
-      <summary><span>Validation results</span></summary>
-      {}
-    </details>
-    <details class="raw-json-shell">
-      <summary>Raw JSON</summary>
-      <pre class="json-shell">{}</pre>
-    </details>
-  </section>
 </div>"#,
         meta_strip,
         report_hero,
         storyline_panel,
-        utilities,
+        gas_profile,
         render_storyline_gap_explanation(&analysis.scenario_outputs)
             .map(|message| format!(
                 r#"<div class="notice info">{}</div>"#,
                 escape_html(&message)
             ))
             .unwrap_or_default(),
-        flow_rows,
-        unresolved_rows,
-        recognizer_rows,
-        validation_rows,
-        escape_html(&raw_json)
     )
 }
 
@@ -3728,11 +3547,30 @@ fn render_tx_report_meta_strip(
         .block_timestamp
         .map(|value| value.to_rfc3339().replace('T', " ").replace('Z', " UTC"))
         .unwrap_or_else(|| "n/a".to_owned());
-    let access_label = if public_share {
-        "Public share · Read only"
-    } else {
-        "Analysis result · Reanalysis available"
-    };
+    let facts = &analysis.normalized_execution_facts.derived_facts;
+    let nonce = facts
+        .get("nonce")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_owned());
+    let value_raw = facts
+        .get("tx_value_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&analysis.value);
+    let gas_used = facts
+        .get("gas_used_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let gas_price = facts
+        .get("effective_gas_price_raw")
+        .and_then(|value| value.as_str())
+        .map(format_gwei_from_wei)
+        .unwrap_or_else(|| "n/a".to_owned());
+    let tx_fee = facts
+        .get("gas_cost_raw")
+        .and_then(|value| value.as_str())
+        .map(format_wei_eth_raw)
+        .unwrap_or_else(|| "n/a".to_owned());
     let share_top_action = if let Some(url) = share_url {
         format!(
             r#"<div class="tx-report-share-action">{}</div>"#,
@@ -3747,7 +3585,7 @@ fn render_tx_report_meta_strip(
         )
     };
     format!(
-        r#"<section class="tx-report-top">
+        r#"<section class="tx-report-top tx-basic-info-panel">
   <div class="tx-report-heading">
     <span class="brand-lockup mini"><span class="brand-mark">{}</span><span>On-chain Transaction Evidence</span></span>
     <div class="tx-report-actions">
@@ -3763,79 +3601,115 @@ fn render_tx_report_meta_strip(
       {}
     </div>
   </div>
-  <div class="tx-meta-strip">
-    <div><span>Network</span><strong>{}</strong></div>
-    <div><span>Block</span><strong>{}</strong></div>
-    <div><span>Time</span><strong>{}</strong></div>
-    <div><span>Status</span><strong>{}</strong></div>
+  <div class="basic-info-card">
+    <h2>Basic Information</h2>
+    <div class="basic-info-grid">
+      <div><span>Status</span><strong class="status-chip status-{}">{}</strong></div>
+      <div><span>Network</span><strong>{}</strong></div>
+      <div><span>Block</span><strong>{}</strong></div>
+      <div><span>Position in Block</span><strong>n/a</strong></div>
+      <div><span>Timestamp</span><strong>{}</strong></div>
+      <div><span>Nonce</span><strong>{}</strong></div>
+      <div><span>Value</span><strong>{}</strong></div>
+      <div class="wide"><span>Sender</span><strong>{}</strong></div>
+      <div class="wide"><span>Receiver</span><strong>{}</strong></div>
+    </div>
+    <details class="basic-info-more">
+      <summary>Other Information</summary>
+      <div class="basic-info-grid">
+        <div><span>Gas Used</span><strong>{}</strong></div>
+        <div><span>Gas Price</span><strong>{}</strong></div>
+        <div><span>Transaction Fee</span><strong>{}</strong></div>
+        <div><span>Txn Type</span><strong>EIP-1559 / legacy</strong></div>
+        <div><span>Event Count</span><strong>{}</strong></div>
+        <div><span>Internal Call Count</span><strong>{}</strong></div>
+        <div class="wide"><span>Input Data</span><strong>{}</strong></div>
+      </div>
+    </details>
   </div>
 </section>"#,
         brand_mark_svg_source(),
-        escape_html(access_label),
+        if public_share {
+            "Public share · Read only"
+        } else {
+            "Analysis result"
+        },
         share_top_action,
         render_copyable_code(&analysis.tx_hash, 16),
+        if analysis.status == crate::domain::enums::TransactionStatus::Success { "success" } else { "failure" },
+        escape_html(&enum_label(&analysis.status)),
         escape_html(network),
         escape_html(&block),
         escape_html(&timestamp),
-        escape_html(&enum_label(&analysis.status)),
+        escape_html(&nonce),
+        escape_html(&format_wei_compact_decimal(value_raw)),
+        render_copyable_code(&analysis.from_address, 12),
+        analysis
+            .to_address
+            .as_deref()
+            .map(|value| render_copyable_code(value, 12))
+            .unwrap_or_else(|| "contract creation".to_owned()),
+        escape_html(gas_used),
+        escape_html(&gas_price),
+        escape_html(&tx_fee),
+        analysis.normalized_execution_facts.event_count,
+        analysis.normalized_execution_facts.internal_call_count,
+        render_copyable_code(&analysis.input_data, 14),
     )
 }
 
-fn render_tx_utilities_panel(
-    analysis: &TransactionAnalysis,
-    share_action: &str,
-    share_url: Option<&str>,
-) -> String {
-    let token_contract = first_report_token_address(&analysis.scenario_outputs)
-        .or_else(|| {
-            analysis
-                .derived_flows
-                .iter()
-                .find_map(|flow| flow.token_address.as_deref())
-        })
-        .unwrap_or("native");
-    let share_card = if let Some(url) = share_url {
-        format!(
-            r#"<div class="utility-card"><span>Copy share link</span>{}</div>"#,
-            render_copyable_code(url, 18)
-        )
-    } else if share_action.is_empty() {
-        String::new()
+fn render_gas_profile_panel(analysis: &TransactionAnalysis) -> String {
+    let facts = &analysis.normalized_execution_facts.derived_facts;
+    let gas_used = facts
+        .get("gas_used_raw")
+        .and_then(|value| value.as_str())
+        .unwrap_or("0");
+    let gas_price = facts
+        .get("effective_gas_price_raw")
+        .and_then(|value| value.as_str())
+        .map(format_gwei_from_wei)
+        .unwrap_or_else(|| "n/a".to_owned());
+    let tx_fee = facts
+        .get("gas_cost_raw")
+        .and_then(|value| value.as_str())
+        .map(format_wei_eth_raw)
+        .unwrap_or_else(|| "n/a".to_owned());
+    let trace_note = if analysis
+        .normalized_execution_facts
+        .derived_facts
+        .get("trace_available")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        "Current trace payload does not include per-call gasUsed, so this is receipt-level gas only."
     } else {
-        format!(
-            r#"<div class="utility-card"><span>Share link</span>{}</div>"#,
-            share_action
-        )
+        "Trace is unavailable, so this is receipt-level gas only."
     };
     format!(
-        r#"<section class="tx-section-card tx-utilities-panel">
-  <div class="tx-section-title">
+        r#"<details class="tx-section-card gas-profile-panel" open>
+  <summary class="tx-section-title">
     <span class="tx-section-index">5</span>
-    <h2>Share / Copy Tools <small>Utilities</small></h2>
+    <h2>Gas Profile</h2>
+    <span class="badge">receipt-level</span>
+  </summary>
+  <div class="gas-profile-summary">
+    <div><span>Total Gas Used</span><strong>{}</strong></div>
+    <div><span>Effective Gas Price</span><strong>{}</strong></div>
+    <div><span>Transaction Fee</span><strong>{}</strong></div>
+    <div><span>Internal Calls</span><strong>{}</strong></div>
   </div>
-  <div class="utility-grid">
-    <div class="utility-card"><span>Copy tx hash</span>{}</div>
-    <div class="utility-card"><span>Copy from address</span>{}</div>
-    <div class="utility-card"><span>Copy token contract</span>{}</div>
-    {}
+  <div class="gas-profile-bar">
+    <span style="width: 100%">Gas used · {}</span>
   </div>
-</section>"#,
-        render_copyable_code(&analysis.tx_hash, 12),
-        render_copyable_code(&analysis.from_address, 10),
-        render_copyable_code(token_contract, 10),
-        share_card,
+  <p class="panel-copy">{}</p>
+</details>"#,
+        escape_html(gas_used),
+        escape_html(&gas_price),
+        escape_html(&tx_fee),
+        analysis.normalized_execution_facts.internal_call_count,
+        escape_html(gas_used),
+        escape_html(trace_note),
     )
-}
-
-fn first_report_token_address(scenario_outputs: &serde_json::Value) -> Option<&str> {
-    let rows = scenario_outputs
-        .get("storyline")?
-        .get("net_effect")?
-        .get("rows")?
-        .as_array()?;
-    rows.iter()
-        .find_map(|row| row.get("token")?.get("address")?.as_str())
-        .filter(|value| !value.eq_ignore_ascii_case("native"))
 }
 
 fn tx_activity_icon(kind: &str) -> &'static str {
@@ -3872,12 +3746,12 @@ fn render_tx_report_hero(
     let verdict = build_tx_report_verdict(storyline);
 
     format!(
-        r#"<section class="tx-section-card tx-report-hero tx-report-{}">
-  <div class="tx-section-title">
+        r#"<details class="tx-section-card tx-report-hero tx-report-{}" open>
+  <summary class="tx-section-title">
     <span class="tx-section-index">1</span>
     <h2>Tx Conclusion</h2>
     <span class="confidence-pill">{} confidence</span>
-  </div>
+  </summary>
   <div class="tx-conclusion-grid">
     <div class="tx-conclusion-icon">{}</div>
     <div class="tx-conclusion-cell">
@@ -3894,7 +3768,7 @@ fn render_tx_report_hero(
       <small>{}</small>
     </div>
   </div>
-</section>"#,
+</details>"#,
         verdict.tone,
         escape_html(primary_confidence),
         tx_activity_icon(kind),
@@ -4082,6 +3956,30 @@ fn format_wei_eth_raw(raw: &str) -> String {
         .unwrap_or_else(|_| "n/a".to_owned())
 }
 
+fn format_wei_compact_decimal(raw: &str) -> String {
+    let value = parse_u128_decimal_or_hex(raw).unwrap_or_default();
+    if value == 0 {
+        return "0 wei".to_owned();
+    }
+    format!("{} ETH", format_unsigned_units_compact(value as i128, 18))
+}
+
+fn format_gwei_from_wei(raw: &str) -> String {
+    let value = parse_u128_decimal_or_hex(raw).unwrap_or_default();
+    if value == 0 {
+        return "0 Gwei".to_owned();
+    }
+    format!("{} Gwei", format_unsigned_units_compact(value as i128, 9))
+}
+
+fn parse_u128_decimal_or_hex(raw: &str) -> Option<u128> {
+    if let Some(hex) = raw.strip_prefix("0x") {
+        u128::from_str_radix(hex, 16).ok()
+    } else {
+        raw.parse::<u128>().ok()
+    }
+}
+
 fn tx_form_prefill(payload: Option<&serde_json::Value>, default_chain_id: u64) -> (String, String) {
     let Some(payload) = payload else {
         return (String::new(), default_chain_id.to_string());
@@ -4251,12 +4149,12 @@ fn render_flow_fallback_panel(
         rows
     };
     format!(
-        r#"<section class="tx-section-card compact-section flow-fallback-panel">
-  <div class="tx-section-title">
+        r#"<details class="tx-section-card compact-section flow-fallback-panel" open>
+  <summary class="tx-section-title">
     <span class="tx-section-index">{}</span>
     <h2>Confirmed Asset Flows</h2>
     <span class="badge">fallback view</span>
-  </div>
+  </summary>
   <p class="panel-copy">{} Tx initiator: {}</p>
   <div class="table-shell compact-table-shell">
     <table class="compact-table">
@@ -4270,7 +4168,7 @@ fn render_flow_fallback_panel(
       <tbody>{}</tbody>
     </table>
   </div>
-</section>"#,
+</details>"#,
         section_index,
         escape_html(explanation),
         render_known_address(&analysis.from_address, 10, book),
@@ -4544,13 +4442,13 @@ fn render_subject_scope(value: Option<&serde_json::Value>) -> String {
         })
         .unwrap_or_default();
     format!(
-        r#"<section class="tx-section-card tx-subject-panel">
-  <div class="tx-section-title">
+        r#"<details class="tx-section-card tx-subject-panel" open>
+  <summary class="tx-section-title">
     <span class="tx-section-index">2</span>
     <h2>Subject Perspective</h2>
-  </div>
+  </summary>
   <div class="subject-scope-line"><span>Subject scope</span><div class="address-pill-row">{}</div><small>{}</small></div>
-</section>"#,
+</details>"#,
         addresses,
         escape_html(label),
     )
@@ -4566,8 +4464,8 @@ fn render_net_effect_panel(
     };
     let rows = render_net_effect_rows(effect, analysis);
     format!(
-        r#"<section class="storyline-net-effect tx-section-card compact-section">
-  <div class="panel-head"><h4>Net Asset Change</h4><span class="badge">subject scope view</span></div>
+        r#"<details class="storyline-net-effect tx-section-card compact-section" open>
+  <summary class="tx-section-title"><h2>Net Asset Change</h2><span class="badge">subject scope view</span></summary>
   <div class="panel-copy">Calculated across <strong>{}</strong>. <strong>In</strong> means assets entered the subject scope, <strong>Out</strong> means assets left it, and <strong>Net</strong> is <strong>In - Out</strong>.</div>
   <div class="table-shell compact-table-shell">
     <table class="compact-table">
@@ -4584,7 +4482,7 @@ fn render_net_effect_panel(
       <tbody>{}</tbody>
     </table>
   </div>
-</section>"#,
+</details>"#,
         escape_html(subject_scope_label),
         rows
     )
@@ -4737,37 +4635,26 @@ fn render_execution_timeline_panel(
     let mut attached_flow_ids = std::collections::BTreeSet::<String>::new();
     let initial_limit = 60usize;
     let hard_limit = 240usize;
-    let rows = items
-        .iter()
-        .take(initial_limit)
-        .map(|item| {
-            render_execution_timeline_row(
-                item,
-                analysis,
-                initiator,
-                executor,
-                protocol_contract,
-                book,
-                &mut attached_flow_ids,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let visible_items = items.iter().take(initial_limit).collect::<Vec<_>>();
+    let rows = render_execution_timeline_tree(
+        &visible_items,
+        analysis,
+        initiator,
+        executor,
+        protocol_contract,
+        book,
+        &mut attached_flow_ids,
+    );
     let hidden_rows = if items.len() > initial_limit {
-        let rows = items
+        let hidden_items = items
             .iter()
             .skip(initial_limit)
             .take(hard_limit.saturating_sub(initial_limit))
+            .collect::<Vec<_>>();
+        let rows = hidden_items
+            .iter()
             .map(|item| {
-                render_execution_timeline_row(
-                    item,
-                    analysis,
-                    initiator,
-                    executor,
-                    protocol_contract,
-                    book,
-                    &mut attached_flow_ids,
-                )
+                render_execution_timeline_row(item, analysis, initiator, executor, protocol_contract, book, &mut attached_flow_ids)
             })
             .collect::<Vec<_>>()
             .join("");
@@ -4794,17 +4681,144 @@ fn render_execution_timeline_panel(
         "top-level only"
     };
     format!(
-        r#"<section class="tx-section-card storyline-steps trace-timeline-panel">
-  <div class="tx-section-title">
+        r#"<details class="tx-section-card storyline-steps trace-timeline-panel" open>
+  <summary class="tx-section-title">
     <span class="tx-section-index">3</span>
     <h2>Transaction Timeline</h2>
     <span class="badge">{}</span>
-  </div>
+  </summary>
   <div class="trace-timeline-list">{}</div>
   {}
-</section>"#,
+</details>"#,
         badge, rows, hidden_rows
     )
+}
+
+fn render_execution_timeline_tree(
+    items: &[&serde_json::Value],
+    analysis: &TransactionAnalysis,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+    book: &AddressDisplayBook,
+    attached_flow_ids: &mut std::collections::BTreeSet<String>,
+) -> String {
+    let mut children = std::collections::BTreeMap::<String, Vec<&serde_json::Value>>::new();
+    let mut by_label = std::collections::BTreeSet::<String>::new();
+    for item in items {
+        by_label.insert(trace_item_label(item));
+    }
+    let mut roots = Vec::new();
+    for item in items {
+        let parent = trace_item_parent_label(item);
+        if parent
+            .as_ref()
+            .map(|label| by_label.contains(label))
+            .unwrap_or(false)
+        {
+            children.entry(parent.unwrap()).or_default().push(*item);
+        } else {
+            roots.push(*item);
+        }
+    }
+    roots
+        .into_iter()
+        .map(|item| {
+            render_execution_timeline_node(
+                item,
+                &children,
+                analysis,
+                initiator,
+                executor,
+                protocol_contract,
+                book,
+                attached_flow_ids,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_execution_timeline_node(
+    item: &serde_json::Value,
+    children: &std::collections::BTreeMap<String, Vec<&serde_json::Value>>,
+    analysis: &TransactionAnalysis,
+    initiator: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+    book: &AddressDisplayBook,
+    attached_flow_ids: &mut std::collections::BTreeSet<String>,
+) -> String {
+    let label = trace_item_label(item);
+    let row = render_execution_timeline_row(
+        item,
+        analysis,
+        initiator,
+        executor,
+        protocol_contract,
+        book,
+        attached_flow_ids,
+    );
+    let child_rows = children
+        .get(&label)
+        .map(|items| {
+            items
+                .iter()
+                .map(|child| {
+                    render_execution_timeline_node(
+                        child,
+                        children,
+                        analysis,
+                        initiator,
+                        executor,
+                        protocol_contract,
+                        book,
+                        attached_flow_ids,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    if child_rows.is_empty() {
+        row
+    } else {
+        format!(
+            r#"<details class="trace-node" open>
+  <summary>{}</summary>
+  <div class="trace-children">{}</div>
+</details>"#,
+            row,
+            child_rows,
+        )
+    }
+}
+
+fn trace_item_label(item: &serde_json::Value) -> String {
+    item.get("trace_address_label")
+        .and_then(|value| value.as_str())
+        .unwrap_or("root")
+        .to_owned()
+}
+
+fn trace_item_parent_label(item: &serde_json::Value) -> Option<String> {
+    let values = item.get("trace_address")?.as_array()?;
+    if values.is_empty() {
+        return None;
+    }
+    let parent = &values[..values.len().saturating_sub(1)];
+    if parent.is_empty() {
+        Some("root".to_owned())
+    } else {
+        Some(
+            parent
+                .iter()
+                .filter_map(|value| value.as_u64())
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join("."),
+        )
+    }
 }
 
 fn render_execution_timeline_row(
@@ -5135,14 +5149,14 @@ fn render_storyline_steps(
         return String::new();
     }
     format!(
-        r#"<section class="tx-section-card storyline-steps">
-  <div class="tx-section-title">
+        r#"<details class="tx-section-card storyline-steps" open>
+  <summary class="tx-section-title">
     <span class="tx-section-index">3</span>
     <h2>Transaction Timeline</h2>
     <span class="badge">ordered events</span>
-  </div>
+  </summary>
   <div class="timeline-list">{}</div>
-</section>"#,
+</details>"#,
         items
             .iter()
             .map(|item| {
@@ -5261,14 +5275,14 @@ fn render_generic_timeline_panel(
         return String::new();
     }
     format!(
-        r#"<section class="tx-section-card storyline-steps">
-  <div class="tx-section-title">
+        r#"<details class="tx-section-card storyline-steps" open>
+  <summary class="tx-section-title">
     <span class="tx-section-index">3</span>
     <h2>Transaction Timeline</h2>
     <span class="badge">derived from logs</span>
-  </div>
+  </summary>
   <div class="timeline-list">{}</div>
-</section>"#,
+</details>"#,
         analysis
             .derived_flows
             .iter()
@@ -5453,11 +5467,11 @@ fn render_storyline_visual(
     };
 
     format!(
-        r#"<section class="tx-section-card storyline-visual-shell">
-  <div class="tx-section-title">
+        r#"<details class="tx-section-card storyline-visual-shell" open>
+  <summary class="tx-section-title">
     <span class="tx-section-index">4</span>
     <h2>Protocol Path</h2>
-  </div>
+  </summary>
   {}
   <div class="storyline-lanes">
     {}
@@ -5465,7 +5479,7 @@ fn render_storyline_visual(
     {}
     {}
   </div>
-</section>"#,
+</details>"#,
         main_path, funding_lane, repay_lane, receipt_lane, exit_lane
     )
 }
@@ -7031,7 +7045,12 @@ textarea { min-height: 140px; resize: vertical; }
 .readonly-pill { display: inline-flex; align-items: center; gap: 6px; width: fit-content; padding: 6px 10px; border: 1px solid rgba(13,110,99,.18); border-radius: 999px; background: #ecfdf5; color: #047857; font-size: .78rem; font-weight: 700; white-space: nowrap; }
 .tx-analysis-shell { display: grid; gap: 14px; counter-reset: tx-section; }
 .tx-section-card { border: 1px solid var(--line); border-radius: 12px; background: #fff; box-shadow: 0 8px 22px rgba(15,23,42,.04); padding: 16px; min-width: 0; }
+.tx-section-card > summary { cursor: pointer; list-style: none; }
+.tx-section-card > summary::-webkit-details-marker, .trace-node > summary::-webkit-details-marker { display: none; }
+.tx-section-card:not([open]) > summary { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
 .tx-section-title { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--line); margin-bottom: 14px; }
+.tx-section-title::after { content: "⌃"; margin-left: 8px; color: var(--muted); font-size: .82rem; }
+.tx-section-card:not([open]) > .tx-section-title::after { content: "⌄"; }
 .tx-section-title h2 { margin: 0; font-size: 1.08rem; line-height: 1.25; }
 .tx-section-title h2 small { color: var(--muted); font-weight: 500; margin-left: 4px; }
 .tx-section-title .badge, .tx-section-title .confidence-pill { margin-left: auto; }
@@ -7047,6 +7066,23 @@ textarea { min-height: 140px; resize: vertical; }
 .tx-report-title-row h1 { margin: 0; font-size: clamp(1.8rem, 2.6vw, 2.5rem); letter-spacing: -.03em; }
 .tx-report-title-row p { margin: 4px 0 12px; color: var(--muted); font-weight: 600; }
 .tx-report-title-row span { display: block; color: var(--muted); font-size: .84rem; margin-bottom: 4px; }
+.basic-info-card { display: grid; gap: 14px; border: 1px solid var(--line); border-radius: 12px; background: #fff; padding: 14px; box-shadow: 0 8px 22px rgba(15,23,42,.04); }
+.basic-info-card h2 { margin: 0; font-size: 1rem; }
+.basic-info-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px 18px; }
+.basic-info-grid > div { display: grid; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--line); min-width: 0; }
+.basic-info-grid > div.wide { grid-column: span 2; }
+.basic-info-grid span { color: var(--muted); font-size: .82rem; }
+.basic-info-grid strong { font-size: .92rem; overflow-wrap: anywhere; }
+.basic-info-more { display: grid; gap: 12px; }
+.basic-info-more summary { cursor: pointer; color: var(--ink); font-weight: 700; padding: 2px 0; }
+.status-chip { display: inline-flex; width: fit-content; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); font-size: .8rem; }
+.status-success { color: #047857; border-color: rgba(4,120,87,.25); background: #ecfdf5; }
+.status-failure { color: #b91c1c; border-color: rgba(185,28,28,.25); background: #fef2f2; }
+.gas-profile-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.gas-profile-summary div { display: grid; gap: 5px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; }
+.gas-profile-summary span { color: var(--muted); font-size: .78rem; }
+.gas-profile-bar { height: 36px; border: 1px solid #bfdbfe; border-radius: 8px; overflow: hidden; background: #eff6ff; }
+.gas-profile-bar span { display: flex; align-items: center; height: 100%; min-width: 160px; padding: 0 10px; color: #fff; font-weight: 800; background: linear-gradient(90deg, #2563eb, #60a5fa); }
 .tx-meta-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 10px; background: #fff; box-shadow: 0 8px 22px rgba(15,23,42,.04); overflow: hidden; }
 .tx-meta-strip div { display: grid; gap: 5px; padding: 12px 18px; border-right: 1px solid var(--line); min-width: 0; }
 .tx-meta-strip div:last-child { border-right: 0; }
@@ -7121,6 +7157,11 @@ textarea { min-height: 140px; resize: vertical; }
 .timeline-arrow-inline { font-size: 1rem; color: var(--accent); }
 .trace-timeline-panel { gap: 10px; }
 .trace-timeline-list { display: grid; border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; background: #fff; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: .82rem; }
+.trace-node { display: grid; min-width: 980px; }
+.trace-node > summary { display: block; cursor: pointer; list-style: none; }
+.trace-node > summary .trace-line::before { content: "−"; display: inline-grid; place-items: center; width: 14px; height: 14px; margin-right: 4px; border: 1px solid #94a3b8; border-radius: 3px; color: #334155; background: #fff; font-size: .72rem; }
+.trace-node:not([open]) > summary .trace-line::before { content: "+"; }
+.trace-children { display: grid; }
 .trace-line { display: grid; grid-template-columns: 34px calc(var(--trace-depth, 0) * 18px) max-content minmax(84px, max-content) minmax(180px, 1fr) 18px minmax(180px, 1fr) max-content minmax(0, 1.1fr) max-content; gap: 6px; align-items: center; min-width: 980px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
 .trace-line:last-child { border-bottom: 0; }
 .trace-order { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
@@ -7205,6 +7246,8 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line
 @media (max-width: 960px) {
   .hero, .dashboard-shell, .dashboard-grid, .tx-report-hero { grid-template-columns: 1fr; }
   .tx-search-form, .tx-meta-strip, .tx-conclusion-grid, .timeline-step, .timeline-flow { grid-template-columns: 1fr; }
+  .basic-info-grid, .gas-profile-summary { grid-template-columns: 1fr; }
+  .basic-info-grid > div.wide { grid-column: span 1; }
   .tx-meta-strip div, .timeline-head, .timeline-mid { border-right: 0; border-left: 0; }
   .tx-meta-strip div { border-bottom: 1px solid var(--line); }
   .tx-meta-strip div:last-child { border-bottom: 0; }
