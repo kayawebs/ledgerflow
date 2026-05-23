@@ -4320,18 +4320,47 @@ fn render_flow_balance_rows(analysis: &TransactionAnalysis, book: &AddressDispla
         .or_insert((token, -gas_raw));
     }
 
-    rows.into_iter()
-        .filter(|(_, (_, amount))| *amount != 0)
-        .take(120)
-        .map(|((address, _), (token, amount))| {
-            render_flow_balance_row(&address, &token, amount, analysis, book)
+    let mut grouped_rows =
+        std::collections::BTreeMap::<String, Vec<(serde_json::Value, i128)>>::new();
+    for ((address, _), (token, amount)) in rows.into_iter().filter(|(_, (_, amount))| *amount != 0)
+    {
+        grouped_rows.entry(address).or_default().push((token, amount));
+    }
+
+    grouped_rows
+        .into_iter()
+        .take(80)
+        .flat_map(|(address, mut items)| {
+            items.sort_by(|(left_token, _), (right_token, _)| {
+                token_sort_key(left_token).cmp(&token_sort_key(right_token))
+            });
+            let rowspan = items.len();
+            items
+                .into_iter()
+                .enumerate()
+                .map(move |(index, (token, amount))| {
+                    render_flow_balance_row(
+                        if index == 0 {
+                            Some(address.as_str())
+                        } else {
+                            None
+                        },
+                        rowspan,
+                        &token,
+                        amount,
+                        analysis,
+                        book,
+                    )
+                })
+                .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>()
         .join("")
 }
 
 fn render_flow_balance_row(
-    address: &str,
+    address: Option<&str>,
+    rowspan: usize,
     token: &serde_json::Value,
     amount: i128,
     analysis: &TransactionAnalysis,
@@ -4353,9 +4382,18 @@ fn render_flow_balance_row(
     let estimated_usd =
         estimated_usd_for_token_amount(&amount.to_string(), token, analysis).unwrap_or_default();
     let amount_class = if amount > 0 { "gained" } else { "spent" };
+    let address_cell = address
+        .map(|address| {
+            format!(
+                r#"<td class="flow-address-cell" rowspan="{}">{}</td>"#,
+                rowspan,
+                render_known_address(address, 10, book)
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "<tr><td>{}</td><td><strong>{}</strong><small>{} · {}</small></td><td><span class=\"table-badge {}\">{}</span><small>raw: {}</small>{}</td></tr>",
-        render_known_address(address, 10, book),
+        "<tr>{}<td><strong>{}</strong><small>{} · {}</small></td><td><span class=\"table-badge {}\">{}</span><small>raw: {}</small>{}</td></tr>",
+        address_cell,
         escape_html(symbol),
         escape_html(name),
         render_copyable_code(token_address, 8),
@@ -4370,6 +4408,20 @@ fn render_flow_balance_row(
                 escape_html(&estimated_usd)
             )
         },
+    )
+}
+
+fn token_sort_key(token: &serde_json::Value) -> String {
+    format!(
+        "{}:{}",
+        token
+            .get("symbol")
+            .and_then(|value| value.as_str())
+            .unwrap_or("asset"),
+        token
+            .get("address")
+            .and_then(|value| value.as_str())
+            .unwrap_or("native")
     )
 }
 
@@ -7039,6 +7091,7 @@ textarea { min-height: 140px; resize: vertical; }
 .compact-section { padding-top: 8px; }
 .compact-table-shell { margin-top: 4px; }
 .compact-table td, .compact-table th { padding: 6px 8px; }
+.compact-table .flow-address-cell { vertical-align: top; border-right: 1px solid var(--line); background: #fbfdff; }
 .address-label-chip, .address-type-pill { display: inline-flex; align-items: center; width: fit-content; margin: 2px 4px 2px 0; padding: 3px 7px; border: 1px solid var(--line); border-radius: 999px; background: #fff; color: var(--muted); font-size: .75rem; line-height: 1.2; }
 .address-type-pill { color: var(--accent); border-color: rgba(13,110,99,.2); background: rgba(13,110,99,.06); }
 .amount-stack { display: grid; gap: 2px; }
