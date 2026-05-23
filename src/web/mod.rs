@@ -4190,7 +4190,11 @@ fn render_tx_storyline_panel(analysis: &TransactionAnalysis, book: &AddressDispl
         .and_then(|value| value.get("label"))
         .and_then(|value| value.as_str())
         .unwrap_or("subject scope");
-    let net_effect = render_net_effect_panel(storyline.get("net_effect"), subject_scope_label);
+    let net_effect = render_net_effect_panel(
+        storyline.get("net_effect"),
+        subject_scope_label,
+        analysis,
+    );
     let execution_timeline =
         render_execution_timeline_panel(analysis, initiator, executor, protocol_contract, book);
     let step_timeline = if !execution_timeline.is_empty() {
@@ -4198,6 +4202,7 @@ fn render_tx_storyline_panel(analysis: &TransactionAnalysis, book: &AddressDispl
     } else {
         let storyline_steps = render_storyline_steps(
             storyline.get("steps"),
+            analysis,
             initiator,
             executor,
             protocol_contract,
@@ -4319,7 +4324,7 @@ fn render_flow_balance_rows(analysis: &TransactionAnalysis, book: &AddressDispla
         .filter(|(_, (_, amount))| *amount != 0)
         .take(120)
         .map(|((address, _), (token, amount))| {
-            render_flow_balance_row(&address, &token, amount, book)
+            render_flow_balance_row(&address, &token, amount, analysis, book)
         })
         .collect::<Vec<_>>()
         .join("")
@@ -4329,6 +4334,7 @@ fn render_flow_balance_row(
     address: &str,
     token: &serde_json::Value,
     amount: i128,
+    analysis: &TransactionAnalysis,
     book: &AddressDisplayBook,
 ) -> String {
     let symbol = token
@@ -4344,9 +4350,11 @@ fn render_flow_balance_row(
         .and_then(|value| value.as_str())
         .unwrap_or("native");
     let amount_display = format_token_amount_display(amount, token);
+    let estimated_usd =
+        estimated_usd_for_token_amount(&amount.to_string(), token, analysis).unwrap_or_default();
     let amount_class = if amount > 0 { "gained" } else { "spent" };
     format!(
-        "<tr><td>{}</td><td><strong>{}</strong><small>{} · {}</small></td><td><span class=\"table-badge {}\">{}</span><small>raw: {}</small></td></tr>",
+        "<tr><td>{}</td><td><strong>{}</strong><small>{} · {}</small></td><td><span class=\"table-badge {}\">{}</span><small>raw: {}</small>{}</td></tr>",
         render_known_address(address, 10, book),
         escape_html(symbol),
         escape_html(name),
@@ -4354,6 +4362,14 @@ fn render_flow_balance_row(
         amount_class,
         escape_html(&amount_display),
         escape_html(&amount.to_string()),
+        if estimated_usd.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<small class=\"estimated-usd\">{}</small>",
+                escape_html(&estimated_usd)
+            )
+        },
     )
 }
 
@@ -4488,11 +4504,15 @@ fn render_subject_scope(value: Option<&serde_json::Value>) -> String {
     )
 }
 
-fn render_net_effect_panel(value: Option<&serde_json::Value>, subject_scope_label: &str) -> String {
+fn render_net_effect_panel(
+    value: Option<&serde_json::Value>,
+    subject_scope_label: &str,
+    analysis: &TransactionAnalysis,
+) -> String {
     let Some(effect) = value else {
         return String::new();
     };
-    let rows = render_net_effect_rows(effect);
+    let rows = render_net_effect_rows(effect, analysis);
     format!(
         r#"<section class="storyline-net-effect tx-section-card compact-section">
   <div class="panel-head"><h4>Net Asset Change</h4><span class="badge">subject scope view</span></div>
@@ -4518,19 +4538,19 @@ fn render_net_effect_panel(value: Option<&serde_json::Value>, subject_scope_labe
     )
 }
 
-fn render_net_effect_rows(effect: &serde_json::Value) -> String {
+fn render_net_effect_rows(effect: &serde_json::Value, analysis: &TransactionAnalysis) -> String {
     let mut rows = effect
         .get("rows")
         .and_then(|value| value.as_array())
         .map(|items| {
             items
                 .iter()
-                .map(render_net_effect_asset_row)
+                .map(|item| render_net_effect_asset_row(item, analysis))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     if let Some(gas) = effect.get("gas").filter(|value| !value.is_null()) {
-        rows.push(render_net_effect_gas_row(gas));
+        rows.push(render_net_effect_gas_row(gas, analysis));
     }
     if rows.is_empty() {
         "<tr><td colspan=\"6\">No scope-crossing asset changes detected yet.</td></tr>".to_owned()
@@ -4539,7 +4559,7 @@ fn render_net_effect_rows(effect: &serde_json::Value) -> String {
     }
 }
 
-fn render_net_effect_asset_row(item: &serde_json::Value) -> String {
+fn render_net_effect_asset_row(item: &serde_json::Value, analysis: &TransactionAnalysis) -> String {
     let token = item.get("token").unwrap_or(&serde_json::Value::Null);
     let symbol = token
         .get("symbol")
@@ -4580,16 +4600,28 @@ fn render_net_effect_asset_row(item: &serde_json::Value) -> String {
     format!(
         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} · {}</td><td>{}</td></tr>",
         escape_html(symbol),
-        render_amount_stack(inflow_display, inflow_raw),
-        render_amount_stack(outflow_display, outflow_raw),
-        render_amount_stack(net_display, net_raw),
+        render_amount_stack_with_usd(
+            inflow_display,
+            inflow_raw,
+            estimated_usd_for_token_amount(inflow_raw, token, analysis).as_deref(),
+        ),
+        render_amount_stack_with_usd(
+            outflow_display,
+            outflow_raw,
+            estimated_usd_for_token_amount(outflow_raw, token, analysis).as_deref(),
+        ),
+        render_amount_stack_with_usd(
+            net_display,
+            net_raw,
+            estimated_usd_for_token_amount(net_raw, token, analysis).as_deref(),
+        ),
         escape_html(symbol),
         escape_html(name),
         render_copyable_code(address, 8),
     )
 }
 
-fn render_net_effect_gas_row(item: &serde_json::Value) -> String {
+fn render_net_effect_gas_row(item: &serde_json::Value, analysis: &TransactionAnalysis) -> String {
     let token = item.get("token").unwrap_or(&serde_json::Value::Null);
     let symbol = token
         .get("symbol")
@@ -4611,8 +4643,16 @@ fn render_net_effect_gas_row(item: &serde_json::Value) -> String {
         "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{} · {}</td><td><code>native</code></td></tr>",
         escape_html(symbol),
         render_amount_stack("0", "0"),
-        render_amount_stack(amount_display, amount_raw),
-        render_amount_stack(&format!("-{}", amount_display), &format!("-{}", amount_raw)),
+        render_amount_stack_with_usd(
+            amount_display,
+            amount_raw,
+            estimated_usd_for_token_amount(amount_raw, token, analysis).as_deref(),
+        ),
+        render_amount_stack_with_usd(
+            &format!("-{}", amount_display),
+            &format!("-{}", amount_raw),
+            estimated_usd_for_token_amount(&format!("-{}", amount_raw), token, analysis).as_deref(),
+        ),
         escape_html(symbol),
         escape_html(name),
     )
@@ -4832,8 +4872,11 @@ fn render_call_attached_flows(
                 .and_then(|value| value.as_str())
                 .unwrap_or("unlabeled");
             rows.push(format!(
-                "<span>{} · {} · {}</span>",
+                "<span>{}{} · {} · {}</span>",
                 escape_html(&format_flow_amount_display(flow, &token)),
+                flow_estimated_usd(flow)
+                    .map(|value| format!(" ({})", escape_html(&value)))
+                    .unwrap_or_default(),
                 escape_html(name),
                 render_copy_only_button(token_address),
             ));
@@ -4843,11 +4886,20 @@ fn render_call_attached_flows(
 }
 
 fn render_amount_stack(display: &str, raw: &str) -> String {
+    render_amount_stack_with_usd(display, raw, None)
+}
+
+fn render_amount_stack_with_usd(display: &str, raw: &str, estimated_usd: Option<&str>) -> String {
     let display = normalize_amount_display(display, raw);
+    let estimated_usd = estimated_usd
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("<small class=\"estimated-usd\">{}</small>", escape_html(value)))
+        .unwrap_or_default();
     format!(
-        "<div class=\"amount-stack\"><strong>{}</strong><small>raw: {}</small></div>",
+        "<div class=\"amount-stack\"><strong>{}</strong><small>raw: {}</small>{}</div>",
         escape_html(&display),
         escape_html(raw),
+        estimated_usd,
     )
 }
 
@@ -4863,8 +4915,124 @@ fn normalize_amount_display(display: &str, raw: &str) -> String {
     }
 }
 
+fn flow_estimated_usd(flow: &crate::domain::value_objects::AssetFlow) -> Option<String> {
+    flow.metadata
+        .pointer("/estimated_usd/value_decimal")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<f64>().ok())
+        .map(format_estimated_usd)
+}
+
+fn estimated_usd_for_token_amount(
+    raw: &str,
+    token: &serde_json::Value,
+    analysis: &TransactionAnalysis,
+) -> Option<String> {
+    let price = price_for_token_usd(token, analysis)?;
+    let decimals = token
+        .get("decimals")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(18);
+    let raw = raw.parse::<f64>().ok()?;
+    let amount = raw / 10f64.powi(decimals.min(38) as i32);
+    let value = amount * price;
+    if value.is_finite() {
+        Some(format_estimated_usd(value))
+    } else {
+        None
+    }
+}
+
+fn price_for_token_usd(token: &serde_json::Value, analysis: &TransactionAnalysis) -> Option<f64> {
+    let address = token
+        .get("address")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let symbol = token
+        .get("symbol")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if matches_ignore_ascii_case(symbol, &["USDC", "USDT", "USDBC"])
+        || matches_ignore_ascii_case(&address, &[
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+            "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
+        ])
+    {
+        return Some(1.0);
+    }
+    let pricing_address = if address == "native" || symbol.eq_ignore_ascii_case("ETH") {
+        "0x4200000000000000000000000000000000000006"
+    } else {
+        address.as_str()
+    };
+    for flow in &analysis.derived_flows {
+        let flow_address = flow
+            .token_address
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if flow_address != pricing_address {
+            continue;
+        }
+        if let Some(price) = flow
+            .metadata
+            .pointer("/estimated_usd/price_decimal")
+            .and_then(|value| value.as_str())
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            return Some(price);
+        }
+    }
+    analysis
+        .scenario_outputs
+        .pointer("/pricing/flow_quotes")
+        .and_then(|value| value.as_array())
+        .and_then(|quotes| {
+            quotes.iter().find_map(|item| {
+                let quote = item.get("quote")?;
+                let quote_address = quote
+                    .get("token_address")
+                    .and_then(|value| value.as_str())?
+                    .to_ascii_lowercase();
+                if quote_address != pricing_address {
+                    return None;
+                }
+                quote
+                    .get("price_decimal")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|value| value.is_finite() && *value > 0.0)
+            })
+        })
+}
+
+fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+}
+
+fn format_estimated_usd(value: f64) -> String {
+    let sign = if value < 0.0 { "-" } else { "" };
+    let abs = value.abs();
+    let amount = if abs >= 1_000.0 {
+        format!("{abs:.2}")
+    } else if abs >= 1.0 {
+        format!("{abs:.4}")
+    } else if abs > 0.0 {
+        format!("{abs:.6}")
+    } else {
+        "0".to_owned()
+    };
+    format!("est. {sign}${amount}")
+}
+
 fn render_storyline_steps(
     value: Option<&serde_json::Value>,
+    analysis: &TransactionAnalysis,
     initiator: &str,
     executor: &str,
     protocol_contract: Option<&str>,
@@ -4918,6 +5086,9 @@ fn render_storyline_steps(
                     .and_then(|value| value.as_str())
                     .unwrap_or("n/a");
                 let amount_display = normalize_amount_display(amount_display, amount_raw);
+                let estimated_usd = estimated_usd_for_token_amount(amount_raw, token, analysis)
+                    .map(|value| format!(" · {}", value))
+                    .unwrap_or_default();
                 let source_hint_label = item
                     .get("source_hint")
                     .and_then(|value| value.get("label"))
@@ -4940,7 +5111,7 @@ fn render_storyline_steps(
     <div class="timeline-index">{}</div>
     <div class="timeline-copy">
       <strong>{}</strong>
-      <small>{} · {} · raw: {}</small>
+      <small>{} · {} · raw: {}{}</small>
       {}
     </div>
   </div>
@@ -4965,6 +5136,7 @@ fn render_storyline_steps(
                     escape_html(symbol),
                     escape_html(name),
                     escape_html(amount_raw),
+                    escape_html(&estimated_usd),
                     source_hint_label
                         .map(|value| format!(
                             "<span class=\"timeline-hint\">Likely source: {}</span>",
@@ -5018,6 +5190,9 @@ fn render_generic_timeline_panel(
                 let name = token.get("name").and_then(|value| value.as_str()).unwrap_or("unlabeled");
                 let token_address = token.get("address").and_then(|value| value.as_str()).or(flow.token_address.as_deref()).unwrap_or("native");
                 let amount_display = format_flow_amount_display(flow, &token);
+                let estimated_usd = flow_estimated_usd(flow)
+                    .map(|value| format!(" · {}", value))
+                    .unwrap_or_default();
                 let from_roles = render_storyline_roles(&flow.from_address, initiator, executor, protocol_contract);
                 let to_roles = render_storyline_roles(&flow.to_address, initiator, executor, protocol_contract);
                 format!(
@@ -5026,7 +5201,7 @@ fn render_generic_timeline_panel(
     <div class="timeline-index">{}</div>
     <div class="timeline-copy">
       <strong>Confirmed asset flow</strong>
-      <small>{} · {} · raw: {}</small>
+      <small>{} · {} · raw: {}{}</small>
     </div>
   </div>
   <div class="timeline-flow compact">
@@ -5039,6 +5214,7 @@ fn render_generic_timeline_panel(
                     escape_html(symbol),
                     escape_html(name),
                     escape_html(&flow.amount_raw),
+                    escape_html(&estimated_usd),
                     render_known_address(&flow.from_address, 10, book),
                     from_roles,
                     escape_html(&amount_display),
@@ -6830,6 +7006,7 @@ textarea { min-height: 140px; resize: vertical; }
 .amount-stack { display: grid; gap: 2px; }
 .amount-stack strong { font-size: .96rem; line-height: 1.25; }
 .amount-stack small { color: var(--muted); line-height: 1.3; }
+.estimated-usd { color: #047857 !important; font-weight: 700; }
 .table-badge { display: inline-flex; align-items: center; padding: 3px 6px; border-radius: 999px; font-size: .75rem; line-height: 1.2; border: 1px solid var(--line); background: #fff; color: var(--muted); }
 .table-badge.gained { border-color: rgba(13,110,99,.24); color: var(--accent); }
 .table-badge.spent, .table-badge.gas { border-color: rgba(197,95,12,.24); color: var(--accent-2); }

@@ -47,6 +47,7 @@ pub struct PriceAnalysisSummary {
     pub requests_enqueued: usize,
     pub observations: Vec<PriceObservation>,
     pub queued_tokens: Vec<String>,
+    pub flow_quotes: Vec<FlowPriceQuote>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -61,6 +62,12 @@ pub struct PriceQuote {
     pub source: String,
     pub observed_block: Option<u64>,
     pub block_bucket: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FlowPriceQuote {
+    pub flow_id: String,
+    pub quote: PriceQuote,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -142,11 +149,13 @@ impl PriceService {
             requests_enqueued += self.enqueue_request(analysis, token_address).await? as usize;
         }
 
+        let flow_quotes = self.attach_flow_quotes(analysis).await?;
         let summary = PriceAnalysisSummary {
             observations_written,
             requests_enqueued,
             observations,
             queued_tokens: requested_tokens.into_iter().collect(),
+            flow_quotes,
         };
         attach_pricing_summary(analysis, &summary);
         Ok(summary)
@@ -160,10 +169,25 @@ impl PriceService {
         decimals: u8,
         block_number: Option<u64>,
     ) -> LedgerResult<Option<PriceQuote>> {
+        let token_address = token_address.to_ascii_lowercase();
+        let amount_decimal_f64 = parse_amount_decimal(amount_raw, decimals)?;
+        if let Some(stable) = stable_token(&token_address) {
+            return Ok(Some(PriceQuote {
+                token_address,
+                quote_symbol: DEFAULT_QUOTE_SYMBOL.to_owned(),
+                amount_raw: amount_raw.to_owned(),
+                amount_decimal: format_decimal(amount_decimal_f64),
+                value_decimal: format_decimal(amount_decimal_f64),
+                price_decimal: "1".to_owned(),
+                confidence: 1.0,
+                source: format!("{SOURCE_STABLE_ANCHOR}:{}", stable.symbol),
+                observed_block: block_number,
+                block_bucket: block_number.map(block_bucket),
+            }));
+        }
         let Some(block_bucket) = block_number.map(block_bucket) else {
             return Ok(None);
         };
-        let token_address = token_address.to_ascii_lowercase();
         let row = sqlx::query(
             r#"
             select
@@ -194,7 +218,6 @@ impl PriceService {
         let Some(row) = row else {
             return Ok(None);
         };
-        let amount_decimal_f64 = parse_amount_decimal(amount_raw, decimals)?;
         let price_decimal = row
             .try_get::<String, _>("price_decimal")
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;
@@ -228,6 +251,55 @@ impl PriceService {
                 .try_into()
                 .ok(),
         }))
+    }
+
+    async fn attach_flow_quotes(
+        &self,
+        analysis: &mut TransactionAnalysis,
+    ) -> LedgerResult<Vec<FlowPriceQuote>> {
+        let mut quotes = Vec::new();
+        for index in 0..analysis.derived_flows.len() {
+            let candidate = {
+                let flow = &analysis.derived_flows[index];
+                if flow.asset_type != AssetType::Erc20 {
+                    None
+                } else {
+                    flow.token_address.as_ref().map(|token_address| {
+                        (
+                            flow.flow_id.clone(),
+                            token_address.clone(),
+                            flow.amount_raw.clone(),
+                            token_decimals(flow),
+                        )
+                    })
+                }
+            };
+            let Some((flow_id, token_address, amount_raw, decimals)) = candidate else {
+                continue;
+            };
+            let Some(quote) = self
+                .quote_amount(
+                    analysis.chain_id,
+                    &token_address,
+                    &amount_raw,
+                    decimals,
+                    analysis.block_number,
+                )
+                .await?
+            else {
+                continue;
+            };
+            let quote_json = serde_json::to_value(&quote).unwrap_or_else(|_| json!({}));
+            let flow = &mut analysis.derived_flows[index];
+            if !flow.metadata.is_object() {
+                flow.metadata = json!({});
+            }
+            if let Some(object) = flow.metadata.as_object_mut() {
+                object.insert("estimated_usd".to_owned(), quote_json);
+            }
+            quotes.push(FlowPriceQuote { flow_id, quote });
+        }
+        Ok(quotes)
     }
 
     pub async fn process_next_price_request(&self) -> LedgerResult<PriceWorkerResult> {
