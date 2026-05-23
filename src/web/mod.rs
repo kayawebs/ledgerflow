@@ -4683,9 +4683,11 @@ fn render_execution_timeline_panel(
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     let mut attached_flow_ids = std::collections::BTreeSet::<String>::new();
+    let initial_limit = 60usize;
+    let hard_limit = 240usize;
     let rows = items
         .iter()
-        .take(120)
+        .take(initial_limit)
         .map(|item| {
             render_execution_timeline_row(
                 item,
@@ -4699,21 +4701,57 @@ fn render_execution_timeline_panel(
         })
         .collect::<Vec<_>>()
         .join("");
+    let hidden_rows = if items.len() > initial_limit {
+        let rows = items
+            .iter()
+            .skip(initial_limit)
+            .take(hard_limit.saturating_sub(initial_limit))
+            .map(|item| {
+                render_execution_timeline_row(
+                    item,
+                    analysis,
+                    initiator,
+                    executor,
+                    protocol_contract,
+                    book,
+                    &mut attached_flow_ids,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let omitted = items.len().saturating_sub(hard_limit);
+        format!(
+            r#"<details class="trace-more">
+  <summary>Show {} more calls{}</summary>
+  <div class="trace-timeline-list">{}</div>
+</details>"#,
+            items.len().saturating_sub(initial_limit).min(hard_limit - initial_limit),
+            if omitted > 0 {
+                format!(" · {omitted} omitted")
+            } else {
+                String::new()
+            },
+            rows
+        )
+    } else {
+        String::new()
+    };
     let badge = if trace_available {
         "call stack"
     } else {
         "top-level only"
     };
     format!(
-        r#"<section class="tx-section-card storyline-steps">
+        r#"<section class="tx-section-card storyline-steps trace-timeline-panel">
   <div class="tx-section-title">
     <span class="tx-section-index">3</span>
     <h2>Transaction Timeline</h2>
     <span class="badge">{}</span>
   </div>
-  <div class="timeline-list">{}</div>
+  <div class="trace-timeline-list">{}</div>
+  {}
 </section>"#,
-        badge, rows
+        badge, rows, hidden_rows
     )
 }
 
@@ -4762,11 +4800,6 @@ fn render_execution_timeline_row(
         .get("trace_address_label")
         .and_then(|value| value.as_str())
         .unwrap_or("root");
-    let title = if kind == "tx_entry" {
-        "Transaction submitted"
-    } else {
-        "Contract call"
-    };
     let from_roles = render_storyline_roles(from_raw, initiator, executor, protocol_contract);
     let to_roles = render_storyline_roles(to_raw, initiator, executor, protocol_contract);
     let attachments = render_call_attached_flows(
@@ -4782,7 +4815,7 @@ fn render_execution_timeline_row(
         .filter(|value| *value > 0)
         .map(|value| {
             format!(
-                "<span class=\"timeline-hint\">native value: {}</span>",
+                "<span class=\"trace-value-chip\">value {}</span>",
                 escape_html(&format_token_amount_display(
                     value,
                     &serde_json::json!({"symbol": "ETH", "name": "Ether", "address": "native", "decimals": 18})
@@ -4790,52 +4823,57 @@ fn render_execution_timeline_row(
             )
         })
         .unwrap_or_default();
-    let indent_px = depth.min(6) * 10;
+    let depth = depth.min(10);
+    let call_label = if kind == "tx_entry" {
+        "TX"
+    } else {
+        call_type
+    };
+    let attachments = if attachments.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<span class="trace-transfer-group">{attachments}</span>"#)
+    };
     format!(
-        r#"<article class="timeline-step">
-  <div class="timeline-head">
-    <div class="timeline-index">{}</div>
-    <div class="timeline-copy">
-      <strong>{}</strong>
-      <small>{} · {} · trace {}</small>
-      {}
-    </div>
-  </div>
-  <div class="timeline-flow compact" style="padding-left: {}px">
-    <div class="timeline-side">
-      {}
-      <div class="timeline-role-row">{}</div>
-    </div>
-    <div class="timeline-mid">
-      <strong>{}</strong>
-      <span>{}</span>
-      {}
-      <span class="timeline-arrow-inline">→</span>
-    </div>
-    <div class="timeline-side">
-      {}
-      <div class="timeline-role-row">{}</div>
-    </div>
-  </div>
-</article>"#,
+        r#"<div class="trace-line" style="--trace-depth:{}">
+  <span class="trace-order">{}</span>
+  <span class="trace-depth-lines"></span>
+  <span class="trace-call-pill">{} → {}</span>
+  <span class="trace-method">{}</span>
+  <span class="trace-endpoint">{}{}</span>
+  <span class="trace-arrow-inline">→</span>
+  <span class="trace-endpoint">{}{}</span>
+  {}
+  {}
+  <span class="trace-ref">trace {}</span>
+</div>"#,
+        depth,
         order,
-        escape_html(title),
-        escape_html(call_type),
+        depth,
+        escape_html(&call_label.to_ascii_uppercase()),
         escape_html(selector),
-        escape_html(trace_label),
-        value_line,
-        indent_px,
-        render_known_address(from_raw, 10, book),
+        render_compact_known_address(from_raw, book),
         from_roles,
-        escape_html(if attachments.is_empty() {
-            "No token transfer"
-        } else {
-            "Attached transfers"
-        }),
-        escape_html(&format!("{} · value raw {}", call_type, value_raw)),
-        attachments,
-        render_known_address(to_raw, 10, book),
+        render_compact_known_address(to_raw, book),
         to_roles,
+        value_line,
+        attachments,
+        escape_html(trace_label),
+    )
+}
+
+fn render_compact_known_address(address: &str, book: &AddressDisplayBook) -> String {
+    if address.is_empty() || address.eq_ignore_ascii_case("n/a") {
+        return "<code>n/a</code>".to_owned();
+    }
+    let label = book
+        .best_label(address)
+        .map(|label| format!(r#"<small>{}</small>"#, escape_html(&label)))
+        .unwrap_or_default();
+    format!(
+        r#"<span class="trace-address-chip">{}{}</span>"#,
+        render_copyable_code(address, 8),
+        label,
     )
 }
 
@@ -7028,6 +7066,25 @@ textarea { min-height: 140px; resize: vertical; }
 .timeline-mid strong { font-size: 1rem; line-height: 1.2; color: var(--ink); }
 .timeline-mid span { color: var(--muted); line-height: 1.35; }
 .timeline-arrow-inline { font-size: 1rem; color: var(--accent); }
+.trace-timeline-panel { gap: 10px; }
+.trace-timeline-list { display: grid; border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; background: #fff; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: .82rem; }
+.trace-line { display: grid; grid-template-columns: 34px calc(var(--trace-depth, 0) * 18px) max-content minmax(84px, max-content) minmax(180px, 1fr) 18px minmax(180px, 1fr) max-content minmax(0, 1.1fr) max-content; gap: 6px; align-items: center; min-width: 980px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+.trace-line:last-child { border-bottom: 0; }
+.trace-order { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.trace-depth-lines { height: 100%; min-height: 24px; border-left: 1px solid #cbd5e1; border-right: 1px solid transparent; opacity: .8; }
+.trace-call-pill { display: inline-flex; align-items: center; width: fit-content; border: 1px solid rgba(37,99,235,.36); background: #eff6ff; color: #1d4ed8; border-radius: 6px; padding: 3px 6px; font-weight: 800; white-space: nowrap; }
+.trace-method { display: inline-flex; align-items: center; width: fit-content; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px solid var(--line); border-radius: 6px; background: #f8fafc; padding: 3px 7px; color: #c2410c; font-weight: 800; }
+.trace-endpoint { display: inline-flex; align-items: center; gap: 4px; min-width: 0; white-space: nowrap; }
+.trace-address-chip { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+.trace-address-chip small { color: #1d5ea8; border: 1px solid rgba(29,94,168,.2); background: #eef5ff; border-radius: 999px; padding: 1px 5px; font-family: Inter, "Segoe UI", sans-serif; font-size: .68rem; }
+.trace-arrow-inline { color: #2563eb; font-weight: 900; text-align: center; }
+.trace-value-chip { display: inline-flex; width: fit-content; border: 1px solid rgba(13,110,99,.22); color: #047857; background: rgba(13,110,99,.06); border-radius: 999px; padding: 2px 6px; white-space: nowrap; }
+.trace-transfer-group { display: flex; gap: 5px; flex-wrap: wrap; min-width: 0; }
+.trace-transfer-group span { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; border: 1px solid rgba(13,110,99,.18); background: rgba(13,110,99,.05); color: #0f766e; border-radius: 6px; padding: 2px 5px; white-space: nowrap; }
+.trace-ref { color: var(--muted); white-space: nowrap; }
+.trace-more { border: 1px solid var(--line); border-radius: 8px; background: #fff; overflow: hidden; }
+.trace-more summary { cursor: pointer; padding: 8px 10px; color: var(--accent); font-weight: 800; }
+.trace-more .trace-timeline-list { border: 0; border-top: 1px solid var(--line); border-radius: 0; }
 .storyline-evidence-shell { border: 1px solid var(--line); border-radius: 8px; background: #fff; overflow: hidden; }
 .storyline-evidence-shell summary { cursor: pointer; padding: 10px 12px; font-weight: 700; }
 .storyline-evidence-shell[open] { padding-bottom: 14px; }
