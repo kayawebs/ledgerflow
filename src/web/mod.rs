@@ -3804,7 +3804,7 @@ fn render_tx_report_hero(
         .and_then(|value| value.get("kind"))
         .and_then(|value| value.as_str())
         .unwrap_or(primary_activity);
-    let verdict = build_tx_report_verdict(storyline);
+    let verdict = build_tx_report_verdict(storyline, analysis);
 
     format!(
         r#"<details class="tx-section-card tx-report-hero tx-report-{}" open>
@@ -3842,7 +3842,10 @@ fn render_tx_report_hero(
     )
 }
 
-fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVerdict {
+fn build_tx_report_verdict(
+    storyline: Option<&serde_json::Value>,
+    analysis: &TransactionAnalysis,
+) -> TxReportVerdict {
     let Some(net_effect) = storyline
         .and_then(|value| value.get("net_effect"))
         .filter(|value| !value.is_null())
@@ -3855,6 +3858,10 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
             result_caption: "missing net effect".to_owned(),
         };
     };
+
+    if let Some(verdict) = build_subject_value_verdict(net_effect, analysis) {
+        return verdict;
+    }
 
     let mut eth_equivalent_raw = 0i128;
     let mut positive_assets = 0usize;
@@ -3961,6 +3968,100 @@ fn build_tx_report_verdict(storyline: Option<&serde_json::Value>) -> TxReportVer
     }
 }
 
+fn build_subject_value_verdict(
+    net_effect: &serde_json::Value,
+    analysis: &TransactionAnalysis,
+) -> Option<TxReportVerdict> {
+    let mut total_usd = 0.0f64;
+    let mut priced_rows = 0usize;
+    let mut missing_prices = Vec::new();
+
+    if let Some(rows) = net_effect.get("rows").and_then(|value| value.as_array()) {
+        for row in rows {
+            let net_raw = row
+                .get("net_raw")
+                .and_then(|value| value.as_str())
+                .unwrap_or("0");
+            if raw_is_zero(net_raw) {
+                continue;
+            }
+            let token = row.get("token").unwrap_or(&serde_json::Value::Null);
+            if let Some(value) = usd_value_for_token_amount(net_raw, token, analysis) {
+                total_usd += value;
+                priced_rows += 1;
+            } else {
+                missing_prices.push(
+                    token
+                        .get("symbol")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("asset")
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
+    if let Some(gas) = net_effect.get("gas").filter(|value| !value.is_null()) {
+        let amount_raw = gas
+            .get("amount_raw")
+            .and_then(|value| value.as_str())
+            .unwrap_or("0");
+        if !raw_is_zero(amount_raw) {
+            let token = gas.get("token").unwrap_or(&serde_json::Value::Null);
+            if let Some(value) = usd_value_for_token_amount(amount_raw, token, analysis) {
+                total_usd -= value;
+                priced_rows += 1;
+            } else {
+                missing_prices.push("gas".to_owned());
+            }
+        }
+    }
+
+    if priced_rows == 0 {
+        return None;
+    }
+
+    let complete = missing_prices.is_empty();
+    let tone = if total_usd > 0.000001 {
+        "profit"
+    } else if total_usd < -0.000001 {
+        "loss"
+    } else if complete {
+        "unknown"
+    } else {
+        "mixed"
+    };
+    let label = if !complete {
+        "Partial subject value change".to_owned()
+    } else if total_usd > 0.000001 {
+        "Subject gained value".to_owned()
+    } else if total_usd < -0.000001 {
+        "Subject lost value".to_owned()
+    } else {
+        "Subject roughly break-even".to_owned()
+    };
+    let result_caption = if complete {
+        "includes gas when priced".to_owned()
+    } else {
+        format!(
+            "missing prices: {}",
+            missing_prices
+                .into_iter()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    Some(TxReportVerdict {
+        tone,
+        label,
+        metric_label: "Subject net value".to_owned(),
+        result: format_signed_usd(total_usd),
+        result_caption,
+    })
+}
+
 fn describe_net_effect_row(row: &serde_json::Value) -> String {
     row.get("net_display")
         .and_then(|value| value.as_str())
@@ -3977,6 +4078,12 @@ fn describe_net_effect_row(row: &serde_json::Value) -> String {
                 .unwrap_or("0");
             format!("{raw} raw {symbol}")
         })
+}
+
+fn raw_is_zero(raw: &str) -> bool {
+    raw.parse::<f64>()
+        .map(|value| value == 0.0)
+        .unwrap_or(false)
 }
 
 fn token_is_eth_equivalent(token: Option<&serde_json::Value>) -> bool {
@@ -5093,6 +5200,14 @@ fn estimated_usd_for_token_amount(
     token: &serde_json::Value,
     analysis: &TransactionAnalysis,
 ) -> Option<String> {
+    usd_value_for_token_amount(raw, token, analysis).map(format_estimated_usd)
+}
+
+fn usd_value_for_token_amount(
+    raw: &str,
+    token: &serde_json::Value,
+    analysis: &TransactionAnalysis,
+) -> Option<f64> {
     let price = price_for_token_usd(token, analysis)?;
     let decimals = token
         .get("decimals")
@@ -5102,7 +5217,7 @@ fn estimated_usd_for_token_amount(
     let amount = raw / 10f64.powi(decimals.min(38) as i32);
     let value = amount * price;
     if value.is_finite() {
-        Some(format_estimated_usd(value))
+        Some(value)
     } else {
         None
     }
@@ -5193,6 +5308,27 @@ fn format_estimated_usd(value: f64) -> String {
         "0".to_owned()
     };
     format!("est. {sign}${amount}")
+}
+
+fn format_signed_usd(value: f64) -> String {
+    let sign = if value > 0.0 {
+        "+"
+    } else if value < 0.0 {
+        "-"
+    } else {
+        ""
+    };
+    let abs = value.abs();
+    let amount = if abs >= 1_000.0 {
+        format!("{abs:.2}")
+    } else if abs >= 1.0 {
+        format!("{abs:.4}")
+    } else if abs > 0.0 {
+        format!("{abs:.6}")
+    } else {
+        "0".to_owned()
+    };
+    format!("{sign}${amount}")
 }
 
 fn render_storyline_steps(
