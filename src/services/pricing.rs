@@ -823,7 +823,9 @@ pub fn derive_tx_execution_observations(
             .iter()
             .filter(|item| item.stable.is_none() && item.amount_decimal > 0.0)
         {
-            let Some(confidence) = pair_confidence(stable, token) else {
+            let Some(confidence) =
+                pair_confidence(stable, token).or_else(|| weth_stable_bootstrap_confidence(token))
+            else {
                 continue;
             };
             if stable.amount_decimal <= 0.0 {
@@ -831,6 +833,9 @@ pub fn derive_tx_execution_observations(
             }
             let price = stable.amount_decimal / token.amount_decimal;
             if !price.is_finite() || price <= 0.0 {
+                continue;
+            }
+            if is_weth_token(&token.token_address) && !(500.0..=10_000.0).contains(&price) {
                 continue;
             }
             observations
@@ -911,6 +916,18 @@ fn flow_amount(flow: &AssetFlow) -> Option<FlowAmount> {
         symbol: token_symbol(flow),
         decimals: Some(decimals),
     })
+}
+
+fn weth_stable_bootstrap_confidence(token: &FlowAmount) -> Option<f32> {
+    if is_weth_token(&token.token_address) {
+        Some(0.42)
+    } else {
+        None
+    }
+}
+
+fn is_weth_token(token_address: &str) -> bool {
+    token_address.eq_ignore_ascii_case("0x4200000000000000000000000000000000000006")
 }
 
 fn token_decimals(flow: &AssetFlow) -> u8 {
@@ -1061,6 +1078,38 @@ mod tests {
                 .iter()
                 .any(|observation| observation.quote_symbol == "WETH")
         );
+    }
+
+    #[test]
+    fn bootstraps_weth_usd_from_same_tx_stable_flow() {
+        let analysis = test_analysis(vec![
+            flow(
+                "stable",
+                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "0xvault",
+                "0xrouter",
+                "3500000000",
+                6,
+                "USDC",
+            ),
+            flow(
+                "weth",
+                "0x4200000000000000000000000000000000000006",
+                "0xpool",
+                "0xexecutor",
+                "1000000000000000000",
+                18,
+                "WETH",
+            ),
+        ]);
+
+        let observations = derive_tx_execution_observations(&analysis);
+        let weth_price = observations
+            .iter()
+            .find(|item| item.token_address == "0x4200000000000000000000000000000000000006")
+            .expect("weth price should be bootstrapped");
+        assert_eq!(weth_price.price_decimal, "3500");
+        assert_eq!(weth_price.confidence, 0.42);
     }
 
     fn test_analysis(flows: Vec<AssetFlow>) -> TransactionAnalysis {

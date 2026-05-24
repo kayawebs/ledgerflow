@@ -3551,8 +3551,7 @@ fn render_tx_report_meta_strip(
     let nonce = facts
         .get("nonce")
         .and_then(|value| value.as_u64())
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "n/a".to_owned());
+        .map(|value| value.to_string());
     let value_raw = facts
         .get("tx_value_raw")
         .and_then(|value| value.as_str())
@@ -3560,17 +3559,102 @@ fn render_tx_report_meta_strip(
     let gas_used = facts
         .get("gas_used_raw")
         .and_then(|value| value.as_str())
-        .unwrap_or("n/a");
+        .filter(|value| !value.is_empty() && *value != "0");
     let gas_price = facts
         .get("effective_gas_price_raw")
         .and_then(|value| value.as_str())
-        .map(format_gwei_from_wei)
-        .unwrap_or_else(|| "n/a".to_owned());
+        .filter(|value| !value.is_empty() && *value != "0")
+        .map(format_gwei_from_wei);
     let tx_fee = facts
         .get("gas_cost_raw")
         .and_then(|value| value.as_str())
-        .map(format_wei_eth_raw)
-        .unwrap_or_else(|| "n/a".to_owned());
+        .filter(|value| !value.is_empty() && *value != "0")
+        .map(format_wei_eth_raw);
+    let mut basic_fields = vec![
+        render_basic_info_item(
+            "Status",
+            &format!(
+                r#"<strong class="status-chip status-{}">{}</strong>"#,
+                if analysis.status == crate::domain::enums::TransactionStatus::Success {
+                    "success"
+                } else {
+                    "failure"
+                },
+                escape_html(&enum_label(&analysis.status))
+            ),
+        ),
+        render_basic_info_item("Network", &format!("<strong>{}</strong>", escape_html(network))),
+        render_basic_info_item("Block", &format!("<strong>{}</strong>", escape_html(&block))),
+        render_basic_info_item(
+            "Timestamp",
+            &format!("<strong>{}</strong>", escape_html(&timestamp)),
+        ),
+        render_basic_info_item(
+            "Value",
+            &format!(
+                "<strong>{}</strong>",
+                escape_html(&format_wei_compact_decimal(value_raw))
+            ),
+        ),
+        render_basic_info_item(
+            "Sender",
+            &format!("<strong>{}</strong>", render_copyable_code(&analysis.from_address, 12)),
+        ),
+        render_basic_info_item(
+            "Receiver",
+            &format!(
+                "<strong>{}</strong>",
+                analysis
+                    .to_address
+                    .as_deref()
+                    .map(|value| render_copyable_code(value, 12))
+                    .unwrap_or_else(|| "contract creation".to_owned())
+            ),
+        ),
+    ];
+    if let Some(nonce) = nonce {
+        basic_fields.insert(
+            4,
+            render_basic_info_item("Nonce", &format!("<strong>{}</strong>", escape_html(&nonce))),
+        );
+    }
+    let mut other_fields = Vec::new();
+    if let Some(gas_used) = gas_used {
+        other_fields.push(render_basic_info_item(
+            "Gas Used",
+            &format!("<strong>{}</strong>", escape_html(gas_used)),
+        ));
+    }
+    if let Some(gas_price) = gas_price.as_deref() {
+        other_fields.push(render_basic_info_item(
+            "Gas Price",
+            &format!("<strong>{}</strong>", escape_html(gas_price)),
+        ));
+    }
+    if let Some(tx_fee) = tx_fee.as_deref() {
+        other_fields.push(render_basic_info_item(
+            "Transaction Fee",
+            &format!("<strong>{}</strong>", escape_html(tx_fee)),
+        ));
+    }
+    other_fields.push(render_basic_info_item(
+        "Event Count",
+        &format!(
+            "<strong>{}</strong>",
+            analysis.normalized_execution_facts.event_count
+        ),
+    ));
+    other_fields.push(render_basic_info_item(
+        "Internal Call Count",
+        &format!(
+            "<strong>{}</strong>",
+            analysis.normalized_execution_facts.internal_call_count
+        ),
+    ));
+    other_fields.push(render_basic_info_item(
+        "Input Data",
+        &format!("<strong>{}</strong>", render_copyable_code(&analysis.input_data, 14)),
+    ));
     let share_top_action = if let Some(url) = share_url {
         format!(
             r#"<div class="tx-report-share-action">{}</div>"#,
@@ -3604,26 +3688,12 @@ fn render_tx_report_meta_strip(
   <div class="basic-info-card">
     <h2>Basic Information</h2>
     <div class="basic-info-grid">
-      <div><span>Status</span><strong class="status-chip status-{}">{}</strong></div>
-      <div><span>Network</span><strong>{}</strong></div>
-      <div><span>Block</span><strong>{}</strong></div>
-      <div><span>Position in Block</span><strong>n/a</strong></div>
-      <div><span>Timestamp</span><strong>{}</strong></div>
-      <div><span>Nonce</span><strong>{}</strong></div>
-      <div><span>Value</span><strong>{}</strong></div>
-      <div class="wide"><span>Sender</span><strong>{}</strong></div>
-      <div class="wide"><span>Receiver</span><strong>{}</strong></div>
+      {}
     </div>
     <details class="basic-info-more">
       <summary>Other Information</summary>
       <div class="basic-info-grid">
-        <div><span>Gas Used</span><strong>{}</strong></div>
-        <div><span>Gas Price</span><strong>{}</strong></div>
-        <div><span>Transaction Fee</span><strong>{}</strong></div>
-        <div><span>Txn Type</span><strong>EIP-1559 / legacy</strong></div>
-        <div><span>Event Count</span><strong>{}</strong></div>
-        <div><span>Internal Call Count</span><strong>{}</strong></div>
-        <div class="wide"><span>Input Data</span><strong>{}</strong></div>
+        {}
       </div>
     </details>
   </div>
@@ -3636,25 +3706,16 @@ fn render_tx_report_meta_strip(
         },
         share_top_action,
         render_copyable_code(&analysis.tx_hash, 16),
-        if analysis.status == crate::domain::enums::TransactionStatus::Success { "success" } else { "failure" },
-        escape_html(&enum_label(&analysis.status)),
-        escape_html(network),
-        escape_html(&block),
-        escape_html(&timestamp),
-        escape_html(&nonce),
-        escape_html(&format_wei_compact_decimal(value_raw)),
-        render_copyable_code(&analysis.from_address, 12),
-        analysis
-            .to_address
-            .as_deref()
-            .map(|value| render_copyable_code(value, 12))
-            .unwrap_or_else(|| "contract creation".to_owned()),
-        escape_html(gas_used),
-        escape_html(&gas_price),
-        escape_html(&tx_fee),
-        analysis.normalized_execution_facts.event_count,
-        analysis.normalized_execution_facts.internal_call_count,
-        render_copyable_code(&analysis.input_data, 14),
+        basic_fields.join(""),
+        other_fields.join(""),
+    )
+}
+
+fn render_basic_info_item(label: &str, value_html: &str) -> String {
+    format!(
+        r#"<div><span>{}</span>{}</div>"#,
+        escape_html(label),
+        value_html,
     )
 }
 
