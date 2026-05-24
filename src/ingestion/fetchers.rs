@@ -227,6 +227,7 @@ impl TransactionBundleFetcher {
                 .unwrap_or("0x")
                 .to_owned(),
             nonce: hex_to_u64(tx_payload.get("nonce").and_then(Value::as_str)),
+            tx_index: hex_to_u64(tx_payload.get("transactionIndex").and_then(Value::as_str)),
         };
         let block_timestamp = if block_timestamp_override.is_some() {
             block_timestamp_override

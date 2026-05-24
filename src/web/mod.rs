@@ -3552,6 +3552,10 @@ fn render_tx_report_meta_strip(
         .get("nonce")
         .and_then(|value| value.as_u64())
         .map(|value| value.to_string());
+    let tx_index = facts
+        .get("tx_index")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.to_string());
     let value_raw = facts
         .get("tx_value_raw")
         .and_then(|value| value.as_str())
@@ -3616,6 +3620,15 @@ fn render_tx_report_meta_strip(
         basic_fields.insert(
             4,
             render_basic_info_item("Nonce", &format!("<strong>{}</strong>", escape_html(&nonce))),
+        );
+    }
+    if let Some(tx_index) = tx_index {
+        basic_fields.insert(
+            4,
+            render_basic_info_item(
+                "Position in Block",
+                &format!("<strong>{}</strong>", escape_html(&tx_index)),
+            ),
         );
     }
     let mut other_fields = Vec::new();

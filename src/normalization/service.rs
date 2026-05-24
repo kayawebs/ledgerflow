@@ -280,6 +280,7 @@ impl EvidenceNormalizer {
                     "token_address": token_address,
                 })).collect::<Vec<_>>(),
                 "nonce": bundle.tx.nonce,
+                "tx_index": bundle.tx.tx_index,
                 "tx_value_raw": hex_to_u128(Some(&bundle.tx.value)).to_string(),
                 "gas_used_raw": hex_to_u128(bundle.receipt.gas_used.as_deref()).to_string(),
                 "effective_gas_price_raw": hex_to_u128(bundle.receipt.effective_gas_price.as_deref()).to_string(),

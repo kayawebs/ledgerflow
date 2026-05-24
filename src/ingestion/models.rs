@@ -21,6 +21,7 @@ pub struct RawTransaction {
     pub value: String,
     pub input_data: String,
     pub nonce: Option<u64>,
+    pub tx_index: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
