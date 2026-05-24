@@ -11,11 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     core::errors::{LedgerError, LedgerResult},
-    domain::{
-        entities::TransactionAnalysis,
-        enums::AssetType,
-        value_objects::AssetFlow,
-    },
+    domain::{entities::TransactionAnalysis, enums::AssetType, value_objects::AssetFlow},
     ingestion::rpc::RpcClient,
 };
 
@@ -260,8 +256,11 @@ impl PriceService {
               and token_address = $2
               and quote_symbol = $3
               and block_bucket between $4 - 2 and $4 + 2
-              and (expires_at is null or expires_at > now())
-              and updated_at > now() - interval '10 minutes'
+              and (
+                metadata->>'historical_state' = 'true'
+                or source = $5
+                or source = $6
+              )
             order by confidence desc, abs(block_bucket - $4) asc, updated_at desc
             limit 1
             "#,
@@ -270,6 +269,8 @@ impl PriceService {
         .bind(&token_address)
         .bind(DEFAULT_QUOTE_SYMBOL)
         .bind(block_bucket as i64)
+        .bind(SOURCE_TX_EXECUTION)
+        .bind(SOURCE_STABLE_ANCHOR)
         .fetch_optional(&self.pool)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
@@ -368,7 +369,8 @@ impl PriceService {
         let token_address = request.token_address.clone();
         match self.resolve_price_request(&request).await {
             Ok(Some(method)) => {
-                self.complete_request(request_id, json!({ "method": method })).await?;
+                self.complete_request(request_id, json!({ "method": method }))
+                    .await?;
                 Ok(PriceWorkerResult {
                     processed: true,
                     completed: true,
@@ -378,7 +380,8 @@ impl PriceService {
                 })
             }
             Ok(None) => {
-                self.release_request(request_id, "price source not available yet").await?;
+                self.release_request(request_id, "price source not available yet")
+                    .await?;
                 Ok(PriceWorkerResult {
                     processed: true,
                     completed: false,
@@ -413,6 +416,8 @@ impl PriceService {
                 metadata: json!({
                     "method": "known_stable_anchor",
                     "request_id": request.request_id,
+                    "state_block": request.target_block,
+                    "historical_state": request.target_block.is_some(),
                     "target_timestamp": request.target_timestamp,
                 }),
             };
@@ -440,14 +445,29 @@ impl PriceService {
         };
         let candidates = self.load_pool_candidates(request).await?;
         for candidate in candidates {
-            let Some(relative_price) = self.fetch_pool_relative_price(rpc_client.as_ref(), &candidate).await? else {
+            let Some(relative_price) = self
+                .fetch_pool_relative_price(rpc_client.as_ref(), &candidate, request.target_block)
+                .await?
+            else {
                 continue;
             };
             let (quote_usd_price, quote_confidence, quote_source) =
                 match stable_token(&candidate.quote_token) {
-                    Some(stable) => (1.0, 0.99, format!("{SOURCE_STABLE_ANCHOR}:{}", stable.symbol)),
+                    Some(stable) => (
+                        1.0,
+                        0.99,
+                        format!("{SOURCE_STABLE_ANCHOR}:{}", stable.symbol),
+                    ),
                     None => {
-                        let Some(cache) = self.latest_usd_cache(request.chain_id, &candidate.quote_token).await? else {
+                        let Some(cache) = self
+                            .usd_cache_for_request(
+                                request.chain_id,
+                                &candidate.quote_token,
+                                request.block_bucket,
+                                request.target_block.is_some(),
+                            )
+                            .await?
+                        else {
                             continue;
                         };
                         cache
@@ -478,6 +498,8 @@ impl PriceService {
                     "quote_token": candidate.quote_token,
                     "relative_price": format_decimal(relative_price),
                     "quote_usd_source": quote_source,
+                    "state_block": request.target_block,
+                    "historical_state": request.target_block.is_some(),
                     "request_id": request.request_id,
                     "target_timestamp": request.target_timestamp,
                 }),
@@ -568,8 +590,24 @@ impl PriceService {
                     .map_err(|err| LedgerError::Persistence(err.to_string()))?,
                 token0,
                 token1,
-                token0_decimals: self.token_decimals(request.chain_id, metadata.get("token0").and_then(Value::as_str).unwrap_or_default()).await?,
-                token1_decimals: self.token_decimals(request.chain_id, metadata.get("token1").and_then(Value::as_str).unwrap_or_default()).await?,
+                token0_decimals: self
+                    .token_decimals(
+                        request.chain_id,
+                        metadata
+                            .get("token0")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+                    .await?,
+                token1_decimals: self
+                    .token_decimals(
+                        request.chain_id,
+                        metadata
+                            .get("token1")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+                    .await?,
                 slot0_supported: metadata
                     .get("slot0_supported")
                     .and_then(Value::as_bool)
@@ -590,6 +628,7 @@ impl PriceService {
         &self,
         rpc_client: &dyn RpcClient,
         candidate: &PoolPriceCandidate,
+        block_number: Option<u64>,
     ) -> LedgerResult<Option<f64>> {
         if candidate.slot0_supported {
             if let Ok(raw) = rpc_client
@@ -597,14 +636,18 @@ impl PriceService {
                     candidate.chain_id,
                     &candidate.pool_address,
                     SLOT0_SELECTOR,
-                    None,
+                    block_number,
                 )
                 .await
             {
-                if let Some(price_token1_per_token0) =
-                    parse_slot0_price_token1_per_token0(&raw, candidate.token0_decimals, candidate.token1_decimals)
-                {
-                    return Ok(candidate.relative_price_from_token1_per_token0(price_token1_per_token0));
+                if let Some(price_token1_per_token0) = parse_slot0_price_token1_per_token0(
+                    &raw,
+                    candidate.token0_decimals,
+                    candidate.token1_decimals,
+                ) {
+                    return Ok(
+                        candidate.relative_price_from_token1_per_token0(price_token1_per_token0)
+                    );
                 }
             }
         }
@@ -614,44 +657,69 @@ impl PriceService {
                     candidate.chain_id,
                     &candidate.pool_address,
                     GET_RESERVES_SELECTOR,
-                    None,
+                    block_number,
                 )
                 .await
             {
-                if let Some(price_token1_per_token0) =
-                    parse_reserves_price_token1_per_token0(&raw, candidate.token0_decimals, candidate.token1_decimals)
-                {
-                    return Ok(candidate.relative_price_from_token1_per_token0(price_token1_per_token0));
+                if let Some(price_token1_per_token0) = parse_reserves_price_token1_per_token0(
+                    &raw,
+                    candidate.token0_decimals,
+                    candidate.token1_decimals,
+                ) {
+                    return Ok(
+                        candidate.relative_price_from_token1_per_token0(price_token1_per_token0)
+                    );
                 }
             }
         }
         Ok(None)
     }
 
-    async fn latest_usd_cache(
+    async fn usd_cache_for_request(
         &self,
         chain_id: u64,
         token_address: &str,
+        block_bucket: Option<u64>,
+        historical: bool,
     ) -> LedgerResult<Option<(f64, f32, String)>> {
-        let row = sqlx::query(
+        let (bucket_filter, freshness_filter) = if historical {
+            (
+                "and block_bucket between $4 - 2 and $4 + 2",
+                "and (metadata->>'historical_state' = 'true' or source = 'tx_execution' or source = 'stable_anchor')",
+            )
+        } else {
+            (
+                "",
+                "and (expires_at is null or expires_at > now()) and updated_at > now() - interval '10 minutes'",
+            )
+        };
+        let sql = format!(
             r#"
             select price_decimal::text as price_decimal, confidence, source
             from token_price_cache
             where chain_id = $1
               and token_address = $2
               and quote_symbol = $3
-              and (expires_at is null or expires_at > now())
-              and updated_at > now() - interval '10 minutes'
+              {bucket_filter}
+              {freshness_filter}
             order by confidence desc, updated_at desc
             limit 1
-            "#,
-        )
-        .bind(chain_id as i64)
-        .bind(token_address.to_ascii_lowercase())
-        .bind(DEFAULT_QUOTE_SYMBOL)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            "#
+        );
+        let mut query = sqlx::query(&sql)
+            .bind(chain_id as i64)
+            .bind(token_address.to_ascii_lowercase())
+            .bind(DEFAULT_QUOTE_SYMBOL);
+        if historical {
+            let Some(block_bucket) = block_bucket else {
+                return Ok(None);
+            };
+            query = query.bind(block_bucket as i64);
+        }
+        let row = query
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         row.map(|row| {
             let price = row
                 .try_get::<String, _>("price_decimal")
@@ -755,7 +823,12 @@ impl PriceService {
         let Some(block_bucket) = request.block_bucket else {
             return Ok(false);
         };
-        let row = sqlx::query(
+        let freshness_filter = if request.target_block.is_some() {
+            "and (metadata->>'historical_state' = 'true' or source = 'tx_execution' or source = 'stable_anchor')"
+        } else {
+            "and (expires_at is null or expires_at > now()) and updated_at > now() - interval '10 minutes'"
+        };
+        let sql = format!(
             r#"
             select 1
             from token_price_cache
@@ -763,18 +836,18 @@ impl PriceService {
               and token_address = $2
               and quote_symbol = $3
               and block_bucket between $4 - 2 and $4 + 2
-              and (expires_at is null or expires_at > now())
-              and updated_at > now() - interval '10 minutes'
+              {freshness_filter}
             limit 1
-            "#,
-        )
-        .bind(request.chain_id as i64)
-        .bind(&request.token_address)
-        .bind(DEFAULT_QUOTE_SYMBOL)
-        .bind(block_bucket as i64)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            "#
+        );
+        let row = sqlx::query(&sql)
+            .bind(request.chain_id as i64)
+            .bind(&request.token_address)
+            .bind(DEFAULT_QUOTE_SYMBOL)
+            .bind(block_bucket as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         Ok(row.is_some())
     }
 
@@ -782,7 +855,12 @@ impl PriceService {
         let Some(block_bucket) = request.block_bucket else {
             return Ok(false);
         };
-        let row = sqlx::query(
+        let quote_cache_filter = if request.target_block.is_some() {
+            "and (usd.metadata->>'historical_state' = 'true' or usd.source = 'tx_execution' or usd.source = 'stable_anchor')"
+        } else {
+            "and (usd.expires_at is null or usd.expires_at > now()) and usd.updated_at > now() - interval '10 minutes'"
+        };
+        let sql = format!(
             r#"
             select
               rel.quote_token,
@@ -802,8 +880,7 @@ impl PriceService {
              and usd.token_address = rel.quote_token
              and usd.quote_symbol = $3
              and usd.block_bucket between $4 - 2 and $4 + 2
-             and (usd.expires_at is null or usd.expires_at > now())
-             and usd.updated_at > now() - interval '10 minutes'
+             {quote_cache_filter}
             where rel.chain_id = $1
               and rel.token_address = $2
               and rel.quote_symbol <> $3
@@ -813,15 +890,16 @@ impl PriceService {
               abs(rel.block_bucket - $4) asc,
               rel.created_at desc
             limit 1
-            "#,
-        )
-        .bind(request.chain_id as i64)
-        .bind(&request.token_address)
-        .bind(DEFAULT_QUOTE_SYMBOL)
-        .bind(block_bucket as i64)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            "#
+        );
+        let row = sqlx::query(&sql)
+            .bind(request.chain_id as i64)
+            .bind(&request.token_address)
+            .bind(DEFAULT_QUOTE_SYMBOL)
+            .bind(block_bucket as i64)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         let Some(row) = row else {
             return Ok(false);
         };
@@ -866,6 +944,8 @@ impl PriceService {
                 "quote_usd_source": row.try_get::<String, _>("quote_usd_source").unwrap_or_default(),
                 "relative_block_number": row.try_get::<Option<i64>, _>("relative_block_number").ok().flatten(),
                 "quote_usd_observed_block": row.try_get::<Option<i64>, _>("quote_usd_observed_block").ok().flatten(),
+                "state_block": request.target_block,
+                "historical_state": request.target_block.is_some(),
                 "relative_metadata": row.try_get::<Json<Value>, _>("relative_metadata").ok().map(|json| json.0),
             }),
         };
@@ -973,47 +1053,64 @@ impl PriceService {
         let Some(block_bucket) = observation.block_bucket else {
             return Ok(());
         };
+        let historical = observation.block_number.is_some();
         sqlx::query(
             r#"
             insert into token_price_cache (
               chain_id, token_address, quote_symbol, block_bucket, price_decimal,
               confidence, source, observed_block, observed_at, expires_at, metadata
             )
-            values ($1,$2,$3,$4,$5::numeric,$6,$7,$8,$9,now() + interval '10 minutes',$10)
+            values (
+              $1,$2,$3,$4,$5::numeric,$6,$7,$8,$9,
+              case when $11 then null else now() + interval '10 minutes' end,
+              $10
+            )
             on conflict (chain_id, token_address, quote_symbol, block_bucket) do update set
               price_decimal = case
+                when $11 and coalesce(token_price_cache.metadata->>'historical_state', 'false') <> 'true'
+                then excluded.price_decimal
                 when excluded.confidence >= token_price_cache.confidence
-                  or token_price_cache.updated_at <= now() - interval '10 minutes'
+                  or (not $11 and token_price_cache.updated_at <= now() - interval '10 minutes')
                 then excluded.price_decimal
                 else token_price_cache.price_decimal
               end,
               confidence = case
-                when token_price_cache.updated_at <= now() - interval '10 minutes'
+                when $11 and coalesce(token_price_cache.metadata->>'historical_state', 'false') <> 'true'
+                then excluded.confidence
+                when not $11 and token_price_cache.updated_at <= now() - interval '10 minutes'
                 then excluded.confidence
                 else greatest(token_price_cache.confidence, excluded.confidence)
               end,
               source = case
+                when $11 and coalesce(token_price_cache.metadata->>'historical_state', 'false') <> 'true'
+                then excluded.source
                 when excluded.confidence >= token_price_cache.confidence
-                  or token_price_cache.updated_at <= now() - interval '10 minutes'
+                  or (not $11 and token_price_cache.updated_at <= now() - interval '10 minutes')
                 then excluded.source
                 else token_price_cache.source
               end,
               observed_block = case
+                when $11 and coalesce(token_price_cache.metadata->>'historical_state', 'false') <> 'true'
+                then excluded.observed_block
                 when excluded.confidence >= token_price_cache.confidence
-                  or token_price_cache.updated_at <= now() - interval '10 minutes'
+                  or (not $11 and token_price_cache.updated_at <= now() - interval '10 minutes')
                 then excluded.observed_block
                 else token_price_cache.observed_block
               end,
               observed_at = case
+                when $11 and coalesce(token_price_cache.metadata->>'historical_state', 'false') <> 'true'
+                then excluded.observed_at
                 when excluded.confidence >= token_price_cache.confidence
-                  or token_price_cache.updated_at <= now() - interval '10 minutes'
+                  or (not $11 and token_price_cache.updated_at <= now() - interval '10 minutes')
                 then excluded.observed_at
                 else token_price_cache.observed_at
               end,
               expires_at = excluded.expires_at,
               metadata = case
+                when $11 and coalesce(token_price_cache.metadata->>'historical_state', 'false') <> 'true'
+                then excluded.metadata
                 when excluded.confidence >= token_price_cache.confidence
-                  or token_price_cache.updated_at <= now() - interval '10 minutes'
+                  or (not $11 and token_price_cache.updated_at <= now() - interval '10 minutes')
                 then excluded.metadata
                 else token_price_cache.metadata
               end,
@@ -1030,6 +1127,7 @@ impl PriceService {
         .bind(observation.block_number.map(|value| value as i64))
         .bind(observed_at)
         .bind(Json(observation.metadata.clone()))
+        .bind(historical)
         .execute(&self.pool)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
@@ -1073,9 +1171,7 @@ impl PriceService {
     }
 }
 
-pub fn derive_tx_execution_observations(
-    analysis: &TransactionAnalysis,
-) -> Vec<PriceObservation> {
+pub fn derive_tx_execution_observations(analysis: &TransactionAnalysis) -> Vec<PriceObservation> {
     let flows = analysis
         .derived_flows
         .iter()
@@ -1101,7 +1197,11 @@ pub fn derive_tx_execution_observations(
                 .clone()
                 .unwrap_or_else(|| truncate_middle(&quote.token_address, 6));
             observations
-                .entry(observation_key(&token.token_address, &quote.token_address, &quote_symbol))
+                .entry(observation_key(
+                    &token.token_address,
+                    &quote.token_address,
+                    &quote_symbol,
+                ))
                 .or_insert_with(|| PriceObservation {
                     chain_id: analysis.chain_id,
                     token_address: token.token_address.clone(),
@@ -1460,9 +1560,7 @@ mod tests {
     fn derives_v2_pool_price_from_reserves() {
         let raw = format!(
             "0x{:064x}{:064x}{:064x}",
-            1_000_000_000_000_000_000u128,
-            3_500_000_000u128,
-            0u128
+            1_000_000_000_000_000_000u128, 3_500_000_000u128, 0u128
         );
         let price = parse_reserves_price_token1_per_token0(&raw, 18, 6)
             .expect("reserve price should parse");

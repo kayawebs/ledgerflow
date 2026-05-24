@@ -132,9 +132,12 @@ impl AddressIntelligenceService {
         } else if role_labels.iter().any(|label| label == "erc20_token") {
             "token".to_owned()
         } else if has_code
-            && role_labels
-                .iter()
-                .any(|label| matches!(label.as_str(), "approval_spender" | "suspected_router" | "suspected_router_or_protocol"))
+            && role_labels.iter().any(|label| {
+                matches!(
+                    label.as_str(),
+                    "approval_spender" | "suspected_router" | "suspected_router_or_protocol"
+                )
+            })
         {
             "router_candidate".to_owned()
         } else if has_code
@@ -289,7 +292,11 @@ impl AddressIntelligenceService {
             stable,
             get_reserves_supported,
             slot0_supported,
-            confidence: if slot0_supported || get_reserves_supported { 0.9 } else { 0.82 },
+            confidence: if slot0_supported || get_reserves_supported {
+                0.9
+            } else {
+                0.82
+            },
         })
     }
 
@@ -513,16 +520,18 @@ impl KnownAddressLabel {
         job: &AddressAnalysisJob,
         now: chrono::DateTime<Utc>,
     ) -> Option<ProtocolAddressMetadata> {
-        let (protocol_family, protocol_name, contract_role) =
-            if self.label.starts_with("uniswap_") {
-                ("dex", "uniswap", self.address_type.as_str())
-            } else if self.label.starts_with("aerodrome_") {
-                ("dex", "aerodrome", self.address_type.as_str())
-            } else if self.label == "morpho_blue" {
-                ("lending", "morpho_blue", self.address_type.as_str())
-            } else {
-                return None;
-            };
+        let (protocol_family, protocol_name, contract_role) = if self.label.starts_with("uniswap_")
+        {
+            ("dex", "uniswap", self.address_type.as_str())
+        } else if self.label.starts_with("aerodrome_") {
+            ("dex", "aerodrome", self.address_type.as_str())
+        } else if self.label.starts_with("zeroex_") {
+            ("dex", "zeroex", self.address_type.as_str())
+        } else if self.label == "morpho_blue" {
+            ("lending", "morpho_blue", self.address_type.as_str())
+        } else {
+            return None;
+        };
         Some(ProtocolAddressMetadata {
             chain_id: job.chain_id,
             address: job.address.to_ascii_lowercase(),
@@ -572,6 +581,11 @@ fn known_address_label(chain_id: u64, address: &str) -> Option<KnownAddressLabel
             label: "aerodrome_router".to_owned(),
             address_type: "router".to_owned(),
             confidence: 0.9,
+        }),
+        "0x7747f8d2a76bd6345cc29622a946a929647f2359" => Some(KnownAddressLabel {
+            label: "zeroex_base_settler".to_owned(),
+            address_type: "router".to_owned(),
+            confidence: 0.95,
         }),
         "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb" => Some(KnownAddressLabel {
             label: "morpho_blue".to_owned(),

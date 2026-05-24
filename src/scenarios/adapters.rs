@@ -39,9 +39,10 @@ impl ScenarioAdapterService {
             .any(|label| label == "arbitrage_like_activity")
         {
             build_arbitrage_story(analysis, protocol.as_deref())
-        } else if labels.iter().any(|label| {
-            label == "approval_then_swap_like" || label == "swap_like_activity"
-        }) {
+        } else if labels
+            .iter()
+            .any(|label| label == "approval_then_swap_like" || label == "swap_like_activity")
+        {
             build_swap_story(
                 analysis,
                 swap_protocol_hint(analysis)
@@ -246,7 +247,11 @@ fn build_liquidation_story(
     }))
 }
 
-fn liquidation_call_summary(sender: &str, executor: &str, protocol_contract: Option<&str>) -> String {
+fn liquidation_call_summary(
+    sender: &str,
+    executor: &str,
+    protocol_contract: Option<&str>,
+) -> String {
     if protocol_contract
         .map(|value| executor.eq_ignore_ascii_case(value))
         .unwrap_or(false)
@@ -397,7 +402,11 @@ fn build_swap_story(analysis: &TransactionAnalysis, protocol: Option<&str>) -> O
 
 fn swap_subject_address(analysis: &TransactionAnalysis) -> Option<(&'static str, String)> {
     let mut candidates = vec![("initiator", analysis.from_address.to_lowercase())];
-    if let Some(executor) = analysis.to_address.as_ref().map(|value| value.to_lowercase()) {
+    if let Some(executor) = analysis
+        .to_address
+        .as_ref()
+        .map(|value| value.to_lowercase())
+    {
         if !candidates
             .iter()
             .any(|(_, address)| address.eq_ignore_ascii_case(&executor))
@@ -442,14 +451,35 @@ fn build_subject_scope(initiator: &str, actor_addresses: &[String]) -> SubjectSc
     let mut addresses = BTreeSet::new();
     addresses.insert(initiator.to_owned());
     for address in actor_addresses {
+        if is_shared_execution_infrastructure(address) {
+            continue;
+        }
         addresses.insert(address.to_lowercase());
     }
     let addresses = addresses.into_iter().collect::<Vec<_>>();
+    let label = if addresses.len() <= 1 {
+        "initiator scope"
+    } else {
+        "initiator + private executor scope"
+    };
     SubjectScope {
         mode: "strategy",
-        label: "initiator + executor scope".to_owned(),
+        label: label.to_owned(),
         addresses,
     }
+}
+
+fn is_shared_execution_infrastructure(address: &str) -> bool {
+    matches!(
+        address.to_ascii_lowercase().as_str(),
+        // 0x Base Settler. This is shared exchange infrastructure, not a
+        // strategy-owned executor, so it must not be counted as user scope.
+        "0x7747f8d2a76bd6345cc29622a946a929647f2359"
+            | "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24"
+            | "0x2626664c2603336e57b271c5c0b26f421741e481"
+            | "0x6ff5693b99212da76ad316178a184ab56d299b43"
+            | "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
+    )
 }
 
 fn build_net_effect(
@@ -656,7 +686,13 @@ fn build_arbitrage_steps(
 fn build_swap_steps(outgoing: &[Value], incoming: &[Value]) -> Vec<Value> {
     let mut steps = Vec::new();
     let mut next_order = 1usize;
-    next_order = extend_steps(&mut steps, next_order, "Spend input asset", outgoing, "Sent");
+    next_order = extend_steps(
+        &mut steps,
+        next_order,
+        "Spend input asset",
+        outgoing,
+        "Sent",
+    );
     let _ = extend_steps(
         &mut steps,
         next_order,
@@ -1082,4 +1118,34 @@ fn short_address(address: &str) -> String {
         return address.to_owned();
     }
     format!("{}...{}", &address[..8], &address[address.len() - 4..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subject_scope_excludes_shared_settlers() {
+        let scope = build_subject_scope(
+            "0x1111111111111111111111111111111111111111",
+            &["0x7747f8d2a76bd6345cc29622a946a929647f2359".to_owned()],
+        );
+
+        assert_eq!(scope.label, "initiator scope");
+        assert_eq!(
+            scope.addresses,
+            vec!["0x1111111111111111111111111111111111111111".to_owned()]
+        );
+    }
+
+    #[test]
+    fn subject_scope_keeps_unknown_private_executor() {
+        let scope = build_subject_scope(
+            "0x1111111111111111111111111111111111111111",
+            &["0x2222222222222222222222222222222222222222".to_owned()],
+        );
+
+        assert_eq!(scope.label, "initiator + private executor scope");
+        assert_eq!(scope.addresses.len(), 2);
+    }
 }
