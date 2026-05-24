@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use ledgerflow::{
     core::{config::AppConfig, env::load_dotenv, logging::init_logging},
+    ingestion::rpc::HttpRpcClient,
     repositories::sqlx::SqlxAnalysisRepository,
     services::{pricing::PriceService, seeds::seed_known_metadata},
 };
@@ -24,7 +25,10 @@ async fn main() {
         .await
         .expect("seed metadata should succeed");
 
-    let price_service = Arc::new(PriceService::new(repository.pool().clone()));
+    let rpc_client = Arc::new(HttpRpcClient::new(config.rpc_url.clone()));
+    let price_service = Arc::new(
+        PriceService::new(repository.pool().clone()).with_rpc_client(rpc_client),
+    );
     let poll_interval = Duration::from_millis(config.price_worker_poll_interval_ms.max(1_000));
 
     info!(
