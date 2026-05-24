@@ -1226,14 +1226,34 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                   status = case
                     when address_analysis_jobs.status = 'failed' then 'pending'
                     when address_analysis_jobs.status = 'completed'
-                      and excluded.metadata->>'source' in ('address_summary', 'address_analysis_page') then 'pending'
+                      and (
+                        excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                        or excluded.metadata->'roles' ?| array[
+                          'suspected_pool',
+                          'suspected_router',
+                          'suspected_protocol',
+                          'suspected_router_or_protocol',
+                          'touched_contract',
+                          'call_target'
+                        ]
+                      ) then 'pending'
                     else address_analysis_jobs.status
                   end,
                   last_error = case
                     when address_analysis_jobs.status = 'failed'
                       or (
                         address_analysis_jobs.status = 'completed'
-                        and excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                        and (
+                          excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                          or excluded.metadata->'roles' ?| array[
+                            'suspected_pool',
+                            'suspected_router',
+                            'suspected_protocol',
+                            'suspected_router_or_protocol',
+                            'touched_contract',
+                            'call_target'
+                          ]
+                        )
                       ) then null
                     else address_analysis_jobs.last_error
                   end,
@@ -1241,7 +1261,17 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                     when address_analysis_jobs.status = 'failed'
                       or (
                         address_analysis_jobs.status = 'completed'
-                        and excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                        and (
+                          excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                          or excluded.metadata->'roles' ?| array[
+                            'suspected_pool',
+                            'suspected_router',
+                            'suspected_protocol',
+                            'suspected_router_or_protocol',
+                            'touched_contract',
+                            'call_target'
+                          ]
+                        )
                       ) then now()
                     else address_analysis_jobs.available_at
                   end,
@@ -1249,6 +1279,14 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                   updated_at = now()
                 where address_analysis_jobs.status <> 'completed'
                   or excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                  or excluded.metadata->'roles' ?| array[
+                    'suspected_pool',
+                    'suspected_router',
+                    'suspected_protocol',
+                    'suspected_router_or_protocol',
+                    'touched_contract',
+                    'call_target'
+                  ]
                 "#,
             )
             .bind(chain_id as i64)

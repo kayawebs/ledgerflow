@@ -254,11 +254,18 @@ fn collect_address_candidates(analysis: &TransactionAnalysis) -> Vec<AddressAnal
     }
     for log in &analysis.normalized_execution_facts.log_summaries {
         if let Some(address) = log.get("address").and_then(|value| value.as_str()) {
+            let mut roles = vec!["log_emitter"];
+            if is_dex_event_log(log) {
+                roles.push("suspected_pool");
+            }
+            if is_liquidation_event_log(log) {
+                roles.push("suspected_protocol");
+            }
             insert_candidate(
                 &mut candidates,
                 address,
-                55,
-                json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["log_emitter"] }),
+                if roles.len() > 1 { 28 } else { 55 },
+                json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": roles }),
             );
         }
     }
@@ -286,7 +293,121 @@ fn collect_address_candidates(analysis: &TransactionAnalysis) -> Vec<AddressAnal
             }
         }
     }
+    if let Some(items) = analysis
+        .normalized_execution_facts
+        .derived_facts
+        .get("approval_edges")
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in items.iter().take(100) {
+            if let Some(owner) = item.get("owner").and_then(serde_json::Value::as_str) {
+                insert_candidate(
+                    &mut candidates,
+                    owner,
+                    45,
+                    json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["approval_owner"] }),
+                );
+            }
+            if let Some(spender) = item.get("spender").and_then(serde_json::Value::as_str) {
+                insert_candidate(
+                    &mut candidates,
+                    spender,
+                    22,
+                    json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["approval_spender", "suspected_router"] }),
+                );
+            }
+            if let Some(token) = item.get("token_address").and_then(serde_json::Value::as_str) {
+                insert_candidate(
+                    &mut candidates,
+                    token,
+                    15,
+                    json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["erc20_token"] }),
+                );
+            }
+        }
+    }
+    if let Some(items) = analysis
+        .normalized_execution_facts
+        .derived_facts
+        .get("execution_timeline")
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in items.iter().take(250) {
+            if let Some(from) = item.get("from_address").and_then(serde_json::Value::as_str) {
+                insert_candidate(
+                    &mut candidates,
+                    from,
+                    65,
+                    json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["call_sender"] }),
+                );
+            }
+            if let Some(to) = item.get("to_address").and_then(serde_json::Value::as_str) {
+                insert_candidate(
+                    &mut candidates,
+                    to,
+                    42,
+                    json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["call_target", "suspected_router_or_protocol"] }),
+                );
+            }
+        }
+    }
+    if let Some(contracts) = analysis
+        .normalized_execution_facts
+        .derived_facts
+        .get("touched_contracts")
+        .and_then(serde_json::Value::as_array)
+    {
+        for contract in contracts.iter().filter_map(serde_json::Value::as_str) {
+            insert_candidate(
+                &mut candidates,
+                contract,
+                50,
+                json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["touched_contract", "suspected_protocol"] }),
+            );
+        }
+    }
     candidates.into_values().collect()
+}
+
+fn is_dex_event_log(log: &serde_json::Value) -> bool {
+    const UNI_V2_SWAP: &str = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+    const UNI_V2_SYNC: &str = "0x1c411e9a96e0712416f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
+    const UNI_V2_MINT: &str = "0x4c209b5fc8ad50758f13e2e1088ba56f10dff1ff73af114a4f0efc9c4b1d797";
+    const UNI_V2_BURN: &str = "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496";
+    const UNI_V3_SWAP: &str = "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f";
+    const UNI_V3_MINT: &str = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488daaf0c7f8d9d54eaf";
+    const UNI_V3_BURN: &str = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
+    const UNI_V3_COLLECT: &str = "0x70935338e69775456f7e439f86c08d6f7828d3e1118c1b7802b2039f521c9f0f";
+    let topic = log
+        .get("topic_0")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase);
+    matches!(
+        topic.as_deref(),
+        Some(UNI_V2_SWAP)
+            | Some(UNI_V2_SYNC)
+            | Some(UNI_V2_MINT)
+            | Some(UNI_V2_BURN)
+            | Some(UNI_V3_SWAP)
+            | Some(UNI_V3_MINT)
+            | Some(UNI_V3_BURN)
+            | Some(UNI_V3_COLLECT)
+    )
+}
+
+fn is_liquidation_event_log(log: &serde_json::Value) -> bool {
+    const MORPHO_BLUE_LIQUIDATE: &str =
+        "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41";
+    const AAVE_LIQUIDATION_CALL: &str =
+        "0xe413a321e8681d83188be0d2364605a8f594ac97918daee13129e6b4f89b8f3";
+    let topic = log
+        .get("topic_0")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase);
+    matches!(
+        topic.as_deref(),
+        Some(MORPHO_BLUE_LIQUIDATE) | Some(AAVE_LIQUIDATION_CALL)
+    )
 }
 
 fn insert_candidate(
