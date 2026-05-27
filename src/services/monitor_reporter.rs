@@ -212,10 +212,7 @@ impl MonitorReporter {
 
         let mut telegram_sent = false;
         if let Some(telegram) = self.telegram.as_ref() {
-            match telegram
-                .send_alerts(window_start, window_end, &reportable)
-                .await
-            {
+            match telegram.send_alerts(&reportable).await {
                 Ok(()) if !reportable.is_empty() => telegram_sent = true,
                 Ok(()) => {}
                 Err(err) => warn!(error = %err, "telegram monitor alerts failed"),
@@ -705,12 +702,7 @@ struct TelegramNotifier {
 }
 
 impl TelegramNotifier {
-    async fn send_alerts(
-        &self,
-        window_start: DateTime<Utc>,
-        window_end: DateTime<Utc>,
-        reportable: &[ReportableTx],
-    ) -> LedgerResult<()> {
+    async fn send_alerts(&self, reportable: &[ReportableTx]) -> LedgerResult<()> {
         for item in reportable {
             let response = self
                 .client
@@ -720,7 +712,8 @@ impl TelegramNotifier {
                 ))
                 .json(&json!({
                     "chat_id": self.chat_id,
-                    "text": telegram_message(window_start, window_end, item),
+                    "text": telegram_message(item),
+                    "parse_mode": "HTML",
                     "disable_web_page_preview": true,
                 }))
                 .send()
@@ -1084,22 +1077,44 @@ fn build_tweet_text(tx: &TopTxCandidate, signal: &TxSignal, share_url: &str) -> 
     truncate_chars(&base, 280)
 }
 
-fn telegram_message(
-    window_start: DateTime<Utc>,
-    window_end: DateTime<Utc>,
-    item: &ReportableTx,
-) -> String {
+fn telegram_message(item: &ReportableTx) -> String {
     format!(
-        "[CONFIRMED {}]\nWindow: {} - {}\nAmount: {}\nEstimated USD: ${:.2}\nReason: {}\nTx: {}\nAnalysis: {}",
-        item.signal.activity_kind.to_ascii_uppercase(),
-        window_start.to_rfc3339(),
-        window_end.to_rfc3339(),
-        item.signal.amount_summary,
-        item.signal.estimated_usd,
-        item.signal.reason,
-        item.tx.tx_hash,
-        item.share_url
+        "<b>{}</b>\n{}\n\nTx: <code>{}</code>\n<a href=\"{}\">Open analysis</a>",
+        telegram_title(&item.signal),
+        telegram_value_line(&item.signal),
+        escape_telegram_html(&item.tx.tx_hash),
+        escape_telegram_html(&item.share_url),
     )
+}
+
+fn telegram_title(signal: &TxSignal) -> &'static str {
+    match signal.activity_kind.as_str() {
+        "arbitrage" => "Confirmed Arbitrage",
+        "liquidation" => "Confirmed Liquidation",
+        "whale-buy" => "Whale Buy",
+        "large-transfer" => "Large Transfer",
+        _ => "Confirmed Activity",
+    }
+}
+
+fn telegram_value_line(signal: &TxSignal) -> String {
+    match signal.activity_kind.as_str() {
+        "arbitrage" => format!("Estimated profit: <b>+${:.2}</b>", signal.estimated_usd),
+        "liquidation" => format!(
+            "Observed liquidation value: <b>~${:.2}</b>",
+            signal.estimated_usd
+        ),
+        "whale-buy" => format!("Trade value: <b>~${:.2}</b>", signal.estimated_usd),
+        _ => format!("Observed value: <b>~${:.2}</b>", signal.estimated_usd),
+    }
+}
+
+fn escape_telegram_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn truncate_middle(value: &str, keep_each_side: usize) -> String {
@@ -1156,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn telegram_alert_contains_report_context() {
+    fn telegram_arbitrage_alert_is_compact_and_labels_profit() {
         let tx = TopTxCandidate {
             tx_hash: "0x1234567890abcdef".to_owned(),
             block_number: 1,
@@ -1168,7 +1183,7 @@ mod tests {
         let item = ReportableTx {
             tx,
             signal: TxSignal {
-                activity_kind: "liquidation".to_owned(),
+                activity_kind: "arbitrage".to_owned(),
                 level: SignalLevel::Confirmed,
                 reason: "Liquidation confirmed.".to_owned(),
                 positive_strategy_net: true,
@@ -1179,18 +1194,14 @@ mod tests {
             share_url: "https://ledgerflow.top/share/tx/123".to_owned(),
             tweet_text: String::new(),
         };
-        let start = DateTime::parse_from_rfc3339("2026-05-27T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let end = DateTime::parse_from_rfc3339("2026-05-27T01:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
+        let text = telegram_message(&item);
 
-        let text = telegram_message(start, end, &item);
-
-        assert!(text.contains("Window: 2026-05-27T00:00:00+00:00"));
-        assert!(text.contains("Reason: Liquidation confirmed."));
-        assert!(text.contains("Tx: 0x1234567890abcdef"));
-        assert!(text.contains("Analysis: https://ledgerflow.top/share/tx/123"));
+        assert!(text.contains("<b>Confirmed Arbitrage</b>"));
+        assert!(text.contains("Estimated profit: <b>+$32000.00</b>"));
+        assert!(text.contains("Tx: <code>0x1234567890abcdef</code>"));
+        assert!(text.contains("<a href=\"https://ledgerflow.top/share/tx/123\">Open analysis</a>"));
+        assert!(!text.contains("Window:"));
+        assert!(!text.contains("Amount:"));
+        assert!(!text.contains("Reason:"));
     }
 }
