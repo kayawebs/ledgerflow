@@ -26,6 +26,8 @@ pub struct MonitorReporterConfig {
     pub window_minutes: i64,
     pub top_n: u32,
     pub min_raw_score: String,
+    pub notify_min_usd: f64,
+    pub whale_addresses: Vec<String>,
     pub run_on_start: bool,
     pub analysis_api_base_url: String,
     pub web_base_url: String,
@@ -35,6 +37,8 @@ pub struct MonitorReporterConfig {
     pub postmark_server_token: Option<String>,
     pub postmark_message_stream: String,
     pub resend_api_key: Option<String>,
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -43,6 +47,7 @@ pub struct MonitorReporter {
     repository: SqlxAnalysisRepository,
     client: Client,
     sender: Arc<dyn ReportEmailSender>,
+    telegram: Option<TelegramNotifier>,
     config: MonitorReporterConfig,
 }
 
@@ -60,6 +65,7 @@ struct TopTxCandidate {
     block_timestamp: Option<DateTime<Utc>>,
     volume_score_raw: String,
     address_count: i64,
+    candidate_kind: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,27 +77,25 @@ struct ReportableTx {
     tweet_text: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct TxSignal {
     activity_kind: String,
     level: SignalLevel,
     reason: String,
     positive_strategy_net: bool,
+    amount_summary: String,
+    estimated_usd: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SignalLevel {
     Confirmed,
-    Probable,
-    Interesting,
 }
 
 impl SignalLevel {
     fn as_str(self) -> &'static str {
         match self {
             SignalLevel::Confirmed => "confirmed",
-            SignalLevel::Probable => "probable",
-            SignalLevel::Interesting => "interesting",
         }
     }
 }
@@ -102,14 +106,39 @@ struct AnalysisEnvelope {
     evidence_pack: EvidencePack,
 }
 
+fn top_tx_from_row(row: sqlx::postgres::PgRow) -> LedgerResult<TopTxCandidate> {
+    Ok(TopTxCandidate {
+        tx_hash: row
+            .try_get("tx_hash")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        block_number: row
+            .try_get("block_number")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        block_timestamp: row
+            .try_get("block_timestamp")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        volume_score_raw: row
+            .try_get("volume_score_raw")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        address_count: row
+            .try_get("address_count")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        candidate_kind: row
+            .try_get("candidate_kind")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+    })
+}
+
 impl MonitorReporter {
     pub fn new(pool: PgPool, config: MonitorReporterConfig) -> Self {
         let sender = build_report_sender(&config);
+        let telegram = build_telegram_notifier(&config);
         Self {
             repository: SqlxAnalysisRepository::from_pool(pool.clone()),
             pool,
             client: Client::new(),
             sender,
+            telegram,
             config,
         }
     }
@@ -141,15 +170,23 @@ impl MonitorReporter {
             }
             match self.analyze_tx(&tx.tx_hash).await {
                 Ok(envelope) => {
-                    if let Err(err) = self.enqueue_analysis_addresses(&tx, &envelope.analysis).await {
+                    if let Err(err) = self
+                        .enqueue_analysis_addresses(&tx, &envelope.analysis)
+                        .await
+                    {
                         warn!(
                             tx_hash = tx.tx_hash,
                             error = %err,
                             "monitor analyzed address intelligence enqueue failed"
                         );
                     }
-                    let signal =
-                        detect_signal(&envelope.analysis).unwrap_or_else(|| top_volume_signal(&envelope.analysis));
+                    let Some(signal) = detect_confirmed_signal(
+                        &envelope.analysis,
+                        self.config.notify_min_usd,
+                        &self.config.whale_addresses,
+                    ) else {
+                        continue;
+                    };
                     let share_id = self.create_share(&envelope, &tx, &signal).await?;
                     let share_url = format!(
                         "{}/share/tx/{}",
@@ -175,12 +212,29 @@ impl MonitorReporter {
             }
         }
 
-        let email_sent = if reportable.is_empty() {
-            false
-        } else {
-            self.sender
+        let mut delivered = false;
+        if let Some(telegram) = self.telegram.as_ref() {
+            match telegram.send_alerts(&reportable).await {
+                Ok(()) if !reportable.is_empty() => delivered = true,
+                Ok(()) => {}
+                Err(err) => warn!(error = %err, "telegram monitor alerts failed"),
+            }
+        }
+        let mut email_sent = false;
+        if !reportable.is_empty() {
+            match self
+                .sender
                 .send_report(&self.config.email_to, window_start, window_end, &reportable)
-                .await?;
+                .await
+            {
+                Ok(()) => {
+                    delivered = true;
+                    email_sent = true;
+                }
+                Err(err) => warn!(error = %err, "monitor email alert delivery failed"),
+            }
+        }
+        if delivered {
             for item in &reportable {
                 self.record_report(
                     &item.tx,
@@ -192,8 +246,7 @@ impl MonitorReporter {
                 )
                 .await?;
             }
-            true
-        };
+        }
 
         info!(
             inspected_txs = candidates.len(),
@@ -214,14 +267,49 @@ impl MonitorReporter {
         window_end: DateTime<Utc>,
     ) -> LedgerResult<Vec<TopTxCandidate>> {
         let top_n = self.config.top_n.clamp(1, 100);
-        let rows = sqlx::query(
+        let candidate_rows = sqlx::query(
+            r#"
+            select
+              c.tx_hash,
+              c.block_number,
+              c.block_timestamp,
+              coalesce(sum(greatest(d.amount_in_raw, d.amount_out_raw)), 0)::text as volume_score_raw,
+              count(distinct d.address)::bigint as address_count,
+              c.candidate_kind
+            from trace_monitor_candidates c
+            left join trace_address_asset_deltas d
+              on d.chain_id = c.chain_id
+             and d.tx_hash = c.tx_hash
+            where c.chain_id = $1
+              and c.block_timestamp >= $2
+              and c.block_timestamp < $3
+              and not exists (
+                select 1
+                from trace_monitor_tx_reports r
+                where r.chain_id = c.chain_id
+                  and r.tx_hash = c.tx_hash
+              )
+            group by c.tx_hash, c.block_number, c.block_timestamp, c.candidate_kind, c.score
+            order by c.score desc, c.block_timestamp desc
+            limit $4
+            "#,
+        )
+        .bind(self.config.chain_id as i64)
+        .bind(window_start)
+        .bind(window_end)
+        .bind(top_n as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let volume_rows = sqlx::query(
             r#"
             select
               d.tx_hash,
               max(d.block_number)::bigint as block_number,
               max(d.block_timestamp) as block_timestamp,
               sum(greatest(d.amount_in_raw, d.amount_out_raw))::text as volume_score_raw,
-              count(distinct d.address)::bigint as address_count
+              count(distinct d.address)::bigint as address_count,
+              null::text as candidate_kind
             from trace_address_asset_deltas d
             where d.chain_id = $1
               and d.block_timestamp >= $2
@@ -247,27 +335,14 @@ impl MonitorReporter {
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
 
-        rows.into_iter()
-            .map(|row| {
-                Ok(TopTxCandidate {
-                    tx_hash: row
-                        .try_get("tx_hash")
-                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
-                    block_number: row
-                        .try_get("block_number")
-                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
-                    block_timestamp: row
-                        .try_get("block_timestamp")
-                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
-                    volume_score_raw: row
-                        .try_get("volume_score_raw")
-                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
-                    address_count: row
-                        .try_get("address_count")
-                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
-                })
-            })
-            .collect()
+        let mut selected = BTreeMap::<String, TopTxCandidate>::new();
+        for row in candidate_rows.into_iter().chain(volume_rows) {
+            let candidate = top_tx_from_row(row)?;
+            selected
+                .entry(candidate.tx_hash.clone())
+                .or_insert(candidate);
+        }
+        Ok(selected.into_values().collect())
     }
 
     async fn analyze_tx(&self, tx_hash: &str) -> LedgerResult<AnalysisEnvelope> {
@@ -312,9 +387,11 @@ impl MonitorReporter {
             truncate_middle(&tx.tx_hash, 10)
         );
         let summary = format!(
-            "{} level={} positive_strategy_net={} Top monitor volume score(raw): {}.",
+            "{} level={} amount={} estimated_usd={:.2} positive_strategy_net={} Top monitor volume score(raw): {}.",
             signal.reason,
             signal.level.as_str(),
+            signal.amount_summary,
+            signal.estimated_usd,
             signal.positive_strategy_net,
             tx.volume_score_raw
         );
@@ -373,6 +450,9 @@ impl MonitorReporter {
             "reason": signal.reason,
             "signal_level": signal.level.as_str(),
             "positive_strategy_net": signal.positive_strategy_net,
+            "amount_summary": signal.amount_summary,
+            "estimated_usd": signal.estimated_usd,
+            "candidate_kind": tx.candidate_kind,
         })))
         .execute(&self.pool)
         .await
@@ -487,18 +567,23 @@ impl MonitorReporter {
             })
         };
 
-        insert_monitor_candidate(&mut candidates, &analysis.from_address, 20, base(vec!["tx_from"]));
+        insert_monitor_candidate(
+            &mut candidates,
+            &analysis.from_address,
+            20,
+            base(vec!["tx_from"]),
+        );
         if let Some(to_address) = analysis.to_address.as_deref() {
-            insert_monitor_candidate(&mut candidates, to_address, 25, base(vec!["tx_to", "executor"]));
+            insert_monitor_candidate(
+                &mut candidates,
+                to_address,
+                25,
+                base(vec!["tx_to", "executor"]),
+            );
         }
 
         for participant in &analysis.normalized_execution_facts.participants {
-            insert_monitor_candidate(
-                &mut candidates,
-                participant,
-                60,
-                base(vec!["participant"]),
-            );
+            insert_monitor_candidate(&mut candidates, participant, 60, base(vec!["participant"]));
         }
         for log in &analysis.normalized_execution_facts.log_summaries {
             if let Some(address) = log.get("address").and_then(Value::as_str) {
@@ -567,12 +652,7 @@ impl MonitorReporter {
         {
             for item in items.iter().take(200) {
                 if let Some(from) = item.get("from_address").and_then(Value::as_str) {
-                    insert_monitor_candidate(
-                        &mut candidates,
-                        from,
-                        65,
-                        base(vec!["call_sender"]),
-                    );
+                    insert_monitor_candidate(&mut candidates, from, 65, base(vec!["call_sender"]));
                 }
                 if let Some(to) = item.get("to_address").and_then(Value::as_str) {
                     insert_monitor_candidate(
@@ -770,7 +850,63 @@ fn build_resend_sender(config: &MonitorReporterConfig) -> Option<Arc<dyn ReportE
     }))
 }
 
-fn detect_signal(analysis: &TransactionAnalysis) -> Option<TxSignal> {
+#[derive(Clone)]
+struct TelegramNotifier {
+    client: Client,
+    bot_token: String,
+    chat_id: String,
+}
+
+impl TelegramNotifier {
+    async fn send_alerts(&self, reportable: &[ReportableTx]) -> LedgerResult<()> {
+        for item in reportable {
+            let response = self
+                .client
+                .post(format!(
+                    "https://api.telegram.org/bot{}/sendMessage",
+                    self.bot_token
+                ))
+                .json(&json!({
+                    "chat_id": self.chat_id,
+                    "text": telegram_message(item),
+                    "disable_web_page_preview": true,
+                }))
+                .send()
+                .await
+                .map_err(|err| LedgerError::TransientIngestion(err.to_string()))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(LedgerError::TransientIngestion(format!(
+                    "telegram alert failed: {status} {body}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn build_telegram_notifier(config: &MonitorReporterConfig) -> Option<TelegramNotifier> {
+    Some(TelegramNotifier {
+        client: Client::new(),
+        bot_token: config.telegram_bot_token.clone()?,
+        chat_id: config.telegram_chat_id.clone()?,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct PricedMovement {
+    symbol: String,
+    amount_decimal: String,
+    price_decimal: String,
+    value_usd: f64,
+}
+
+fn detect_confirmed_signal(
+    analysis: &TransactionAnalysis,
+    notify_min_usd: f64,
+    whale_addresses: &[String],
+) -> Option<TxSignal> {
     let scenario_kind = analysis
         .scenario_outputs
         .pointer("/storyline/kind")
@@ -786,89 +922,147 @@ fn detect_signal(analysis: &TransactionAnalysis) -> Option<TxSignal> {
             None
         }
     });
-    let positive_strategy_net = has_positive_strategy_net(analysis);
-    if let Some(activity_kind) = scenario_kind
-        .or(recognizer_kind)
-        .filter(|kind| kind == "liquidation" || kind == "arbitrage")
-    {
-        let level = if positive_strategy_net {
-            SignalLevel::Confirmed
-        } else {
-            SignalLevel::Probable
-        };
-        let reason = if positive_strategy_net {
-            "LedgerFlow detected liquidation/arbitrage behavior with positive strategy net effect."
-        } else {
-            "LedgerFlow detected liquidation/arbitrage behavior, but strategy net effect is unresolved or not positive yet."
-        };
+    let primary_movement = largest_priced_movement(analysis)?;
+    let activity_kind = scenario_kind.or(recognizer_kind);
+    if activity_kind.as_deref() == Some("liquidation") {
         return Some(TxSignal {
-            activity_kind,
-            level,
-            reason: reason.to_owned(),
-            positive_strategy_net,
+            activity_kind: "liquidation".to_owned(),
+            level: SignalLevel::Confirmed,
+            reason: "Protocol liquidation event confirmed from transaction analysis.".to_owned(),
+            positive_strategy_net: estimated_subject_net_usd(analysis)
+                .map(|value| value > 0.0)
+                .unwrap_or(false),
+            amount_summary: format_movement(&primary_movement),
+            estimated_usd: primary_movement.value_usd,
         });
     }
 
-    if is_probable_arbitrage_route(analysis) {
+    if activity_kind.as_deref() == Some("arbitrage") || is_probable_arbitrage_route(analysis) {
+        let net_usd = estimated_subject_net_usd(analysis)?;
+        if net_usd <= 0.0 {
+            return None;
+        }
         return Some(TxSignal {
             activity_kind: "arbitrage".to_owned(),
-            level: SignalLevel::Probable,
-            reason: "Large multi-token route looks arbitrage-like, but protocol/PnL attribution is still unresolved."
+            level: SignalLevel::Confirmed,
+            reason: "Arbitrage-like route confirmed with positive estimated subject value change."
                 .to_owned(),
-            positive_strategy_net,
+            positive_strategy_net: true,
+            amount_summary: format!(
+                "est. net +${:.2}; largest leg {}",
+                net_usd,
+                format_movement(&primary_movement)
+            ),
+            estimated_usd: net_usd,
         });
     }
 
-    if is_interesting_value_movement(analysis) {
-        return Some(TxSignal {
-            activity_kind: "complex-flow".to_owned(),
-            level: SignalLevel::Interesting,
-            reason: "High-volume tx has complex multi-address or multi-asset movement worth review."
-                .to_owned(),
-            positive_strategy_net,
-        });
-    }
-
-    None
-}
-
-fn top_volume_signal(analysis: &TransactionAnalysis) -> TxSignal {
-    TxSignal {
-        activity_kind: "top-volume".to_owned(),
-        level: SignalLevel::Interesting,
-        reason: format!(
-            "Top monitor transaction did not match liquidation/arbitrage rules yet; included for review because it ranked in the high-volume window. derived_flows={}, recognizers={}.",
-            analysis.derived_flows.len(),
-            analysis.recognizer_results.len()
-        ),
-        positive_strategy_net: has_positive_strategy_net(analysis),
-    }
-}
-
-fn has_positive_strategy_net(analysis: &TransactionAnalysis) -> bool {
-    let Some(net_effect) = analysis.scenario_outputs.pointer("/storyline/net_effect") else {
-        return false;
-    };
-    if net_effect
-        .get("gained")
-        .and_then(Value::as_array)
-        .map(|items| !items.is_empty())
-        .unwrap_or(false)
+    if whale_addresses
+        .iter()
+        .any(|address| address.eq_ignore_ascii_case(&analysis.from_address))
+        && is_swap_activity(analysis)
+        && primary_movement.value_usd >= notify_min_usd
     {
-        return true;
+        return Some(TxSignal {
+            activity_kind: "whale-buy".to_owned(),
+            level: SignalLevel::Confirmed,
+            reason: "Watched address swap confirmed above the configured USD threshold.".to_owned(),
+            positive_strategy_net: estimated_subject_net_usd(analysis)
+                .map(|value| value > 0.0)
+                .unwrap_or(false),
+            amount_summary: format_movement(&primary_movement),
+            estimated_usd: primary_movement.value_usd,
+        });
     }
-    net_effect
-        .get("rows")
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter().any(|row| {
-                row.get("net_raw")
-                    .and_then(Value::as_str)
-                    .and_then(|value| value.parse::<i128>().ok())
-                    .map(|value| value > 0)
-                    .unwrap_or(false)
+
+    (primary_movement.value_usd >= notify_min_usd).then(|| TxSignal {
+        activity_kind: "large-transfer".to_owned(),
+        level: SignalLevel::Confirmed,
+        reason: "Priced asset movement exceeds the configured USD alert threshold.".to_owned(),
+        positive_strategy_net: estimated_subject_net_usd(analysis)
+            .map(|value| value > 0.0)
+            .unwrap_or(false),
+        amount_summary: format_movement(&primary_movement),
+        estimated_usd: primary_movement.value_usd,
+    })
+}
+
+fn largest_priced_movement(analysis: &TransactionAnalysis) -> Option<PricedMovement> {
+    analysis
+        .derived_flows
+        .iter()
+        .filter_map(|flow| {
+            let estimate = flow.metadata.get("estimated_usd")?;
+            let value_usd = estimate
+                .get("value_decimal")?
+                .as_str()?
+                .parse::<f64>()
+                .ok()?;
+            let amount_decimal = estimate.get("amount_decimal")?.as_str()?.to_owned();
+            let price_decimal = estimate.get("price_decimal")?.as_str()?.to_owned();
+            let symbol = flow
+                .metadata
+                .pointer("/token/symbol")
+                .and_then(Value::as_str)
+                .unwrap_or("TOKEN")
+                .to_owned();
+            Some(PricedMovement {
+                symbol,
+                amount_decimal,
+                price_decimal,
+                value_usd,
             })
         })
+        .max_by(|left, right| left.value_usd.total_cmp(&right.value_usd))
+}
+
+fn format_movement(movement: &PricedMovement) -> String {
+    format!(
+        "{} {} (~${:.2}, ${}/token)",
+        movement.amount_decimal, movement.symbol, movement.value_usd, movement.price_decimal
+    )
+}
+
+fn estimated_subject_net_usd(analysis: &TransactionAnalysis) -> Option<f64> {
+    let scope = analysis
+        .scenario_outputs
+        .pointer("/storyline/subject_scope/addresses")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .collect::<std::collections::BTreeSet<_>>();
+    if scope.is_empty() {
+        return None;
+    }
+    let mut net = 0.0;
+    let mut priced_boundary_flow = false;
+    for flow in &analysis.derived_flows {
+        let from_scope = scope.contains(&flow.from_address.to_ascii_lowercase());
+        let to_scope = scope.contains(&flow.to_address.to_ascii_lowercase());
+        if from_scope == to_scope {
+            continue;
+        }
+        let Some(value) = flow
+            .metadata
+            .pointer("/estimated_usd/value_decimal")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        priced_boundary_flow = true;
+        net += if to_scope { value } else { -value };
+    }
+    priced_boundary_flow.then_some(net)
+}
+
+fn is_swap_activity(analysis: &TransactionAnalysis) -> bool {
+    analysis
+        .scenario_outputs
+        .pointer("/storyline/kind")
+        .and_then(Value::as_str)
+        .map(|kind| kind.eq_ignore_ascii_case("swap"))
         .unwrap_or(false)
 }
 
@@ -889,12 +1083,6 @@ fn is_probable_arbitrage_route(analysis: &TransactionAnalysis) -> bool {
     has_route_label && analysis.derived_flows.len() >= 2 && token_count >= 2 && address_count >= 3
 }
 
-fn is_interesting_value_movement(analysis: &TransactionAnalysis) -> bool {
-    analysis.derived_flows.len() >= 3
-        || distinct_token_count(analysis) >= 2
-        || distinct_flow_address_count(analysis) >= 4
-}
-
 fn is_dex_event_log(log: &Value) -> bool {
     const UNI_V2_SWAP: &str = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
     const UNI_V2_SYNC: &str = "0x1c411e9a96e0712416f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
@@ -903,7 +1091,8 @@ fn is_dex_event_log(log: &Value) -> bool {
     const UNI_V3_SWAP: &str = "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f";
     const UNI_V3_MINT: &str = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488daaf0c7f8d9d54eaf";
     const UNI_V3_BURN: &str = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
-    const UNI_V3_COLLECT: &str = "0x70935338e69775456f7e439f86c08d6f7828d3e1118c1b7802b2039f521c9f0f";
+    const UNI_V3_COLLECT: &str =
+        "0x70935338e69775456f7e439f86c08d6f7828d3e1118c1b7802b2039f521c9f0f";
     let topic = log
         .get("topic_0")
         .and_then(Value::as_str)
@@ -1014,37 +1203,32 @@ fn merge_monitor_metadata(left: Value, right: Value) -> Value {
 
 fn build_tweet_text(tx: &TopTxCandidate, signal: &TxSignal, share_url: &str) -> String {
     let base = format!(
-        "LedgerFlow Base signal: {} {} candidate. tx {}. positive_net={}. monitor volume score(raw) {}. Analysis: {}",
-        signal.level.as_str(),
+        "LedgerFlow Base: confirmed {}. {} Estimated USD ${:.2}. Tx {}. Analysis: {}",
         signal.activity_kind,
+        signal.amount_summary,
+        signal.estimated_usd,
         truncate_middle(&tx.tx_hash, 8),
-        signal.positive_strategy_net,
-        tx.volume_score_raw,
         share_url
     );
     truncate_chars(&base, 280)
 }
 
-fn report_subject(reportable: &[ReportableTx]) -> String {
-    let confirmed = reportable
-        .iter()
-        .filter(|item| item.signal.level == SignalLevel::Confirmed)
-        .count();
-    let probable = reportable
-        .iter()
-        .filter(|item| item.signal.level == SignalLevel::Probable)
-        .count();
-    let interesting = reportable
-        .iter()
-        .filter(|item| item.signal.level == SignalLevel::Interesting)
-        .count();
+fn telegram_message(item: &ReportableTx) -> String {
     format!(
-        "LedgerFlow monitor: {} top tx report{} ({} confirmed, {} probable, {} review)",
+        "[CONFIRMED {}]\n{}\nEstimated value: ${:.2}\nTx: {}\n{}",
+        item.signal.activity_kind.to_ascii_uppercase(),
+        item.signal.amount_summary,
+        item.signal.estimated_usd,
+        truncate_middle(&item.tx.tx_hash, 10),
+        item.share_url
+    )
+}
+
+fn report_subject(reportable: &[ReportableTx]) -> String {
+    format!(
+        "LedgerFlow monitor: {} confirmed alert{}",
         reportable.len(),
         if reportable.len() == 1 { "" } else { "s" },
-        confirmed,
-        probable,
-        interesting
     )
 }
 
@@ -1061,24 +1245,24 @@ fn report_bodies(
     );
     for item in reportable {
         text.push_str(&format!(
-            "- [{}] {} {}\n  reason: {}\n  tx: {}\n  share: {}\n  tweet:\n{}\n\n",
+            "- [{}] {}\n  amount: {}\n  estimated USD: ${:.2}\n  reason: {}\n  tx: {}\n  share: {}\n\n",
             item.signal.level.as_str(),
             item.signal.activity_kind,
-            item.tx.volume_score_raw,
+            item.signal.amount_summary,
+            item.signal.estimated_usd,
             item.signal.reason,
             item.tx.tx_hash,
             item.share_url,
-            item.tweet_text
         ));
         html.push_str(&format!(
-            "<hr><p><strong>[{}] {}</strong> volume score(raw): {}</p><p>{}</p><p>tx: <code>{}</code></p><p><a href=\"{}\">Open share</a></p><pre>{}</pre>",
+            "<hr><p><strong>[{}] {}</strong></p><p>{} (~${:.2})</p><p>{}</p><p>tx: <code>{}</code></p><p><a href=\"{}\">Open analysis</a></p>",
             html_escape(item.signal.level.as_str()),
             html_escape(&item.signal.activity_kind),
-            html_escape(&item.tx.volume_score_raw),
+            html_escape(&item.signal.amount_summary),
+            item.signal.estimated_usd,
             html_escape(&item.signal.reason),
             html_escape(&item.tx.tx_hash),
             html_escape(&item.share_url),
-            html_escape(&item.tweet_text)
         ));
     }
     html.push_str("</div>");
@@ -1132,12 +1316,15 @@ mod tests {
             block_timestamp: None,
             volume_score_raw: "123456789000000000000000000000000000000000".to_owned(),
             address_count: 4,
+            candidate_kind: Some("liquidation_event".to_owned()),
         };
         let signal = TxSignal {
             activity_kind: "liquidation".to_owned(),
             level: SignalLevel::Confirmed,
             reason: "test".to_owned(),
             positive_strategy_net: true,
+            amount_summary: "12.5 WETH (~$32000.00, $2560/token)".to_owned(),
+            estimated_usd: 32_000.0,
         };
         let text = build_tweet_text(&tx, &signal, "https://ledgerflow.top/share/tx/123");
         assert!(text.chars().count() <= 280);

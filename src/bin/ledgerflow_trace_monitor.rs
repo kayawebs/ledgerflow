@@ -75,6 +75,8 @@ async fn main() {
             window_minutes: config.trace_monitor_report_window_minutes,
             top_n: config.trace_monitor_report_top_n,
             min_raw_score: config.trace_monitor_report_min_raw_score.clone(),
+            notify_min_usd: config.trace_monitor_notify_min_usd,
+            whale_addresses: config.trace_monitor_whale_addresses.clone(),
             run_on_start: config.trace_monitor_report_run_on_start,
             analysis_api_base_url,
             web_base_url,
@@ -84,6 +86,8 @@ async fn main() {
             postmark_server_token: config.postmark_server_token.clone(),
             postmark_message_stream: config.postmark_message_stream.clone(),
             resend_api_key: config.resend_api_key.clone(),
+            telegram_bot_token: config.telegram_bot_token.clone(),
+            telegram_chat_id: config.telegram_chat_id.clone(),
         },
     );
     let poll_interval = Duration::from_millis(config.trace_monitor_poll_interval_ms.max(1000));
@@ -146,6 +150,7 @@ async fn main() {
                     failed_txs = iteration.failed_txs,
                     address_delta_rows = iteration.address_delta_rows,
                     cluster_delta_rows = iteration.cluster_delta_rows,
+                    candidate_rows = iteration.candidate_rows,
                     skipped_blocks = iteration.skipped_blocks,
                     "trace monitor iteration completed"
                 );

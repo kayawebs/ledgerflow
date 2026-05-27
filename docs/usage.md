@@ -324,16 +324,35 @@ curl "http://127.0.0.1:3010/top-address-deltas?start=2026-05-12T00:00:00Z&end=20
 
 The response is intentionally small. Each item contains the address, asset type, token address, raw `in / out / net` amounts, tx count, and up to 50 contributing tx hashes. It does not return full tx payloads; pass the tx hashes to the analysis API when you want interpretation.
 
-The monitor fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. This keeps the monitor focused on detection rather than explanation.
+The monitor fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. It also detects liquidation event topics and multi-DEX-swap candidates directly from receipts without additional RPC calls. This keeps the live scan focused on detection rather than explanation.
 
 | Table | Purpose |
 | --- | --- |
 | `trace_address_asset_deltas` | per tx, per address, per asset `in / out / net` |
 | `trace_cluster_asset_deltas` | the same deltas collapsed over existing cluster addresses |
+| `trace_monitor_candidates` | lightweight liquidation and multi-swap candidates detected from receipts |
 
 The default retention is 7 days. It is configured by `LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS`.
 
 The monitor intentionally does not call trace RPC. When you need transaction interpretation or internal native movement, pass the returned tx hashes to the transaction analysis API.
+
+### Confirmed alert delivery
+
+The periodic report path confirms only selected candidates through the existing transaction analysis API. Unconfirmed candidates do not send email or Telegram alerts.
+
+- `liquidation`: a recognized liquidation with a priced asset movement.
+- `arbitrage`: an arbitrage-like route with positive estimated subject value change.
+- `large-transfer`: a priced movement over `LEDGERFLOW_TRACE_MONITOR_NOTIFY_MIN_USD`.
+- `whale-buy`: a priced swap over that threshold initiated by an address listed in `LEDGERFLOW_TRACE_MONITOR_WHALE_ADDRESSES`.
+
+Configure Telegram delivery with:
+
+```bash
+LEDGERFLOW_TELEGRAM_BOT_TOKEN=your-bot-token
+LEDGERFLOW_TELEGRAM_CHAT_ID=@your_public_channel_username
+```
+
+For a private channel, use its numeric Bot API channel ID instead of `@username`. The bot must be a channel administrator with permission to post messages.
 
 ## Check cluster coverage
 

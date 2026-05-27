@@ -45,6 +45,10 @@ pub struct AppConfig {
     pub trace_monitor_report_min_raw_score: String,
     pub trace_monitor_report_run_on_start: bool,
     pub trace_monitor_report_email_to: String,
+    pub trace_monitor_notify_min_usd: f64,
+    pub trace_monitor_whale_addresses: Vec<String>,
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
     pub price_worker_poll_interval_ms: u64,
     pub email_from: Option<String>,
     pub email_delivery_mode: String,
@@ -155,6 +159,15 @@ impl AppConfig {
             .unwrap_or(true),
             trace_monitor_report_email_to: env::var("LEDGERFLOW_TRACE_MONITOR_REPORT_EMAIL_TO")
                 .unwrap_or_else(|_| "wcy19960411@gmail.com".to_owned()),
+            trace_monitor_notify_min_usd: env::var("LEDGERFLOW_TRACE_MONITOR_NOTIFY_MIN_USD")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(10_000.0),
+            trace_monitor_whale_addresses: parse_list(
+                &env::var("LEDGERFLOW_TRACE_MONITOR_WHALE_ADDRESSES").unwrap_or_default(),
+            ),
+            telegram_bot_token: env::var("LEDGERFLOW_TELEGRAM_BOT_TOKEN").ok(),
+            telegram_chat_id: env::var("LEDGERFLOW_TELEGRAM_CHAT_ID").ok(),
             price_worker_poll_interval_ms: env::var("LEDGERFLOW_PRICE_WORKER_POLL_INTERVAL_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())

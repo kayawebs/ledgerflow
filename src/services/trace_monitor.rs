@@ -16,8 +16,8 @@ use crate::{
     domain::{enums::AssetType, interfaces::AnalysisRepository, value_objects::AssetFlow},
     flows::derivation::derive_basic_flows,
     indexer::rpc::IndexerRpcClient,
-    ingestion::fetchers::TransactionBundleFetcher,
     ingestion::rpc::HttpRpcClient,
+    ingestion::{fetchers::TransactionBundleFetcher, models::RawTransactionBundle},
     repositories::sqlx::SqlxAnalysisRepository,
 };
 
@@ -42,6 +42,7 @@ pub struct TraceMonitorIteration {
     pub failed_txs: u64,
     pub address_delta_rows: u64,
     pub cluster_delta_rows: u64,
+    pub candidate_rows: u64,
     pub skipped_blocks: u64,
 }
 
@@ -64,6 +65,15 @@ struct ClusterDeltaKey {
     cluster_id: Uuid,
     asset_type: String,
     token_address: String,
+}
+
+#[derive(Clone, Debug)]
+struct LightMonitorCandidate {
+    kind: &'static str,
+    score: i32,
+    dex_swap_count: u32,
+    liquidation_event_count: u32,
+    metadata: Value,
 }
 
 #[derive(Clone)]
@@ -165,10 +175,11 @@ impl TraceMonitorService {
             for tx_ref in tx_refs {
                 let tx_hash = tx_ref.tx_hash.clone();
                 match self.process_light_tx(tx_ref, &clusters).await {
-                    Ok((address_rows, cluster_rows)) => {
+                    Ok((address_rows, cluster_rows, candidate_rows)) => {
                         iteration.processed_txs += 1;
                         iteration.address_delta_rows += address_rows;
                         iteration.cluster_delta_rows += cluster_rows;
+                        iteration.candidate_rows += candidate_rows;
                     }
                     Err(err) => {
                         iteration.failed_txs += 1;
@@ -192,7 +203,7 @@ impl TraceMonitorService {
         &self,
         tx_ref: BlockTxRef,
         clusters: &[ClusterScope],
-    ) -> LedgerResult<(u64, u64)> {
+    ) -> LedgerResult<(u64, u64, u64)> {
         let bundle = match (tx_ref.tx_payload, tx_ref.receipt_payload) {
             (Some(tx_payload), Some(receipt_payload)) => {
                 self.light_fetcher
@@ -224,6 +235,7 @@ impl TraceMonitorService {
             }
         };
         let flows = derive_basic_flows(&bundle);
+        let candidates = detect_light_candidates(&bundle, &flows);
         let address_deltas = aggregate_address_deltas(&flows);
         let address_rows = self
             .upsert_address_deltas(
@@ -247,7 +259,8 @@ impl TraceMonitorService {
                 &cluster_deltas,
             )
             .await?;
-        Ok((address_rows, cluster_rows))
+        let candidate_rows = self.upsert_candidates(&bundle, &candidates).await?;
+        Ok((address_rows, cluster_rows, candidate_rows))
     }
 
     pub async fn top_address_deltas(
@@ -350,7 +363,11 @@ impl TraceMonitorService {
             .and_then(Value::as_str)
             .and_then(|value| u64::from_str_radix(value.trim_start_matches("0x"), 16).ok())
             .and_then(|value| Utc.timestamp_opt(value as i64, 0).single());
-        let receipts_by_hash = match self.block_receipt_rpc.get_block_receipts(block_number).await {
+        let receipts_by_hash = match self
+            .block_receipt_rpc
+            .get_block_receipts(block_number)
+            .await
+        {
             Ok(receipts) => receipts
                 .into_iter()
                 .filter_map(|receipt| {
@@ -569,9 +586,54 @@ impl TraceMonitorService {
         Ok(rows)
     }
 
+    async fn upsert_candidates(
+        &self,
+        bundle: &RawTransactionBundle,
+        candidates: &[LightMonitorCandidate],
+    ) -> LedgerResult<u64> {
+        let mut rows = 0;
+        for candidate in candidates {
+            sqlx::query(
+                r#"
+                insert into trace_monitor_candidates (
+                  chain_id, tx_hash, candidate_kind, block_number, block_timestamp,
+                  score, dex_swap_count, liquidation_event_count, metadata, created_at, updated_at
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),now())
+                on conflict (chain_id, tx_hash, candidate_kind) do update set
+                  block_number = excluded.block_number,
+                  block_timestamp = excluded.block_timestamp,
+                  score = greatest(trace_monitor_candidates.score, excluded.score),
+                  dex_swap_count = excluded.dex_swap_count,
+                  liquidation_event_count = excluded.liquidation_event_count,
+                  metadata = excluded.metadata,
+                  updated_at = now()
+                "#,
+            )
+            .bind(self.config.chain_id as i64)
+            .bind(&bundle.tx.tx_hash)
+            .bind(candidate.kind)
+            .bind(bundle.tx.block_number.unwrap_or_default() as i64)
+            .bind(bundle.tx.block_timestamp)
+            .bind(candidate.score)
+            .bind(candidate.dex_swap_count as i32)
+            .bind(candidate.liquidation_event_count as i32)
+            .bind(Json(candidate.metadata.clone()))
+            .execute(self.repository.pool())
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            rows += 1;
+        }
+        Ok(rows)
+    }
+
     async fn cleanup_expired_rows(&self) -> LedgerResult<()> {
         let cutoff = Utc::now() - Duration::days(self.config.retention_days.max(1));
-        for table in ["trace_address_asset_deltas", "trace_cluster_asset_deltas"] {
+        for table in [
+            "trace_address_asset_deltas",
+            "trace_cluster_asset_deltas",
+            "trace_monitor_candidates",
+        ] {
             let deleted = sqlx::query(&format!(
                 "delete from {table} where block_timestamp is not null and block_timestamp < $1"
             ))
@@ -693,6 +755,83 @@ fn parse_amount_i128(value: &str) -> i128 {
     value.parse::<i128>().unwrap_or_default()
 }
 
+fn detect_light_candidates(
+    bundle: &RawTransactionBundle,
+    flows: &[AssetFlow],
+) -> Vec<LightMonitorCandidate> {
+    let dex_swap_count = bundle
+        .receipt
+        .logs
+        .iter()
+        .filter(|log| {
+            log.topics
+                .first()
+                .map(|topic| is_dex_swap_topic(topic))
+                .unwrap_or(false)
+        })
+        .count() as u32;
+    let liquidation_event_count = bundle
+        .receipt
+        .logs
+        .iter()
+        .filter(|log| {
+            log.topics
+                .first()
+                .map(|topic| is_liquidation_topic(topic))
+                .unwrap_or(false)
+        })
+        .count() as u32;
+    let transfer_token_count = flows
+        .iter()
+        .filter_map(|flow| flow.token_address.as_deref())
+        .map(str::to_ascii_lowercase)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut candidates = Vec::new();
+    if liquidation_event_count > 0 {
+        candidates.push(LightMonitorCandidate {
+            kind: "liquidation_event",
+            score: 100,
+            dex_swap_count,
+            liquidation_event_count,
+            metadata: json!({
+                "detection": "receipt_topic",
+                "transfer_token_count": transfer_token_count,
+            }),
+        });
+    }
+    if dex_swap_count >= 2 {
+        candidates.push(LightMonitorCandidate {
+            kind: "dex_multi_swap",
+            score: 70 + i32::try_from(dex_swap_count.min(10)).unwrap_or_default(),
+            dex_swap_count,
+            liquidation_event_count,
+            metadata: json!({
+                "detection": "receipt_topic",
+                "transfer_token_count": transfer_token_count,
+                "candidate_reason": "multiple dex swap events in one transaction",
+            }),
+        });
+    }
+    candidates
+}
+
+fn is_dex_swap_topic(topic: &str) -> bool {
+    matches!(
+        topic.to_ascii_lowercase().as_str(),
+        "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+            | "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f"
+    )
+}
+
+fn is_liquidation_topic(topic: &str) -> bool {
+    matches!(
+        topic.to_ascii_lowercase().as_str(),
+        "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41"
+            | "0xe413a321e8681d83188be0d2364605a8f594ac97918daee13129e6b4f89b8f3"
+    )
+}
+
 fn next_start_block(
     skip_history_on_startup: bool,
     last_processed: Option<u64>,
@@ -723,6 +862,7 @@ fn next_start_block(
 #[cfg(test)]
 mod tests {
     use crate::domain::value_objects::EvidenceRef;
+    use crate::ingestion::models::{RawReceipt, RawTransaction};
 
     use super::*;
 
@@ -778,10 +918,72 @@ mod tests {
             next_start_block(false, Some(100), Some(200), 500, 30),
             (471, 370)
         );
-        assert_eq!(
-            next_start_block(false, None, Some(490), 500, 30),
-            (490, 0)
-        );
+        assert_eq!(next_start_block(false, None, Some(490), 500, 30), (490, 0));
         assert_eq!(next_start_block(false, None, None, 500, 30), (500, 0));
+    }
+
+    #[test]
+    fn receipt_detector_keeps_liquidations_and_multi_swap_routes_only() {
+        let bundle = RawTransactionBundle {
+            tx: RawTransaction {
+                chain_id: 8453,
+                tx_hash: "0xcandidate".to_owned(),
+                block_number: Some(10),
+                block_timestamp: None,
+                from_address: "0xaaa".to_owned(),
+                to_address: Some("0xbbb".to_owned()),
+                value: "0x0".to_owned(),
+                input_data: "0x".to_owned(),
+                nonce: None,
+                tx_index: None,
+            },
+            receipt: RawReceipt {
+                tx_hash: "0xcandidate".to_owned(),
+                status: 1,
+                gas_used: None,
+                effective_gas_price: None,
+                logs: vec![
+                    crate::ingestion::models::RawLog {
+                        log_index: 1,
+                        address: "0xpool1".to_owned(),
+                        topics: vec![
+                            "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f"
+                                .to_owned(),
+                        ],
+                        data: "0x".to_owned(),
+                    },
+                    crate::ingestion::models::RawLog {
+                        log_index: 2,
+                        address: "0xpool2".to_owned(),
+                        topics: vec![
+                            "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
+                                .to_owned(),
+                        ],
+                        data: "0x".to_owned(),
+                    },
+                    crate::ingestion::models::RawLog {
+                        log_index: 3,
+                        address: "0xprotocol".to_owned(),
+                        topics: vec![
+                            "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41"
+                                .to_owned(),
+                        ],
+                        data: "0x".to_owned(),
+                    },
+                ],
+            },
+            trace: None,
+            target_code: None,
+            snapshots: vec![],
+            metadata: json!({}),
+        };
+
+        let candidates = detect_light_candidates(&bundle, &[]);
+        assert!(
+            candidates
+                .iter()
+                .any(|item| item.kind == "liquidation_event")
+        );
+        assert!(candidates.iter().any(|item| item.kind == "dex_multi_swap"));
     }
 }
