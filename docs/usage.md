@@ -343,7 +343,29 @@ The periodic report path confirms only selected candidates through the existing 
 - `liquidation`: a recognized liquidation with a priced asset movement.
 - `arbitrage`: an arbitrage-like route with positive estimated subject value change.
 - `large-transfer`: a priced movement over `LEDGERFLOW_TRACE_MONITOR_NOTIFY_MIN_USD`.
-- `whale-buy`: a priced swap over that threshold initiated by an address listed in `LEDGERFLOW_TRACE_MONITOR_WHALE_ADDRESSES`.
+- `whale-buy`: a priced swap over that threshold initiated by an address carrying the `actor:whale` address label.
+
+Use the existing `address_labels` table to maintain watched whale addresses; no additional schema is required:
+
+```sql
+insert into address_labels (
+  chain_id, address, label, source, confidence, evidence_json, created_at, updated_at
+)
+values (
+  8453,
+  lower('0xYOUR_WHALE_ADDRESS'),
+  'actor:whale',
+  'manual',
+  1.0,
+  '{"reason":"monitor watchlist"}'::jsonb,
+  now(),
+  now()
+)
+on conflict (chain_id, address, label, source) do update set
+  confidence = excluded.confidence,
+  evidence_json = excluded.evidence_json,
+  updated_at = now();
+```
 
 Configure Telegram delivery with:
 

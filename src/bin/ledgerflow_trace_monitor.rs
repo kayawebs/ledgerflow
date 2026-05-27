@@ -76,7 +76,6 @@ async fn main() {
             top_n: config.trace_monitor_report_top_n,
             min_raw_score: config.trace_monitor_report_min_raw_score.clone(),
             notify_min_usd: config.trace_monitor_notify_min_usd,
-            whale_addresses: config.trace_monitor_whale_addresses.clone(),
             run_on_start: config.trace_monitor_report_run_on_start,
             analysis_api_base_url,
             web_base_url,

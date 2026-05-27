@@ -27,7 +27,6 @@ pub struct MonitorReporterConfig {
     pub top_n: u32,
     pub min_raw_score: String,
     pub notify_min_usd: f64,
-    pub whale_addresses: Vec<String>,
     pub run_on_start: bool,
     pub analysis_api_base_url: String,
     pub web_base_url: String,
@@ -180,10 +179,19 @@ impl MonitorReporter {
                             "monitor analyzed address intelligence enqueue failed"
                         );
                     }
+                    let initiator_is_whale = if should_lookup_whale_label(
+                        &envelope.analysis,
+                        self.config.notify_min_usd,
+                    ) {
+                        self.has_whale_label(&envelope.analysis.from_address)
+                            .await?
+                    } else {
+                        false
+                    };
                     let Some(signal) = detect_confirmed_signal(
                         &envelope.analysis,
                         self.config.notify_min_usd,
-                        &self.config.whale_addresses,
+                        initiator_is_whale,
                     ) else {
                         continue;
                     };
@@ -688,6 +696,16 @@ impl MonitorReporter {
             .enqueue_address_analysis_candidates(self.config.chain_id, &candidates)
             .await
     }
+
+    async fn has_whale_label(&self, address: &str) -> LedgerResult<bool> {
+        let labels = self
+            .repository
+            .list_address_labels(self.config.chain_id, &[address.to_ascii_lowercase()])
+            .await?;
+        Ok(labels
+            .iter()
+            .any(|label| label.label.eq_ignore_ascii_case("actor:whale")))
+    }
 }
 
 #[async_trait]
@@ -905,7 +923,7 @@ struct PricedMovement {
 fn detect_confirmed_signal(
     analysis: &TransactionAnalysis,
     notify_min_usd: f64,
-    whale_addresses: &[String],
+    initiator_is_whale: bool,
 ) -> Option<TxSignal> {
     let scenario_kind = analysis
         .scenario_outputs
@@ -957,9 +975,7 @@ fn detect_confirmed_signal(
         });
     }
 
-    if whale_addresses
-        .iter()
-        .any(|address| address.eq_ignore_ascii_case(&analysis.from_address))
+    if initiator_is_whale
         && is_swap_activity(analysis)
         && primary_movement.value_usd >= notify_min_usd
     {
@@ -985,6 +1001,13 @@ fn detect_confirmed_signal(
         amount_summary: format_movement(&primary_movement),
         estimated_usd: primary_movement.value_usd,
     })
+}
+
+fn should_lookup_whale_label(analysis: &TransactionAnalysis, notify_min_usd: f64) -> bool {
+    is_swap_activity(analysis)
+        && largest_priced_movement(analysis)
+            .map(|movement| movement.value_usd >= notify_min_usd)
+            .unwrap_or(false)
 }
 
 fn largest_priced_movement(analysis: &TransactionAnalysis) -> Option<PricedMovement> {
