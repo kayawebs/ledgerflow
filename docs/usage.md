@@ -382,7 +382,7 @@ LEDGERFLOW_TELEGRAM_CHAT_ID=@your_public_channel_username
 
 For a private channel, use its numeric Bot API channel ID instead of `@username`. The bot must be a channel administrator with permission to post messages.
 
-Each Telegram alert contains the confirmed activity type, an explicitly labeled profit or observed value estimate, a copyable transaction hash, and the public share link. Email provider settings remain relevant only to website login/register verification codes.
+Each Telegram alert contains the confirmed activity type, an explicitly labeled profit or observed value estimate, the main subject address, known address labels when available, transfer direction for large-transfer alerts, a copyable transaction hash, and the public share link. Email provider settings remain relevant only to website login/register verification codes.
 
 ## Check cluster coverage
 

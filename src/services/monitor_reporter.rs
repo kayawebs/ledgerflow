@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{
-        entities::{AddressAnalysisCandidate, EvidencePack, TransactionAnalysis},
+        entities::{AddressAnalysisCandidate, AddressLabel, EvidencePack, TransactionAnalysis},
         interfaces::AnalysisRepository,
     },
     repositories::sqlx::SqlxAnalysisRepository,
@@ -63,9 +63,26 @@ struct TopTxCandidate {
 struct ReportableTx {
     tx: TopTxCandidate,
     signal: TxSignal,
+    subject: AlertSubject,
     share_id: Uuid,
     share_url: String,
     tweet_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AlertSubject {
+    role: String,
+    address: String,
+    labels: Vec<String>,
+    detail: Option<String>,
+    counterparty: Option<AlertCounterparty>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AlertCounterparty {
+    role: String,
+    address: String,
+    labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -185,6 +202,9 @@ impl MonitorReporter {
                     ) else {
                         continue;
                     };
+                    let subject = self
+                        .build_alert_subject(&envelope.analysis, &signal)
+                        .await?;
                     let share_id = self.create_share(&envelope, &tx, &signal).await?;
                     let share_url = format!(
                         "{}/share/tx/{}",
@@ -195,6 +215,7 @@ impl MonitorReporter {
                     reportable.push(ReportableTx {
                         tx,
                         signal,
+                        subject,
                         share_id,
                         share_url,
                         tweet_text,
@@ -692,6 +713,59 @@ impl MonitorReporter {
             .iter()
             .any(|label| label.label.eq_ignore_ascii_case("actor:whale")))
     }
+
+    async fn build_alert_subject(
+        &self,
+        analysis: &TransactionAnalysis,
+        signal: &TxSignal,
+    ) -> LedgerResult<AlertSubject> {
+        let primary_movement = largest_priced_movement(analysis);
+        let subject_address = match signal.activity_kind.as_str() {
+            "large-transfer" => primary_movement
+                .as_ref()
+                .map(|movement| movement.to_address.as_str())
+                .unwrap_or(&analysis.from_address),
+            _ => primary_subject_address(analysis).unwrap_or(&analysis.from_address),
+        };
+        let counterparty_address = match signal.activity_kind.as_str() {
+            "large-transfer" => primary_movement
+                .as_ref()
+                .map(|movement| movement.from_address.as_str()),
+            _ => analysis.to_address.as_deref(),
+        };
+        let mut label_addresses = vec![subject_address.to_ascii_lowercase()];
+        if let Some(counterparty_address) = counterparty_address {
+            label_addresses.push(counterparty_address.to_ascii_lowercase());
+        }
+        let labels = self
+            .repository
+            .list_address_labels(self.config.chain_id, &label_addresses)
+            .await?;
+        let labels_by_address = group_address_labels(labels);
+        let subject_key = subject_address.to_ascii_lowercase();
+        let counterparty = counterparty_address.map(|address| AlertCounterparty {
+            role: counterparty_role(signal.activity_kind.as_str()).to_owned(),
+            address: address.to_ascii_lowercase(),
+            labels: labels_by_address
+                .get(&address.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_default(),
+        });
+        Ok(AlertSubject {
+            role: subject_role(signal.activity_kind.as_str()).to_owned(),
+            address: subject_key.clone(),
+            labels: labels_by_address
+                .get(&subject_key)
+                .cloned()
+                .unwrap_or_default(),
+            detail: subject_detail(
+                signal.activity_kind.as_str(),
+                analysis,
+                primary_movement.as_ref(),
+            ),
+            counterparty,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -745,6 +819,8 @@ struct PricedMovement {
     amount_decimal: String,
     price_decimal: String,
     value_usd: f64,
+    from_address: String,
+    to_address: String,
 }
 
 fn detect_confirmed_signal(
@@ -861,6 +937,8 @@ fn largest_priced_movement(analysis: &TransactionAnalysis) -> Option<PricedMovem
                 amount_decimal,
                 price_decimal,
                 value_usd,
+                from_address: flow.from_address.to_ascii_lowercase(),
+                to_address: flow.to_address.to_ascii_lowercase(),
             })
         })
         .max_by(|left, right| left.value_usd.total_cmp(&right.value_usd))
@@ -905,6 +983,74 @@ fn estimated_subject_net_usd(analysis: &TransactionAnalysis) -> Option<f64> {
         net += if to_scope { value } else { -value };
     }
     priced_boundary_flow.then_some(net)
+}
+
+fn primary_subject_address(analysis: &TransactionAnalysis) -> Option<&str> {
+    analysis
+        .scenario_outputs
+        .pointer("/storyline/subject_scope/addresses")
+        .and_then(Value::as_array)
+        .and_then(|items| items.iter().filter_map(Value::as_str).next())
+}
+
+fn group_address_labels(labels: Vec<AddressLabel>) -> BTreeMap<String, Vec<String>> {
+    let mut labels_by_address = BTreeMap::<String, Vec<String>>::new();
+    for label in labels {
+        labels_by_address
+            .entry(label.address.to_ascii_lowercase())
+            .or_default()
+            .push(label.label);
+    }
+    for labels in labels_by_address.values_mut() {
+        labels.sort();
+        labels.dedup();
+        labels.truncate(3);
+    }
+    labels_by_address
+}
+
+fn subject_role(activity_kind: &str) -> &'static str {
+    match activity_kind {
+        "arbitrage" => "Profit subject",
+        "liquidation" => "Liquidation subject",
+        "whale-buy" => "Whale",
+        "large-transfer" => "Recipient",
+        _ => "Subject",
+    }
+}
+
+fn counterparty_role(activity_kind: &str) -> &'static str {
+    match activity_kind {
+        "large-transfer" => "Sender",
+        "arbitrage" | "liquidation" | "whale-buy" => "Counterparty",
+        _ => "Counterparty",
+    }
+}
+
+fn subject_detail(
+    activity_kind: &str,
+    analysis: &TransactionAnalysis,
+    primary_movement: Option<&PricedMovement>,
+) -> Option<String> {
+    match activity_kind {
+        "large-transfer" => primary_movement.map(|movement| {
+            format!(
+                "received {} {} from {}",
+                movement.amount_decimal,
+                movement.symbol,
+                truncate_middle(&movement.from_address, 6)
+            )
+        }),
+        "arbitrage" => Some("estimated winner".to_owned()),
+        "liquidation" => analysis
+            .scenario_outputs
+            .pointer("/storyline/protocol")
+            .and_then(Value::as_str)
+            .map(|protocol| format!("protocol {protocol}"))
+            .or_else(|| Some("liquidation participant".to_owned())),
+        "whale-buy" => Some("watched labeled address".to_owned()),
+        _ => None,
+    }
 }
 
 fn is_swap_activity(analysis: &TransactionAnalysis) -> bool {
@@ -1079,11 +1225,47 @@ fn build_tweet_text(tx: &TopTxCandidate, signal: &TxSignal, share_url: &str) -> 
 
 fn telegram_message(item: &ReportableTx) -> String {
     format!(
-        "<b>{}</b>\n{}\n\nTx: <code>{}</code>\n<a href=\"{}\">Open analysis</a>",
+        "<b>{}</b>\n{}\n{}\n\nTx: <code>{}</code>\n<a href=\"{}\">Open analysis</a>",
         telegram_title(&item.signal),
         telegram_value_line(&item.signal),
+        telegram_subject_lines(&item.subject),
         escape_telegram_html(&item.tx.tx_hash),
         escape_telegram_html(&item.share_url),
+    )
+}
+
+fn telegram_subject_lines(subject: &AlertSubject) -> String {
+    let mut lines = vec![format!(
+        "{}: <code>{}</code>{}",
+        escape_telegram_html(&subject.role),
+        escape_telegram_html(&subject.address),
+        format_label_suffix(&subject.labels)
+    )];
+    if let Some(detail) = subject.detail.as_deref() {
+        lines.push(format!("Action: {}", escape_telegram_html(detail)));
+    }
+    if let Some(counterparty) = subject.counterparty.as_ref() {
+        lines.push(format!(
+            "{}: <code>{}</code>{}",
+            escape_telegram_html(&counterparty.role),
+            escape_telegram_html(&counterparty.address),
+            format_label_suffix(&counterparty.labels)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_label_suffix(labels: &[String]) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    format!(
+        " [{}]",
+        labels
+            .iter()
+            .map(|label| escape_telegram_html(label))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -1190,6 +1372,17 @@ mod tests {
                 amount_summary: "12.5 WETH (~$32000.00, $2560/token)".to_owned(),
                 estimated_usd: 32_000.0,
             },
+            subject: AlertSubject {
+                role: "Profit subject".to_owned(),
+                address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
+                labels: vec!["actor:whale".to_owned()],
+                detail: Some("estimated winner".to_owned()),
+                counterparty: Some(AlertCounterparty {
+                    role: "Counterparty".to_owned(),
+                    address: "0x1111111111111111111111111111111111111111".to_owned(),
+                    labels: vec!["router".to_owned()],
+                }),
+            },
             share_id: Uuid::nil(),
             share_url: "https://ledgerflow.top/share/tx/123".to_owned(),
             tweet_text: String::new(),
@@ -1198,6 +1391,13 @@ mod tests {
 
         assert!(text.contains("<b>Confirmed Arbitrage</b>"));
         assert!(text.contains("Estimated profit: <b>+$32000.00</b>"));
+        assert!(text.contains(
+            "Profit subject: <code>0xabcdefabcdefabcdefabcdefabcdefabcdefabcd</code> [actor:whale]"
+        ));
+        assert!(text.contains("Action: estimated winner"));
+        assert!(text.contains(
+            "Counterparty: <code>0x1111111111111111111111111111111111111111</code> [router]"
+        ));
         assert!(text.contains("Tx: <code>0x1234567890abcdef</code>"));
         assert!(text.contains("<a href=\"https://ledgerflow.top/share/tx/123\">Open analysis</a>"));
         assert!(!text.contains("Window:"));
