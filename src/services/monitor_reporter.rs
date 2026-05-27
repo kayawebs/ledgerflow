@@ -93,6 +93,7 @@ struct TxSignal {
     positive_strategy_net: bool,
     amount_summary: String,
     estimated_usd: f64,
+    value_label: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,10 +398,11 @@ impl MonitorReporter {
             truncate_middle(&tx.tx_hash, 10)
         );
         let summary = format!(
-            "{} level={} amount={} estimated_usd={:.2} positive_strategy_net={} Top monitor volume score(raw): {}.",
+            "{} level={} amount={} {}={:.2} positive_strategy_net={} Top monitor volume score(raw): {}.",
             signal.reason,
             signal.level.as_str(),
             signal.amount_summary,
+            signal.value_label,
             signal.estimated_usd,
             signal.positive_strategy_net,
             tx.volume_score_raw
@@ -467,6 +469,7 @@ impl MonitorReporter {
             "positive_strategy_net": signal.positive_strategy_net,
             "amount_summary": signal.amount_summary,
             "estimated_usd": signal.estimated_usd,
+            "value_label": signal.value_label,
             "candidate_kind": tx.candidate_kind,
         })))
         .execute(&self.pool)
@@ -846,15 +849,19 @@ fn detect_confirmed_signal(
     let primary_movement = largest_priced_movement(analysis)?;
     let activity_kind = scenario_kind.or(recognizer_kind);
     if activity_kind.as_deref() == Some("liquidation") {
+        let subject_net_usd = estimated_subject_net_usd(analysis);
         return Some(TxSignal {
             activity_kind: "liquidation".to_owned(),
             level: SignalLevel::Confirmed,
             reason: "Protocol liquidation event confirmed from transaction analysis.".to_owned(),
-            positive_strategy_net: estimated_subject_net_usd(analysis)
-                .map(|value| value > 0.0)
-                .unwrap_or(false),
+            positive_strategy_net: subject_net_usd.is_some_and(|value| value > 0.0),
             amount_summary: format_movement(&primary_movement),
-            estimated_usd: primary_movement.value_usd,
+            estimated_usd: subject_net_usd.unwrap_or(primary_movement.value_usd),
+            value_label: if subject_net_usd.is_some() {
+                "Subject net value".to_owned()
+            } else {
+                "Observed liquidation value".to_owned()
+            },
         });
     }
 
@@ -875,6 +882,7 @@ fn detect_confirmed_signal(
                 format_movement(&primary_movement)
             ),
             estimated_usd: net_usd,
+            value_label: "Estimated profit".to_owned(),
         });
     }
 
@@ -891,6 +899,7 @@ fn detect_confirmed_signal(
                 .unwrap_or(false),
             amount_summary: format_movement(&primary_movement),
             estimated_usd: primary_movement.value_usd,
+            value_label: "Trade value".to_owned(),
         });
     }
 
@@ -903,6 +912,7 @@ fn detect_confirmed_signal(
             .unwrap_or(false),
         amount_summary: format_movement(&primary_movement),
         estimated_usd: primary_movement.value_usd,
+        value_label: "Observed value".to_owned(),
     })
 }
 
@@ -1215,10 +1225,11 @@ fn merge_monitor_metadata(left: Value, right: Value) -> Value {
 
 fn build_tweet_text(tx: &TopTxCandidate, signal: &TxSignal, share_url: &str) -> String {
     let base = format!(
-        "LedgerFlow Base: confirmed {}. {} Estimated USD ${:.2}. Tx {}. Analysis: {}",
+        "LedgerFlow Base: confirmed {}. {} {} {}. Tx {}. Analysis: {}",
         signal.activity_kind,
         signal.amount_summary,
-        signal.estimated_usd,
+        signal.value_label,
+        format_usd_for_plaintext(signal.estimated_usd, signal_value_is_signed(signal)),
         truncate_middle(&tx.tx_hash, 8),
         share_url
     );
@@ -1337,14 +1348,34 @@ fn telegram_title(signal: &TxSignal) -> &'static str {
 }
 
 fn telegram_value_line(signal: &TxSignal) -> String {
-    match signal.activity_kind.as_str() {
-        "arbitrage" => format!("Estimated profit: <b>+${:.2}</b>", signal.estimated_usd),
-        "liquidation" => format!(
-            "Observed liquidation value: <b>~${:.2}</b>",
-            signal.estimated_usd
-        ),
-        "whale-buy" => format!("Trade value: <b>~${:.2}</b>", signal.estimated_usd),
-        _ => format!("Observed value: <b>~${:.2}</b>", signal.estimated_usd),
+    let signed = signal_value_is_signed(signal);
+    format!(
+        "{}: <b>{}</b>",
+        escape_telegram_html(&signal.value_label),
+        format_usd_for_html(signal.estimated_usd, signed)
+    )
+}
+
+fn signal_value_is_signed(signal: &TxSignal) -> bool {
+    matches!(
+        signal.value_label.as_str(),
+        "Estimated profit" | "Subject net value"
+    )
+}
+
+fn format_usd_for_html(value: f64, signed: bool) -> String {
+    escape_telegram_html(&format_usd_for_plaintext(value, signed))
+}
+
+fn format_usd_for_plaintext(value: f64, signed: bool) -> String {
+    if signed {
+        if value >= 0.0 {
+            format!("+${value:.2}")
+        } else {
+            format!("-${:.2}", value.abs())
+        }
+    } else {
+        format!("~${value:.2}")
     }
 }
 
@@ -1404,6 +1435,7 @@ mod tests {
             positive_strategy_net: true,
             amount_summary: "12.5 WETH (~$32000.00, $2560/token)".to_owned(),
             estimated_usd: 32_000.0,
+            value_label: "Observed liquidation value".to_owned(),
         };
         let text = build_tweet_text(&tx, &signal, "https://ledgerflow.top/share/tx/123");
         assert!(text.chars().count() <= 280);
@@ -1428,6 +1460,7 @@ mod tests {
                 positive_strategy_net: true,
                 amount_summary: "12.5 WETH (~$32000.00, $2560/token)".to_owned(),
                 estimated_usd: 32_000.0,
+                value_label: "Estimated profit".to_owned(),
             },
             subject: AlertSubject {
                 role: "Main address".to_owned(),
@@ -1463,5 +1496,24 @@ mod tests {
         assert!(!text.contains("Window:"));
         assert!(!text.contains("Amount:"));
         assert!(!text.contains("Reason:"));
+    }
+
+    #[test]
+    fn telegram_liquidation_alert_uses_subject_net_value_label() {
+        let signal = TxSignal {
+            activity_kind: "liquidation".to_owned(),
+            level: SignalLevel::Confirmed,
+            reason: "Liquidation confirmed.".to_owned(),
+            positive_strategy_net: true,
+            amount_summary: "100 TOKEN (~$168.77, $1.6877/token)".to_owned(),
+            estimated_usd: 9.0,
+            value_label: "Subject net value".to_owned(),
+        };
+
+        let line = telegram_value_line(&signal);
+
+        assert_eq!(line, "Subject net value: <b>+$9.00</b>");
+        assert!(!line.contains("Observed liquidation value"));
+        assert!(!line.contains("168.77"));
     }
 }
