@@ -420,7 +420,7 @@ Goal: turn the live monitor into a practical "large liquidation / arbitrage cand
 
 ### 6.1 Reduce Alert False Negatives
 
-Current reporter behavior only sends email when a tx is already recognized as liquidation/arbitrage and has positive strategy net. That is too strict while protocol adapters are still incomplete.
+Current reporter behavior only sends a Telegram alert after analysis confirms a reportable signal. That is too strict while protocol adapters are still incomplete.
 
 Tasks:
 
@@ -428,7 +428,7 @@ Tasks:
    - `confirmed`: recognized liquidation/arbitrage with positive strategy net
    - `probable`: recognized liquidation/arbitrage or strong multi-leg route, but PnL is unknown or partially unresolved
    - `interesting`: high-volume complex value movement worth human review
-2. Send email for all three levels, with the level clearly shown in subject/body.
+2. Send Telegram alerts for all three levels, with the level clearly shown in the message.
 3. Keep the existing top-N and min score gates to avoid unlimited spam.
 
 ### 6.2 Feed Address Intelligence From Monitor Candidates
@@ -499,7 +499,7 @@ Tasks:
 
 Acceptance criteria:
 
-- the monitor sends emails for high-value probable candidates even when exact profit is unresolved
+- the monitor sends Telegram alerts for high-value probable candidates even when exact profit is unresolved
 - top txs automatically seed address intelligence
 - DEX/pool/router labels improve over time without manual per-address analysis
 - confirmed liquidation/arbitrage still appears as the strongest signal, not the only signal

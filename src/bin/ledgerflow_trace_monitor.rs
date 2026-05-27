@@ -79,12 +79,6 @@ async fn main() {
             run_on_start: config.trace_monitor_report_run_on_start,
             analysis_api_base_url,
             web_base_url,
-            email_to: config.trace_monitor_report_email_to.clone(),
-            email_from: config.email_from.clone(),
-            email_delivery_mode: config.email_delivery_mode.clone(),
-            postmark_server_token: config.postmark_server_token.clone(),
-            postmark_message_stream: config.postmark_message_stream.clone(),
-            resend_api_key: config.resend_api_key.clone(),
             telegram_bot_token: config.telegram_bot_token.clone(),
             telegram_chat_id: config.telegram_chat_id.clone(),
         },
@@ -102,7 +96,8 @@ async fn main() {
         report_enabled = config.trace_monitor_report_enabled,
         report_interval_ms = config.trace_monitor_report_interval_ms,
         report_top_n = config.trace_monitor_report_top_n,
-        report_email_to = config.trace_monitor_report_email_to,
+        telegram_delivery_configured =
+            config.telegram_bot_token.is_some() && config.telegram_chat_id.is_some(),
         "trace monitor started"
     );
 

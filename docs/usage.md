@@ -338,7 +338,7 @@ The monitor intentionally does not call trace RPC. When you need transaction int
 
 ### Confirmed alert delivery
 
-The periodic report path confirms only selected candidates through the existing transaction analysis API. Unconfirmed candidates do not send email or Telegram alerts.
+The periodic report path confirms only selected candidates through the existing transaction analysis API. Confirmed alerts are delivered through Telegram only; unconfirmed candidates are not sent.
 
 - `liquidation`: a recognized liquidation with a priced asset movement.
 - `arbitrage`: an arbitrage-like route with positive estimated subject value change.
@@ -381,6 +381,8 @@ LEDGERFLOW_TELEGRAM_CHAT_ID=@your_public_channel_username
 ```
 
 For a private channel, use its numeric Bot API channel ID instead of `@username`. The bot must be a channel administrator with permission to post messages.
+
+Each Telegram alert contains the confirmed activity type, priced amount, USD estimate, analysis reason, transaction hash, and public share link. Email provider settings remain relevant only to website login/register verification codes.
 
 ## Check cluster coverage
 

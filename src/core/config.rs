@@ -44,7 +44,6 @@ pub struct AppConfig {
     pub trace_monitor_report_top_n: u32,
     pub trace_monitor_report_min_raw_score: String,
     pub trace_monitor_report_run_on_start: bool,
-    pub trace_monitor_report_email_to: String,
     pub trace_monitor_notify_min_usd: f64,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
@@ -157,8 +156,6 @@ impl AppConfig {
             )
             .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
             .unwrap_or(true),
-            trace_monitor_report_email_to: env::var("LEDGERFLOW_TRACE_MONITOR_REPORT_EMAIL_TO")
-                .unwrap_or_else(|_| "wcy19960411@gmail.com".to_owned()),
             trace_monitor_notify_min_usd: env::var("LEDGERFLOW_TRACE_MONITOR_NOTIFY_MIN_USD")
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())

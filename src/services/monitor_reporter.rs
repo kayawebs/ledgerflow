@@ -1,6 +1,5 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
-use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -30,12 +29,6 @@ pub struct MonitorReporterConfig {
     pub run_on_start: bool,
     pub analysis_api_base_url: String,
     pub web_base_url: String,
-    pub email_to: String,
-    pub email_from: Option<String>,
-    pub email_delivery_mode: String,
-    pub postmark_server_token: Option<String>,
-    pub postmark_message_stream: String,
-    pub resend_api_key: Option<String>,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
 }
@@ -45,7 +38,6 @@ pub struct MonitorReporter {
     pool: PgPool,
     repository: SqlxAnalysisRepository,
     client: Client,
-    sender: Arc<dyn ReportEmailSender>,
     telegram: Option<TelegramNotifier>,
     config: MonitorReporterConfig,
 }
@@ -54,7 +46,7 @@ pub struct MonitorReporter {
 pub struct MonitorReportSummary {
     pub inspected_txs: usize,
     pub reportable_txs: usize,
-    pub email_sent: bool,
+    pub telegram_sent: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -130,13 +122,11 @@ fn top_tx_from_row(row: sqlx::postgres::PgRow) -> LedgerResult<TopTxCandidate> {
 
 impl MonitorReporter {
     pub fn new(pool: PgPool, config: MonitorReporterConfig) -> Self {
-        let sender = build_report_sender(&config);
         let telegram = build_telegram_notifier(&config);
         Self {
             repository: SqlxAnalysisRepository::from_pool(pool.clone()),
             pool,
             client: Client::new(),
-            sender,
             telegram,
             config,
         }
@@ -220,29 +210,23 @@ impl MonitorReporter {
             }
         }
 
-        let mut delivered = false;
+        let mut telegram_sent = false;
         if let Some(telegram) = self.telegram.as_ref() {
-            match telegram.send_alerts(&reportable).await {
-                Ok(()) if !reportable.is_empty() => delivered = true,
+            match telegram
+                .send_alerts(window_start, window_end, &reportable)
+                .await
+            {
+                Ok(()) if !reportable.is_empty() => telegram_sent = true,
                 Ok(()) => {}
                 Err(err) => warn!(error = %err, "telegram monitor alerts failed"),
             }
+        } else if !reportable.is_empty() {
+            warn!(
+                reportable_txs = reportable.len(),
+                "confirmed monitor alerts dropped because Telegram delivery is not configured"
+            );
         }
-        let mut email_sent = false;
-        if !reportable.is_empty() {
-            match self
-                .sender
-                .send_report(&self.config.email_to, window_start, window_end, &reportable)
-                .await
-            {
-                Ok(()) => {
-                    delivered = true;
-                    email_sent = true;
-                }
-                Err(err) => warn!(error = %err, "monitor email alert delivery failed"),
-            }
-        }
-        if delivered {
+        if telegram_sent {
             for item in &reportable {
                 self.record_report(
                     &item.tx,
@@ -259,13 +243,13 @@ impl MonitorReporter {
         info!(
             inspected_txs = candidates.len(),
             reportable_txs = reportable.len(),
-            email_sent,
+            telegram_sent,
             "trace monitor hourly report completed"
         );
         Ok(MonitorReportSummary {
             inspected_txs: candidates.len(),
             reportable_txs: reportable.len(),
-            email_sent,
+            telegram_sent,
         })
     }
 
@@ -436,7 +420,7 @@ impl MonitorReporter {
             r#"
             insert into trace_monitor_tx_reports (
               chain_id, tx_hash, window_start, window_end, activity_kind, volume_score_raw,
-              share_id, tweet_text, email_to, sent_at, metadata
+              share_id, tweet_text, notification_target, sent_at, metadata
             )
             values ($1,$2,$3,$4,$5,$6::numeric,$7,$8,$9,now(),$10)
             on conflict (chain_id, tx_hash) do nothing
@@ -450,7 +434,12 @@ impl MonitorReporter {
         .bind(&tx.volume_score_raw)
         .bind(share_id)
         .bind(tweet_text)
-        .bind(&self.config.email_to)
+        .bind(
+            self.config
+                .telegram_chat_id
+                .as_deref()
+                .unwrap_or("telegram"),
+        )
         .bind(SqlJson(json!({
             "block_number": tx.block_number,
             "block_timestamp": tx.block_timestamp,
@@ -708,166 +697,6 @@ impl MonitorReporter {
     }
 }
 
-#[async_trait]
-trait ReportEmailSender: Send + Sync {
-    async fn send_report(
-        &self,
-        email: &str,
-        window_start: DateTime<Utc>,
-        window_end: DateTime<Utc>,
-        reportable: &[ReportableTx],
-    ) -> LedgerResult<()>;
-}
-
-struct LogReportEmailSender;
-
-#[async_trait]
-impl ReportEmailSender for LogReportEmailSender {
-    async fn send_report(
-        &self,
-        email: &str,
-        window_start: DateTime<Utc>,
-        window_end: DateTime<Utc>,
-        reportable: &[ReportableTx],
-    ) -> LedgerResult<()> {
-        info!(
-            email,
-            window_start = %window_start,
-            window_end = %window_end,
-            count = reportable.len(),
-            delivery_mode = "log",
-            "trace monitor report email logged"
-        );
-        for item in reportable {
-            info!(tweet_text = %item.tweet_text, share_url = %item.share_url, "trace monitor report item");
-        }
-        Ok(())
-    }
-}
-
-struct PostmarkReportEmailSender {
-    client: Client,
-    server_token: String,
-    from_email: String,
-    message_stream: String,
-}
-
-#[async_trait]
-impl ReportEmailSender for PostmarkReportEmailSender {
-    async fn send_report(
-        &self,
-        email: &str,
-        window_start: DateTime<Utc>,
-        window_end: DateTime<Utc>,
-        reportable: &[ReportableTx],
-    ) -> LedgerResult<()> {
-        let subject = report_subject(reportable);
-        let (text_body, html_body) = report_bodies(window_start, window_end, reportable);
-        let response = self
-            .client
-            .post("https://api.postmarkapp.com/email")
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .header("X-Postmark-Server-Token", &self.server_token)
-            .json(&json!({
-                "From": self.from_email,
-                "To": email,
-                "Subject": subject,
-                "TextBody": text_body,
-                "HtmlBody": html_body,
-                "MessageStream": self.message_stream,
-            }))
-            .send()
-            .await
-            .map_err(|err| LedgerError::TransientIngestion(err.to_string()))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(LedgerError::TransientIngestion(format!(
-                "postmark monitor report failed: {status} {body}"
-            )));
-        }
-        Ok(())
-    }
-}
-
-struct ResendReportEmailSender {
-    client: Client,
-    api_key: String,
-    from_email: String,
-}
-
-#[async_trait]
-impl ReportEmailSender for ResendReportEmailSender {
-    async fn send_report(
-        &self,
-        email: &str,
-        window_start: DateTime<Utc>,
-        window_end: DateTime<Utc>,
-        reportable: &[ReportableTx],
-    ) -> LedgerResult<()> {
-        let subject = report_subject(reportable);
-        let (text_body, html_body) = report_bodies(window_start, window_end, reportable);
-        let response = self
-            .client
-            .post("https://api.resend.com/emails")
-            .bearer_auth(&self.api_key)
-            .json(&json!({
-                "from": self.from_email,
-                "to": [email],
-                "subject": subject,
-                "text": text_body,
-                "html": html_body,
-            }))
-            .send()
-            .await
-            .map_err(|err| LedgerError::TransientIngestion(err.to_string()))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(LedgerError::TransientIngestion(format!(
-                "resend monitor report failed: {status} {body}"
-            )));
-        }
-        Ok(())
-    }
-}
-
-fn build_report_sender(config: &MonitorReporterConfig) -> Arc<dyn ReportEmailSender> {
-    let mode = config.email_delivery_mode.to_ascii_lowercase();
-    match mode.as_str() {
-        "postmark" => build_postmark_sender(config).unwrap_or_else(|| {
-            warn!("postmark report email config missing; falling back to log delivery");
-            Arc::new(LogReportEmailSender)
-        }),
-        "resend" => build_resend_sender(config).unwrap_or_else(|| {
-            warn!("resend report email config missing; falling back to log delivery");
-            Arc::new(LogReportEmailSender)
-        }),
-        "log" => Arc::new(LogReportEmailSender),
-        _ => build_postmark_sender(config)
-            .or_else(|| build_resend_sender(config))
-            .unwrap_or_else(|| Arc::new(LogReportEmailSender)),
-    }
-}
-
-fn build_postmark_sender(config: &MonitorReporterConfig) -> Option<Arc<dyn ReportEmailSender>> {
-    Some(Arc::new(PostmarkReportEmailSender {
-        client: Client::new(),
-        server_token: config.postmark_server_token.clone()?,
-        from_email: config.email_from.clone()?,
-        message_stream: config.postmark_message_stream.clone(),
-    }))
-}
-
-fn build_resend_sender(config: &MonitorReporterConfig) -> Option<Arc<dyn ReportEmailSender>> {
-    Some(Arc::new(ResendReportEmailSender {
-        client: Client::new(),
-        api_key: config.resend_api_key.clone()?,
-        from_email: config.email_from.clone()?,
-    }))
-}
-
 #[derive(Clone)]
 struct TelegramNotifier {
     client: Client,
@@ -876,7 +705,12 @@ struct TelegramNotifier {
 }
 
 impl TelegramNotifier {
-    async fn send_alerts(&self, reportable: &[ReportableTx]) -> LedgerResult<()> {
+    async fn send_alerts(
+        &self,
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
+        reportable: &[ReportableTx],
+    ) -> LedgerResult<()> {
         for item in reportable {
             let response = self
                 .client
@@ -886,7 +720,7 @@ impl TelegramNotifier {
                 ))
                 .json(&json!({
                     "chat_id": self.chat_id,
-                    "text": telegram_message(item),
+                    "text": telegram_message(window_start, window_end, item),
                     "disable_web_page_preview": true,
                 }))
                 .send()
@@ -1250,60 +1084,22 @@ fn build_tweet_text(tx: &TopTxCandidate, signal: &TxSignal, share_url: &str) -> 
     truncate_chars(&base, 280)
 }
 
-fn telegram_message(item: &ReportableTx) -> String {
-    format!(
-        "[CONFIRMED {}]\n{}\nEstimated value: ${:.2}\nTx: {}\n{}",
-        item.signal.activity_kind.to_ascii_uppercase(),
-        item.signal.amount_summary,
-        item.signal.estimated_usd,
-        truncate_middle(&item.tx.tx_hash, 10),
-        item.share_url
-    )
-}
-
-fn report_subject(reportable: &[ReportableTx]) -> String {
-    format!(
-        "LedgerFlow monitor: {} confirmed alert{}",
-        reportable.len(),
-        if reportable.len() == 1 { "" } else { "s" },
-    )
-}
-
-fn report_bodies(
+fn telegram_message(
     window_start: DateTime<Utc>,
     window_end: DateTime<Utc>,
-    reportable: &[ReportableTx],
-) -> (String, String) {
-    let mut text = format!("Window: {window_start} - {window_end}\n\n");
-    let mut html = format!(
-        "<div style=\"font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.5\"><p><strong>Window:</strong> {} - {}</p>",
-        html_escape(&window_start.to_string()),
-        html_escape(&window_end.to_string())
-    );
-    for item in reportable {
-        text.push_str(&format!(
-            "- [{}] {}\n  amount: {}\n  estimated USD: ${:.2}\n  reason: {}\n  tx: {}\n  share: {}\n\n",
-            item.signal.level.as_str(),
-            item.signal.activity_kind,
-            item.signal.amount_summary,
-            item.signal.estimated_usd,
-            item.signal.reason,
-            item.tx.tx_hash,
-            item.share_url,
-        ));
-        html.push_str(&format!(
-            "<hr><p><strong>[{}] {}</strong></p><p>{} (~${:.2})</p><p>{}</p><p>tx: <code>{}</code></p><p><a href=\"{}\">Open analysis</a></p>",
-            html_escape(item.signal.level.as_str()),
-            html_escape(&item.signal.activity_kind),
-            html_escape(&item.signal.amount_summary),
-            item.signal.estimated_usd,
-            html_escape(&item.signal.reason),
-            html_escape(&item.tx.tx_hash),
-            html_escape(&item.share_url),
-        ));
-    }
-    html.push_str("</div>");
-    (text, html)
+    item: &ReportableTx,
+) -> String {
+    format!(
+        "[CONFIRMED {}]\nWindow: {} - {}\nAmount: {}\nEstimated USD: ${:.2}\nReason: {}\nTx: {}\nAnalysis: {}",
+        item.signal.activity_kind.to_ascii_uppercase(),
+        window_start.to_rfc3339(),
+        window_end.to_rfc3339(),
+        item.signal.amount_summary,
+        item.signal.estimated_usd,
+        item.signal.reason,
+        item.tx.tx_hash,
+        item.share_url
+    )
 }
 
 fn truncate_middle(value: &str, keep_each_side: usize) -> String {
@@ -1332,14 +1128,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1365,5 +1153,44 @@ mod tests {
         };
         let text = build_tweet_text(&tx, &signal, "https://ledgerflow.top/share/tx/123");
         assert!(text.chars().count() <= 280);
+    }
+
+    #[test]
+    fn telegram_alert_contains_report_context() {
+        let tx = TopTxCandidate {
+            tx_hash: "0x1234567890abcdef".to_owned(),
+            block_number: 1,
+            block_timestamp: None,
+            volume_score_raw: "1".to_owned(),
+            address_count: 2,
+            candidate_kind: Some("liquidation_event".to_owned()),
+        };
+        let item = ReportableTx {
+            tx,
+            signal: TxSignal {
+                activity_kind: "liquidation".to_owned(),
+                level: SignalLevel::Confirmed,
+                reason: "Liquidation confirmed.".to_owned(),
+                positive_strategy_net: true,
+                amount_summary: "12.5 WETH (~$32000.00, $2560/token)".to_owned(),
+                estimated_usd: 32_000.0,
+            },
+            share_id: Uuid::nil(),
+            share_url: "https://ledgerflow.top/share/tx/123".to_owned(),
+            tweet_text: String::new(),
+        };
+        let start = DateTime::parse_from_rfc3339("2026-05-27T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2026-05-27T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let text = telegram_message(start, end, &item);
+
+        assert!(text.contains("Window: 2026-05-27T00:00:00+00:00"));
+        assert!(text.contains("Reason: Liquidation confirmed."));
+        assert!(text.contains("Tx: 0x1234567890abcdef"));
+        assert!(text.contains("Analysis: https://ledgerflow.top/share/tx/123"));
     }
 }
