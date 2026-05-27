@@ -312,6 +312,121 @@ impl PriceService {
         }))
     }
 
+    pub async fn quote_current_amount(
+        &self,
+        chain_id: u64,
+        token_address: &str,
+        amount_raw: &str,
+        decimals: u8,
+    ) -> LedgerResult<Option<PriceQuote>> {
+        let token_address = token_address.to_ascii_lowercase();
+        let amount_decimal_f64 = parse_amount_decimal(amount_raw, decimals)?;
+        if let Some(stable) = stable_token(&token_address) {
+            return Ok(Some(PriceQuote {
+                token_address,
+                quote_symbol: DEFAULT_QUOTE_SYMBOL.to_owned(),
+                amount_raw: amount_raw.to_owned(),
+                amount_decimal: format_decimal(amount_decimal_f64),
+                value_decimal: format_decimal(amount_decimal_f64),
+                price_decimal: "1".to_owned(),
+                confidence: 1.0,
+                source: format!("{SOURCE_STABLE_ANCHOR}:{}", stable.symbol),
+                observed_block: None,
+                block_bucket: Some(0),
+            }));
+        }
+        let mut row = self
+            .load_current_usd_cache(chain_id, &token_address)
+            .await?;
+        if row.is_none() {
+            let request = PriceRequest {
+                request_id: Uuid::new_v4(),
+                chain_id,
+                token_address: token_address.clone(),
+                quote_symbol: DEFAULT_QUOTE_SYMBOL.to_owned(),
+                target_block: None,
+                block_bucket: Some(0),
+                target_timestamp: None,
+            };
+            if self.resolve_price_request(&request).await?.is_some() {
+                row = self
+                    .load_current_usd_cache(chain_id, &token_address)
+                    .await?;
+            }
+        }
+        let Some(row) = row else {
+            self.enqueue_current_request(chain_id, &token_address)
+                .await?;
+            return Ok(None);
+        };
+        let price_decimal = row
+            .try_get::<String, _>("price_decimal")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let price_f64 = price_decimal
+            .parse::<f64>()
+            .map_err(|err| LedgerError::MalformedEvidence(err.to_string()))?;
+        Ok(Some(PriceQuote {
+            token_address: row
+                .try_get("token_address")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            quote_symbol: row
+                .try_get("quote_symbol")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            amount_raw: amount_raw.to_owned(),
+            amount_decimal: format_decimal(amount_decimal_f64),
+            value_decimal: format_decimal(amount_decimal_f64 * price_f64),
+            price_decimal,
+            confidence: row
+                .try_get::<f32, _>("confidence")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            source: row
+                .try_get("source")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            observed_block: row
+                .try_get::<Option<i64>, _>("observed_block")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                .map(|value| value as u64),
+            block_bucket: row
+                .try_get::<i64, _>("block_bucket")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                .try_into()
+                .ok(),
+        }))
+    }
+
+    async fn load_current_usd_cache(
+        &self,
+        chain_id: u64,
+        token_address: &str,
+    ) -> LedgerResult<Option<sqlx::postgres::PgRow>> {
+        sqlx::query(
+            r#"
+            select
+              token_address,
+              quote_symbol,
+              price_decimal::text as price_decimal,
+              confidence,
+              source,
+              observed_block,
+              block_bucket
+            from token_price_cache
+            where chain_id = $1
+              and token_address = $2
+              and quote_symbol = $3
+              and block_bucket = 0
+              and (expires_at is null or expires_at > now())
+            order by confidence desc, updated_at desc
+            limit 1
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(token_address.to_ascii_lowercase())
+        .bind(DEFAULT_QUOTE_SYMBOL)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))
+    }
+
     async fn attach_flow_quotes(
         &self,
         analysis: &mut TransactionAnalysis,
@@ -1163,6 +1278,37 @@ impl PriceService {
             "source": "tx_analysis",
             "tx_hash": analysis.tx_hash,
             "block_number": analysis.block_number,
+        })))
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(result.rows_affected())
+    }
+
+    async fn enqueue_current_request(
+        &self,
+        chain_id: u64,
+        token_address: &str,
+    ) -> LedgerResult<u64> {
+        let result = sqlx::query(
+            r#"
+            insert into price_requests (
+              request_id, chain_id, token_address, quote_symbol, target_block,
+              block_bucket, target_timestamp, priority, reason, metadata
+            )
+            values ($1,$2,$3,$4,null,0,null,$5,$6,$7)
+            on conflict do nothing
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(chain_id as i64)
+        .bind(token_address.to_ascii_lowercase())
+        .bind(DEFAULT_QUOTE_SYMBOL)
+        .bind(20i32)
+        .bind("address_portfolio_current_price")
+        .bind(Json(json!({
+            "source": "address_portfolio",
+            "current_snapshot": true,
         })))
         .execute(&self.pool)
         .await

@@ -3206,11 +3206,34 @@ fn render_address_analysis_panel(
                 .profile
                 .as_ref()
                 .map(|profile| {
+                    let portfolio = profile
+                        .metadata
+                        .pointer("/portfolio_estimate/estimated_usd")
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|estimated_usd| {
+                            let classification = if profile
+                                .metadata
+                                .pointer("/portfolio_estimate/is_whale")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false)
+                            {
+                                "whale"
+                            } else {
+                                "below threshold / partial"
+                            };
+                            format!(
+                                r#"<div class="stat"><span>Observed portfolio value</span><strong>${:.2}</strong><small>{}</small></div>"#,
+                                estimated_usd,
+                                escape_html(classification)
+                            )
+                        })
+                        .unwrap_or_default();
                     format!(
                         r#"<div class="stat"><span>Type</span><strong>{}</strong></div>
-<div class="stat"><span>Code bytes</span><strong>{}</strong></div>"#,
+<div class="stat"><span>Code bytes</span><strong>{}</strong></div>{}"#,
                         escape_html(&profile.address_type),
-                        profile.bytecode_length.unwrap_or_default()
+                        profile.bytecode_length.unwrap_or_default(),
+                        portfolio
                     )
                 })
                 .unwrap_or_else(|| {

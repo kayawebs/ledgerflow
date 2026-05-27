@@ -345,7 +345,13 @@ The periodic report path confirms only selected candidates through the existing 
 - `large-transfer`: a priced movement over `LEDGERFLOW_TRACE_MONITOR_NOTIFY_MIN_USD`.
 - `whale-buy`: a priced swap over that threshold initiated by an address carrying the `actor:whale` address label.
 
-Use the existing `address_labels` table to maintain watched whale addresses; no additional schema is required:
+`ledgerflow_address_worker` automatically promotes an EOA to
+`actor:whale` once the priced balance lower bound of tokens already observed in its analyzed
+history exceeds `LEDGERFLOW_ADDRESS_WHALE_THRESHOLD_USD` (default `$100,000`). Token prices are
+resolved lazily through known DEX pools and `ledgerflow_price_worker`; contracts, routers, pools,
+tokens, and protocol contracts are not promoted. No additional schema is required.
+
+You can also maintain the same label manually:
 
 ```sql
 insert into address_labels (

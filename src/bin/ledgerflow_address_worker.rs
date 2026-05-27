@@ -9,8 +9,7 @@ use ledgerflow::{
     repositories::sqlx::SqlxAnalysisRepository,
     services::{
         address_intelligence::AddressIntelligenceService, analysis::AnalysisService,
-        indexer_client::IndexerHttpClient, pricing::PriceService,
-        seeds::seed_known_metadata,
+        indexer_client::IndexerHttpClient, pricing::PriceService, seeds::seed_known_metadata,
         token_metadata::TokenMetadataService,
     },
 };
@@ -44,7 +43,8 @@ async fn main() {
         repository.pool().clone(),
         rpc_client.clone(),
     ));
-    let price_service = Arc::new(PriceService::new(repository.pool().clone()));
+    let price_service =
+        Arc::new(PriceService::new(repository.pool().clone()).with_rpc_client(rpc_client.clone()));
     let fetcher = TransactionBundleFetcher::new(rpc_client.clone(), config.trace_enabled);
     let repository = Arc::new(repository);
     let analysis_service = Arc::new(
@@ -56,23 +56,32 @@ async fn main() {
             config.enabled_recognizers.clone(),
         )
         .with_token_metadata_service(token_metadata_service)
-        .with_price_service(price_service),
+        .with_price_service(price_service.clone()),
     );
     let service = if let Some(indexer_url) = config.indexer_api_base_url.clone() {
         let tx_source = Arc::new(IndexerHttpClient::new(
             indexer_url,
             config.indexer_api_bearer_token.clone(),
         )) as Arc<dyn ClusterTxSource>;
-        AddressIntelligenceService::new(repository, rpc_client).with_history_backfill(
-            analysis_service,
-            tx_source,
-            config.cluster_backfill_query_limit,
-        )
+        AddressIntelligenceService::new(repository, rpc_client)
+            .with_portfolio_classification(
+                price_service.clone(),
+                config.address_whale_threshold_usd,
+            )
+            .with_history_backfill(
+                analysis_service,
+                tx_source,
+                config.cluster_backfill_query_limit,
+            )
     } else {
         AddressIntelligenceService::new(repository, rpc_client)
+            .with_portfolio_classification(price_service, config.address_whale_threshold_usd)
     };
 
-    info!("address intelligence worker started");
+    info!(
+        whale_threshold_usd = config.address_whale_threshold_usd,
+        "address intelligence worker started"
+    );
     loop {
         match service.process_next_job().await {
             Ok(Some(profile)) => {

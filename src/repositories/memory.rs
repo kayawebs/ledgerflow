@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -33,7 +33,8 @@ pub struct InMemoryAnalysisRepository {
     cluster_alerts: RwLock<HashMap<Uuid, Vec<ClusterAlert>>>,
     address_profiles: RwLock<HashMap<(u64, String), AddressProfile>>,
     address_labels: RwLock<HashMap<(u64, String, String, String), AddressLabel>>,
-    protocol_metadata: RwLock<HashMap<(u64, String, String, String, String), ProtocolAddressMetadata>>,
+    protocol_metadata:
+        RwLock<HashMap<(u64, String, String, String, String), ProtocolAddressMetadata>>,
     address_jobs: RwLock<HashMap<(u64, String), AddressAnalysisJob>>,
 }
 
@@ -566,15 +567,27 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
                 .and_then(|value| value.as_str())
                 .map(|value| matches!(value, "address_summary" | "address_analysis_page"))
                 .unwrap_or(false);
+            let portfolio_refresh = candidate
+                .metadata
+                .get("roles")
+                .and_then(Value::as_array)
+                .map(|roles| {
+                    roles
+                        .iter()
+                        .any(|role| role.as_str() == Some("portfolio_refresh"))
+                })
+                .unwrap_or(false);
             match jobs.get_mut(&key) {
-                Some(existing) if existing.status != "completed" || manual_lookup => {
+                Some(existing)
+                    if existing.status != "completed" || manual_lookup || portfolio_refresh =>
+                {
                     existing.last_seen_at = now;
                     existing.updated_at = now;
                     existing.priority = existing.priority.min(candidate.priority);
                     existing.metadata =
                         merge_json(existing.metadata.clone(), candidate.metadata.clone());
                     if existing.status == "failed"
-                        || (existing.status == "completed" && manual_lookup)
+                        || (existing.status == "completed" && (manual_lookup || portfolio_refresh))
                     {
                         existing.status = "pending".to_owned();
                         existing.available_at = now;

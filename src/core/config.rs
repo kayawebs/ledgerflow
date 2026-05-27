@@ -49,6 +49,7 @@ pub struct AppConfig {
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub price_worker_poll_interval_ms: u64,
+    pub address_whale_threshold_usd: f64,
     pub email_from: Option<String>,
     pub email_delivery_mode: String,
     pub postmark_server_token: Option<String>,
@@ -168,6 +169,10 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(10_000),
+            address_whale_threshold_usd: env::var("LEDGERFLOW_ADDRESS_WHALE_THRESHOLD_USD")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(100_000.0),
             email_from: env::var("LEDGERFLOW_EMAIL_FROM").ok(),
             email_delivery_mode: env::var("LEDGERFLOW_EMAIL_DELIVERY_MODE")
                 .unwrap_or_else(|_| "auto".to_owned()),

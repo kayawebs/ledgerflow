@@ -531,7 +531,7 @@ impl MonitorReporter {
                         "source": "trace_monitor",
                         "tx_hash": tx.tx_hash,
                         "block_number": tx.block_number,
-                        "roles": ["tx_from"],
+                        "roles": ["tx_from", "portfolio_refresh"],
                     }),
                 );
             }
@@ -579,7 +579,7 @@ impl MonitorReporter {
             &mut candidates,
             &analysis.from_address,
             20,
-            base(vec!["tx_from"]),
+            base(vec!["tx_from", "portfolio_refresh"]),
         );
         if let Some(to_address) = analysis.to_address.as_deref() {
             insert_monitor_candidate(
@@ -1216,7 +1216,21 @@ fn merge_monitor_metadata(left: Value, right: Value) -> Value {
     match (left, right) {
         (Value::Object(mut left), Value::Object(right)) => {
             for (key, value) in right {
-                left.insert(key, value);
+                if key == "roles" {
+                    let mut roles = left
+                        .get("roles")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for role in value.as_array().cloned().unwrap_or_default() {
+                        if !roles.contains(&role) {
+                            roles.push(role);
+                        }
+                    }
+                    left.insert(key, Value::Array(roles));
+                } else {
+                    left.insert(key, value);
+                }
             }
             Value::Object(left)
         }

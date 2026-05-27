@@ -1234,7 +1234,8 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                           'suspected_protocol',
                           'suspected_router_or_protocol',
                           'touched_contract',
-                          'call_target'
+                          'call_target',
+                          'portfolio_refresh'
                         ]
                       ) then 'pending'
                     else address_analysis_jobs.status
@@ -1251,7 +1252,8 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                             'suspected_protocol',
                             'suspected_router_or_protocol',
                             'touched_contract',
-                            'call_target'
+                            'call_target',
+                            'portfolio_refresh'
                           ]
                         )
                       ) then null
@@ -1269,7 +1271,8 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                             'suspected_protocol',
                             'suspected_router_or_protocol',
                             'touched_contract',
-                            'call_target'
+                            'call_target',
+                            'portfolio_refresh'
                           ]
                         )
                       ) then now()
@@ -1285,7 +1288,8 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                     'suspected_protocol',
                     'suspected_router_or_protocol',
                     'touched_contract',
-                    'call_target'
+                    'call_target',
+                    'portfolio_refresh'
                   ]
                 "#,
             )

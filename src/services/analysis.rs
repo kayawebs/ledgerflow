@@ -234,14 +234,14 @@ fn collect_address_candidates(analysis: &TransactionAnalysis) -> Vec<AddressAnal
         &mut candidates,
         &analysis.from_address,
         20,
-        json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["tx_from"] }),
+        json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["tx_from", "portfolio_refresh"] }),
     );
     if let Some(to_address) = analysis.to_address.as_deref() {
         insert_candidate(
             &mut candidates,
             to_address,
             25,
-            json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["tx_to"] }),
+            json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["tx_to", "portfolio_refresh"] }),
         );
     }
     for participant in &analysis.normalized_execution_facts.participants {
@@ -316,7 +316,10 @@ fn collect_address_candidates(analysis: &TransactionAnalysis) -> Vec<AddressAnal
                     json!({ "source": "tx_analysis", "tx_hash": analysis.tx_hash, "roles": ["approval_spender", "suspected_router"] }),
                 );
             }
-            if let Some(token) = item.get("token_address").and_then(serde_json::Value::as_str) {
+            if let Some(token) = item
+                .get("token_address")
+                .and_then(serde_json::Value::as_str)
+            {
                 insert_candidate(
                     &mut candidates,
                     token,
@@ -377,7 +380,8 @@ fn is_dex_event_log(log: &serde_json::Value) -> bool {
     const UNI_V3_SWAP: &str = "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f";
     const UNI_V3_MINT: &str = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488daaf0c7f8d9d54eaf";
     const UNI_V3_BURN: &str = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
-    const UNI_V3_COLLECT: &str = "0x70935338e69775456f7e439f86c08d6f7828d3e1118c1b7802b2039f521c9f0f";
+    const UNI_V3_COLLECT: &str =
+        "0x70935338e69775456f7e439f86c08d6f7828d3e1118c1b7802b2039f521c9f0f";
     let topic = log
         .get("topic_0")
         .and_then(serde_json::Value::as_str)
@@ -449,7 +453,21 @@ fn merge_candidate_metadata(
     match (left, right) {
         (serde_json::Value::Object(mut left), serde_json::Value::Object(right)) => {
             for (key, value) in right {
-                left.insert(key, value);
+                if key == "roles" {
+                    let mut roles = left
+                        .get("roles")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    for role in value.as_array().cloned().unwrap_or_default() {
+                        if !roles.contains(&role) {
+                            roles.push(role);
+                        }
+                    }
+                    left.insert(key, serde_json::Value::Array(roles));
+                } else {
+                    left.insert(key, value);
+                }
             }
             serde_json::Value::Object(left)
         }
