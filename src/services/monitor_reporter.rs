@@ -1011,19 +1011,21 @@ fn group_address_labels(labels: Vec<AddressLabel>) -> BTreeMap<String, Vec<Strin
 
 fn subject_role(activity_kind: &str) -> &'static str {
     match activity_kind {
-        "arbitrage" => "Profit subject",
-        "liquidation" => "Liquidation subject",
-        "whale-buy" => "Whale",
+        "arbitrage" => "Main address",
+        "liquidation" => "Main address",
+        "whale-buy" => "Whale address",
         "large-transfer" => "Recipient",
-        _ => "Subject",
+        _ => "Main address",
     }
 }
 
 fn counterparty_role(activity_kind: &str) -> &'static str {
     match activity_kind {
         "large-transfer" => "Sender",
-        "arbitrage" | "liquidation" | "whale-buy" => "Counterparty",
-        _ => "Counterparty",
+        "arbitrage" => "Executor / router",
+        "liquidation" => "Executor / protocol",
+        "whale-buy" => "Swap target",
+        _ => "Related address",
     }
 }
 
@@ -1041,7 +1043,7 @@ fn subject_detail(
                 truncate_middle(&movement.from_address, 6)
             )
         }),
-        "arbitrage" => Some("estimated winner".to_owned()),
+        "arbitrage" => Some("estimated profit owner".to_owned()),
         "liquidation" => analysis
             .scenario_outputs
             .pointer("/storyline/protocol")
@@ -1225,7 +1227,7 @@ fn build_tweet_text(tx: &TopTxCandidate, signal: &TxSignal, share_url: &str) -> 
 
 fn telegram_message(item: &ReportableTx) -> String {
     format!(
-        "<b>{}</b>\n{}\n{}\n\nTx: <code>{}</code>\n<a href=\"{}\">Open analysis</a>",
+        "<b>LedgerFlow</b>\n<b>{}</b>\n{}\n\n{}\n\n<b>Tx</b>\n<code>{}</code>\n<a href=\"{}\">Open analysis</a>",
         telegram_title(&item.signal),
         telegram_value_line(&item.signal),
         telegram_subject_lines(&item.subject),
@@ -1235,38 +1237,93 @@ fn telegram_message(item: &ReportableTx) -> String {
 }
 
 fn telegram_subject_lines(subject: &AlertSubject) -> String {
-    let mut lines = vec![format!(
-        "{}: <code>{}</code>{}",
+    let mut lines = vec![render_address_section(
         escape_telegram_html(&subject.role),
-        escape_telegram_html(&subject.address),
-        format_label_suffix(&subject.labels)
+        &subject.address,
+        subject.detail.as_deref(),
+        &subject.labels,
     )];
-    if let Some(detail) = subject.detail.as_deref() {
-        lines.push(format!("Action: {}", escape_telegram_html(detail)));
-    }
     if let Some(counterparty) = subject.counterparty.as_ref() {
-        lines.push(format!(
-            "{}: <code>{}</code>{}",
+        lines.push(render_address_section(
             escape_telegram_html(&counterparty.role),
-            escape_telegram_html(&counterparty.address),
-            format_label_suffix(&counterparty.labels)
+            &counterparty.address,
+            None,
+            &counterparty.labels,
         ));
     }
     lines.join("\n")
 }
 
-fn format_label_suffix(labels: &[String]) -> String {
-    if labels.is_empty() {
-        return String::new();
+fn render_address_section(
+    title: String,
+    address: &str,
+    detail: Option<&str>,
+    labels: &[String],
+) -> String {
+    let mut lines = vec![format!(
+        "<b>{}</b>{}\n<code>{}</code>",
+        title,
+        detail
+            .map(|detail| format!(" ({})", escape_telegram_html(detail)))
+            .unwrap_or_default(),
+        escape_telegram_html(address)
+    )];
+    let (type_labels, role_labels) = explain_address_labels(labels);
+    if !type_labels.is_empty() {
+        lines.push(format!("Type: {}", type_labels.join(", ")));
     }
-    format!(
-        " [{}]",
-        labels
-            .iter()
-            .map(|label| escape_telegram_html(label))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    if !role_labels.is_empty() {
+        lines.push(format!("Roles: {}", role_labels.join(", ")));
+    }
+    lines.join("\n")
+}
+
+fn explain_address_labels(labels: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut types = Vec::new();
+    let mut roles = Vec::new();
+    for label in labels {
+        let normalized = label.trim().to_ascii_lowercase();
+        let display = friendly_address_label(&normalized);
+        if matches!(
+            normalized.as_str(),
+            "eoa" | "contract" | "actor:whale" | "token" | "erc20_token"
+        ) {
+            types.push(display);
+        } else {
+            roles.push(display);
+        }
+    }
+    types.sort();
+    types.dedup();
+    roles.sort();
+    roles.dedup();
+    (types, roles)
+}
+
+fn friendly_address_label(label: &str) -> String {
+    match label {
+        "actor:whale" => "whale wallet".to_owned(),
+        "eoa" => "EOA".to_owned(),
+        "contract" => "contract".to_owned(),
+        "erc20_token" | "token" => "token contract".to_owned(),
+        "tx_from" => "transaction sender".to_owned(),
+        "tx_to" => "transaction target".to_owned(),
+        "executor" => "executor".to_owned(),
+        "call_sender" => "call sender".to_owned(),
+        "call_target" => "call target".to_owned(),
+        "flow_sender" => "sent funds".to_owned(),
+        "flow_receiver" => "received funds".to_owned(),
+        "monitor_delta_address" => "large balance change".to_owned(),
+        "approval_spender" => "approval spender".to_owned(),
+        "suspected_router" => "suspected router".to_owned(),
+        "suspected_router_or_protocol" => "suspected router/protocol".to_owned(),
+        "suspected_protocol" => "suspected protocol".to_owned(),
+        "suspected_pool" => "suspected pool".to_owned(),
+        "participant" => "tx participant".to_owned(),
+        "log_emitter" => "event emitter".to_owned(),
+        "touched_contract" => "called contract".to_owned(),
+        other => other.replace(['_', ':'], " "),
+    }
 }
 
 fn telegram_title(signal: &TxSignal) -> &'static str {
@@ -1373,14 +1430,14 @@ mod tests {
                 estimated_usd: 32_000.0,
             },
             subject: AlertSubject {
-                role: "Profit subject".to_owned(),
+                role: "Main address".to_owned(),
                 address: "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
-                labels: vec!["actor:whale".to_owned()],
-                detail: Some("estimated winner".to_owned()),
+                labels: vec!["actor:whale".to_owned(), "flow_receiver".to_owned()],
+                detail: Some("estimated profit owner".to_owned()),
                 counterparty: Some(AlertCounterparty {
-                    role: "Counterparty".to_owned(),
+                    role: "Executor / router".to_owned(),
                     address: "0x1111111111111111111111111111111111111111".to_owned(),
-                    labels: vec!["router".to_owned()],
+                    labels: vec!["contract".to_owned(), "call_target".to_owned()],
                 }),
             },
             share_id: Uuid::nil(),
@@ -1392,13 +1449,16 @@ mod tests {
         assert!(text.contains("<b>Confirmed Arbitrage</b>"));
         assert!(text.contains("Estimated profit: <b>+$32000.00</b>"));
         assert!(text.contains(
-            "Profit subject: <code>0xabcdefabcdefabcdefabcdefabcdefabcdefabcd</code> [actor:whale]"
+            "<b>Main address</b> (estimated profit owner)\n<code>0xabcdefabcdefabcdefabcdefabcdefabcdefabcd</code>"
         ));
-        assert!(text.contains("Action: estimated winner"));
+        assert!(text.contains("Type: whale wallet"));
+        assert!(text.contains("Roles: received funds"));
         assert!(text.contains(
-            "Counterparty: <code>0x1111111111111111111111111111111111111111</code> [router]"
+            "<b>Executor / router</b>\n<code>0x1111111111111111111111111111111111111111</code>"
         ));
-        assert!(text.contains("Tx: <code>0x1234567890abcdef</code>"));
+        assert!(text.contains("Type: contract"));
+        assert!(text.contains("Roles: call target"));
+        assert!(text.contains("<b>Tx</b>\n<code>0x1234567890abcdef</code>"));
         assert!(text.contains("<a href=\"https://ledgerflow.top/share/tx/123\">Open analysis</a>"));
         assert!(!text.contains("Window:"));
         assert!(!text.contains("Amount:"));
