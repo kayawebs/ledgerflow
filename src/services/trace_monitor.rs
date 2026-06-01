@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI64, Ordering},
 };
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -20,6 +20,9 @@ use crate::{
     ingestion::{fetchers::TransactionBundleFetcher, models::RawTransactionBundle},
     repositories::sqlx::SqlxAnalysisRepository,
 };
+
+const CLEANUP_INTERVAL_SECS: i64 = 15 * 60;
+const CLEANUP_BATCH_ROWS: i64 = 10_000;
 
 #[derive(Clone, Debug)]
 pub struct TraceMonitorConfig {
@@ -84,6 +87,7 @@ pub struct TraceMonitorService {
     light_fetcher: TransactionBundleFetcher,
     config: TraceMonitorConfig,
     startup_anchor_initialized: Arc<AtomicBool>,
+    next_cleanup_at_unix: Arc<AtomicI64>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +132,9 @@ impl TraceMonitorService {
             light_fetcher,
             config,
             startup_anchor_initialized: Arc::new(AtomicBool::new(false)),
+            next_cleanup_at_unix: Arc::new(AtomicI64::new(
+                Utc::now().timestamp().saturating_add(CLEANUP_INTERVAL_SECS),
+            )),
         }
     }
 
@@ -158,7 +165,7 @@ impl TraceMonitorService {
 
         if start_block > target_block {
             iteration.start_block = None;
-            self.cleanup_expired_rows().await?;
+            self.cleanup_expired_rows_if_due().await?;
             return Ok(iteration);
         }
 
@@ -195,7 +202,7 @@ impl TraceMonitorService {
             iteration.processed_blocks += 1;
         }
 
-        self.cleanup_expired_rows().await?;
+        self.cleanup_expired_rows_if_due().await?;
         Ok(iteration)
     }
 
@@ -627,7 +634,25 @@ impl TraceMonitorService {
         Ok(rows)
     }
 
-    async fn cleanup_expired_rows(&self) -> LedgerResult<()> {
+    async fn cleanup_expired_rows_if_due(&self) -> LedgerResult<()> {
+        let now = Utc::now().timestamp();
+        let next_cleanup_at = self.next_cleanup_at_unix.load(Ordering::SeqCst);
+        if now < next_cleanup_at {
+            return Ok(());
+        }
+        let claimed = self
+            .next_cleanup_at_unix
+            .compare_exchange(
+                next_cleanup_at,
+                now.saturating_add(CLEANUP_INTERVAL_SECS),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok();
+        if !claimed {
+            return Ok(());
+        }
+
         let cutoff = Utc::now() - Duration::days(self.config.retention_days.max(1));
         for table in [
             "trace_address_asset_deltas",
@@ -635,9 +660,18 @@ impl TraceMonitorService {
             "trace_monitor_candidates",
         ] {
             let deleted = sqlx::query(&format!(
-                "delete from {table} where block_timestamp is not null and block_timestamp < $1"
+                r#"
+                delete from {table}
+                where ctid in (
+                  select ctid
+                  from {table}
+                  where block_timestamp is not null and block_timestamp < $1
+                  limit $2
+                )
+                "#
             ))
             .bind(cutoff)
+            .bind(CLEANUP_BATCH_ROWS)
             .execute(self.repository.pool())
             .await
             .map_err(|err| LedgerError::Persistence(err.to_string()))?

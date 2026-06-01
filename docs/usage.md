@@ -332,7 +332,7 @@ The monitor fetches each transaction and receipt without trace, derives visible 
 | `trace_cluster_asset_deltas` | the same deltas collapsed over existing cluster addresses |
 | `trace_monitor_candidates` | lightweight liquidation and multi-swap candidates detected from receipts |
 
-The default retention is 7 days. It is configured by `LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS`.
+The default retention is 7 days. It is configured by `LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS`. Cleanup is intentionally low-priority: the live monitor performs bounded cleanup batches roughly every 15 minutes instead of deleting old rows on every scan iteration.
 
 The monitor intentionally does not call trace RPC. When you need transaction interpretation or internal native movement, pass the returned tx hashes to the transaction analysis API.
 
