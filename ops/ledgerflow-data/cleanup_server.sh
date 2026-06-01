@@ -19,11 +19,14 @@ EOF
   exit 1
 fi
 
+COMPOSE="${COMPOSE:-docker compose}"
+DOCKER="${DOCKER:-docker}"
+
 echo "Stopping LedgerFlow compose stack and removing compose volumes..."
-docker compose down -v --remove-orphans
+$COMPOSE down -v --remove-orphans
 
 echo "Removing legacy LedgerFlow containers if they still exist..."
-docker rm -f \
+$DOCKER rm -f \
   ledgerflow-db-1 \
   ledgerflow-clickhouse-1 \
   ledgerflow-app-1 \
@@ -37,8 +40,8 @@ docker rm -f \
   2>/dev/null || true
 
 echo "Removing LedgerFlow named volumes if they still exist..."
-docker volume ls --format '{{.Name}}' \
+$DOCKER volume ls --format '{{.Name}}' \
   | grep '^ledgerflow_' \
-  | xargs -r docker volume rm
+  | xargs -r $DOCKER volume rm
 
 echo "LedgerFlow Docker data cleanup completed."

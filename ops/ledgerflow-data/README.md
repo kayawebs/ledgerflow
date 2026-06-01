@@ -26,6 +26,12 @@ LEDGERFLOW_INDEXER_CLICKHOUSE_USER=ledgerflow
 LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
 ```
 
+If the current user cannot access Docker directly, prefix the scripts with:
+
+```bash
+DOCKER="sudo docker" COMPOSE="sudo docker compose"
+```
+
 ## Export On The Old Server
 
 Stop LedgerFlow writers first if possible:

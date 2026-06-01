@@ -11,11 +11,12 @@ CLICKHOUSE_CONTAINER="${CLICKHOUSE_CONTAINER:-ledgerflow-clickhouse-1}"
 CLICKHOUSE_DB="${LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE:-ledgerflow_indexer}"
 CLICKHOUSE_USER="${LEDGERFLOW_INDEXER_CLICKHOUSE_USER:-ledgerflow}"
 CLICKHOUSE_PASSWORD="${LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD:-ledgerflow}"
+DOCKER="${DOCKER:-docker}"
 
 mkdir -p "$OUT_DIR/postgres" "$OUT_DIR/clickhouse"
 
 echo "Exporting Postgres database '$POSTGRES_DB' from container '$POSTGRES_CONTAINER'..."
-docker exec "$POSTGRES_CONTAINER" pg_dump \
+$DOCKER exec "$POSTGRES_CONTAINER" pg_dump \
   -U "$POSTGRES_USER" \
   -d "$POSTGRES_DB" \
   -Fc \
@@ -24,7 +25,7 @@ docker exec "$POSTGRES_CONTAINER" pg_dump \
   > "$OUT_DIR/postgres/ledgerflow.dump"
 
 clickhouse_client() {
-  docker exec -i "$CLICKHOUSE_CONTAINER" clickhouse-client \
+  $DOCKER exec -i "$CLICKHOUSE_CONTAINER" clickhouse-client \
     --user "$CLICKHOUSE_USER" \
     --password "$CLICKHOUSE_PASSWORD" \
     "$@"

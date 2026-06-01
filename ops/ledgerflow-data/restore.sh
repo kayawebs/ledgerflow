@@ -15,6 +15,7 @@ CLICKHOUSE_CONTAINER="${CLICKHOUSE_CONTAINER:-ledgerflow-clickhouse-1}"
 CLICKHOUSE_DB="${LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE:-ledgerflow_indexer}"
 CLICKHOUSE_USER="${LEDGERFLOW_INDEXER_CLICKHOUSE_USER:-ledgerflow}"
 CLICKHOUSE_PASSWORD="${LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD:-ledgerflow}"
+DOCKER="${DOCKER:-docker}"
 
 POSTGRES_DUMP="$BACKUP_DIR/postgres/ledgerflow.dump"
 if [[ ! -f "$POSTGRES_DUMP" ]]; then
@@ -23,7 +24,7 @@ if [[ ! -f "$POSTGRES_DUMP" ]]; then
 fi
 
 echo "Restoring Postgres database '$POSTGRES_DB' into container '$POSTGRES_CONTAINER'..."
-docker exec -i "$POSTGRES_CONTAINER" pg_restore \
+$DOCKER exec -i "$POSTGRES_CONTAINER" pg_restore \
   -U "$POSTGRES_USER" \
   -d "$POSTGRES_DB" \
   --clean \
@@ -33,7 +34,7 @@ docker exec -i "$POSTGRES_CONTAINER" pg_restore \
   < "$POSTGRES_DUMP"
 
 clickhouse_client() {
-  docker exec -i "$CLICKHOUSE_CONTAINER" clickhouse-client \
+  $DOCKER exec -i "$CLICKHOUSE_CONTAINER" clickhouse-client \
     --user "$CLICKHOUSE_USER" \
     --password "$CLICKHOUSE_PASSWORD" \
     "$@"
