@@ -1,0 +1,6 @@
+target
+.git
+.idea
+ledgerflow-backups
+*.log
+.env

@@ -43,14 +43,15 @@ For operators using a self-hosted Base node that is bound only to `127.0.0.1:854
 
 ## Quick start
 
-1. Copy `.env.example` to `.env`. Docker Compose now reads `.env` as the runtime config file.
-2. Start Postgres, the API, the backfill worker, and the web process:
+1. Copy `.env.example` to `.env`. Docker Compose reads `.env` as the runtime config file.
+2. Set `LEDGERFLOW_RPC_URL` and `LEDGERFLOW_INDEXER_RPC_URL` to your external Base RPC endpoint. If the node runs on the Docker host, use `http://host.docker.internal:8545`.
+3. Start the full stack:
 
 ```bash
-docker-compose up --build db app worker web
+docker compose up -d --build
 ```
 
-3. Run checks locally:
+4. Run checks locally:
 
 ```bash
 make check
@@ -61,9 +62,10 @@ For a practical operator walkthrough, read [docs/usage.md](docs/usage.md).
 
 Default local endpoints:
 
-- API: `http://127.0.0.1:3000` when run directly on the host, `http://127.0.0.1:8180` in Docker
-- Web: `http://127.0.0.1:3001` when run directly on the host, `http://127.0.0.1:3000` in Docker
+- API: `http://127.0.0.1:3000`
+- Web: `http://127.0.0.1:3001`
 - Indexer API: `http://localhost:8090`
+- Trace monitor API: `http://127.0.0.1:3010`
 
 The intended exposure model is: web public, analysis API private. In local/dev this means the API stays on localhost or container-internal networking while operators use the web process.
 
@@ -105,6 +107,20 @@ curl "http://localhost:8090/addresses/0x1111111111111111111111111111111111111111
 ```
 
 For the full operational flow, read [docs/indexer.md](docs/indexer.md).
+
+## Data migration
+
+LedgerFlow stores analysis/web/monitor data in PostgreSQL and top-level indexer data in ClickHouse. Export, restore, and old-server cleanup scripts live in [ops/ledgerflow-data](ops/ledgerflow-data).
+
+Typical migration flow:
+
+```bash
+./ops/ledgerflow-data/export.sh
+scp -r ubuntu@<old-server>:/home/ubuntu/ledgerflow/ledgerflow-backups/ledgerflow-YYYYMMDDTHHMMSSZ ./
+docker compose up -d db clickhouse
+./ops/ledgerflow-data/restore.sh ledgerflow-backups/ledgerflow-YYYYMMDDTHHMMSSZ
+docker compose up -d
+```
 
 ## API
 

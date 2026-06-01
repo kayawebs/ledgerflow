@@ -1,103 +1,151 @@
+name: ledgerflow
+
+x-ledgerflow-env: &ledgerflow-env
+  env_file:
+    - path: .env
+      required: false
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+x-ledgerflow-image: &ledgerflow-image
+  image: ledgerflow:latest
+  build:
+    context: .
+
 services:
   db:
     image: postgres:16
     environment:
-      POSTGRES_DB: ledgerflow
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-ledgerflow}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
-      - "127.0.0.1:5532:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5532}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-ledgerflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   clickhouse:
     image: clickhouse/clickhouse-server:25.3
     environment:
-      CLICKHOUSE_DB: ledgerflow_indexer
-      CLICKHOUSE_USER: ledgerflow
-      CLICKHOUSE_PASSWORD: ledgerflow
+      CLICKHOUSE_DB: ${LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE:-ledgerflow_indexer}
+      CLICKHOUSE_USER: ${LEDGERFLOW_INDEXER_CLICKHOUSE_USER:-ledgerflow}
+      CLICKHOUSE_PASSWORD: ${LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD:-ledgerflow}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ports:
-      - "127.0.0.1:8123:8123"
-      - "127.0.0.1:9002:9000"
+      - "127.0.0.1:${CLICKHOUSE_HTTP_HOST_PORT:-8123}:8123"
+      - "127.0.0.1:${CLICKHOUSE_NATIVE_HOST_PORT:-9002}:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   app:
-    image: rust:1.92
-    working_dir: /app
-    command: sh -c "cargo run --bin ledgerflow"
-    volumes:
-      - .:/app
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
+    <<: [*ledgerflow-env, *ledgerflow-image]
+    command: ["ledgerflow"]
     environment:
-      LEDGERFLOW_BIND_ADDR: 0.0.0.0:8080
-      LEDGERFLOW_DATABASE_URL: postgres://postgres:postgres@db:5432/ledgerflow
-      LEDGERFLOW_RPC_URL: http://host.docker.internal:18545
+      LEDGERFLOW_BIND_ADDR: 0.0.0.0:3000
+      LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
       LEDGERFLOW_INDEXER_API_BASE_URL: http://indexer:8090
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     ports:
-      - "127.0.0.1:8180:8080"
-
-  worker:
-    image: rust:1.92
-    working_dir: /app
-    command: sh -c "cargo run --bin ledgerflow_backfill_worker"
-    volumes:
-      - .:/app
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      LEDGERFLOW_DATABASE_URL: postgres://postgres:postgres@db:5432/ledgerflow
-      LEDGERFLOW_RPC_URL: http://host.docker.internal:18545
-      LEDGERFLOW_INDEXER_API_BASE_URL: http://indexer:8090
-    depends_on:
-      - db
+      - "127.0.0.1:${LEDGERFLOW_API_HOST_PORT:-3000}:3000"
+    restart: unless-stopped
 
   web:
-    image: rust:1.92
-    working_dir: /app
-    command: sh -c "cargo run --bin web"
-    volumes:
-      - .:/app
-    env_file:
-      - .env
+    <<: [*ledgerflow-env, *ledgerflow-image]
+    command: ["web"]
     environment:
-      LEDGERFLOW_DATABASE_URL: postgres://postgres:postgres@db:5432/ledgerflow
-      LEDGERFLOW_API_BASE_URL: http://app:8080
-      LEDGERFLOW_WEB_BIND_ADDR: 0.0.0.0:3000
-      LEDGERFLOW_WEB_BASE_URL: http://127.0.0.1:3000
+      LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
+      LEDGERFLOW_API_BASE_URL: http://app:3000
+      LEDGERFLOW_WEB_BIND_ADDR: 0.0.0.0:3001
+      LEDGERFLOW_WEB_BASE_URL: ${LEDGERFLOW_WEB_BASE_URL:-http://127.0.0.1:3001}
     depends_on:
-      - app
+      app:
+        condition: service_started
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${LEDGERFLOW_WEB_HOST_PORT:-3001}:3001"
+    restart: unless-stopped
 
   indexer:
-    image: rust:1.92
-    working_dir: /app
-    command: sh -c "cargo run --bin ledgerflow_indexer"
-    volumes:
-      - .:/app
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
+    <<: [*ledgerflow-env, *ledgerflow-image]
+    command: ["ledgerflow_indexer"]
     environment:
       LEDGERFLOW_INDEXER_BIND_ADDR: 0.0.0.0:8090
+      LEDGERFLOW_INDEXER_RPC_URL: ${LEDGERFLOW_INDEXER_RPC_URL:-http://host.docker.internal:8545}
       LEDGERFLOW_INDEXER_CLICKHOUSE_URL: http://clickhouse:8123
-      LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE: ledgerflow_indexer
-      LEDGERFLOW_INDEXER_CLICKHOUSE_USER: ledgerflow
-      LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD: ledgerflow
+      LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE: ${LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE:-ledgerflow_indexer}
+      LEDGERFLOW_INDEXER_CLICKHOUSE_USER: ${LEDGERFLOW_INDEXER_CLICKHOUSE_USER:-ledgerflow}
+      LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD: ${LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD:-ledgerflow}
     depends_on:
-      - clickhouse
+      clickhouse:
+        condition: service_healthy
     ports:
-      - "127.0.0.1:8090:8090"
+      - "127.0.0.1:${LEDGERFLOW_INDEXER_HOST_PORT:-8090}:8090"
+    restart: unless-stopped
+
+  backfill-worker:
+    <<: [*ledgerflow-env, *ledgerflow-image]
+    command: ["ledgerflow_backfill_worker"]
+    environment:
+      LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
+      LEDGERFLOW_INDEXER_API_BASE_URL: http://indexer:8090
+    depends_on:
+      db:
+        condition: service_healthy
+      indexer:
+        condition: service_started
+    restart: unless-stopped
+
+  price-worker:
+    <<: [*ledgerflow-env, *ledgerflow-image]
+    command: ["ledgerflow_price_worker"]
+    environment:
+      LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  address-worker:
+    <<: [*ledgerflow-env, *ledgerflow-image]
+    command: ["ledgerflow_address_worker"]
+    environment:
+      LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  trace-monitor:
+    <<: [*ledgerflow-env, *ledgerflow-image]
+    command: ["ledgerflow_trace_monitor"]
+    environment:
+      LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
+      LEDGERFLOW_BIND_ADDR: http://app:3000
+      LEDGERFLOW_TRACE_MONITOR_BIND_ADDR: 0.0.0.0:3010
+    depends_on:
+      db:
+        condition: service_healthy
+      app:
+        condition: service_started
+    ports:
+      - "127.0.0.1:${LEDGERFLOW_TRACE_MONITOR_HOST_PORT:-3010}:3010"
+    restart: unless-stopped
 
 volumes:
   postgres_data:
