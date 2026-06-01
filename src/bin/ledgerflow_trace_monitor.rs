@@ -126,6 +126,20 @@ async fn main() {
         }
     });
 
+    if config.trace_monitor_enabled {
+        match service.anchor_to_live_start().await {
+            Ok((latest_block, target_block)) => {
+                info!(
+                    latest_block,
+                    target_block, "trace monitor anchored live start"
+                );
+            }
+            Err(err) => {
+                error!(error = %err, "trace monitor live start anchor failed");
+            }
+        }
+    }
+
     loop {
         if !config.trace_monitor_enabled {
             info!("trace monitor disabled");

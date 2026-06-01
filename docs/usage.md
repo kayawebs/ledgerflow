@@ -324,7 +324,7 @@ curl "http://127.0.0.1:3010/top-address-deltas?start=2026-05-12T00:00:00Z&end=20
 
 The response is intentionally small. Each item contains the address, asset type, token address, raw `in / out / net` amounts, tx count, and up to 50 contributing tx hashes. It does not return full tx payloads; pass the tx hashes to the analysis API when you want interpretation.
 
-The monitor fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. It also detects liquidation event topics and multi-DEX-swap candidates directly from receipts without additional RPC calls. This keeps the live scan focused on detection rather than explanation.
+On every process start, the monitor anchors its progress to the current confirmed block and only scans blocks that arrive after startup. It does not replay an old persisted monitor position. The monitor fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. It also detects liquidation event topics and multi-DEX-swap candidates directly from receipts without additional RPC calls. This keeps the live scan focused on detection rather than explanation.
 
 | Table | Purpose |
 | --- | --- |

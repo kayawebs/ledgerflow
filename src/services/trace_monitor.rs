@@ -206,6 +206,15 @@ impl TraceMonitorService {
         Ok(iteration)
     }
 
+    pub async fn anchor_to_live_start(&self) -> LedgerResult<(u64, u64)> {
+        let latest_block = self.rpc_client.get_latest_block_number().await?;
+        let target_block = latest_block.saturating_sub(self.config.confirmations);
+        self.upsert_progress(Some(target_block)).await?;
+        self.startup_anchor_initialized
+            .store(true, Ordering::SeqCst);
+        Ok((latest_block, target_block))
+    }
+
     async fn process_light_tx(
         &self,
         tx_ref: BlockTxRef,
