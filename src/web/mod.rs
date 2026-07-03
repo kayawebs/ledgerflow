@@ -3221,7 +3221,7 @@ fn render_cluster_management_panel(
       <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
       <label>Owner label<input type="text" name="owner_label" value="{}" placeholder="ops_team" required></label>
       <label>Cluster name<input type="text" name="name" value="{}" placeholder="liquidation_operator" required></label>
-      <label>Description<input type="text" name="description" value="{}" placeholder="seed collector wallets; worker expands related addresses automatically"></label>
+      <label><span class="label-row">Description<span class="optional-icon" title="Optional field" aria-label="Optional field">i</span></span><input type="text" name="description" value="{}" placeholder="seed collector wallets; worker expands related addresses automatically"></label>
       <label>Seed addresses<textarea name="addresses" placeholder="0x111...,collector,collector&#10;0x222...,seed-2,collector" required>{}</textarea></label>
       <div class="field-hint">One seed per line. Format: <code>address,label,role</code>. For collector wallets you can paste only <code>0xabc...</code>; LedgerFlow marks it as a seed, the worker finds related addresses, stores suggestions, auto-adds high-confidence candidates, then runs analysis.</div>
       <div class="button-row">
@@ -8004,6 +8004,8 @@ a { color: inherit; text-decoration: none; }
 .notice.warning { background: rgba(197,95,12,.12); color: var(--accent-2); }
 .notice.error { background: rgba(197,95,12,.1); color: var(--accent-2); }
 label { display: grid; gap: 8px; font-size: .95rem; }
+.label-row { display: inline-flex; align-items: center; gap: 6px; width: fit-content; }
+.optional-icon { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 999px; border: 1px solid rgba(31,111,235,.32); color: #1d5ea8; background: #eef5ff; font-size: .68rem; font-weight: 800; line-height: 1; }
 .field-hint { margin-top: -4px; color: var(--muted); font-size: .88rem; line-height: 1.5; }
 .field-hint code { font-size: .85rem; }
 input, textarea, select { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; font: inherit; }
