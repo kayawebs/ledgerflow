@@ -261,6 +261,50 @@ pub struct ClusterSpendSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterDailyAssetChange {
+    pub day: String,
+    pub asset_type: AssetType,
+    pub token_address: Option<String>,
+    pub incoming_raw: String,
+    pub outgoing_raw: String,
+    pub gas_raw: String,
+    pub internal_raw: String,
+    pub net_raw: String,
+    pub tx_count: u32,
+    pub flow_count: u32,
+    pub sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterAssetPurposeBreakdown {
+    pub day: String,
+    pub asset_type: AssetType,
+    pub token_address: Option<String>,
+    pub purpose: String,
+    pub counterparty: Option<String>,
+    pub amount_raw: String,
+    pub tx_count: u32,
+    pub flow_count: u32,
+    pub sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterAssetChangeReport {
+    pub cluster_id: Uuid,
+    pub chain_id: u64,
+    pub owner_label: String,
+    pub cluster_name: String,
+    pub window_start: Option<DateTime<Utc>>,
+    pub window_end: Option<DateTime<Utc>>,
+    pub generated_at: DateTime<Utc>,
+    pub address_count: u32,
+    pub analyzed_tx_count: u32,
+    pub daily_changes: Vec<ClusterDailyAssetChange>,
+    pub purpose_breakdowns: Vec<ClusterAssetPurposeBreakdown>,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ClusterBackfillRun {
     pub run_id: Uuid,
     pub cluster_id: Uuid,

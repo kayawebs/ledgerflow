@@ -19,8 +19,8 @@ use crate::{
     domain::{
         entities::{
             AddressCluster, AddressLabel, AddressProfile, AppUser, ClassifiedTransaction,
-            ClusterAlert, ClusterCoverage, ClusterMetricsSnapshot, ClusterSpendSummary,
-            ClusterTrackingState, EvidencePack, TransactionAnalysis,
+            ClusterAlert, ClusterAssetChangeReport, ClusterCoverage, ClusterMetricsSnapshot,
+            ClusterSpendSummary, ClusterTrackingState, EvidencePack, TransactionAnalysis,
         },
         enums::{AddressHitDirection, ClusterBackfillStatus, VerificationPurpose},
     },
@@ -294,6 +294,14 @@ struct CreateClusterRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+struct ClusterBackfillRequest {
+    start_block: Option<u64>,
+    end_block: Option<u64>,
+    force_reanalyze: Option<bool>,
+    query_limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct AnalyzeTxRequest {
     chain_id: u64,
     tx_hash: String,
@@ -558,6 +566,7 @@ struct ClusterLiveResponse {
     tracking: Option<ClusterTrackingState>,
     coverage: Option<ClusterCoverage>,
     spend_summary: Option<ClusterSpendSummary>,
+    asset_changes: Option<ClusterAssetChangeReport>,
     metrics: Vec<ClusterMetricsSnapshot>,
     alerts: Vec<ClusterAlert>,
     strategy_analysis: Option<ClusterStrategyAnalysisPayload>,
@@ -773,6 +782,10 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/clusters/create", post(create_cluster))
         .route("/app/clusters/{cluster_id}/update", post(update_cluster))
         .route("/app/clusters/{cluster_id}/delete", post(delete_cluster))
+        .route(
+            "/app/clusters/{cluster_id}/backfill",
+            post(queue_cluster_backfill),
+        )
         .route(
             "/app/clusters/{cluster_id}/tracking/enable",
             post(enable_cluster_tracking),
@@ -1501,7 +1514,7 @@ async fn update_cluster(
     .await
     {
         Ok(cluster) => Ok(redirect_response(&format!(
-            "/app/clusters?cluster_id={}&notice=cluster-updated",
+            "/app/clusters?cluster_id={}&notice=cluster-updated-needs-backfill",
             cluster.cluster_id
         ))),
         Err(err) => {
@@ -1555,6 +1568,37 @@ async fn delete_cluster(
         Ok(_) => Ok(redirect_response("/app/clusters?notice=cluster-deleted")),
         Err(err) => Ok(redirect_response(&format!(
             "/app/clusters?cluster_id={cluster_id}&notice=cluster-delete-error&error={}",
+            urlencoding::encode(&err.to_string())
+        ))),
+    }
+}
+
+async fn queue_cluster_backfill(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(cluster_id): Path<String>,
+) -> Result<Response, WebError> {
+    let Some(_user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    ensure_user_owns_cluster(&state, _user.user_id, &cluster_id).await?;
+    match api_post_json::<_, serde_json::Value>(
+        &state,
+        &format!("/clusters/{cluster_id}/backfill"),
+        &ClusterBackfillRequest {
+            start_block: None,
+            end_block: None,
+            force_reanalyze: Some(false),
+            query_limit: None,
+        },
+    )
+    .await
+    {
+        Ok(_) => Ok(redirect_response(&format!(
+            "/app/clusters/{cluster_id}?notice=cluster-backfill-queued"
+        ))),
+        Err(err) => Ok(redirect_response(&format!(
+            "/app/clusters/{cluster_id}?notice=cluster-backfill-error&error={}",
             urlencoding::encode(&err.to_string())
         ))),
     }
@@ -1827,6 +1871,7 @@ async fn render_dashboard_response(
         tracking,
         coverage,
         spend_summary,
+        asset_changes,
         metrics,
         alerts,
         strategy_analysis,
@@ -1847,6 +1892,7 @@ async fn render_dashboard_response(
                     payload.tracking,
                     payload.coverage,
                     payload.spend_summary,
+                    payload.asset_changes,
                     payload.metrics,
                     payload.alerts,
                     payload.strategy_analysis,
@@ -1854,6 +1900,7 @@ async fn render_dashboard_response(
                     None::<String>,
                 ),
                 Err(err) => (
+                    None,
                     None,
                     None,
                     None,
@@ -1865,10 +1912,30 @@ async fn render_dashboard_response(
                 ),
             }
         } else {
-            (None, None, None, Vec::new(), Vec::new(), None, None, None)
+            (
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+            )
         }
     } else {
-        (None, None, None, Vec::new(), Vec::new(), None, None, None)
+        (
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
     };
 
     let classified_page = if tab == DashboardTab::ClusterAnalysis
@@ -1948,6 +2015,7 @@ async fn render_dashboard_response(
         tracking.as_ref(),
         coverage.as_ref(),
         spend_summary.as_ref(),
+        asset_changes.as_ref(),
         &metrics,
         &alerts,
         strategy_analysis.as_ref(),
@@ -1997,96 +2065,122 @@ async fn load_cluster_live_response(
             )
         }
     };
-    let (coverage, tracking, spend_summary, metrics, alerts, strategy_analysis) = match selected_tab
-    {
-        ClusterAnalysisTab::Overview => {
-            let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
-            let tracking_path = format!("/clusters/{}/tracking", cluster_id);
-            let alerts_path = format!(
-                "/clusters/{}/alerts?include_read=false&limit=12",
-                cluster_id
-            );
-            let tracking_fut = api_get_json::<ClusterTrackingState>(state, &tracking_path);
-            let alerts_fut = api_get_json::<Vec<ClusterAlert>>(state, &alerts_path);
-            let (coverage, tracking, alerts) = tokio::join!(coverage_fut, tracking_fut, alerts_fut);
-            (
-                coverage.ok(),
-                tracking.ok(),
-                None,
-                Vec::new(),
-                alerts.unwrap_or_default(),
-                None,
+    let asset_changes_path = match (start, end) {
+        (None, None) => format!("/clusters/{}/asset-changes", cluster_id),
+        _ => {
+            let mut params = Vec::new();
+            if let Some(start) = start {
+                params.push(format!("start={}", urlencoding::encode(start)));
+            }
+            if let Some(end) = end {
+                params.push(format!("end={}", urlencoding::encode(end)));
+            }
+            format!(
+                "/clusters/{}/asset-changes?{}",
+                cluster_id,
+                params.join("&")
             )
         }
-        ClusterAnalysisTab::Metrics => {
-            let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
-            let metrics_path = format!("/clusters/{}/metrics", cluster_id);
-            let metrics_fut = api_get_json::<Vec<ClusterMetricsSnapshot>>(state, &metrics_path);
-            let (coverage, metrics) = tokio::join!(coverage_fut, metrics_fut);
-            (
-                coverage.ok(),
-                None,
-                None,
-                metrics.unwrap_or_default(),
-                Vec::new(),
-                None,
-            )
-        }
-        ClusterAnalysisTab::Summary => {
-            let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
-            let summary_fut = api_get_json::<ClusterSpendSummary>(state, &summary_path);
-            let (coverage, spend_summary) = tokio::join!(coverage_fut, summary_fut);
-            (
-                coverage.ok(),
-                None,
-                spend_summary.ok(),
-                Vec::new(),
-                Vec::new(),
-                None,
-            )
-        }
-        ClusterAnalysisTab::Strategy => {
-            let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
-            let strategy_path = match (start, end) {
-                (None, None) => format!("/clusters/{}/strategy-analysis", cluster_id),
-                _ => {
-                    let mut params = Vec::new();
-                    if let Some(start) = start {
-                        params.push(format!("start={}", urlencoding::encode(start)));
-                    }
-                    if let Some(end) = end {
-                        params.push(format!("end={}", urlencoding::encode(end)));
-                    }
-                    format!(
-                        "/clusters/{}/strategy-analysis?{}",
-                        cluster_id,
-                        params.join("&")
-                    )
-                }
-            };
-            let strategy_fut =
-                api_get_json::<ClusterStrategyAnalysisPayload>(state, &strategy_path);
-            let (coverage, strategy_analysis) = tokio::join!(coverage_fut, strategy_fut);
-            (
-                coverage.ok(),
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                strategy_analysis.ok(),
-            )
-        }
-        ClusterAnalysisTab::Activity => (
-            api_get_json::<ClusterCoverage>(state, &coverage_path)
-                .await
-                .ok(),
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-        ),
     };
+    let (coverage, tracking, spend_summary, asset_changes, metrics, alerts, strategy_analysis) =
+        match selected_tab {
+            ClusterAnalysisTab::Overview => {
+                let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+                let tracking_path = format!("/clusters/{}/tracking", cluster_id);
+                let alerts_path = format!(
+                    "/clusters/{}/alerts?include_read=false&limit=12",
+                    cluster_id
+                );
+                let tracking_fut = api_get_json::<ClusterTrackingState>(state, &tracking_path);
+                let alerts_fut = api_get_json::<Vec<ClusterAlert>>(state, &alerts_path);
+                let (coverage, tracking, alerts) =
+                    tokio::join!(coverage_fut, tracking_fut, alerts_fut);
+                (
+                    coverage.ok(),
+                    tracking.ok(),
+                    None,
+                    None,
+                    Vec::new(),
+                    alerts.unwrap_or_default(),
+                    None,
+                )
+            }
+            ClusterAnalysisTab::Metrics => {
+                let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+                let metrics_path = format!("/clusters/{}/metrics", cluster_id);
+                let metrics_fut = api_get_json::<Vec<ClusterMetricsSnapshot>>(state, &metrics_path);
+                let (coverage, metrics) = tokio::join!(coverage_fut, metrics_fut);
+                (
+                    coverage.ok(),
+                    None,
+                    None,
+                    None,
+                    metrics.unwrap_or_default(),
+                    Vec::new(),
+                    None,
+                )
+            }
+            ClusterAnalysisTab::Summary => {
+                let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+                let summary_fut = api_get_json::<ClusterSpendSummary>(state, &summary_path);
+                let asset_changes_fut =
+                    api_get_json::<ClusterAssetChangeReport>(state, &asset_changes_path);
+                let (coverage, spend_summary, asset_changes) =
+                    tokio::join!(coverage_fut, summary_fut, asset_changes_fut);
+                (
+                    coverage.ok(),
+                    None,
+                    spend_summary.ok(),
+                    asset_changes.ok(),
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                )
+            }
+            ClusterAnalysisTab::Strategy => {
+                let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+                let strategy_path = match (start, end) {
+                    (None, None) => format!("/clusters/{}/strategy-analysis", cluster_id),
+                    _ => {
+                        let mut params = Vec::new();
+                        if let Some(start) = start {
+                            params.push(format!("start={}", urlencoding::encode(start)));
+                        }
+                        if let Some(end) = end {
+                            params.push(format!("end={}", urlencoding::encode(end)));
+                        }
+                        format!(
+                            "/clusters/{}/strategy-analysis?{}",
+                            cluster_id,
+                            params.join("&")
+                        )
+                    }
+                };
+                let strategy_fut =
+                    api_get_json::<ClusterStrategyAnalysisPayload>(state, &strategy_path);
+                let (coverage, strategy_analysis) = tokio::join!(coverage_fut, strategy_fut);
+                (
+                    coverage.ok(),
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    strategy_analysis.ok(),
+                )
+            }
+            ClusterAnalysisTab::Activity => (
+                api_get_json::<ClusterCoverage>(state, &coverage_path)
+                    .await
+                    .ok(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+        };
     let (status_label, status_tone) = derive_cluster_status(coverage.as_ref());
     Ok(ClusterLiveResponse {
         status_label,
@@ -2094,6 +2188,7 @@ async fn load_cluster_live_response(
         tracking,
         coverage,
         spend_summary,
+        asset_changes,
         metrics,
         alerts,
         strategy_analysis,
@@ -2474,6 +2569,13 @@ fn render_notice_message(code: &str) -> Option<&'static str> {
         "logged-out" => Some("Signed out."),
         "cluster-created" => Some("Cluster created and queued for historical backfill."),
         "cluster-updated" => Some("Cluster definition updated."),
+        "cluster-updated-needs-backfill" => Some(
+            "Cluster definition updated. Review the address set, then manually run a backfill or incremental analysis for the new cluster scope.",
+        ),
+        "cluster-backfill-queued" => {
+            Some("Cluster analysis backfill queued. The worker will process it in the background.")
+        }
+        "cluster-backfill-error" => Some("Cluster analysis backfill could not be queued."),
         "cluster-deleted" => Some("Cluster deleted."),
         "cluster-delete-error" => {
             Some("Cluster delete failed. Inspect the latest server response or logs.")
@@ -2723,6 +2825,7 @@ fn render_dashboard_page(
     tracking: Option<&ClusterTrackingState>,
     coverage: Option<&ClusterCoverage>,
     spend_summary: Option<&ClusterSpendSummary>,
+    asset_changes: Option<&ClusterAssetChangeReport>,
     metrics: &[ClusterMetricsSnapshot],
     alerts: &[ClusterAlert],
     strategy_analysis: Option<&ClusterStrategyAnalysisPayload>,
@@ -2849,9 +2952,12 @@ fn render_dashboard_page(
             ),
             ClusterAnalysisTab::Summary => format!(
                 r#"<section class="cluster-tab-panel active" data-cluster-tab-panel="summary">
+      <h3>Daily asset changes</h3>
+      <div id="cluster-live-asset-changes">{}</div>
       <h3>Spend summary</h3>
       <div id="cluster-live-summary">{}</div>
     </section>"#,
+                render_cluster_asset_changes_panel(asset_changes),
                 render_cluster_summary_panel(spend_summary),
             ),
             ClusterAnalysisTab::Activity => format!(
@@ -2880,6 +2986,9 @@ fn render_dashboard_page(
     </form>
     <div id="cluster-live-root" data-cluster-id="{}" data-start="{}" data-end="{}"></div>
     <div id="cluster-live-status" class="notice {}">{}</div>
+    <form class="button-row" method="post" action="/app/clusters/{}/backfill">
+      <button class="cta secondary" type="submit">Queue manual analysis</button>
+    </form>
     <div class="cluster-tabbar" role="tablist" aria-label="Cluster analysis sections">
       <a class="cluster-tab {}" href="{}">Overview</a>
       <a class="cluster-tab {}" href="{}">Metrics</a>
@@ -2902,6 +3011,7 @@ fn render_dashboard_page(
             escape_html(end.unwrap_or_default()),
             escape_html(status_tone),
             escape_html(status_label),
+            cluster.cluster_id,
             overview_active,
             overview_href,
             metrics_active,
@@ -5973,7 +6083,7 @@ fn render_cluster_auto_discovery_panel(cluster: &DashboardClusterRecord) -> Stri
         .get("auto_discovery")
         .and_then(|value| value.as_object())
     else {
-        return "<div class=\"empty-state\">Worker onboarding has not written auto-discovery results yet. Create or update a seed cluster and wait for the backfill worker to claim the queued run.</div>".to_owned();
+        return "<div class=\"empty-state\">Worker onboarding has not written auto-discovery results yet. New seed clusters queue onboarding on create; after editing addresses, review the cluster and manually run backfill when ready.</div>".to_owned();
     };
     let status = discovery
         .get("status")
@@ -6872,6 +6982,33 @@ fn cluster_analysis_tab_href(
     format!("/app/clusters/{cluster_id}?{}", params.join("&"))
 }
 
+fn render_asset_ref(asset_type: &str, token_address: Option<&str>) -> String {
+    if asset_type == "native" {
+        return "<code>native ETH</code>".to_owned();
+    }
+    token_address
+        .map(|value| render_copyable_code(value, 6))
+        .unwrap_or_else(|| format!("<code>{}</code>", escape_html(asset_type)))
+}
+
+fn format_asset_amount(asset_type: &str, raw: &str) -> String {
+    if asset_type == "native" {
+        return format_signed_wei_compact(raw);
+    }
+    raw.to_owned()
+}
+
+fn format_signed_wei_compact(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let negative = trimmed.starts_with('-');
+    let unsigned = trimmed.trim_start_matches('-');
+    let mut formatted = format_wei_compact(unsigned);
+    if negative && formatted != "0 ETH" {
+        formatted.insert(0, '-');
+    }
+    formatted
+}
+
 fn format_wei_compact(raw: &str) -> String {
     let Ok(value) = raw.trim().parse::<f64>() else {
         return raw.to_owned();
@@ -7195,6 +7332,117 @@ fn render_cluster_coverage_cards(coverage: Option<&ClusterCoverage>) -> String {
         })
         .unwrap_or_else(|| {
             "<div class=\"empty-state\">Coverage is not available yet. The worker may still be discovering transactions.</div>".to_owned()
+        })
+}
+
+fn render_cluster_asset_changes_panel(asset_changes: Option<&ClusterAssetChangeReport>) -> String {
+    asset_changes
+        .map(|report| {
+            let daily_rows = if report.daily_changes.is_empty() {
+                "<tr><td colspan=\"8\">No analyzed asset changes in this window yet.</td></tr>"
+                    .to_owned()
+            } else {
+                report
+                    .daily_changes
+                    .iter()
+                    .take(40)
+                    .map(|row| {
+                        let asset_type = enum_label(&row.asset_type);
+                        format!(
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            escape_html(&row.day),
+                            render_asset_ref(&asset_type, row.token_address.as_deref()),
+                            escape_html(&format_asset_amount(&asset_type, &row.incoming_raw)),
+                            escape_html(&format_asset_amount(&asset_type, &row.outgoing_raw)),
+                            escape_html(&format_asset_amount(&asset_type, &row.gas_raw)),
+                            escape_html(&format_asset_amount(&asset_type, &row.internal_raw)),
+                            escape_html(&format_asset_amount(&asset_type, &row.net_raw)),
+                            row.tx_count,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            let purpose_rows = if report.purpose_breakdowns.is_empty() {
+                "<tr><td colspan=\"7\">No source/use breakdowns in this window yet.</td></tr>"
+                    .to_owned()
+            } else {
+                report
+                    .purpose_breakdowns
+                    .iter()
+                    .take(80)
+                    .map(|row| {
+                        let asset_type = enum_label(&row.asset_type);
+                        let sample = row
+                            .sample_tx_hashes
+                            .first()
+                            .map(|value| render_copyable_code(value, 6))
+                            .unwrap_or_else(|| "n/a".to_owned());
+                        format!(
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            escape_html(&row.day),
+                            render_asset_ref(&asset_type, row.token_address.as_deref()),
+                            escape_html(&row.purpose),
+                            row.counterparty
+                                .as_deref()
+                                .map(|value| render_copyable_code(value, 6))
+                                .unwrap_or_else(|| "n/a".to_owned()),
+                            escape_html(&format_asset_amount(&asset_type, &row.amount_raw)),
+                            row.tx_count,
+                            sample,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            let warnings = report
+                .metadata
+                .get("warnings")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty())
+                .map(|items| {
+                    format!(
+                        "<div class=\"notice warning\">{}</div>",
+                        escape_html(&items.join(" | "))
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                r#"<div class="stats-grid">
+  <div class="stat"><span>Analyzed txs</span><strong>{}</strong></div>
+  <div class="stat"><span>Assets</span><strong>{}</strong></div>
+  <div class="stat"><span>Breakdowns</span><strong>{}</strong></div>
+  <div class="stat"><span>Formula</span><strong>in - out - gas</strong><small>internal excluded from net</small></div>
+</div>
+{}
+<div class="table-shell">
+  <table>
+    <thead><tr><th>Day</th><th>Asset</th><th>In</th><th>Out</th><th>Gas</th><th>Internal</th><th>Net</th><th>Txs</th></tr></thead>
+    <tbody>{}</tbody>
+  </table>
+</div>
+<div class="table-shell">
+  <table>
+    <thead><tr><th>Day</th><th>Asset</th><th>Source / use</th><th>Counterparty</th><th>Amount</th><th>Txs</th><th>Sample</th></tr></thead>
+    <tbody>{}</tbody>
+  </table>
+</div>"#,
+                report.analyzed_tx_count,
+                report.daily_changes.len(),
+                report.purpose_breakdowns.len(),
+                warnings,
+                daily_rows,
+                purpose_rows,
+            )
+        })
+        .unwrap_or_else(|| {
+            "<div class=\"empty-state\">Daily asset changes will appear once analyzed transactions exist for this cluster.</div>".to_owned()
         })
 }
 

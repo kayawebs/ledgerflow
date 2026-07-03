@@ -13,8 +13,8 @@ use uuid::Uuid;
 use crate::core::errors::LedgerError;
 use crate::domain::entities::{
     AddressAnalysisCandidate, AddressCluster, AddressLabel, AddressProfile, ClassifiedTransaction,
-    ClusterAddress, ClusterAlert, ClusterMetricsSnapshot, ClusterSpendSummary,
-    ClusterStrategyReportSnapshot, ClusterTrackingState, TransactionAnalysis,
+    ClusterAddress, ClusterAlert, ClusterAssetChangeReport, ClusterMetricsSnapshot,
+    ClusterSpendSummary, ClusterStrategyReportSnapshot, ClusterTrackingState, TransactionAnalysis,
 };
 use crate::ingestion::rpc::RpcClient;
 use crate::plugins::loader::PluginManifest;
@@ -227,6 +227,10 @@ pub fn router(
         )
         .route("/clusters/{cluster_id}/backfill", post(backfill_cluster))
         .route("/clusters/{cluster_id}/coverage", get(get_cluster_coverage))
+        .route(
+            "/clusters/{cluster_id}/asset-changes",
+            get(get_cluster_asset_changes),
+        )
         .route(
             "/clusters/{cluster_id}/backfill-runs",
             get(list_cluster_backfill_runs),
@@ -795,6 +799,23 @@ async fn get_cluster_spend_summary(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(summary))
+}
+
+async fn get_cluster_asset_changes(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+    Query(query): Query<ClusterSummaryQuery>,
+) -> Result<Json<ClusterAssetChangeReport>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let start = parse_time(query.start.as_deref())?;
+    let end = parse_time(query.end.as_deref())?;
+    let report = state
+        .cluster_service
+        .get_cluster_asset_changes(cluster_id, start, end)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(report))
 }
 
 async fn backfill_cluster(

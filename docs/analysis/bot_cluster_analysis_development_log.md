@@ -350,3 +350,63 @@ No Docker services were started or restarted for this implementation step. The t
 ### Deployment Note
 
 Deploying this change requires restarting the web/app and backfill worker processes. The worker will run bounded discovery during cluster backfill, so deployment should use the existing RPC gateway/rate-limit settings and should not be paired with an unbounded historical backfill spike.
+
+## 2026-07-03 Phase 7 Start
+
+### Product Decision
+
+Every cluster needs a direct asset-change view before deeper strategy reports. The most urgent workflow is daily PnL for an operator's own addresses, split by native ETH and each ERC20 token, with enough source/use labeling to explain where value came from or went.
+
+### Implemented
+
+Added a read-only cluster asset-change MVP:
+
+- `ClusterAssetChangeReport`
+- daily asset rows grouped by UTC day, asset type, and token address
+- per-day raw `incoming`, `outgoing`, `gas`, `internal`, and `net` amounts
+- native ETH net includes gas cost
+- internal transfers are tracked separately and excluded from net
+- purpose/source rows for:
+  - `gas_cost`
+  - `arbitrage_gain`
+  - `arbitrage_spend`
+  - `liquidation_gain`
+  - `liquidation_spend`
+  - `position_inflow`
+  - `position_spend`
+  - `lp_inflow`
+  - `lp_spend`
+  - `external_inflow`
+  - `external_outflow`
+  - `internal_transfer`
+- API endpoint:
+  - `GET /clusters/{cluster_id}/asset-changes?start=...&end=...`
+- web Summary tab section:
+  - Daily asset changes
+  - Source/use breakdown
+
+The report only reads already persisted analyses plus classified transaction labels. It does not trigger RPC, backfill, trace, indexer work, or price lookups.
+
+### Cluster Edit UX
+
+Cluster editing remains manual:
+
+- saving edited addresses does not enqueue backfill
+- the web notice tells the user to review the new address set and manually queue analysis
+- a `Queue manual analysis` button was added to the cluster analysis page
+
+This supports removing auto-discovered addresses the user rejects or adding addresses the user knows belong to the cluster, without immediately creating RPC or worker pressure.
+
+### Current Limitations
+
+ERC20 rows currently display raw token units and token address. The next step should join token metadata/decimals and price snapshots so the same report can show human units and USD daily PnL.
+
+Purpose labels are transaction-behavior driven. For arbitrage/liquidation they are useful enough for a first pass, but later versions should derive more precise per-flow intent from strategy facts and protocol adapters.
+
+### Verification Results
+
+Passed:
+
+- `cargo check --bins --locked`
+- `cargo test cluster_summary --locked`
+- `cargo test cluster_asset_changes_roll_up_daily_token_net_and_purposes --locked`

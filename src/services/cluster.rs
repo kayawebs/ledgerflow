@@ -7,10 +7,11 @@ use uuid::Uuid;
 
 use crate::core::errors::{LedgerError, LedgerResult};
 use crate::domain::entities::{
-    AddressCluster, ClusterAddress, ClusterSpendBreakdown, ClusterSpendSummary,
-    ClusterTransactionSummary, TransactionAnalysis,
+    AddressCluster, ClusterAddress, ClusterAssetChangeReport, ClusterAssetPurposeBreakdown,
+    ClusterDailyAssetChange, ClusterSpendBreakdown, ClusterSpendSummary, ClusterTransactionSummary,
+    TransactionAnalysis,
 };
-use crate::domain::enums::{AssetType, SpendCategory};
+use crate::domain::enums::{AssetType, BehaviorTag, SpendCategory};
 use crate::domain::interfaces::AnalysisRepository;
 
 #[derive(Clone)]
@@ -74,6 +75,45 @@ impl ClusterService {
             .await?;
         let coverage = self.repository.get_cluster_coverage(cluster_id).await?;
         Ok(self.summarize_cluster(&cluster, &analyses, start, end, coverage))
+    }
+
+    pub async fn get_cluster_asset_changes(
+        &self,
+        cluster_id: Uuid,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> LedgerResult<ClusterAssetChangeReport> {
+        let cluster = self
+            .repository
+            .get_cluster(cluster_id)
+            .await?
+            .ok_or_else(|| LedgerError::NotFound(format!("cluster {cluster_id} not found")))?;
+        let address_set = cluster
+            .addresses
+            .iter()
+            .map(|item| item.address.clone())
+            .collect::<Vec<_>>();
+        let analyses = self
+            .repository
+            .list_analyses_for_cluster(cluster.chain_id, &address_set, start, end)
+            .await?;
+        let classified = self
+            .repository
+            .list_classified_transactions_for_cluster(cluster_id, start, end)
+            .await?;
+        let classified_by_tx = classified
+            .into_iter()
+            .map(|item| (item.tx_hash.clone(), item.behavior_tag))
+            .collect::<BTreeMap<_, _>>();
+        let coverage = self.repository.get_cluster_coverage(cluster_id).await?;
+        Ok(self.summarize_cluster_asset_changes(
+            &cluster,
+            &analyses,
+            &classified_by_tx,
+            start,
+            end,
+            coverage,
+        ))
     }
 
     pub async fn get_cluster(&self, cluster_id: Uuid) -> LedgerResult<AddressCluster> {
@@ -311,7 +351,10 @@ impl ClusterService {
                 ));
             }
             if coverage.discovered_tx_count > coverage.analyzed_tx_count {
-                warnings.push("summary only reflects analyzed transactions, not all discovered transactions".to_owned());
+                warnings.push(
+                    "summary only reflects analyzed transactions, not all discovered transactions"
+                        .to_owned(),
+                );
             }
         }
         if trace_missing_tx_count > 0 {
@@ -353,6 +396,245 @@ impl ClusterService {
             }),
         }
     }
+
+    fn summarize_cluster_asset_changes(
+        &self,
+        cluster: &AddressCluster,
+        analyses: &[TransactionAnalysis],
+        classified_by_tx: &BTreeMap<String, BehaviorTag>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+        coverage: Option<crate::domain::entities::ClusterCoverage>,
+    ) -> ClusterAssetChangeReport {
+        let cluster_set = cluster
+            .addresses
+            .iter()
+            .map(|item| item.address.to_lowercase())
+            .collect::<BTreeSet<_>>();
+        let mut daily =
+            BTreeMap::<(String, AssetType, Option<String>), DailyAssetAccumulator>::new();
+        let mut purpose = BTreeMap::<
+            (String, AssetType, Option<String>, String, Option<String>),
+            PurposeAssetAccumulator,
+        >::new();
+        let mut unresolved_tx_count = 0u32;
+        let mut trace_missing_tx_count = 0u32;
+
+        for analysis in analyses {
+            let day = analysis_day(analysis);
+            let behavior = classified_by_tx.get(&analysis.tx_hash);
+            let gas_cost = parse_raw_amount(
+                analysis
+                    .accounting_outputs
+                    .get("gas_cost_raw")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("0"),
+            );
+            if cluster_set.contains(&analysis.from_address.to_lowercase()) && gas_cost > 0 {
+                let amount = u128_to_i128(gas_cost);
+                let key = (day.clone(), AssetType::Native, None);
+                let entry = daily.entry(key.clone()).or_default();
+                entry.gas += amount;
+                entry.net -= amount;
+                entry.tx_hashes.insert(analysis.tx_hash.clone());
+                push_sample(&mut entry.sample_tx_hashes, &analysis.tx_hash, 10);
+                increment_purpose(
+                    &mut purpose,
+                    key,
+                    "gas_cost",
+                    Some("network_gas".to_owned()),
+                    amount,
+                    &analysis.tx_hash,
+                );
+            }
+
+            for flow in &analysis.derived_flows {
+                let from_in_cluster = cluster_set.contains(&flow.from_address.to_lowercase());
+                let to_in_cluster = cluster_set.contains(&flow.to_address.to_lowercase());
+                if !from_in_cluster && !to_in_cluster {
+                    continue;
+                }
+                let amount = u128_to_i128(parse_raw_amount(&flow.amount_raw));
+                if amount == 0 {
+                    continue;
+                }
+                let token_address = flow
+                    .token_address
+                    .as_ref()
+                    .map(|value| value.to_lowercase());
+                let key = (day.clone(), flow.asset_type.clone(), token_address);
+                let entry = daily.entry(key.clone()).or_default();
+                entry.flow_count += 1;
+                entry.tx_hashes.insert(analysis.tx_hash.clone());
+                push_sample(&mut entry.sample_tx_hashes, &analysis.tx_hash, 10);
+
+                if from_in_cluster && to_in_cluster {
+                    entry.internal += amount;
+                    increment_purpose(
+                        &mut purpose,
+                        key,
+                        "internal_transfer",
+                        Some(flow.to_address.clone()),
+                        amount,
+                        &analysis.tx_hash,
+                    );
+                } else if from_in_cluster {
+                    entry.outgoing += amount;
+                    entry.net -= amount;
+                    increment_purpose(
+                        &mut purpose,
+                        key,
+                        outflow_purpose(behavior),
+                        Some(flow.to_address.clone()),
+                        amount,
+                        &analysis.tx_hash,
+                    );
+                } else {
+                    entry.incoming += amount;
+                    entry.net += amount;
+                    increment_purpose(
+                        &mut purpose,
+                        key,
+                        inflow_purpose(behavior),
+                        Some(flow.from_address.clone()),
+                        amount,
+                        &analysis.tx_hash,
+                    );
+                }
+            }
+
+            if !analysis.unresolved_items.is_empty() {
+                unresolved_tx_count += 1;
+            }
+            let trace_available = analysis
+                .normalized_execution_facts
+                .derived_facts
+                .get("trace_available")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if !trace_available {
+                trace_missing_tx_count += 1;
+            }
+        }
+
+        let mut daily_changes = daily
+            .into_iter()
+            .map(
+                |((day, asset_type, token_address), value)| ClusterDailyAssetChange {
+                    day,
+                    asset_type,
+                    token_address,
+                    incoming_raw: value.incoming.to_string(),
+                    outgoing_raw: value.outgoing.to_string(),
+                    gas_raw: value.gas.to_string(),
+                    internal_raw: value.internal.to_string(),
+                    net_raw: value.net.to_string(),
+                    tx_count: value.tx_hashes.len() as u32,
+                    flow_count: value.flow_count,
+                    sample_tx_hashes: value.sample_tx_hashes,
+                },
+            )
+            .collect::<Vec<_>>();
+        daily_changes.sort_by(|left, right| {
+            (
+                left.day.as_str(),
+                asset_sort_key(&left.asset_type),
+                left.token_address.as_deref(),
+            )
+                .cmp(&(
+                    right.day.as_str(),
+                    asset_sort_key(&right.asset_type),
+                    right.token_address.as_deref(),
+                ))
+        });
+
+        let purpose_breakdowns = purpose
+            .into_iter()
+            .map(
+                |((day, asset_type, token_address, purpose, counterparty), value)| {
+                    ClusterAssetPurposeBreakdown {
+                        day,
+                        asset_type,
+                        token_address,
+                        purpose,
+                        counterparty,
+                        amount_raw: value.amount.to_string(),
+                        tx_count: value.tx_hashes.len() as u32,
+                        flow_count: value.flow_count,
+                        sample_tx_hashes: value.sample_tx_hashes,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+
+        let mut warnings = Vec::new();
+        if let Some(coverage) = coverage.as_ref() {
+            if coverage.pending_tx_count > 0 {
+                warnings.push(format!(
+                    "coverage is partial: {} discovered txs are still pending analysis",
+                    coverage.pending_tx_count
+                ));
+            }
+            if coverage.failed_tx_count > 0 {
+                warnings.push(format!(
+                    "{} discovered txs failed analysis and may affect totals",
+                    coverage.failed_tx_count
+                ));
+            }
+            if coverage.discovered_tx_count > coverage.analyzed_tx_count {
+                warnings.push("asset changes only reflect analyzed transactions, not all discovered transactions".to_owned());
+            }
+        }
+        if trace_missing_tx_count > 0 {
+            warnings.push(format!(
+                "{} analyzed txs were processed without trace data",
+                trace_missing_tx_count
+            ));
+        }
+
+        ClusterAssetChangeReport {
+            cluster_id: cluster.cluster_id,
+            chain_id: cluster.chain_id,
+            owner_label: cluster.owner_label.clone(),
+            cluster_name: cluster.name.clone(),
+            window_start: start,
+            window_end: end,
+            generated_at: Utc::now(),
+            address_count: cluster.addresses.len() as u32,
+            analyzed_tx_count: analyses.len() as u32,
+            daily_changes,
+            purpose_breakdowns,
+            metadata: json!({
+                "note": "daily asset changes are derived from already analyzed cluster transactions",
+                "coverage_mode": "persisted_analyses_only",
+                "coverage": coverage,
+                "warnings": warnings,
+                "unresolved_tx_count": unresolved_tx_count,
+                "trace_missing_tx_count": trace_missing_tx_count,
+                "net_formula": "incoming_raw - outgoing_raw - gas_raw; internal transfers are tracked separately and excluded from net_raw",
+            }),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DailyAssetAccumulator {
+    incoming: i128,
+    outgoing: i128,
+    gas: i128,
+    internal: i128,
+    net: i128,
+    tx_hashes: BTreeSet<String>,
+    flow_count: u32,
+    sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Default)]
+struct PurposeAssetAccumulator {
+    amount: i128,
+    tx_hashes: BTreeSet<String>,
+    flow_count: u32,
+    sample_tx_hashes: Vec<String>,
 }
 
 fn normalize_addresses(addresses: Vec<ClusterAddress>) -> Vec<ClusterAddress> {
@@ -366,6 +648,70 @@ fn normalize_addresses(addresses: Vec<ClusterAddress>) -> Vec<ClusterAddress> {
 
 fn parse_raw_amount(value: &str) -> u128 {
     value.parse::<u128>().unwrap_or_default()
+}
+
+fn u128_to_i128(value: u128) -> i128 {
+    i128::try_from(value).unwrap_or(i128::MAX)
+}
+
+fn analysis_day(analysis: &TransactionAnalysis) -> String {
+    analysis
+        .block_timestamp
+        .map(|value| value.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn asset_sort_key(asset_type: &AssetType) -> u8 {
+    match asset_type {
+        AssetType::Native => 0,
+        AssetType::Erc20 => 1,
+    }
+}
+
+fn inflow_purpose(behavior: Option<&BehaviorTag>) -> &'static str {
+    match behavior {
+        Some(BehaviorTag::Arbitrage) => "arbitrage_gain",
+        Some(BehaviorTag::Liquidation) => "liquidation_gain",
+        Some(BehaviorTag::Position) => "position_inflow",
+        Some(BehaviorTag::Lp) => "lp_inflow",
+        Some(BehaviorTag::Unknown) | None => "external_inflow",
+    }
+}
+
+fn outflow_purpose(behavior: Option<&BehaviorTag>) -> &'static str {
+    match behavior {
+        Some(BehaviorTag::Arbitrage) => "arbitrage_spend",
+        Some(BehaviorTag::Liquidation) => "liquidation_spend",
+        Some(BehaviorTag::Position) => "position_spend",
+        Some(BehaviorTag::Lp) => "lp_spend",
+        Some(BehaviorTag::Unknown) | None => "external_outflow",
+    }
+}
+
+fn push_sample(items: &mut Vec<String>, tx_hash: &str, limit: usize) {
+    if items.len() < limit && !items.iter().any(|item| item == tx_hash) {
+        items.push(tx_hash.to_owned());
+    }
+}
+
+fn increment_purpose(
+    purpose_map: &mut BTreeMap<
+        (String, AssetType, Option<String>, String, Option<String>),
+        PurposeAssetAccumulator,
+    >,
+    key: (String, AssetType, Option<String>),
+    purpose: &str,
+    counterparty: Option<String>,
+    amount: i128,
+    tx_hash: &str,
+) {
+    let entry = purpose_map
+        .entry((key.0, key.1, key.2, purpose.to_owned(), counterparty))
+        .or_default();
+    entry.amount += amount;
+    entry.tx_hashes.insert(tx_hash.to_owned());
+    entry.flow_count += 1;
+    push_sample(&mut entry.sample_tx_hashes, tx_hash, 10);
 }
 
 fn increment_breakdown(
