@@ -30,7 +30,6 @@ use crate::{
             ResendVerificationSender, VerificationSender, verification_purpose_from_str,
             verification_purpose_to_str,
         },
-        discovery::ClusterDiscoveryResponse,
         portal::{DashboardClusterRecord, PortalService},
     },
 };
@@ -574,13 +573,6 @@ struct ClusterTxTableState {
     sort_dir: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct ClusterDiscoveryQuery {
-    address: Option<String>,
-    max_hops: Option<u8>,
-    notice: Option<String>,
-}
-
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 enum ClusterAnalysisTab {
     Overview,
@@ -616,7 +608,6 @@ impl ClusterAnalysisTab {
 enum DashboardTab {
     Clusters,
     ClusterAnalysis,
-    ClusterDiscovery,
     AddressAnalysis,
     TxAnalysis,
     ClusterGraph,
@@ -629,7 +620,6 @@ fn section_title(tab: &DashboardTab) -> &'static str {
     match tab {
         DashboardTab::Clusters => "Cluster management",
         DashboardTab::ClusterAnalysis => "Cluster analysis",
-        DashboardTab::ClusterDiscovery => "Cluster discovery",
         DashboardTab::AddressAnalysis => "Address analysis",
         DashboardTab::TxAnalysis => "Single tx analysis",
         DashboardTab::ClusterGraph => "Cluster graph",
@@ -643,7 +633,6 @@ impl DashboardTab {
     fn from_query(value: Option<&str>) -> Self {
         match value {
             Some("cluster-analysis") => Self::ClusterAnalysis,
-            Some("cluster-discovery") => Self::ClusterDiscovery,
             Some("address-analysis") => Self::AddressAnalysis,
             Some("tx-analysis") => Self::TxAnalysis,
             Some("cluster-graph") => Self::ClusterGraph,
@@ -780,7 +769,6 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/clusters", get(clusters_page))
         .route("/app/clusters/status", get(cluster_status))
         .route("/app/clusters/{cluster_id}", get(cluster_analysis_page))
-        .route("/app/cluster-discovery", get(cluster_discovery_page))
         .route("/app/address-analysis", get(address_analysis_page))
         .route("/app/clusters/create", post(create_cluster))
         .route("/app/clusters/{cluster_id}/update", post(update_cluster))
@@ -1006,7 +994,6 @@ async fn dashboard(Query(query): Query<DashboardQuery>) -> Result<Response, WebE
                 "/app/clusters".to_owned()
             }
         }
-        DashboardTab::ClusterDiscovery => "/app/cluster-discovery".to_owned(),
         DashboardTab::AddressAnalysis => "/app/address-analysis".to_owned(),
         DashboardTab::TxAnalysis => "/app/tx-analysis".to_owned(),
         DashboardTab::ClusterGraph => "/app/cluster-graph".to_owned(),
@@ -1057,8 +1044,6 @@ async fn clusters_page(
         None,
         None,
         None,
-        None,
-        None,
     )
     .await
 }
@@ -1095,66 +1080,6 @@ async fn cluster_analysis_page(
         None,
         None,
         None,
-        None,
-        None,
-        None,
-    )
-    .await
-}
-
-async fn cluster_discovery_page(
-    State(state): State<WebState>,
-    headers: HeaderMap,
-    Query(query): Query<ClusterDiscoveryQuery>,
-) -> Result<Response, WebError> {
-    let Some(user) = current_user(&state, &headers).await? else {
-        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
-    };
-    let (payload, error) = if let Some(address) = query
-        .address
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let max_hops = query.max_hops.unwrap_or(1).clamp(1, 3);
-        let path = format!(
-            "/discovery/cluster?chain_id={}&seed_address={}&max_hops={}",
-            state.default_chain_id,
-            urlencoding::encode(address),
-            max_hops
-        );
-        match api_get_json::<ClusterDiscoveryResponse>(&state, &path).await {
-            Ok(payload) => (Some(payload), None),
-            Err(err) => (None, Some(err.to_string())),
-        }
-    } else {
-        (None, None)
-    };
-    render_dashboard_response(
-        &state,
-        user,
-        DashboardQuery {
-            tab: Some("cluster-discovery".to_owned()),
-            cluster_id: None,
-            start: None,
-            end: None,
-            cluster_tab: None,
-            tx_page: None,
-            tx_page_size: None,
-            tx_behavior: None,
-            tx_protocol: None,
-            tx_sort_by: None,
-            tx_sort_dir: None,
-            notice: query.notice.clone(),
-            created_key: None,
-        },
-        None,
-        None,
-        error,
-        None,
-        None,
-        payload,
-        Some(query),
         None,
     )
     .await
@@ -1211,8 +1136,6 @@ async fn address_analysis_page(
         error,
         None,
         None,
-        None,
-        None,
         payload,
     )
     .await
@@ -1244,8 +1167,6 @@ async fn tx_analysis_page(
             notice: query.notice,
             created_key: query.created_key,
         },
-        None,
-        None,
         None,
         None,
         None,
@@ -1288,8 +1209,6 @@ async fn cluster_graph_page(
         None,
         None,
         None,
-        None,
-        None,
     )
     .await
 }
@@ -1320,8 +1239,6 @@ async fn indexer_progress_page(
             notice: query.notice,
             created_key: query.created_key,
         },
-        None,
-        None,
         None,
         None,
         None,
@@ -1373,8 +1290,6 @@ async fn indexer_lookup_page(
         payload,
         Some(query),
         None,
-        None,
-        None,
     )
     .await
 }
@@ -1405,8 +1320,6 @@ async fn indexer_api_keys_page(
             notice: query.notice,
             created_key: query.created_key,
         },
-        None,
-        None,
         None,
         None,
         None,
@@ -1556,8 +1469,6 @@ async fn create_cluster(
                 None,
                 None,
                 None,
-                None,
-                None,
             )
             .await
         }
@@ -1616,8 +1527,6 @@ async fn update_cluster(
                 editable_cluster.as_ref(),
                 None,
                 Some(err.to_string()),
-                None,
-                None,
                 None,
                 None,
                 None,
@@ -1794,8 +1703,6 @@ async fn run_tx_analysis(
                 None,
                 None,
                 None,
-                None,
-                None,
             )
             .await
         }
@@ -1807,8 +1714,6 @@ async fn run_tx_analysis(
                 None,
                 None,
                 Some(err.to_string()),
-                None,
-                None,
                 None,
                 None,
                 None,
@@ -1897,8 +1802,6 @@ async fn render_dashboard_response(
     error: Option<String>,
     indexer_lookup: Option<IndexerAddressRefsPayload>,
     indexer_query: Option<IndexerLookupQuery>,
-    discovery_result: Option<ClusterDiscoveryResponse>,
-    discovery_query: Option<ClusterDiscoveryQuery>,
     address_summary: Option<AddressSummaryEnvelope>,
 ) -> Result<Response, WebError> {
     let tab = DashboardTab::from_query(query.tab.as_deref());
@@ -2053,8 +1956,6 @@ async fn render_dashboard_response(
         cluster_status.as_ref(),
         &cluster_analysis_tab,
         tx_result.as_ref(),
-        discovery_result.as_ref(),
-        discovery_query.as_ref(),
         indexer_progress.as_ref(),
         indexer_lookup.as_ref(),
         &indexer_api_keys,
@@ -2830,8 +2731,6 @@ fn render_dashboard_page(
     cluster_status: Option<&(String, String)>,
     cluster_analysis_tab: &ClusterAnalysisTab,
     tx_result: Option<&serde_json::Value>,
-    discovery_result: Option<&ClusterDiscoveryResponse>,
-    discovery_query: Option<&ClusterDiscoveryQuery>,
     indexer_progress: Option<&IndexerProgressPayload>,
     indexer_lookup: Option<&IndexerAddressRefsPayload>,
     indexer_api_keys: &[IndexerApiKeyPayload],
@@ -2917,6 +2816,8 @@ fn render_dashboard_page(
         let tab_panel = match cluster_analysis_tab {
             ClusterAnalysisTab::Overview => format!(
                 r#"<section class="cluster-tab-panel active" data-cluster-tab-panel="overview">
+      <h3>Auto discovery</h3>
+      {}
       <h3>Tracking</h3>
       <div id="cluster-live-tracking">{}</div>
       <h3>Coverage</h3>
@@ -2924,6 +2825,7 @@ fn render_dashboard_page(
       <h3>Alerts</h3>
       <div id="cluster-live-alerts">{}</div>
     </section>"#,
+                render_cluster_auto_discovery_panel(cluster),
                 render_tracking_status_panel(cluster, tracking),
                 render_cluster_coverage_cards(coverage),
                 render_cluster_alerts_panel(cluster, alerts),
@@ -3053,8 +2955,6 @@ fn render_dashboard_page(
                 "<div class=\"empty-state\">Enter one tx hash to load the saved result if it already exists. Use Reanalyze when you want LedgerFlow to fetch evidence again and rerun the recognizers.</div>".to_owned()
             })
     );
-    let cluster_discovery_panel = render_cluster_discovery_panel(discovery_result, discovery_query);
-
     let graph_panel = render_cluster_graph_panel(clusters);
     let address_analysis_panel =
         render_address_analysis_panel(address_summary, state.default_chain_id);
@@ -3078,8 +2978,6 @@ fn render_dashboard_page(
         indexer_progress_panel.clone()
     } else if *tab == DashboardTab::IndexerApiKeys {
         indexer_api_keys_panel.clone()
-    } else if *tab == DashboardTab::ClusterDiscovery {
-        cluster_discovery_panel.clone()
     } else if *tab == DashboardTab::TxAnalysis {
         tx_panel.clone()
     } else if *tab == DashboardTab::ClusterGraph {
@@ -3129,7 +3027,6 @@ fn render_dashboard_page(
         <nav class="side-nav">
           <a class="{}" href="/app/clusters">Cluster management</a>
           <a class="{}" href="{}">Cluster analysis</a>
-          <a class="{}" href="/app/cluster-discovery">Cluster discovery</a>
           <a class="{}" href="/app/cluster-graph">Cluster graph</a>
           <a class="{}" href="/app/address-analysis">Address analysis</a>
           <a class="{}" href="/app/tx-analysis">Single tx analysis</a>
@@ -3146,7 +3043,7 @@ fn render_dashboard_page(
         <section class="dashboard-hero">
           <span class="eyebrow">Application</span>
           <h1>{}</h1>
-          <p>Use one signed-in portal for both layers: the Base indexer discovery surface and the analysis workflows built on top of it. Keep address lookup lightweight, then move into cluster backfill, spend attribution, graph planning, and dedicated single-tx debugging.</p>
+          <p>Use one signed-in portal for seed-based cluster onboarding, worker-driven address expansion, backfill analysis, bot reports, and dedicated single-tx debugging.</p>
           {}
           {}
         </section>
@@ -3165,7 +3062,6 @@ fn render_dashboard_page(
         selected_cluster
             .map(|cluster| format!("/app/clusters/{}", cluster.cluster_id))
             .unwrap_or_else(|| "/app/clusters".to_owned()),
-        active_class(tab, DashboardTab::ClusterDiscovery),
         active_class(tab, DashboardTab::ClusterGraph),
         active_class(tab, DashboardTab::AddressAnalysis),
         active_class(tab, DashboardTab::TxAnalysis),
@@ -3214,10 +3110,10 @@ fn render_cluster_management_panel(
     <form class="stack-form" method="post" action="{}">
       <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
       <label>Owner label<input type="text" name="owner_label" value="{}" placeholder="ops_team" required></label>
-      <label>Cluster name<input type="text" name="name" value="{}" placeholder="primary_searcher" required></label>
-      <label>Description<input type="text" name="description" value="{}" placeholder="main bot + treasury EOAs"></label>
-      <label>Addresses<textarea name="addresses" placeholder="0x111...,bot-1,bot&#10;0x222...,treasury,eoa" required>{}</textarea></label>
-      <div class="field-hint">One record per line. Format: <code>address,label,role</code>. Only the address is required, so <code>0xabc...</code> or <code>0xabc...,bot-1</code> also works.</div>
+      <label>Cluster name<input type="text" name="name" value="{}" placeholder="liquidation_operator" required></label>
+      <label>Description<input type="text" name="description" value="{}" placeholder="seed collector wallets; worker expands related addresses automatically"></label>
+      <label>Seed addresses<textarea name="addresses" placeholder="0x111...,collector,collector&#10;0x222...,seed-2,collector" required>{}</textarea></label>
+      <div class="field-hint">One seed per line. Format: <code>address,label,role</code>. For collector wallets you can paste only <code>0xabc...</code>; LedgerFlow marks it as a seed, the worker finds related addresses, stores suggestions, auto-adds high-confidence candidates, then runs analysis.</div>
       <div class="button-row">
         <button class="cta primary" type="submit">{}</button>
         {}
@@ -3234,7 +3130,7 @@ fn render_cluster_management_panel(
         if is_editing {
             "Update the cluster definition in place. Existing analyses stay in the database, while future tracking and backfill runs use the edited address set."
         } else {
-            "Create a cluster for one operator, wallet family, or bot set. As soon as creation succeeds, LedgerFlow queues a historical backfill job for the separate worker process."
+            "Create a cluster from one or more seed addresses. As soon as creation succeeds, LedgerFlow queues worker onboarding: related address discovery, candidate classification, high-confidence auto-add, historical backfill, and report refresh."
         },
         action,
         chain_id,
@@ -3252,144 +3148,6 @@ fn render_cluster_management_panel(
         } else {
             String::new()
         }
-    )
-}
-
-fn render_cluster_discovery_panel(
-    discovery_result: Option<&ClusterDiscoveryResponse>,
-    discovery_query: Option<&ClusterDiscoveryQuery>,
-) -> String {
-    let address = discovery_query
-        .and_then(|value| value.address.as_deref())
-        .unwrap_or_default();
-    let max_hops = discovery_query
-        .and_then(|value| value.max_hops)
-        .unwrap_or(1);
-    let result_panel = discovery_result
-        .map(|payload| {
-            let warnings = if payload.warnings.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "<div class=\"notice warning\">{}</div>",
-                    escape_html(&payload.warnings.join(" | "))
-                )
-            };
-            format!(
-                r#"
-{}<div class="stats-grid">
-  <div class="stat"><span>Seed</span><strong><code>{}</code></strong></div>
-  <div class="stat"><span>Max hops</span><strong>{}</strong></div>
-  <div class="stat"><span>Nodes</span><strong>{}</strong></div>
-  <div class="stat"><span>Edges</span><strong>{}</strong></div>
-</div>
-<div class="split-panels">
-  <div class="table-shell">
-    <table>
-      <thead>
-        <tr>
-          <th>Address</th>
-          <th>Type</th>
-          <th>First hop</th>
-          <th>Inbound</th>
-          <th>Outbound</th>
-        </tr>
-      </thead>
-      <tbody>{}</tbody>
-    </table>
-  </div>
-  <div class="table-shell">
-    <table>
-      <thead>
-        <tr>
-          <th>From</th>
-          <th>To</th>
-          <th>Hop</th>
-          <th>Tx count</th>
-          <th>Blocks</th>
-        </tr>
-      </thead>
-      <tbody>{}</tbody>
-    </table>
-  </div>
-</div>
-"#,
-                warnings,
-                escape_html(&truncate_middle(&payload.seed_address, 8)),
-                payload.max_hops,
-                payload.total_nodes,
-                payload.total_edges,
-                payload
-                    .nodes
-                    .iter()
-                    .take(200)
-                    .map(|node| {
-                        format!(
-                            "<tr><td><code>{}</code></td><td>{:?}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                            escape_html(&truncate_middle(&node.address, 8)),
-                            node.address_type,
-                            node.first_seen_hop,
-                            node.inbound_edge_count,
-                            node.outbound_edge_count
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(""),
-                payload
-                    .edges
-                    .iter()
-                    .take(200)
-                    .map(|edge| {
-                        format!(
-                            "<tr><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{} - {}</td></tr>",
-                            escape_html(&truncate_middle(&edge.from_address, 8)),
-                            escape_html(&truncate_middle(&edge.to_address, 8)),
-                            edge.first_seen_hop,
-                            edge.tx_count,
-                            edge.min_block_number.map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned()),
-                            edge.max_block_number.map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned())
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("")
-            )
-        })
-        .unwrap_or_else(|| {
-            "<div class=\"empty-state\">Enter one Base address, choose 1 to 3 hops, and LedgerFlow will scan indexed top-level history in both directions to build a first-pass connection graph.</div>".to_owned()
-        });
-
-    format!(
-        r#"
-<section class="panel">
-  <div class="panel-head"><h2>Cluster discovery</h2><span class="badge">top-level graph</span></div>
-  <div class="panel-body">
-    <p class="panel-copy">This feature explores one-hop to three-hop top-level address connectivity from a seed Base address. It scans indexed history for both incoming and outgoing top-level links, then labels counterparties as EOA or contract via <code>eth_getCode</code>.</p>
-    <form class="stack-form" method="get" action="/app/cluster-discovery">
-      <label>Seed address<input type="text" name="address" value="{}" placeholder="0x..." required></label>
-      <div class="split-fields">
-        <label>Max hops
-          <select name="max_hops">
-            <option value="1" {}>1 hop</option>
-            <option value="2" {}>2 hops</option>
-            <option value="3" {}>3 hops</option>
-          </select>
-        </label>
-      </div>
-      <div class="field-hint">This is intentionally top-level only for now. It scans indexed history rather than sampling a fixed number of tx refs, but it is still not a substitute for trace-based fund-flow attribution.</div>
-      <div class="button-row">
-        <button class="cta secondary" type="submit">Discover connected addresses</button>
-        <a class="cta ghost" href="/app/indexer/address-lookup">Open raw indexer lookup</a>
-      </div>
-    </form>
-    {}
-  </div>
-</section>
-"#,
-        escape_html(address),
-        if max_hops == 1 { "selected" } else { "" },
-        if max_hops == 2 { "selected" } else { "" },
-        if max_hops == 3 { "selected" } else { "" },
-        result_panel
     )
 }
 
@@ -6206,6 +5964,93 @@ fn render_tracking_status_panel(
             .unwrap_or_default(),
         action_path,
         action_label
+    )
+}
+
+fn render_cluster_auto_discovery_panel(cluster: &DashboardClusterRecord) -> String {
+    let Some(discovery) = cluster
+        .metadata
+        .get("auto_discovery")
+        .and_then(|value| value.as_object())
+    else {
+        return "<div class=\"empty-state\">Worker onboarding has not written auto-discovery results yet. Create or update a seed cluster and wait for the backfill worker to claim the queued run.</div>".to_owned();
+    };
+    let status = discovery
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let updated_at = discovery
+        .get("updated_at")
+        .and_then(|value| value.as_str())
+        .unwrap_or("n/a");
+    let auto_added = discovery
+        .get("auto_added_addresses")
+        .and_then(|value| value.as_array())
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let suggestions = discovery
+        .get("suggested_addresses")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let rows = suggestions
+        .iter()
+        .take(20)
+        .map(|item| {
+            let address = item
+                .get("address")
+                .and_then(|value| value.as_str())
+                .unwrap_or("n/a");
+            let role = item
+                .get("role")
+                .and_then(|value| value.as_str())
+                .unwrap_or("n/a");
+            let relation = item
+                .get("relation_type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("n/a");
+            let confidence = item
+                .get("confidence")
+                .and_then(|value| value.as_f64())
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "n/a".to_owned());
+            let auto_add = item
+                .get("auto_add")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let reason = item
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("n/a");
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                render_copyable_code(address, 6),
+                escape_html(role),
+                escape_html(relation),
+                confidence,
+                if auto_add { "yes" } else { "suggested" },
+                escape_html(reason),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<div class="stats-grid">
+  <div class="stat"><span>Status</span><strong>{}</strong></div>
+  <div class="stat"><span>Auto-added</span><strong>{}</strong></div>
+  <div class="stat"><span>Suggestions</span><strong>{}</strong></div>
+  <div class="stat"><span>Updated</span><strong>{}</strong></div>
+</div>
+{}"#,
+        escape_html(status),
+        auto_added,
+        suggestions.len(),
+        escape_html(updated_at),
+        render_table_or_empty(
+            &rows,
+            "No related address suggestions were produced for this cluster.",
+            "<tr><th>Address</th><th>Role</th><th>Relation</th><th>Confidence</th><th>Action</th><th>Reason</th></tr>",
+        )
     )
 }
 

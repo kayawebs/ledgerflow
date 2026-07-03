@@ -28,6 +28,8 @@ pub struct ClusterDiscoveryRequest {
     pub chain_id: u64,
     pub seed_address: String,
     pub max_hops: u8,
+    pub max_nodes: Option<u32>,
+    pub max_windows: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,6 +90,8 @@ impl ClusterDiscoveryService {
     ) -> LedgerResult<ClusterDiscoveryResponse> {
         let seed_address = normalize_address(&request.seed_address)?;
         let max_hops = request.max_hops.clamp(1, MAX_HOPS);
+        let max_nodes = request.max_nodes.unwrap_or(u32::MAX).max(1);
+        let max_windows = request.max_windows.unwrap_or(MAX_DISCOVERY_WINDOWS).max(1);
 
         let mut warnings = Vec::new();
         let mut frontier = VecDeque::from([(seed_address.clone(), 0u8)]);
@@ -121,7 +125,12 @@ impl ClusterDiscoveryService {
             }
 
             let refs = self
-                .collect_full_history_refs(request.chain_id, &current_address, &mut warnings)
+                .collect_full_history_refs(
+                    request.chain_id,
+                    &current_address,
+                    max_windows,
+                    &mut warnings,
+                )
                 .await?;
 
             let mut unique_refs = BTreeMap::<String, AddressTxRef>::new();
@@ -144,6 +153,12 @@ impl ClusterDiscoveryService {
                     continue;
                 };
                 if counterparty == current_address {
+                    continue;
+                }
+                if !nodes.contains_key(&counterparty) && nodes.len() as u32 >= max_nodes {
+                    warnings.push(format!(
+                        "discovery reached the max_nodes cap ({max_nodes}), so additional related addresses were skipped"
+                    ));
                     continue;
                 }
 
@@ -187,7 +202,8 @@ impl ClusterDiscoveryService {
 
                 let edge_key = (from.clone(), to.clone().unwrap_or_default());
                 let edge = edges.entry(edge_key.clone()).or_insert_with(|| {
-                    let edge_relation = infer_edge_relation(&seed_address, &edge_key.0, &edge_key.1);
+                    let edge_relation =
+                        infer_edge_relation(&seed_address, &edge_key.0, &edge_key.1);
                     ClusterDiscoveryEdge {
                         from_address: edge_key.0.clone(),
                         to_address: edge_key.1.clone(),
@@ -213,7 +229,9 @@ impl ClusterDiscoveryService {
                         .map(|value| value.max(tx_ref.block_number))
                         .unwrap_or(tx_ref.block_number),
                 );
-                edge.confidence = edge.confidence.max(edge_confidence(edge.tx_count, next_hop));
+                edge.confidence = edge
+                    .confidence
+                    .max(edge_confidence(edge.tx_count, next_hop));
 
                 if let Some(node) = nodes.get_mut(&from) {
                     node.outbound_edge_count += 1;
@@ -261,6 +279,7 @@ impl ClusterDiscoveryService {
         &self,
         chain_id: u64,
         address: &str,
+        max_windows: usize,
         warnings: &mut Vec<String>,
     ) -> LedgerResult<Vec<AddressTxRef>> {
         let mut collected = Vec::new();
@@ -270,7 +289,7 @@ impl ClusterDiscoveryService {
 
         loop {
             windows += 1;
-            if windows > MAX_DISCOVERY_WINDOWS {
+            if windows > max_windows {
                 warnings.push(format!(
                     "address {} exceeded the discovery pagination safety cap, so results may be incomplete",
                     address

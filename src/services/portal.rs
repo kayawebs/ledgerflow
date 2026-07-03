@@ -1,4 +1,6 @@
 use chrono::{DateTime, Utc};
+use serde_json::Value;
+use sqlx::types::Json as SqlJson;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -13,6 +15,7 @@ pub struct DashboardClusterRecord {
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
     pub address_count: u32,
+    pub metadata: Value,
 }
 
 #[derive(Clone)]
@@ -58,6 +61,7 @@ impl PortalService {
               clusters.name,
               clusters.description,
               clusters.created_at,
+              clusters.metadata,
               count(addresses.cluster_address_id)::bigint as address_count
             from app_user_clusters links
             join address_clusters clusters on clusters.cluster_id = links.cluster_id
@@ -69,7 +73,8 @@ impl PortalService {
               clusters.owner_label,
               clusters.name,
               clusters.description,
-              clusters.created_at
+              clusters.created_at,
+              clusters.metadata
             order by clusters.created_at desc, clusters.name asc
             "#,
         )
@@ -104,6 +109,10 @@ impl PortalService {
                         .try_get::<i64, _>("address_count")
                         .map_err(|err| LedgerError::Persistence(err.to_string()))?
                         as u32,
+                    metadata: row
+                        .try_get::<SqlJson<Value>, _>("metadata")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                        .0,
                 })
             })
             .collect()

@@ -1,10 +1,13 @@
 mod common;
 
-use std::{collections::HashMap, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use common::MockRpcClient;
 use ledgerflow::{
@@ -15,14 +18,14 @@ use ledgerflow::{
         interfaces::ClusterTxSource,
         value_objects::AddressTxRef,
     },
-    ingestion::fetchers::TransactionBundleFetcher,
+    ingestion::{fetchers::TransactionBundleFetcher, rpc::RpcClient},
     plugins::loader::load_plugins,
     recognition::registry::RecognizerRegistry,
     repositories::memory::InMemoryAnalysisRepository,
     services::{
         analysis::AnalysisService, cluster::ClusterService,
         cluster_backfill::ClusterBackfillRequest, cluster_backfill::ClusterBackfillService,
-        cluster_tracking::ClusterTrackingService,
+        cluster_tracking::ClusterTrackingService, discovery::ClusterDiscoveryService,
     },
 };
 
@@ -116,6 +119,37 @@ impl ClusterTxSource for MutableClusterTxSource {
             .filter(|item| item.block_number >= from_block && item.block_number <= to_block)
             .take(limit as usize)
             .collect())
+    }
+}
+
+#[derive(Clone)]
+struct EoaOnlyRpcClient;
+
+#[async_trait]
+impl RpcClient for EoaOnlyRpcClient {
+    async fn get_transaction(&self, _chain_id: u64, _tx_hash: &str) -> LedgerResult<Value> {
+        Ok(Value::Null)
+    }
+
+    async fn get_receipt(&self, _chain_id: u64, _tx_hash: &str) -> LedgerResult<Value> {
+        Ok(Value::Null)
+    }
+
+    async fn get_block(&self, _chain_id: u64, _block_number: u64) -> LedgerResult<Value> {
+        Ok(Value::Null)
+    }
+
+    async fn get_trace(&self, _chain_id: u64, _tx_hash: &str) -> LedgerResult<Option<Value>> {
+        Ok(None)
+    }
+
+    async fn get_code(
+        &self,
+        _chain_id: u64,
+        _address: &str,
+        _block_number: Option<u64>,
+    ) -> LedgerResult<String> {
+        Ok("0x".to_owned())
     }
 }
 
@@ -383,6 +417,140 @@ async fn queued_cluster_backfill_is_processed_by_worker_path() {
     assert_eq!(result.run.status, ClusterBackfillStatus::Completed);
     assert_eq!(result.coverage.discovered_tx_count, 1);
     assert_eq!(result.coverage.analyzed_tx_count, 1);
+}
+
+#[tokio::test]
+async fn cluster_backfill_auto_discovers_seed_related_addresses_before_analysis() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let fetcher = TransactionBundleFetcher::new(MockRpcClient::default().boxed(), true);
+    let mut registry = RecognizerRegistry::new();
+    let plugin_context = load_plugins(&["sample_builtin_pack".to_owned()], &mut registry);
+    let analysis_service = Arc::new(AnalysisService::new(
+        fetcher,
+        registry,
+        plugin_context,
+        repository.clone(),
+        vec!["selector_presence".to_owned(), "native_transfer".to_owned()],
+    ));
+
+    let seed = "0x1111111111111111111111111111111111111111";
+    let funder = "0x9999999999999999999999999999999999999999";
+    let recipient = "0x8888888888888888888888888888888888888888";
+    let tx_source: Arc<dyn ClusterTxSource> = Arc::new(MockClusterTxSource {
+        last_indexed_block: 100,
+        refs_by_address: HashMap::from([
+            (
+                seed.to_owned(),
+                vec![
+                    AddressTxRef {
+                        address: seed.to_owned(),
+                        tx_hash: "0xseed-funded".to_owned(),
+                        block_number: 20,
+                        tx_index: 0,
+                        direction: AddressHitDirection::To,
+                        from_address: Some(funder.to_owned()),
+                        to_address: Some(seed.to_owned()),
+                    },
+                    AddressTxRef {
+                        address: seed.to_owned(),
+                        tx_hash: "0xseed-outbound".to_owned(),
+                        block_number: 24,
+                        tx_index: 0,
+                        direction: AddressHitDirection::From,
+                        from_address: Some(seed.to_owned()),
+                        to_address: Some(recipient.to_owned()),
+                    },
+                ],
+            ),
+            (
+                funder.to_owned(),
+                vec![AddressTxRef {
+                    address: funder.to_owned(),
+                    tx_hash: "0xseed-funded".to_owned(),
+                    block_number: 20,
+                    tx_index: 0,
+                    direction: AddressHitDirection::From,
+                    from_address: Some(funder.to_owned()),
+                    to_address: Some(seed.to_owned()),
+                }],
+            ),
+        ]),
+    });
+    let discovery_service = Arc::new(ClusterDiscoveryService::new(
+        tx_source.clone(),
+        Arc::new(EoaOnlyRpcClient),
+    ));
+    let backfill_service =
+        ClusterBackfillService::new(Arc::clone(&analysis_service), Some(tx_source), 100, 8)
+            .with_discovery_service(discovery_service);
+    let cluster_service = ClusterService::new(repository.clone());
+
+    let cluster = cluster_service
+        .create_cluster(
+            8453,
+            "ops_team",
+            "collector_seed_cluster",
+            None,
+            vec![ClusterAddress {
+                address: seed.to_owned(),
+                label: Some("collector".to_owned()),
+                role: Some("seed".to_owned()),
+                metadata: json!({
+                    "source": "user_seed",
+                    "auto_discovery_seed": true,
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let result = backfill_service
+        .backfill_cluster(
+            cluster.cluster_id,
+            ClusterBackfillRequest {
+                start_block: Some(0),
+                end_block: Some(100),
+                force_reanalyze: false,
+                query_limit: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.run.address_count, 2);
+    assert_eq!(result.run.discovered_tx_count, 2);
+
+    let updated = cluster_service
+        .get_cluster(cluster.cluster_id)
+        .await
+        .unwrap();
+    assert!(updated.addresses.iter().any(|address| {
+        address.address == funder
+            && address.role.as_deref() == Some("executor")
+            && address.metadata["source"] == json!("auto_seed_discovery")
+            && address.metadata["relation_type"] == json!("inbound_to_seed")
+    }));
+    assert!(
+        !updated
+            .addresses
+            .iter()
+            .any(|address| address.address == recipient)
+    );
+
+    let auto_discovery = &updated.metadata["auto_discovery"];
+    assert_eq!(auto_discovery["status"], json!("completed"));
+    assert_eq!(auto_discovery["auto_added_addresses"], json!([funder]));
+    let suggestions = auto_discovery["suggested_addresses"].as_array().unwrap();
+    assert!(suggestions.iter().any(|suggestion| {
+        suggestion["address"] == json!(funder)
+            && suggestion["relation_type"] == json!("inbound_to_seed")
+            && suggestion["auto_add"] == json!(true)
+    }));
+    assert!(suggestions.iter().any(|suggestion| {
+        suggestion["address"] == json!(recipient)
+            && suggestion["relation_type"] == json!("outbound_from_seed")
+            && suggestion["auto_add"] == json!(false)
+    }));
 }
 
 #[tokio::test]

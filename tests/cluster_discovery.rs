@@ -5,9 +5,13 @@ use serde_json::Value;
 
 use ledgerflow::{
     core::errors::LedgerResult,
-    domain::{enums::AddressHitDirection, interfaces::ClusterTxSource, value_objects::AddressTxRef},
+    domain::{
+        enums::AddressHitDirection, interfaces::ClusterTxSource, value_objects::AddressTxRef,
+    },
     ingestion::rpc::RpcClient,
-    services::discovery::{ClusterDiscoveryRequest, ClusterDiscoveryService, DiscoveredAddressType},
+    services::discovery::{
+        ClusterDiscoveryRequest, ClusterDiscoveryService, DiscoveredAddressType,
+    },
 };
 
 #[derive(Clone)]
@@ -140,24 +144,22 @@ async fn cluster_discovery_finds_neighbors_and_types_across_two_hops() {
             chain_id: 8453,
             seed_address: "0x1111111111111111111111111111111111111111".to_owned(),
             max_hops: 2,
+            max_nodes: None,
+            max_windows: None,
         })
         .await
         .unwrap();
 
     assert_eq!(result.total_nodes, 3);
     assert_eq!(result.total_edges, 2);
-    assert!(result
-        .nodes
-        .iter()
-        .any(|node| node.address == "0x2222222222222222222222222222222222222222"
-            && node.address_type == DiscoveredAddressType::Contract
-            && node.first_seen_hop == 1));
-    assert!(result
-        .nodes
-        .iter()
-        .any(|node| node.address == "0x3333333333333333333333333333333333333333"
-            && node.address_type == DiscoveredAddressType::Eoa
-            && node.first_seen_hop == 2));
+    assert!(result.nodes.iter().any(|node| node.address
+        == "0x2222222222222222222222222222222222222222"
+        && node.address_type == DiscoveredAddressType::Contract
+        && node.first_seen_hop == 1));
+    assert!(result.nodes.iter().any(|node| node.address
+        == "0x3333333333333333333333333333333333333333"
+        && node.address_type == DiscoveredAddressType::Eoa
+        && node.first_seen_hop == 2));
 }
 
 #[tokio::test]
@@ -196,21 +198,19 @@ async fn cluster_discovery_includes_inbound_neighbors_for_seed() {
             chain_id: 8453,
             seed_address: "0x1111111111111111111111111111111111111111".to_owned(),
             max_hops: 1,
+            max_nodes: None,
+            max_windows: None,
         })
         .await
         .unwrap();
 
-    assert!(result
-        .nodes
-        .iter()
-        .any(|node| node.address == "0x9999999999999999999999999999999999999999"
-            && node.first_seen_hop == 1));
-    assert!(result
-        .edges
-        .iter()
-        .any(|edge| edge.from_address == "0x9999999999999999999999999999999999999999"
-            && edge.to_address == "0x1111111111111111111111111111111111111111"
-            && edge.tx_count == 1));
+    assert!(result.nodes.iter().any(|node| node.address
+        == "0x9999999999999999999999999999999999999999"
+        && node.first_seen_hop == 1));
+    assert!(result.edges.iter().any(|edge| edge.from_address
+        == "0x9999999999999999999999999999999999999999"
+        && edge.to_address == "0x1111111111111111111111111111111111111111"
+        && edge.tx_count == 1));
 }
 
 #[tokio::test]
@@ -247,6 +247,8 @@ async fn cluster_discovery_paginates_across_full_history() {
             chain_id: 8453,
             seed_address: seed,
             max_hops: 1,
+            max_nodes: None,
+            max_windows: None,
         })
         .await
         .unwrap();

@@ -9,17 +9,28 @@ use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{
         entities::{
-            ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx, ClusterTrackingState,
+            AddressCluster, ClusterAddress, ClusterBackfillRun, ClusterCoverage,
+            ClusterDiscoveredTx, ClusterTrackingState,
         },
         enums::{ClusterBackfillStatus, ClusterTrackingStatus, ClusterTxStatus},
         interfaces::ClusterTxSource,
         value_objects::AddressTxRef,
     },
     services::{
-        alerts::ClusterAlertService, analysis::AnalysisService, behavior::BehaviorClassifier,
+        alerts::ClusterAlertService,
+        analysis::AnalysisService,
+        behavior::BehaviorClassifier,
+        discovery::{ClusterDiscoveryRequest, ClusterDiscoveryService, DiscoveredAddressType},
         metrics::ClusterMetricsService,
+        strategy_analysis::ClusterStrategyAnalysisService,
     },
 };
+
+const AUTO_DISCOVERY_MAX_HOPS: u8 = 1;
+const AUTO_DISCOVERY_MAX_NODES: u32 = 40;
+const AUTO_DISCOVERY_MAX_WINDOWS: usize = 3;
+const AUTO_DISCOVERY_MAX_AUTO_ADD: usize = 12;
+const AUTO_DISCOVERY_MIN_AUTO_ADD_CONFIDENCE: f32 = 0.75;
 
 #[derive(Clone, Debug)]
 pub struct ClusterBackfillRequest {
@@ -44,6 +55,8 @@ pub struct ClusterBackfillService {
     behavior_classifier: BehaviorClassifier,
     metrics_service: ClusterMetricsService,
     alert_service: ClusterAlertService,
+    strategy_analysis_service: ClusterStrategyAnalysisService,
+    discovery_service: Option<Arc<ClusterDiscoveryService>>,
 }
 
 impl ClusterBackfillService {
@@ -61,8 +74,18 @@ impl ClusterBackfillService {
             continuous_watch_lookback_blocks,
             behavior_classifier: BehaviorClassifier::default(),
             metrics_service: ClusterMetricsService::new(repository.clone()),
-            alert_service: ClusterAlertService::new(repository),
+            alert_service: ClusterAlertService::new(repository.clone()),
+            strategy_analysis_service: ClusterStrategyAnalysisService::new(repository),
+            discovery_service: None,
         }
+    }
+
+    pub fn with_discovery_service(
+        mut self,
+        discovery_service: Arc<ClusterDiscoveryService>,
+    ) -> Self {
+        self.discovery_service = Some(discovery_service);
+        self
     }
 
     pub async fn backfill_cluster(
@@ -227,21 +250,19 @@ impl ClusterBackfillService {
             }
 
             let last_indexed_block = tx_source.get_last_indexed_block(cluster.chain_id).await?;
-            let latest_completed_end = tracking
-                .last_processed_block
-                .or_else(|| {
-                    runs.iter()
-                        .filter(|run| {
-                            matches!(
-                                run.status,
-                                ClusterBackfillStatus::Completed
-                                    | ClusterBackfillStatus::Partial
-                                    | ClusterBackfillStatus::Failed
-                            )
-                        })
-                        .filter_map(|run| run.end_block)
-                        .max()
-                });
+            let latest_completed_end = tracking.last_processed_block.or_else(|| {
+                runs.iter()
+                    .filter(|run| {
+                        matches!(
+                            run.status,
+                            ClusterBackfillStatus::Completed
+                                | ClusterBackfillStatus::Partial
+                                | ClusterBackfillStatus::Failed
+                        )
+                    })
+                    .filter_map(|run| run.end_block)
+                    .max()
+            });
 
             let start_block = latest_completed_end
                 .map(|value| {
@@ -329,7 +350,9 @@ impl ClusterBackfillService {
     ) -> LedgerResult<()> {
         let repository = &self.analysis_service.repository;
         let now = Utc::now();
-        let existing = repository.get_cluster_tracking_state(run.cluster_id).await?;
+        let existing = repository
+            .get_cluster_tracking_state(run.cluster_id)
+            .await?;
         let state = ClusterTrackingState {
             cluster_id: run.cluster_id,
             chain_id: cluster.chain_id,
@@ -358,7 +381,10 @@ impl ClusterBackfillService {
         error: &LedgerError,
     ) -> LedgerResult<()> {
         let repository = &self.analysis_service.repository;
-        let Some(existing) = repository.get_cluster_tracking_state(run.cluster_id).await? else {
+        let Some(existing) = repository
+            .get_cluster_tracking_state(run.cluster_id)
+            .await?
+        else {
             return Ok(());
         };
         let now = Utc::now();
@@ -374,6 +400,155 @@ impl ClusterBackfillService {
             ..existing
         };
         repository.upsert_cluster_tracking_state(&state).await
+    }
+
+    async fn expand_cluster_from_seeds(
+        &self,
+        run: &ClusterBackfillRun,
+        cluster: AddressCluster,
+        _tx_source: &dyn ClusterTxSource,
+    ) -> LedgerResult<AddressCluster> {
+        let Some(discovery_service) = self.discovery_service.as_ref() else {
+            return Ok(cluster);
+        };
+        let seed_addresses = seed_addresses_for_cluster(&cluster);
+        if seed_addresses.is_empty() || auto_discovery_is_current(&cluster, &seed_addresses) {
+            return Ok(cluster);
+        }
+
+        let mut responses = Vec::new();
+        let mut warnings = Vec::new();
+        for seed_address in &seed_addresses {
+            match discovery_service
+                .discover(ClusterDiscoveryRequest {
+                    chain_id: cluster.chain_id,
+                    seed_address: seed_address.clone(),
+                    max_hops: AUTO_DISCOVERY_MAX_HOPS,
+                    max_nodes: Some(AUTO_DISCOVERY_MAX_NODES),
+                    max_windows: Some(AUTO_DISCOVERY_MAX_WINDOWS),
+                })
+                .await
+            {
+                Ok(response) => responses.push(response),
+                Err(err) => warnings.push(format!("{seed_address}: {err}")),
+            }
+        }
+
+        if responses.is_empty() {
+            return Ok(cluster);
+        }
+
+        let mut existing = cluster
+            .addresses
+            .iter()
+            .map(|item| (item.address.to_ascii_lowercase(), item.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut suggestions = Vec::new();
+        let mut auto_added = Vec::new();
+
+        for response in &responses {
+            warnings.extend(response.warnings.clone());
+            let mut candidates = response
+                .nodes
+                .iter()
+                .filter(|node| node.first_seen_hop > 0)
+                .filter(|node| !seed_addresses.iter().any(|seed| seed == &node.address))
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| {
+                right
+                    .confidence
+                    .partial_cmp(&left.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right.outbound_edge_count.cmp(&left.outbound_edge_count))
+                    .then_with(|| right.inbound_edge_count.cmp(&left.inbound_edge_count))
+            });
+
+            for node in candidates {
+                let address = node.address.to_ascii_lowercase();
+                let already_in_cluster = existing.contains_key(&address);
+                let should_auto_add = auto_added.len() < AUTO_DISCOVERY_MAX_AUTO_ADD
+                    && !already_in_cluster
+                    && node.confidence >= AUTO_DISCOVERY_MIN_AUTO_ADD_CONFIDENCE
+                    && matches!(
+                        node.address_type,
+                        DiscoveredAddressType::Eoa | DiscoveredAddressType::Unknown
+                    )
+                    && node.relation_type == "inbound_to_seed";
+                let suggestion = json!({
+                    "address": address,
+                    "role": node.role,
+                    "relation_type": node.relation_type,
+                    "confidence": node.confidence,
+                    "address_type": node.address_type,
+                    "evidence_tx_hashes": node.evidence_tx_hashes,
+                    "reason": node.reason,
+                    "seed_address": response.seed_address,
+                    "auto_add": should_auto_add,
+                    "already_in_cluster": already_in_cluster,
+                });
+                suggestions.push(suggestion);
+
+                if should_auto_add {
+                    let role = suggested_cluster_role(&node.role, &node.relation_type);
+                    let cluster_address = ClusterAddress {
+                        address: address.clone(),
+                        label: Some(format!("auto-{}", role)),
+                        role: Some(role),
+                        metadata: json!({
+                            "source": "auto_seed_discovery",
+                            "seed_address": response.seed_address,
+                            "relation_type": node.relation_type,
+                            "confidence": node.confidence,
+                            "address_type": node.address_type,
+                            "evidence_tx_hashes": node.evidence_tx_hashes,
+                            "reason": node.reason,
+                        }),
+                    };
+                    existing.insert(address.clone(), cluster_address);
+                    auto_added.push(address);
+                }
+            }
+        }
+
+        let mut addresses = existing.into_values().collect::<Vec<_>>();
+        addresses.sort_by(|left, right| {
+            address_sort_key(left)
+                .cmp(&address_sort_key(right))
+                .then_with(|| left.address.cmp(&right.address))
+        });
+
+        let mut metadata = cluster.metadata.as_object().cloned().unwrap_or_default();
+        metadata.insert("seed_addresses".to_owned(), json!(seed_addresses));
+        metadata.insert(
+            "auto_discovery".to_owned(),
+            json!({
+                "status": "completed",
+                "source": "cluster_backfill_worker",
+                "run_id": run.run_id,
+                "max_hops": AUTO_DISCOVERY_MAX_HOPS,
+                "max_nodes": AUTO_DISCOVERY_MAX_NODES,
+                "max_windows": AUTO_DISCOVERY_MAX_WINDOWS,
+                "auto_added_addresses": auto_added,
+                "suggested_addresses": suggestions,
+                "warnings": warnings,
+                "updated_at": Utc::now(),
+            }),
+        );
+
+        let updated = AddressCluster {
+            addresses,
+            metadata: Value::Object(metadata),
+            ..cluster
+        };
+        self.analysis_service
+            .repository
+            .create_cluster(&updated)
+            .await?;
+        self.analysis_service
+            .repository
+            .replace_cluster_addresses(updated.cluster_id, &updated.addresses)
+            .await?;
+        Ok(updated)
     }
 
     fn tx_address_for_cluster(
@@ -436,7 +611,13 @@ impl ClusterBackfillService {
         let cluster = repository
             .get_cluster(run.cluster_id)
             .await?
-            .ok_or_else(|| LedgerError::NotFound(format!("cluster {} not found", run.cluster_id)))?;
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("cluster {} not found", run.cluster_id))
+            })?;
+        let cluster = self
+            .expand_cluster_from_seeds(run, cluster, tx_source)
+            .await?;
+        run.address_count = cluster.addresses.len() as u32;
 
         let start_block = request.start_block.unwrap_or(0);
         let end_block = match request.end_block {
@@ -456,7 +637,10 @@ impl ClusterBackfillService {
         run.status = ClusterBackfillStatus::Running;
         repository.update_cluster_backfill_run(run).await?;
 
-        let query_limit = request.query_limit.unwrap_or(self.default_query_limit).max(1);
+        let query_limit = request
+            .query_limit
+            .unwrap_or(self.default_query_limit)
+            .max(1);
         let mut tx_map = BTreeMap::<String, AddressTxRef>::new();
         let mut warnings = Vec::new();
 
@@ -497,7 +681,9 @@ impl ClusterBackfillService {
                 }),
             })
             .collect::<Vec<_>>();
-        repository.upsert_cluster_discovered_txs(&discovered).await?;
+        repository
+            .upsert_cluster_discovered_txs(&discovered)
+            .await?;
 
         let mut analyzed_count = 0u32;
         let mut failed_count = 0u32;
@@ -513,7 +699,10 @@ impl ClusterBackfillService {
 
         for tx_ref in &txs {
             if !request.force_reanalyze
-                && repository.get_analysis(chain_id, &tx_ref.tx_hash).await?.is_some()
+                && repository
+                    .get_analysis(chain_id, &tx_ref.tx_hash)
+                    .await?
+                    .is_some()
             {
                 if let Some(existing_analysis) =
                     repository.get_analysis(chain_id, &tx_ref.tx_hash).await?
@@ -578,12 +767,20 @@ impl ClusterBackfillService {
         }
 
         if !classified.is_empty() {
-            repository.upsert_classified_transactions(&classified).await?;
+            repository
+                .upsert_classified_transactions(&classified)
+                .await?;
         }
         self.metrics_service
             .refresh_cluster_metrics(run.cluster_id)
             .await?;
-        self.alert_service.refresh_cluster_alerts(run.cluster_id).await?;
+        self.alert_service
+            .refresh_cluster_alerts(run.cluster_id)
+            .await?;
+        let _ = self
+            .strategy_analysis_service
+            .refresh_cluster_report_snapshot(run.cluster_id, None, None)
+            .await;
 
         run.discovered_tx_count = txs.len() as u32;
         run.analyzed_tx_count = analyzed_count;
@@ -726,4 +923,80 @@ fn merge_run_metadata(existing: &Value, extra: Value) -> Value {
         }
     }
     Value::Object(merged)
+}
+
+fn seed_addresses_for_cluster(cluster: &AddressCluster) -> Vec<String> {
+    let mut seeds = cluster
+        .addresses
+        .iter()
+        .filter(|address| {
+            address
+                .metadata
+                .get("auto_discovery_seed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || address.role.as_deref() == Some("seed")
+                || address.role.as_deref() == Some("collector")
+        })
+        .map(|address| address.address.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if seeds.is_empty() {
+        seeds = cluster
+            .addresses
+            .iter()
+            .map(|address| address.address.to_ascii_lowercase())
+            .collect();
+    }
+    seeds.sort();
+    seeds.dedup();
+    seeds
+}
+
+fn auto_discovery_is_current(cluster: &AddressCluster, seed_addresses: &[String]) -> bool {
+    let Some(discovery) = cluster.metadata.get("auto_discovery") else {
+        return false;
+    };
+    if discovery.get("status").and_then(Value::as_str) != Some("completed") {
+        return false;
+    }
+    let Some(stored_seeds) = cluster
+        .metadata
+        .get("seed_addresses")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    let mut stored = stored_seeds
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    stored.sort();
+    stored.dedup();
+    stored == seed_addresses
+}
+
+fn suggested_cluster_role(role: &str, relation_type: &str) -> String {
+    match (role, relation_type) {
+        (_, "inbound_to_seed") => "executor".to_owned(),
+        (_, "outbound_from_seed") => "related_wallet".to_owned(),
+        ("source_or_executor", _) => "executor".to_owned(),
+        _ => "related_wallet".to_owned(),
+    }
+}
+
+fn address_sort_key(address: &ClusterAddress) -> u8 {
+    if address
+        .metadata
+        .get("auto_discovery_seed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        0
+    } else if address.metadata.get("source").and_then(Value::as_str) == Some("auto_seed_discovery")
+    {
+        2
+    } else {
+        1
+    }
 }

@@ -11,8 +11,7 @@ use ledgerflow::{
     services::{
         analysis::AnalysisService, cluster_backfill::ClusterBackfillService,
         discovery::ClusterDiscoveryService, indexer_client::IndexerHttpClient,
-        pricing::PriceService, seeds::seed_known_metadata,
-        token_metadata::TokenMetadataService,
+        pricing::PriceService, seeds::seed_known_metadata, token_metadata::TokenMetadataService,
     },
 };
 use std::sync::Arc as StdArc;
@@ -64,12 +63,16 @@ async fn main() {
     let discovery_service = tx_source
         .clone()
         .map(|source| Arc::new(ClusterDiscoveryService::new(source, rpc_client.clone())));
-    let backfill_service = Arc::new(ClusterBackfillService::new(
+    let mut backfill_service = ClusterBackfillService::new(
         Arc::clone(&service),
         tx_source,
         config.cluster_backfill_query_limit,
         config.cluster_continuous_watch_lookback_blocks,
-    ));
+    );
+    if let Some(discovery_service) = discovery_service.clone() {
+        backfill_service = backfill_service.with_discovery_service(discovery_service);
+    }
+    let backfill_service = Arc::new(backfill_service);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
@@ -79,7 +82,6 @@ async fn main() {
         api::router(
             service,
             backfill_service,
-            discovery_service,
             rpc_client,
             config.cluster_auto_backfill_on_create,
         ),

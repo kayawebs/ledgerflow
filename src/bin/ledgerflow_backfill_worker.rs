@@ -9,9 +9,8 @@ use ledgerflow::{
     repositories::sqlx::SqlxAnalysisRepository,
     services::{
         analysis::AnalysisService, cluster_backfill::ClusterBackfillService,
-        indexer_client::IndexerHttpClient, pricing::PriceService,
-        seeds::seed_known_metadata,
-        token_metadata::TokenMetadataService,
+        discovery::ClusterDiscoveryService, indexer_client::IndexerHttpClient,
+        pricing::PriceService, seeds::seed_known_metadata, token_metadata::TokenMetadataService,
     },
 };
 use tracing::{error, info};
@@ -42,7 +41,7 @@ async fn main() {
         rpc_client.clone(),
     ));
     let price_service = Arc::new(PriceService::new(repository.pool().clone()));
-    let fetcher = TransactionBundleFetcher::new(rpc_client, config.trace_enabled);
+    let fetcher = TransactionBundleFetcher::new(rpc_client.clone(), config.trace_enabled);
     let service = Arc::new(
         AnalysisService::new(
             fetcher,
@@ -60,12 +59,18 @@ async fn main() {
             config.indexer_api_bearer_token.clone(),
         )) as Arc<dyn ClusterTxSource>
     });
-    let backfill_service = ClusterBackfillService::new(
+    let discovery_service = tx_source
+        .clone()
+        .map(|source| Arc::new(ClusterDiscoveryService::new(source, rpc_client.clone())));
+    let mut backfill_service = ClusterBackfillService::new(
         Arc::clone(&service),
         tx_source,
         config.cluster_backfill_query_limit,
         config.cluster_continuous_watch_lookback_blocks,
     );
+    if let Some(discovery_service) = discovery_service {
+        backfill_service = backfill_service.with_discovery_service(discovery_service);
+    }
     let poll_interval =
         Duration::from_millis(config.cluster_backfill_worker_poll_interval_ms.max(250));
 

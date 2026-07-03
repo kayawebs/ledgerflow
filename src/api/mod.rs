@@ -26,9 +26,6 @@ use crate::services::cluster_backfill::{
     ClusterBackfillService,
 };
 use crate::services::cluster_tracking::ClusterTrackingService;
-use crate::services::discovery::{
-    ClusterDiscoveryRequest, ClusterDiscoveryResponse, ClusterDiscoveryService,
-};
 use crate::services::metrics::ClusterMetricsService;
 use crate::services::report_agent::{
     ReportAgentFilters, ReportAgentQuery, ReportAgentResponse, ReportAgentSection,
@@ -47,7 +44,6 @@ pub struct ApiState {
     pub strategy_analysis_service: Arc<ClusterStrategyAnalysisService>,
     pub report_agent_service: Arc<ReportAgentService>,
     pub alert_service: Arc<ClusterAlertService>,
-    pub discovery_service: Option<Arc<ClusterDiscoveryService>>,
     pub auto_backfill_on_cluster_create: bool,
 }
 
@@ -189,13 +185,6 @@ pub struct ClusterAlertsQuery {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ClusterDiscoveryQuery {
-    pub chain_id: Option<u64>,
-    pub seed_address: String,
-    pub max_hops: Option<u8>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct AddressIntelligenceQuery {
     pub chain_id: Option<u64>,
     pub addresses: String,
@@ -204,7 +193,6 @@ pub struct AddressIntelligenceQuery {
 pub fn router(
     service: Arc<AnalysisService>,
     backfill_service: Arc<ClusterBackfillService>,
-    discovery_service: Option<Arc<ClusterDiscoveryService>>,
     rpc_client: Arc<dyn RpcClient>,
     auto_backfill_on_cluster_create: bool,
 ) -> Router {
@@ -229,7 +217,6 @@ pub fn router(
         )
         .route("/addresses/summary", get(get_address_summary))
         .route("/replay/tx", post(replay_tx))
-        .route("/discovery/cluster", get(discover_cluster))
         .route("/clusters", post(create_cluster))
         .route("/clusters/{cluster_id}", get(get_cluster))
         .route("/clusters/{cluster_id}/update", post(update_cluster))
@@ -289,7 +276,6 @@ pub fn router(
             strategy_analysis_service,
             report_agent_service,
             alert_service,
-            discovery_service,
             auto_backfill_on_cluster_create,
         })
 }
@@ -657,26 +643,6 @@ fn profile_history_backfilled(profile: &AddressProfile) -> bool {
         .is_some()
 }
 
-async fn discover_cluster(
-    State(state): State<ApiState>,
-    Query(query): Query<ClusterDiscoveryQuery>,
-) -> Result<Json<ClusterDiscoveryResponse>, ApiError> {
-    let Some(discovery_service) = state.discovery_service.as_ref() else {
-        return Err(ApiError::conflict(
-            "cluster discovery requires a configured indexer api".to_owned(),
-        ));
-    };
-    let payload = discovery_service
-        .discover(ClusterDiscoveryRequest {
-            chain_id: query.chain_id.unwrap_or(8453),
-            seed_address: query.seed_address,
-            max_hops: query.max_hops.unwrap_or(1),
-        })
-        .await
-        .map_err(ApiError::from)?;
-    Ok(Json(payload))
-}
-
 async fn create_cluster(
     State(state): State<ApiState>,
     Json(request): Json<CreateClusterRequest>,
@@ -694,8 +660,11 @@ async fn create_cluster(
                 .map(|item| ClusterAddress {
                     address: item.address,
                     label: item.label,
-                    role: item.role,
-                    metadata: json!({}),
+                    role: item.role.or_else(|| Some("seed".to_owned())),
+                    metadata: json!({
+                        "source": "user_seed",
+                        "auto_discovery_seed": true,
+                    }),
                 })
                 .collect(),
         )
@@ -740,14 +709,46 @@ async fn update_cluster(
 ) -> Result<Json<AddressCluster>, ApiError> {
     let cluster_id = Uuid::parse_str(&cluster_id)
         .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let existing = state
+        .cluster_service
+        .get_cluster(cluster_id)
+        .await
+        .map_err(ApiError::from)?;
+    let existing_by_address = existing
+        .addresses
+        .into_iter()
+        .map(|address| (address.address.to_ascii_lowercase(), address))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let addresses = request
         .addresses
         .into_iter()
-        .map(|entry| ClusterAddress {
-            address: entry.address,
-            label: entry.label,
-            role: entry.role,
-            metadata: json!({}),
+        .map(|entry| {
+            let existing = existing_by_address.get(&entry.address.to_ascii_lowercase());
+            let metadata = if existing
+                .and_then(|address| address.metadata.get("source"))
+                .and_then(serde_json::Value::as_str)
+                == Some("auto_seed_discovery")
+            {
+                existing
+                    .map(|address| address.metadata.clone())
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                json!({
+                    "source": "user_seed",
+                    "auto_discovery_seed": true,
+                })
+            };
+            ClusterAddress {
+                address: entry.address,
+                label: entry
+                    .label
+                    .or_else(|| existing.and_then(|address| address.label.clone())),
+                role: entry
+                    .role
+                    .or_else(|| existing.and_then(|address| address.role.clone()))
+                    .or_else(|| Some("seed".to_owned())),
+                metadata,
+            }
         })
         .collect();
     let cluster = state

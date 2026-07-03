@@ -297,3 +297,56 @@ Passed:
 - `cargo test strategy_analysis_rolls_up_cluster_arbitrage_behavior --locked`
 
 No test performs RPC, Docker, backfill, trace, or indexer work.
+
+## 2026-07-03 Phase 6 Start
+
+### Product Decision
+
+Standalone cluster discovery is no longer the primary user flow. A user should create a cluster by entering one or more seed addresses, then let the worker do the first-pass related-address discovery, candidate classification, conservative auto-add, historical backfill, and report refresh.
+
+This matches the collector-address workflow: the seed can be a liquidation/arbitrage proceeds address, while related executor/source wallets are inferred from indexed top-level activity.
+
+### Implemented
+
+Replaced the user-facing discovery workflow with seed-based cluster onboarding:
+
+- removed the web dashboard Cluster Discovery tab, route, and panel
+- removed the public `/discovery/cluster` API route
+- changed cluster create/update inputs so submitted addresses are marked as `seed`
+- extended bounded discovery requests with `max_nodes` and `max_windows`
+- injected `ClusterDiscoveryService` into app/backfill-worker backfill services
+- added worker-side cluster expansion before backfill analysis
+- auto-adds only high-confidence direct `inbound_to_seed` EOA/Unknown candidates
+- stores all candidate suggestions under `cluster.metadata.auto_discovery`
+- refreshes cluster strategy report snapshots after backfill
+- shows auto-discovery status, auto-added count, suggested count, and candidate rows on the cluster Overview tab
+
+### Safety Bounds
+
+Worker auto-discovery uses intentionally conservative defaults:
+
+- `max_hops = 1`
+- `max_nodes = 40`
+- `max_windows = 3`
+- `max_auto_add = 12`
+- `min_auto_add_confidence = 0.75`
+
+Only inbound-to-seed candidates are auto-added. Outbound recipients, protocol contracts, exchanges, and lower-confidence counterparties stay as suggestions in cluster metadata for review.
+
+### Verification Results
+
+Passed:
+
+- `cargo check --bins --locked`
+- `cargo test cluster_backfill --locked`
+- `cargo test cluster_discovery --locked`
+- `cargo test report_agent --locked`
+- `cargo test strategy_analysis_rolls_up_cluster_arbitrage_behavior --locked`
+
+Added `cluster_backfill_auto_discovers_seed_related_addresses_before_analysis`, which verifies that a seed collector address can auto-add an inbound EOA executor before analysis while retaining outbound candidates as non-auto-add suggestions.
+
+No Docker services were started or restarted for this implementation step. The tests use in-memory repositories and mock RPC clients only.
+
+### Deployment Note
+
+Deploying this change requires restarting the web/app and backfill worker processes. The worker will run bounded discovery during cluster backfill, so deployment should use the existing RPC gateway/rate-limit settings and should not be paired with an unbounded historical backfill spike.
