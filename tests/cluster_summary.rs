@@ -207,7 +207,21 @@ async fn cluster_asset_changes_roll_up_daily_token_net_and_purposes() {
             evidence_refs: Vec::new(),
             derivation_method: "test_asset_change".to_owned(),
             confidence: 1.0,
-            metadata: json!({}),
+            metadata: json!({
+                "token": {
+                    "symbol": "ABC",
+                    "name": "Alpha Bot Coin",
+                    "address": token,
+                    "decimals": 2,
+                    "fetch_status": "ok"
+                },
+                "estimated_usd": {
+                    "amount_decimal": "1",
+                    "value_decimal": "2",
+                    "price_decimal": "2",
+                    "source": "tx_execution"
+                }
+            }),
         },
         AssetFlow {
             flow_id: "0xasset-change:token:in".to_owned(),
@@ -220,7 +234,21 @@ async fn cluster_asset_changes_roll_up_daily_token_net_and_purposes() {
             evidence_refs: Vec::new(),
             derivation_method: "test_asset_change".to_owned(),
             confidence: 1.0,
-            metadata: json!({}),
+            metadata: json!({
+                "token": {
+                    "symbol": "ABC",
+                    "name": "Alpha Bot Coin",
+                    "address": token,
+                    "decimals": 2,
+                    "fetch_status": "ok"
+                },
+                "estimated_usd": {
+                    "amount_decimal": "1.5",
+                    "value_decimal": "3",
+                    "price_decimal": "2",
+                    "source": "tx_execution"
+                }
+            }),
         },
     ];
     repository.save_analysis(&analysis).await.unwrap();
@@ -280,6 +308,13 @@ async fn cluster_asset_changes_roll_up_daily_token_net_and_purposes() {
     assert_eq!(token_day.incoming_raw, "150");
     assert_eq!(token_day.outgoing_raw, "100");
     assert_eq!(token_day.net_raw, "50");
+    assert_eq!(token_day.token_symbol.as_deref(), Some("ABC"));
+    assert_eq!(token_day.token_decimals, Some(2));
+    assert_eq!(token_day.incoming_decimal.as_deref(), Some("1.5"));
+    assert_eq!(token_day.outgoing_decimal.as_deref(), Some("1"));
+    assert_eq!(token_day.net_decimal.as_deref(), Some("0.5"));
+    assert_eq!(token_day.net_usd.as_deref(), Some("1"));
+    assert_eq!(token_day.price_sources, vec!["tx_execution".to_owned()]);
 
     let native_day = report
         .daily_changes
@@ -288,16 +323,24 @@ async fn cluster_asset_changes_roll_up_daily_token_net_and_purposes() {
         .expect("expected native gas row");
     assert_eq!(native_day.gas_raw, "10");
     assert_eq!(native_day.net_raw, "-10");
+    assert_eq!(
+        native_day.gas_decimal.as_deref(),
+        Some("0.00000000000000001")
+    );
 
     assert!(report.purpose_breakdowns.iter().any(|row| {
         row.asset_type == AssetType::Erc20
             && row.purpose == "arbitrage_gain"
             && row.amount_raw == "150"
+            && row.amount_decimal.as_deref() == Some("1.5")
+            && row.amount_usd.as_deref() == Some("3")
     }));
     assert!(report.purpose_breakdowns.iter().any(|row| {
         row.asset_type == AssetType::Erc20
             && row.purpose == "arbitrage_spend"
             && row.amount_raw == "100"
+            && row.amount_decimal.as_deref() == Some("1")
+            && row.amount_usd.as_deref() == Some("2")
     }));
     assert!(report.purpose_breakdowns.iter().any(|row| {
         row.asset_type == AssetType::Native && row.purpose == "gas_cost" && row.amount_raw == "10"

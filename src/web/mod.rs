@@ -6982,9 +6982,28 @@ fn cluster_analysis_tab_href(
     format!("/app/clusters/{cluster_id}?{}", params.join("&"))
 }
 
-fn render_asset_ref(asset_type: &str, token_address: Option<&str>) -> String {
+fn render_asset_ref(
+    asset_type: &str,
+    token_address: Option<&str>,
+    token_symbol: Option<&str>,
+    token_name: Option<&str>,
+) -> String {
     if asset_type == "native" {
         return "<code>native ETH</code>".to_owned();
+    }
+    if token_symbol.is_some() || token_name.is_some() {
+        let label = token_symbol
+            .filter(|value| !value.trim().is_empty())
+            .or(token_name)
+            .unwrap_or("ERC20");
+        let address = token_address
+            .map(|value| render_copyable_code(value, 6))
+            .unwrap_or_default();
+        return format!(
+            "<span>{}</span><small>{}</small>",
+            escape_html(label),
+            address
+        );
     }
     token_address
         .map(|value| render_copyable_code(value, 6))
@@ -6996,6 +7015,31 @@ fn format_asset_amount(asset_type: &str, raw: &str) -> String {
         return format_signed_wei_compact(raw);
     }
     raw.to_owned()
+}
+
+fn format_asset_display_amount(
+    asset_type: &str,
+    raw: &str,
+    decimal: Option<&str>,
+    token_symbol: Option<&str>,
+) -> String {
+    if let Some(decimal) = decimal {
+        let symbol = if asset_type == "native" {
+            "ETH"
+        } else {
+            token_symbol
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("tokens")
+        };
+        return format!("{decimal} {symbol}");
+    }
+    format_asset_amount(asset_type, raw)
+}
+
+fn format_usd_cell(value: Option<&str>) -> String {
+    value
+        .map(|value| format!("${value}"))
+        .unwrap_or_else(|| "n/a".to_owned())
 }
 
 fn format_signed_wei_compact(raw: &str) -> String {
@@ -7339,7 +7383,7 @@ fn render_cluster_asset_changes_panel(asset_changes: Option<&ClusterAssetChangeR
     asset_changes
         .map(|report| {
             let daily_rows = if report.daily_changes.is_empty() {
-                "<tr><td colspan=\"8\">No analyzed asset changes in this window yet.</td></tr>"
+                "<tr><td colspan=\"9\">No analyzed asset changes in this window yet.</td></tr>"
                     .to_owned()
             } else {
                 report
@@ -7349,14 +7393,45 @@ fn render_cluster_asset_changes_panel(asset_changes: Option<&ClusterAssetChangeR
                     .map(|row| {
                         let asset_type = enum_label(&row.asset_type);
                         format!(
-                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                             escape_html(&row.day),
-                            render_asset_ref(&asset_type, row.token_address.as_deref()),
-                            escape_html(&format_asset_amount(&asset_type, &row.incoming_raw)),
-                            escape_html(&format_asset_amount(&asset_type, &row.outgoing_raw)),
-                            escape_html(&format_asset_amount(&asset_type, &row.gas_raw)),
-                            escape_html(&format_asset_amount(&asset_type, &row.internal_raw)),
-                            escape_html(&format_asset_amount(&asset_type, &row.net_raw)),
+                            render_asset_ref(
+                                &asset_type,
+                                row.token_address.as_deref(),
+                                row.token_symbol.as_deref(),
+                                row.token_name.as_deref()
+                            ),
+                            escape_html(&format_asset_display_amount(
+                                &asset_type,
+                                &row.incoming_raw,
+                                row.incoming_decimal.as_deref(),
+                                row.token_symbol.as_deref()
+                            )),
+                            escape_html(&format_asset_display_amount(
+                                &asset_type,
+                                &row.outgoing_raw,
+                                row.outgoing_decimal.as_deref(),
+                                row.token_symbol.as_deref()
+                            )),
+                            escape_html(&format_asset_display_amount(
+                                &asset_type,
+                                &row.gas_raw,
+                                row.gas_decimal.as_deref(),
+                                row.token_symbol.as_deref()
+                            )),
+                            escape_html(&format_asset_display_amount(
+                                &asset_type,
+                                &row.internal_raw,
+                                row.internal_decimal.as_deref(),
+                                row.token_symbol.as_deref()
+                            )),
+                            escape_html(&format_asset_display_amount(
+                                &asset_type,
+                                &row.net_raw,
+                                row.net_decimal.as_deref(),
+                                row.token_symbol.as_deref()
+                            )),
+                            escape_html(&format_usd_cell(row.net_usd.as_deref())),
                             row.tx_count,
                         )
                     })
@@ -7364,7 +7439,7 @@ fn render_cluster_asset_changes_panel(asset_changes: Option<&ClusterAssetChangeR
                     .join("")
             };
             let purpose_rows = if report.purpose_breakdowns.is_empty() {
-                "<tr><td colspan=\"7\">No source/use breakdowns in this window yet.</td></tr>"
+                "<tr><td colspan=\"8\">No source/use breakdowns in this window yet.</td></tr>"
                     .to_owned()
             } else {
                 report
@@ -7379,15 +7454,26 @@ fn render_cluster_asset_changes_panel(asset_changes: Option<&ClusterAssetChangeR
                             .map(|value| render_copyable_code(value, 6))
                             .unwrap_or_else(|| "n/a".to_owned());
                         format!(
-                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                             escape_html(&row.day),
-                            render_asset_ref(&asset_type, row.token_address.as_deref()),
+                            render_asset_ref(
+                                &asset_type,
+                                row.token_address.as_deref(),
+                                row.token_symbol.as_deref(),
+                                row.token_name.as_deref()
+                            ),
                             escape_html(&row.purpose),
                             row.counterparty
                                 .as_deref()
                                 .map(|value| render_copyable_code(value, 6))
                                 .unwrap_or_else(|| "n/a".to_owned()),
-                            escape_html(&format_asset_amount(&asset_type, &row.amount_raw)),
+                            escape_html(&format_asset_display_amount(
+                                &asset_type,
+                                &row.amount_raw,
+                                row.amount_decimal.as_deref(),
+                                row.token_symbol.as_deref()
+                            )),
+                            escape_html(&format_usd_cell(row.amount_usd.as_deref())),
                             row.tx_count,
                             sample,
                         )
@@ -7423,13 +7509,13 @@ fn render_cluster_asset_changes_panel(asset_changes: Option<&ClusterAssetChangeR
 {}
 <div class="table-shell">
   <table>
-    <thead><tr><th>Day</th><th>Asset</th><th>In</th><th>Out</th><th>Gas</th><th>Internal</th><th>Net</th><th>Txs</th></tr></thead>
+    <thead><tr><th>Day</th><th>Asset</th><th>In</th><th>Out</th><th>Gas</th><th>Internal</th><th>Net</th><th>Net USD</th><th>Txs</th></tr></thead>
     <tbody>{}</tbody>
   </table>
 </div>
 <div class="table-shell">
   <table>
-    <thead><tr><th>Day</th><th>Asset</th><th>Source / use</th><th>Counterparty</th><th>Amount</th><th>Txs</th><th>Sample</th></tr></thead>
+    <thead><tr><th>Day</th><th>Asset</th><th>Source / use</th><th>Counterparty</th><th>Amount</th><th>USD</th><th>Txs</th><th>Sample</th></tr></thead>
     <tbody>{}</tbody>
   </table>
 </div>"#,

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::core::errors::{LedgerError, LedgerResult};
@@ -13,6 +13,7 @@ use crate::domain::entities::{
 };
 use crate::domain::enums::{AssetType, BehaviorTag, SpendCategory};
 use crate::domain::interfaces::AnalysisRepository;
+use crate::domain::value_objects::AssetFlow;
 
 #[derive(Clone)]
 pub struct ClusterService {
@@ -419,6 +420,9 @@ impl ClusterService {
         >::new();
         let mut unresolved_tx_count = 0u32;
         let mut trace_missing_tx_count = 0u32;
+        let mut priced_flow_count = 0u32;
+        let mut unpriced_erc20_flow_count = 0u32;
+        let mut unpriced_erc20_assets = BTreeSet::<String>::new();
 
         for analysis in analyses {
             let day = analysis_day(analysis);
@@ -445,6 +449,8 @@ impl ClusterService {
                     Some("network_gas".to_owned()),
                     amount,
                     &analysis.tx_hash,
+                    None,
+                    None,
                 );
             }
 
@@ -463,13 +469,25 @@ impl ClusterService {
                     .as_ref()
                     .map(|value| value.to_lowercase());
                 let key = (day.clone(), flow.asset_type.clone(), token_address);
+                let usd_estimate = flow_usd_estimate(flow);
+                if usd_estimate.is_some() {
+                    priced_flow_count += 1;
+                } else if flow.asset_type == AssetType::Erc20 && from_in_cluster != to_in_cluster {
+                    unpriced_erc20_flow_count += 1;
+                    if let Some(token_address) = flow.token_address.as_deref() {
+                        unpriced_erc20_assets.insert(token_address.to_ascii_lowercase());
+                    }
+                }
                 let entry = daily.entry(key.clone()).or_default();
+                merge_flow_asset_metadata(entry, flow);
+                record_price_source(&mut entry.price_sources, usd_estimate.as_ref());
                 entry.flow_count += 1;
                 entry.tx_hashes.insert(analysis.tx_hash.clone());
                 push_sample(&mut entry.sample_tx_hashes, &analysis.tx_hash, 10);
 
                 if from_in_cluster && to_in_cluster {
                     entry.internal += amount;
+                    add_usd(&mut entry.internal_usd, usd_estimate.as_ref(), 1.0);
                     increment_purpose(
                         &mut purpose,
                         key,
@@ -477,10 +495,14 @@ impl ClusterService {
                         Some(flow.to_address.clone()),
                         amount,
                         &analysis.tx_hash,
+                        Some(flow),
+                        usd_estimate.as_ref(),
                     );
                 } else if from_in_cluster {
                     entry.outgoing += amount;
                     entry.net -= amount;
+                    add_usd(&mut entry.outgoing_usd, usd_estimate.as_ref(), 1.0);
+                    add_usd(&mut entry.net_usd, usd_estimate.as_ref(), -1.0);
                     increment_purpose(
                         &mut purpose,
                         key,
@@ -488,10 +510,14 @@ impl ClusterService {
                         Some(flow.to_address.clone()),
                         amount,
                         &analysis.tx_hash,
+                        Some(flow),
+                        usd_estimate.as_ref(),
                     );
                 } else {
                     entry.incoming += amount;
                     entry.net += amount;
+                    add_usd(&mut entry.incoming_usd, usd_estimate.as_ref(), 1.0);
+                    add_usd(&mut entry.net_usd, usd_estimate.as_ref(), 1.0);
                     increment_purpose(
                         &mut purpose,
                         key,
@@ -499,6 +525,8 @@ impl ClusterService {
                         Some(flow.from_address.clone()),
                         amount,
                         &analysis.tx_hash,
+                        Some(flow),
+                        usd_estimate.as_ref(),
                     );
                 }
             }
@@ -521,14 +549,47 @@ impl ClusterService {
             .into_iter()
             .map(
                 |((day, asset_type, token_address), value)| ClusterDailyAssetChange {
-                    day,
-                    asset_type,
-                    token_address,
                     incoming_raw: value.incoming.to_string(),
                     outgoing_raw: value.outgoing.to_string(),
                     gas_raw: value.gas.to_string(),
                     internal_raw: value.internal.to_string(),
                     net_raw: value.net.to_string(),
+                    incoming_decimal: format_asset_decimal(
+                        &asset_type,
+                        value.token_decimals,
+                        &value.incoming.to_string(),
+                    ),
+                    outgoing_decimal: format_asset_decimal(
+                        &asset_type,
+                        value.token_decimals,
+                        &value.outgoing.to_string(),
+                    ),
+                    gas_decimal: format_asset_decimal(
+                        &asset_type,
+                        value.token_decimals,
+                        &value.gas.to_string(),
+                    ),
+                    internal_decimal: format_asset_decimal(
+                        &asset_type,
+                        value.token_decimals,
+                        &value.internal.to_string(),
+                    ),
+                    net_decimal: format_asset_decimal(
+                        &asset_type,
+                        value.token_decimals,
+                        &value.net.to_string(),
+                    ),
+                    incoming_usd: format_usd(value.incoming_usd),
+                    outgoing_usd: format_usd(value.outgoing_usd),
+                    internal_usd: format_usd(value.internal_usd),
+                    net_usd: format_usd(value.net_usd),
+                    price_sources: value.price_sources.into_iter().collect(),
+                    day,
+                    asset_type,
+                    token_address,
+                    token_symbol: value.token_symbol,
+                    token_name: value.token_name,
+                    token_decimals: value.token_decimals,
                     tx_count: value.tx_hashes.len() as u32,
                     flow_count: value.flow_count,
                     sample_tx_hashes: value.sample_tx_hashes,
@@ -552,13 +613,22 @@ impl ClusterService {
             .into_iter()
             .map(
                 |((day, asset_type, token_address, purpose, counterparty), value)| {
+                    let amount_raw = value.amount.to_string();
+                    let amount_decimal =
+                        format_asset_decimal(&asset_type, value.token_decimals, &amount_raw);
                     ClusterAssetPurposeBreakdown {
                         day,
                         asset_type,
                         token_address,
+                        token_symbol: value.token_symbol,
+                        token_name: value.token_name,
+                        token_decimals: value.token_decimals,
                         purpose,
                         counterparty,
-                        amount_raw: value.amount.to_string(),
+                        amount_raw,
+                        amount_decimal,
+                        amount_usd: format_usd(value.amount_usd),
+                        price_sources: value.price_sources.into_iter().collect(),
                         tx_count: value.tx_hashes.len() as u32,
                         flow_count: value.flow_count,
                         sample_tx_hashes: value.sample_tx_hashes,
@@ -591,6 +661,12 @@ impl ClusterService {
                 trace_missing_tx_count
             ));
         }
+        if unpriced_erc20_flow_count > 0 {
+            warnings.push(format!(
+                "{} ERC20 boundary flows do not have USD quotes yet",
+                unpriced_erc20_flow_count
+            ));
+        }
 
         ClusterAssetChangeReport {
             cluster_id: cluster.cluster_id,
@@ -611,7 +687,11 @@ impl ClusterService {
                 "warnings": warnings,
                 "unresolved_tx_count": unresolved_tx_count,
                 "trace_missing_tx_count": trace_missing_tx_count,
+                "priced_flow_count": priced_flow_count,
+                "unpriced_erc20_flow_count": unpriced_erc20_flow_count,
+                "unpriced_erc20_assets": unpriced_erc20_assets.into_iter().collect::<Vec<_>>(),
                 "net_formula": "incoming_raw - outgoing_raw - gas_raw; internal transfers are tracked separately and excluded from net_raw",
+                "usd_estimate_mode": "uses per-flow estimated_usd already persisted on analyzed transactions; this endpoint does not trigger price lookups",
             }),
         }
     }
@@ -624,6 +704,14 @@ struct DailyAssetAccumulator {
     gas: i128,
     internal: i128,
     net: i128,
+    token_symbol: Option<String>,
+    token_name: Option<String>,
+    token_decimals: Option<u8>,
+    incoming_usd: Option<f64>,
+    outgoing_usd: Option<f64>,
+    internal_usd: Option<f64>,
+    net_usd: Option<f64>,
+    price_sources: BTreeSet<String>,
     tx_hashes: BTreeSet<String>,
     flow_count: u32,
     sample_tx_hashes: Vec<String>,
@@ -632,9 +720,20 @@ struct DailyAssetAccumulator {
 #[derive(Default)]
 struct PurposeAssetAccumulator {
     amount: i128,
+    token_symbol: Option<String>,
+    token_name: Option<String>,
+    token_decimals: Option<u8>,
+    amount_usd: Option<f64>,
+    price_sources: BTreeSet<String>,
     tx_hashes: BTreeSet<String>,
     flow_count: u32,
     sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FlowUsdEstimate {
+    value: f64,
+    source: Option<String>,
 }
 
 fn normalize_addresses(addresses: Vec<ClusterAddress>) -> Vec<ClusterAddress> {
@@ -666,6 +765,145 @@ fn asset_sort_key(asset_type: &AssetType) -> u8 {
         AssetType::Native => 0,
         AssetType::Erc20 => 1,
     }
+}
+
+fn flow_usd_estimate(flow: &AssetFlow) -> Option<FlowUsdEstimate> {
+    let estimate = flow.metadata.get("estimated_usd")?;
+    let value = estimate
+        .get("value_decimal")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())?;
+    if !value.is_finite() {
+        return None;
+    }
+    Some(FlowUsdEstimate {
+        value,
+        source: estimate
+            .get("source")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn merge_flow_asset_metadata(entry: &mut DailyAssetAccumulator, flow: &AssetFlow) {
+    merge_asset_metadata(
+        &mut entry.token_symbol,
+        &mut entry.token_name,
+        &mut entry.token_decimals,
+        flow,
+    );
+}
+
+fn merge_purpose_asset_metadata(entry: &mut PurposeAssetAccumulator, flow: &AssetFlow) {
+    merge_asset_metadata(
+        &mut entry.token_symbol,
+        &mut entry.token_name,
+        &mut entry.token_decimals,
+        flow,
+    );
+}
+
+fn merge_asset_metadata(
+    token_symbol: &mut Option<String>,
+    token_name: &mut Option<String>,
+    token_decimals: &mut Option<u8>,
+    flow: &AssetFlow,
+) {
+    if token_symbol.is_none() {
+        *token_symbol = flow
+            .metadata
+            .pointer("/token/symbol")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .filter(|value| !value.trim().is_empty());
+    }
+    if token_name.is_none() {
+        *token_name = flow
+            .metadata
+            .pointer("/token/name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .filter(|value| !value.trim().is_empty());
+    }
+    if token_decimals.is_none() {
+        *token_decimals = flow
+            .metadata
+            .pointer("/token/decimals")
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok());
+    }
+}
+
+fn add_usd(target: &mut Option<f64>, estimate: Option<&FlowUsdEstimate>, multiplier: f64) {
+    let Some(estimate) = estimate else {
+        return;
+    };
+    *target = Some(target.unwrap_or_default() + estimate.value * multiplier);
+}
+
+fn record_price_source(sources: &mut BTreeSet<String>, estimate: Option<&FlowUsdEstimate>) {
+    if let Some(source) = estimate.and_then(|estimate| estimate.source.as_deref()) {
+        sources.insert(source.to_owned());
+    }
+}
+
+fn format_asset_decimal(
+    asset_type: &AssetType,
+    token_decimals: Option<u8>,
+    raw: &str,
+) -> Option<String> {
+    let decimals = match asset_type {
+        AssetType::Native => 18,
+        AssetType::Erc20 => token_decimals?,
+    };
+    signed_raw_to_decimal(raw, decimals)
+}
+
+fn signed_raw_to_decimal(raw: &str, decimals: u8) -> Option<String> {
+    let trimmed = raw.trim();
+    let negative = trimmed.starts_with('-');
+    let digits = trimmed.trim_start_matches('-');
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let unsigned = if decimals == 0 {
+        digits.to_owned()
+    } else {
+        let decimals = usize::from(decimals);
+        let mut value = if digits.len() <= decimals {
+            format!("0.{}{}", "0".repeat(decimals - digits.len()), digits)
+        } else {
+            let split = digits.len() - decimals;
+            format!("{}.{}", &digits[..split], &digits[split..])
+        };
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+        value
+    };
+    if negative && unsigned != "0" {
+        Some(format!("-{unsigned}"))
+    } else {
+        Some(unsigned)
+    }
+}
+
+fn format_usd(value: Option<f64>) -> Option<String> {
+    let value = value?;
+    value.is_finite().then(|| format_compact_decimal(value))
+}
+
+fn format_compact_decimal(value: f64) -> String {
+    let formatted = format!("{value:.8}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
 }
 
 fn inflow_purpose(behavior: Option<&BehaviorTag>) -> &'static str {
@@ -704,10 +942,17 @@ fn increment_purpose(
     counterparty: Option<String>,
     amount: i128,
     tx_hash: &str,
+    flow: Option<&AssetFlow>,
+    usd_estimate: Option<&FlowUsdEstimate>,
 ) {
     let entry = purpose_map
         .entry((key.0, key.1, key.2, purpose.to_owned(), counterparty))
         .or_default();
+    if let Some(flow) = flow {
+        merge_purpose_asset_metadata(entry, flow);
+    }
+    add_usd(&mut entry.amount_usd, usd_estimate, 1.0);
+    record_price_source(&mut entry.price_sources, usd_estimate);
     entry.amount += amount;
     entry.tx_hashes.insert(tx_hash.to_owned());
     entry.flow_count += 1;

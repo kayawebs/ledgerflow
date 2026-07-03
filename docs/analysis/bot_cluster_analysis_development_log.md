@@ -410,3 +410,56 @@ Passed:
 - `cargo check --bins --locked`
 - `cargo test cluster_summary --locked`
 - `cargo test cluster_asset_changes_roll_up_daily_token_net_and_purposes --locked`
+
+## 2026-07-04 Phase 7 Asset Valuation Follow-up
+
+### Product Decision
+
+Daily asset changes should be directly usable for operator PnL. Raw ERC20 units are not enough; the report should display token symbol/decimals when already known and show USD estimates when the analysis pipeline has already priced the flow.
+
+The report endpoint should remain read-only. It must not fetch token metadata, query prices, call RPC, or enqueue work when a user opens the cluster page.
+
+### Existing Pricing/Metadata Architecture
+
+The project already has the right worker shape:
+
+- `erc20_token_metadata` stores ERC20 symbol/name/decimals.
+- `TokenMetadataService` enriches ERC20 flows during transaction analysis.
+- `price_observations`, `token_price_cache`, and `price_requests` store price facts and pending price work.
+- `ledgerflow_price_worker` processes queued price requests.
+- `PriceService` can derive USD prices from same-transaction stablecoin pair flows and from known DEX pools using `slot0()` or `getReserves()`.
+- `ledgerflow_address_worker` can identify DEX pool contracts and persist pool token metadata in `address_protocol_metadata`.
+
+Short-term recommendation: continue using `ledgerflow_price_worker` rather than adding a separate price binary. If a dedicated token metadata sweeper is needed later, add it as a bounded queue worker, not as work performed by report requests.
+
+### Implemented
+
+Cluster asset changes now include:
+
+- token symbol/name/decimals copied from persisted flow metadata
+- decimal display amounts for native ETH and ERC20 rows when decimals are known
+- per-row USD estimates copied from persisted per-flow `estimated_usd`
+- daily net USD and purpose-level USD totals when prices are available
+- price source tracking per row
+- metadata warnings for ERC20 boundary flows that do not have USD quotes yet
+
+The API still keeps all raw fields, so exact raw accounting remains available even when metadata or price is missing.
+
+### Pricing Data Source Position
+
+Use price confidence tiers:
+
+1. Stable anchors: USDC/USDbC/USDT = 1 USD.
+2. Transaction execution prices: when the same analyzed transaction has a stablecoin leg paired with the token.
+3. Known DEX pool snapshots: `slot0()` for V3-style pools or `getReserves()` for V2-style pools, only after the pool is identified and stored in protocol metadata.
+4. Composed cache: token-to-token observation times quote-token USD cache.
+
+Oracle feeds can be added later, but they need a separate feed registry and confidence policy. For bot/operator PnL, DEX execution and pool snapshots are more aligned with realized trading context.
+
+### Verification Results
+
+Passed:
+
+- `cargo check --bins --locked`
+- `cargo test cluster_summary --locked`
+- `cargo test cluster_asset_changes_roll_up_daily_token_net_and_purposes --locked`
