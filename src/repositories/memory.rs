@@ -11,8 +11,8 @@ use crate::domain::{
     entities::{
         AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
         ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
-        ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState, EvidencePack,
-        ProtocolAddressMetadata, TransactionAnalysis,
+        ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterStrategyReportSnapshot,
+        ClusterTrackingState, EvidencePack, ProtocolAddressMetadata, TransactionAnalysis,
     },
     enums::{ClusterBackfillStatus, ClusterTrackingStatus, ClusterTxStatus},
     interfaces::AnalysisRepository,
@@ -30,6 +30,8 @@ pub struct InMemoryAnalysisRepository {
     cluster_tracking_states: RwLock<HashMap<Uuid, ClusterTrackingState>>,
     classified_transactions: RwLock<HashMap<(Uuid, String), ClassifiedTransaction>>,
     cluster_metrics_snapshots: RwLock<HashMap<Uuid, Vec<ClusterMetricsSnapshot>>>,
+    cluster_strategy_report_snapshots:
+        RwLock<HashMap<(Uuid, String), ClusterStrategyReportSnapshot>>,
     cluster_alerts: RwLock<HashMap<Uuid, Vec<ClusterAlert>>>,
     address_profiles: RwLock<HashMap<(u64, String), AddressProfile>>,
     address_labels: RwLock<HashMap<(u64, String, String, String), AddressLabel>>,
@@ -125,6 +127,10 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
             .write()
             .await
             .remove(&cluster_id);
+        self.cluster_strategy_report_snapshots
+            .write()
+            .await
+            .retain(|(stored_cluster_id, _), _| *stored_cluster_id != cluster_id);
         self.cluster_alerts.write().await.remove(&cluster_id);
         self.cluster_discovered_txs
             .write()
@@ -496,6 +502,30 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
             .get(&cluster_id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    async fn upsert_cluster_strategy_report_snapshot(
+        &self,
+        snapshot: &ClusterStrategyReportSnapshot,
+    ) -> LedgerResult<()> {
+        self.cluster_strategy_report_snapshots.write().await.insert(
+            (snapshot.cluster_id, snapshot.window_key.clone()),
+            snapshot.clone(),
+        );
+        Ok(())
+    }
+
+    async fn get_cluster_strategy_report_snapshot(
+        &self,
+        cluster_id: Uuid,
+        window_key: &str,
+    ) -> LedgerResult<Option<ClusterStrategyReportSnapshot>> {
+        Ok(self
+            .cluster_strategy_report_snapshots
+            .read()
+            .await
+            .get(&(cluster_id, window_key.to_owned()))
+            .cloned())
     }
 
     async fn insert_cluster_alerts(&self, alerts: &[ClusterAlert]) -> LedgerResult<()> {

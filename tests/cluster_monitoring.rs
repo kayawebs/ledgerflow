@@ -800,4 +800,24 @@ async fn strategy_analysis_rolls_up_cluster_arbitrage_behavior() {
         analysis.representative_transactions[0].tx_hash,
         "0xliquidation"
     );
+
+    let snapshot = strategy_service
+        .refresh_cluster_report_snapshot(cluster.cluster_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.cluster_id, cluster.cluster_id);
+    assert_eq!(snapshot.chain_id, 8453);
+    assert_eq!(snapshot.window_key, "*..*");
+    assert_eq!(
+        snapshot.report_json["behavior_profile"]["primary_behavior"],
+        json!("arbitrage")
+    );
+
+    let cached = strategy_service
+        .get_cached_cluster_report_snapshot(cluster.cluster_id, None, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cached.snapshot_id, snapshot.snapshot_id);
+    assert_eq!(cached.report_json["tx_count"], json!(3));
 }

@@ -9,7 +9,11 @@ use uuid::Uuid;
 
 use crate::{
     core::errors::{LedgerError, LedgerResult},
-    domain::{entities::ClassifiedTransaction, enums::BehaviorTag, interfaces::AnalysisRepository},
+    domain::{
+        entities::{ClassifiedTransaction, ClusterStrategyReportSnapshot},
+        enums::BehaviorTag,
+        interfaces::AnalysisRepository,
+    },
     services::strategy_facts::build_strategy_fact,
 };
 
@@ -349,6 +353,47 @@ impl ClusterStrategyAnalysisService {
             strategy_breakdown,
         })
     }
+
+    pub async fn refresh_cluster_report_snapshot(
+        &self,
+        cluster_id: Uuid,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> LedgerResult<ClusterStrategyReportSnapshot> {
+        let report = self.analyze_cluster(cluster_id, start, end).await?;
+        let generated_at = Utc::now();
+        let snapshot = ClusterStrategyReportSnapshot {
+            snapshot_id: Uuid::new_v4(),
+            cluster_id,
+            chain_id: report.chain_id,
+            window_start: start,
+            window_end: end,
+            window_key: report_window_key(start, end),
+            generated_at,
+            report_json: serde_json::to_value(&report)
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            metadata: serde_json::json!({
+                "source": "classified_transactions",
+                "schema": "cluster_strategy_report.v1",
+                "report_generated_at": report.generated_at,
+            }),
+        };
+        self.repository
+            .upsert_cluster_strategy_report_snapshot(&snapshot)
+            .await?;
+        Ok(snapshot)
+    }
+
+    pub async fn get_cached_cluster_report_snapshot(
+        &self,
+        cluster_id: Uuid,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> LedgerResult<Option<ClusterStrategyReportSnapshot>> {
+        self.repository
+            .get_cluster_strategy_report_snapshot(cluster_id, &report_window_key(start, end))
+            .await
+    }
 }
 
 #[derive(Default)]
@@ -591,6 +636,17 @@ fn metric_sort_key(value: Option<f64>) -> i64 {
         .filter(|value| value.is_finite())
         .map(|value| (value * 100.0).round() as i64)
         .unwrap_or(i64::MIN)
+}
+
+fn report_window_key(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> String {
+    format!(
+        "{}..{}",
+        start
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "*".to_owned()),
+        end.map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "*".to_owned())
+    )
 }
 
 fn infer_address_role(tx: &ClassifiedTransaction) -> String {

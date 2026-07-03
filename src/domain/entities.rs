@@ -342,6 +342,19 @@ pub struct ClusterMetricsSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ClusterStrategyReportSnapshot {
+    pub snapshot_id: Uuid,
+    pub cluster_id: Uuid,
+    pub chain_id: u64,
+    pub window_start: Option<DateTime<Utc>>,
+    pub window_end: Option<DateTime<Utc>>,
+    pub window_key: String,
+    pub generated_at: DateTime<Utc>,
+    pub report_json: Value,
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ClassifiedTransaction {
     pub cluster_id: Uuid,
     pub chain_id: u64,

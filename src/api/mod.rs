@@ -14,7 +14,7 @@ use crate::core::errors::LedgerError;
 use crate::domain::entities::{
     AddressAnalysisCandidate, AddressCluster, AddressLabel, AddressProfile, ClassifiedTransaction,
     ClusterAddress, ClusterAlert, ClusterMetricsSnapshot, ClusterSpendSummary,
-    ClusterTrackingState, TransactionAnalysis,
+    ClusterStrategyReportSnapshot, ClusterTrackingState, TransactionAnalysis,
 };
 use crate::ingestion::rpc::RpcClient;
 use crate::plugins::loader::PluginManifest;
@@ -244,6 +244,14 @@ pub fn router(
         .route(
             "/clusters/{cluster_id}/strategy-analysis",
             get(get_cluster_strategy_analysis),
+        )
+        .route(
+            "/clusters/{cluster_id}/strategy-analysis/snapshot",
+            get(get_cluster_strategy_analysis_snapshot),
+        )
+        .route(
+            "/clusters/{cluster_id}/strategy-analysis/refresh",
+            post(refresh_cluster_strategy_analysis_snapshot),
         )
         .route("/clusters/{cluster_id}/alerts", get(list_cluster_alerts))
         .route(
@@ -942,6 +950,45 @@ async fn get_cluster_strategy_analysis(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(analysis))
+}
+
+async fn get_cluster_strategy_analysis_snapshot(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+    Query(query): Query<ClusterSummaryQuery>,
+) -> Result<Json<ClusterStrategyReportSnapshot>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let start = parse_time(query.start.as_deref())?;
+    let end = parse_time(query.end.as_deref())?;
+    let snapshot = state
+        .strategy_analysis_service
+        .get_cached_cluster_report_snapshot(cluster_id, start, end)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| {
+            ApiError::from(LedgerError::NotFound(format!(
+                "cluster strategy report snapshot for {cluster_id} not found"
+            )))
+        })?;
+    Ok(Json(snapshot))
+}
+
+async fn refresh_cluster_strategy_analysis_snapshot(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+    Query(query): Query<ClusterSummaryQuery>,
+) -> Result<Json<ClusterStrategyReportSnapshot>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let start = parse_time(query.start.as_deref())?;
+    let end = parse_time(query.end.as_deref())?;
+    let snapshot = state
+        .strategy_analysis_service
+        .refresh_cluster_report_snapshot(cluster_id, start, end)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(snapshot))
 }
 
 async fn list_cluster_alerts(

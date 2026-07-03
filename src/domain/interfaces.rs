@@ -7,8 +7,9 @@ use crate::core::errors::LedgerResult;
 use crate::domain::entities::{
     AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
     ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
-    ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState, EvidencePack,
-    ProtocolAddressMetadata, RecognizerResult, TransactionAnalysis,
+    ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterStrategyReportSnapshot,
+    ClusterTrackingState, EvidencePack, ProtocolAddressMetadata, RecognizerResult,
+    TransactionAnalysis,
 };
 use crate::domain::enums::BehaviorTag;
 use crate::domain::value_objects::{AddressTxRef, AssetFlow, ValidationMessage};
@@ -110,6 +111,15 @@ pub trait AnalysisRepository: Send + Sync {
         &self,
         cluster_id: uuid::Uuid,
     ) -> LedgerResult<Vec<ClusterMetricsSnapshot>>;
+    async fn upsert_cluster_strategy_report_snapshot(
+        &self,
+        snapshot: &ClusterStrategyReportSnapshot,
+    ) -> LedgerResult<()>;
+    async fn get_cluster_strategy_report_snapshot(
+        &self,
+        cluster_id: uuid::Uuid,
+        window_key: &str,
+    ) -> LedgerResult<Option<ClusterStrategyReportSnapshot>>;
     async fn insert_cluster_alerts(&self, alerts: &[ClusterAlert]) -> LedgerResult<()>;
     async fn list_cluster_alerts(
         &self,

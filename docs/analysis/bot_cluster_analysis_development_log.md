@@ -173,3 +173,43 @@ Passed:
 - `cargo test strategy_analysis_rolls_up_cluster_arbitrage_behavior --locked`
 
 No RPC calls are made by the new tests. No service restart is required until this Phase 2 code is deployed.
+
+## 2026-07-03 Phase 3 Start
+
+### Implemented
+
+Added the first materialization boundary for cluster strategy reports:
+
+- `ClusterStrategyReportSnapshot` entity
+- `cluster_strategy_report_snapshots` migration
+- repository methods for upsert/read by `(cluster_id, window_key)`
+- in-memory repository implementation
+- SQLx repository implementation
+- `ClusterStrategyAnalysisService::refresh_cluster_report_snapshot`
+- `ClusterStrategyAnalysisService::get_cached_cluster_report_snapshot`
+- API endpoints:
+  - `GET /clusters/{cluster_id}/strategy-analysis/snapshot`
+  - `POST /clusters/{cluster_id}/strategy-analysis/refresh`
+
+The snapshot stores the full typed report payload as JSON with stable window metadata. This keeps Phase 3 compatible with the current report contract while making it possible to move report generation off the request path later.
+
+### Window Key
+
+Snapshot uniqueness uses:
+
+```text
+{window_start_or_*}..{window_end_or_*}
+```
+
+Examples:
+
+- `*..*`
+- `2026-07-01T00:00:00+00:00..*`
+- `*..2026-07-03T00:00:00+00:00`
+- `2026-07-01T00:00:00+00:00..2026-07-03T00:00:00+00:00`
+
+This avoids nullable unique-index behavior differences and gives the future worker a stable upsert key.
+
+### Deferred
+
+The report worker is still deferred. The current refresh endpoint is explicit and bounded by cluster/window. It reads existing classified transactions only and does not trigger RPC, backfill, trace, or indexer work.

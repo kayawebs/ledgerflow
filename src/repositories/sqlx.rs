@@ -9,8 +9,8 @@ use crate::domain::{
     entities::{
         AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
         ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
-        ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterTrackingState, EvidencePack,
-        ProtocolAddressMetadata, TransactionAnalysis,
+        ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterStrategyReportSnapshot,
+        ClusterTrackingState, EvidencePack, ProtocolAddressMetadata, TransactionAnalysis,
     },
     enums::{
         AlertSeverity, AlertType, BehaviorTag, ClusterBackfillStatus, ClusterTrackingStatus,
@@ -1128,6 +1128,64 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         rows.into_iter().map(row_to_metrics_snapshot).collect()
     }
 
+    async fn upsert_cluster_strategy_report_snapshot(
+        &self,
+        snapshot: &ClusterStrategyReportSnapshot,
+    ) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            insert into cluster_strategy_report_snapshots (
+              snapshot_id, cluster_id, chain_id, window_start, window_end, window_key,
+              generated_at, report_json, metadata
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            on conflict (cluster_id, window_key) do update set
+              snapshot_id = excluded.snapshot_id,
+              chain_id = excluded.chain_id,
+              window_start = excluded.window_start,
+              window_end = excluded.window_end,
+              generated_at = excluded.generated_at,
+              report_json = excluded.report_json,
+              metadata = excluded.metadata,
+              updated_at = now()
+            "#,
+        )
+        .bind(snapshot.snapshot_id)
+        .bind(snapshot.cluster_id)
+        .bind(snapshot.chain_id as i64)
+        .bind(snapshot.window_start)
+        .bind(snapshot.window_end)
+        .bind(&snapshot.window_key)
+        .bind(snapshot.generated_at)
+        .bind(Json(snapshot.report_json.clone()))
+        .bind(Json(snapshot.metadata.clone()))
+        .execute(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_cluster_strategy_report_snapshot(
+        &self,
+        cluster_id: Uuid,
+        window_key: &str,
+    ) -> LedgerResult<Option<ClusterStrategyReportSnapshot>> {
+        let row = sqlx::query(
+            r#"
+            select *
+            from cluster_strategy_report_snapshots
+            where cluster_id = $1 and window_key = $2
+            limit 1
+            "#,
+        )
+        .bind(cluster_id)
+        .bind(window_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        row.map(row_to_strategy_report_snapshot).transpose()
+    }
+
     async fn insert_cluster_alerts(&self, alerts: &[ClusterAlert]) -> LedgerResult<()> {
         for alert in alerts {
             sqlx::query(
@@ -1902,6 +1960,42 @@ fn row_to_metrics_snapshot(row: sqlx::postgres::PgRow) -> LedgerResult<ClusterMe
             .map_err(|err| LedgerError::Persistence(err.to_string()))?
             as u32,
         behavior_breakdown,
+        metadata,
+    })
+}
+
+fn row_to_strategy_report_snapshot(
+    row: sqlx::postgres::PgRow,
+) -> LedgerResult<ClusterStrategyReportSnapshot> {
+    let Json(report_json): Json<Value> = row
+        .try_get("report_json")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    let Json(metadata): Json<Value> = row
+        .try_get("metadata")
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+    Ok(ClusterStrategyReportSnapshot {
+        snapshot_id: row
+            .try_get("snapshot_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        cluster_id: row
+            .try_get("cluster_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        chain_id: row
+            .try_get::<i64, _>("chain_id")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))? as u64,
+        window_start: row
+            .try_get("window_start")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        window_end: row
+            .try_get("window_end")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        window_key: row
+            .try_get("window_key")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        generated_at: row
+            .try_get("generated_at")
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+        report_json,
         metadata,
     })
 }
