@@ -113,3 +113,63 @@ Passed:
 - `cargo test strategy_analysis_rolls_up_cluster_arbitrage_behavior --locked`
 
 No Docker services were started or restarted for this implementation step. No RPC calls were made by the tests.
+
+## 2026-07-03 Phase 2 Start
+
+### Implemented
+
+Added a pure strategy fact normalization layer:
+
+- `src/services/strategy_facts.rs`
+- `tests/strategy_facts.rs`
+
+The fact builder converts a `ClassifiedTransaction` into `TransactionStrategyFact`:
+
+- `strategy_type`
+- `strategy_subtype`
+- `protocol_name`
+- `protocol_family`
+- normalized route key and token refs
+- outcome/profitability/failure reason
+- PnL-to-gas ratio
+
+`ClusterStrategyAnalysisService` now consumes `TransactionStrategyFact` for route, protocol, strategy type, and report success. This removes duplicate local string inference from report aggregation and gives future materialized report tables a stable normalization contract.
+
+### Current Strategy Fact Rules
+
+Arbitrage subtype:
+
+- `token_pair_arbitrage` when both token in and token out are present.
+- `arbitrage_unknown_route` when route data is incomplete.
+
+Liquidation subtype:
+
+- `{protocol_family}_liquidation` when the protocol family is recognized.
+- `liquidation_unknown_protocol` when it is not.
+
+Outcome:
+
+- `profitable = estimated_pnl_usd >= 0` when PnL exists.
+- `report_success = profitable.unwrap_or(true)` for compatibility with existing MVP reports.
+- `failure_reason = negative_estimated_pnl` for negative PnL.
+
+Protocol families currently recognized:
+
+- uniswap
+- aerodrome
+- aave
+- morpho
+- compound
+- curve
+- balancer
+- pancake
+
+### Verification Results
+
+Passed:
+
+- `cargo check --bins --locked`
+- `cargo test strategy_fact --locked`
+- `cargo test strategy_analysis_rolls_up_cluster_arbitrage_behavior --locked`
+
+No RPC calls are made by the new tests. No service restart is required until this Phase 2 code is deployed.

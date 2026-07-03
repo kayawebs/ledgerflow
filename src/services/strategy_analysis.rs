@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::{
     core::errors::{LedgerError, LedgerResult},
     domain::{entities::ClassifiedTransaction, enums::BehaviorTag, interfaces::AnalysisRepository},
+    services::strategy_facts::build_strategy_fact,
 };
 
 #[derive(Clone)]
@@ -96,7 +97,9 @@ pub struct StrategyProtocolStat {
 pub struct RepresentativeTransaction {
     pub tx_hash: String,
     pub behavior_tag: String,
+    pub strategy_subtype: String,
     pub protocol: Option<String>,
+    pub protocol_family: Option<String>,
     pub address: String,
     pub block_number: u64,
     pub timestamp: Option<DateTime<Utc>>,
@@ -194,10 +197,11 @@ impl ClusterStrategyAnalysisService {
         let mut failed_arbitrage_tx_count = 0u32;
 
         for tx in &txs {
+            let fact = build_strategy_fact(tx);
             total_pnl.add(tx.estimated_pnl_usd);
             total_gas.add(tx.gas_cost_usd);
-            let strategy_type = strategy_type(tx);
-            let is_success = is_successful(tx);
+            let strategy_type = fact.strategy_type.clone();
+            let is_success = fact.outcome.report_success;
             if is_success {
                 successful_tx_count += 1;
             } else {
@@ -220,7 +224,10 @@ impl ClusterStrategyAnalysisService {
                 })
                 .add(tx, is_success);
 
-            let protocol = tx.protocol.clone().unwrap_or_else(|| "unknown".to_owned());
+            let protocol = fact
+                .protocol_name
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
             protocol_stats
                 .entry(protocol.clone())
                 .or_insert_with(|| ProtocolAccumulator {
@@ -238,9 +245,9 @@ impl ClusterStrategyAnalysisService {
                 } else {
                     failed_arbitrage_tx_count += 1;
                 }
-                let route = route_key(tx);
+                let route = fact.route.route_key.clone();
                 route_stats.entry(route).or_default().add(tx, is_success);
-                let route = route_key(tx);
+                let route = fact.route.route_key.clone();
                 arbitrage_route_stats
                     .entry(route)
                     .or_default()
@@ -258,7 +265,7 @@ impl ClusterStrategyAnalysisService {
                 }
             } else if tx.behavior_tag == BehaviorTag::Liquidation {
                 liquidation_total.add(tx, is_success);
-                let route = route_key(tx);
+                let route = fact.route.route_key.clone();
                 liquidation_route_stats
                     .entry(route)
                     .or_default()
@@ -555,16 +562,19 @@ fn representative_transactions_for_behavior(
 }
 
 fn representative_transaction(tx: &ClassifiedTransaction) -> RepresentativeTransaction {
+    let fact = build_strategy_fact(tx);
     RepresentativeTransaction {
         tx_hash: tx.tx_hash.clone(),
-        behavior_tag: strategy_type(tx),
-        protocol: tx.protocol.clone(),
+        behavior_tag: fact.strategy_type,
+        strategy_subtype: fact.strategy_subtype,
+        protocol: fact.protocol_name,
+        protocol_family: fact.protocol_family,
         address: tx.address.clone(),
         block_number: tx.block_number,
         timestamp: tx.timestamp,
         estimated_pnl_usd: tx.estimated_pnl_usd,
         gas_cost_usd: tx.gas_cost_usd,
-        route: route_key(tx),
+        route: fact.route.route_key,
     }
 }
 
@@ -581,46 +591,6 @@ fn metric_sort_key(value: Option<f64>) -> i64 {
         .filter(|value| value.is_finite())
         .map(|value| (value * 100.0).round() as i64)
         .unwrap_or(i64::MIN)
-}
-
-fn route_key(tx: &ClassifiedTransaction) -> String {
-    match (tx.token_out.as_deref(), tx.token_in.as_deref()) {
-        (Some(out), Some(input)) if !out.is_empty() && !input.is_empty() => {
-            format!("{} -> {}", short_token(out), short_token(input))
-        }
-        (None, Some(input)) => format!("unknown -> {}", short_token(input)),
-        (Some(out), None) => format!("{} -> unknown", short_token(out)),
-        _ => "unknown_route".to_owned(),
-    }
-}
-
-fn short_token(token: &str) -> String {
-    let token = token.to_ascii_lowercase();
-    match token.as_str() {
-        "0x4200000000000000000000000000000000000006" => "WETH".to_owned(),
-        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => "USDC".to_owned(),
-        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" => "USDbC".to_owned(),
-        "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => "USDT".to_owned(),
-        _ if token.len() > 12 => format!("{}...{}", &token[..8], &token[token.len() - 4..]),
-        _ => token,
-    }
-}
-
-fn strategy_type(tx: &ClassifiedTransaction) -> String {
-    match tx.behavior_tag {
-        BehaviorTag::Arbitrage => "arbitrage",
-        BehaviorTag::Liquidation => "liquidation",
-        BehaviorTag::Lp => "lp",
-        BehaviorTag::Position => "position",
-        BehaviorTag::Unknown => "unknown",
-    }
-    .to_owned()
-}
-
-fn is_successful(tx: &ClassifiedTransaction) -> bool {
-    tx.estimated_pnl_usd
-        .map(|value| value >= 0.0)
-        .unwrap_or(true)
 }
 
 fn infer_address_role(tx: &ClassifiedTransaction) -> String {
