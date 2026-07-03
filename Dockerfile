@@ -23,6 +23,7 @@ COPY --from=builder /app/target/release/ledgerflow_backfill_worker /usr/local/bi
 COPY --from=builder /app/target/release/ledgerflow_price_worker /usr/local/bin/ledgerflow_price_worker
 COPY --from=builder /app/target/release/ledgerflow_address_worker /usr/local/bin/ledgerflow_address_worker
 COPY --from=builder /app/target/release/ledgerflow_trace_monitor /usr/local/bin/ledgerflow_trace_monitor
+COPY --from=builder /app/target/release/ledgerflow_rpc_gateway /usr/local/bin/ledgerflow_rpc_gateway
 
 ENV RUST_LOG=info
 

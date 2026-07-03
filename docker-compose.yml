@@ -47,15 +47,31 @@ services:
       timeout: 5s
       retries: 10
 
+  rpc-gateway:
+    <<: [*ledgerflow-env, *ledgerflow-image]
+    command: ["ledgerflow_rpc_gateway"]
+    environment:
+      LEDGERFLOW_RPC_GATEWAY_BIND_ADDR: 0.0.0.0:8545
+      LEDGERFLOW_RPC_GATEWAY_UPSTREAM_URL: ${LEDGERFLOW_RPC_GATEWAY_UPSTREAM_URL:-http://host.docker.internal:18545}
+      LEDGERFLOW_RPC_GATEWAY_MAX_IN_FLIGHT: ${LEDGERFLOW_RPC_GATEWAY_MAX_IN_FLIGHT:-8}
+      LEDGERFLOW_RPC_GATEWAY_RPS: ${LEDGERFLOW_RPC_GATEWAY_RPS:-20}
+      LEDGERFLOW_RPC_GATEWAY_BURST: ${LEDGERFLOW_RPC_GATEWAY_BURST:-20}
+      LEDGERFLOW_RPC_GATEWAY_UPSTREAM_TIMEOUT_MS: ${LEDGERFLOW_RPC_GATEWAY_UPSTREAM_TIMEOUT_MS:-30000}
+    ports:
+      - "127.0.0.1:${LEDGERFLOW_RPC_GATEWAY_HOST_PORT:-18555}:8545"
+    restart: unless-stopped
+
   app:
     <<: [*ledgerflow-env, *ledgerflow-image]
     command: ["ledgerflow"]
     environment:
       LEDGERFLOW_BIND_ADDR: 0.0.0.0:3000
       LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
-      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_COMPOSE_RPC_URL:-http://rpc-gateway:8545}
       LEDGERFLOW_INDEXER_API_BASE_URL: http://indexer:8090
     depends_on:
+      rpc-gateway:
+        condition: service_started
       db:
         condition: service_healthy
     ports:
@@ -82,12 +98,14 @@ services:
     command: ["ledgerflow_indexer"]
     environment:
       LEDGERFLOW_INDEXER_BIND_ADDR: 0.0.0.0:8090
-      LEDGERFLOW_INDEXER_RPC_URL: ${LEDGERFLOW_INDEXER_RPC_URL:-http://host.docker.internal:8545}
+      LEDGERFLOW_INDEXER_RPC_URL: ${LEDGERFLOW_INDEXER_COMPOSE_RPC_URL:-http://rpc-gateway:8545}
       LEDGERFLOW_INDEXER_CLICKHOUSE_URL: http://clickhouse:8123
       LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE: ${LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE:-ledgerflow_indexer}
       LEDGERFLOW_INDEXER_CLICKHOUSE_USER: ${LEDGERFLOW_INDEXER_CLICKHOUSE_USER:-ledgerflow}
       LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD: ${LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD:-ledgerflow}
     depends_on:
+      rpc-gateway:
+        condition: service_started
       clickhouse:
         condition: service_healthy
     ports:
@@ -99,9 +117,11 @@ services:
     command: ["ledgerflow_backfill_worker"]
     environment:
       LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
-      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_COMPOSE_RPC_URL:-http://rpc-gateway:8545}
       LEDGERFLOW_INDEXER_API_BASE_URL: http://indexer:8090
     depends_on:
+      rpc-gateway:
+        condition: service_started
       db:
         condition: service_healthy
       indexer:
@@ -113,8 +133,10 @@ services:
     command: ["ledgerflow_price_worker"]
     environment:
       LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
-      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_COMPOSE_RPC_URL:-http://rpc-gateway:8545}
     depends_on:
+      rpc-gateway:
+        condition: service_started
       db:
         condition: service_healthy
     restart: unless-stopped
@@ -124,8 +146,10 @@ services:
     command: ["ledgerflow_address_worker"]
     environment:
       LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
-      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_COMPOSE_RPC_URL:-http://rpc-gateway:8545}
     depends_on:
+      rpc-gateway:
+        condition: service_started
       db:
         condition: service_healthy
     restart: unless-stopped
@@ -135,10 +159,12 @@ services:
     command: ["ledgerflow_trace_monitor"]
     environment:
       LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
-      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_RPC_URL:-http://host.docker.internal:8545}
+      LEDGERFLOW_RPC_URL: ${LEDGERFLOW_COMPOSE_RPC_URL:-http://rpc-gateway:8545}
       LEDGERFLOW_BIND_ADDR: http://app:3000
       LEDGERFLOW_TRACE_MONITOR_BIND_ADDR: 0.0.0.0:3010
     depends_on:
+      rpc-gateway:
+        condition: service_started
       db:
         condition: service_healthy
       app:

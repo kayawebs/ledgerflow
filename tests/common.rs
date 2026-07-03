@@ -99,7 +99,11 @@ impl RpcClient for MockRpcClient {
     }
 
     async fn get_receipt(&self, _chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
-        let status = if tx_hash.contains("fail") { "0x0" } else { "0x1" };
+        let status = if tx_hash.contains("fail") {
+            "0x0"
+        } else {
+            "0x1"
+        };
         if tx_hash.contains("flashloan-liquidation") {
             return Ok(json!({
                 "status": status,

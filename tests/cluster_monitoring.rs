@@ -19,6 +19,7 @@ use ledgerflow::{
     services::{
         alerts::ClusterAlertService, analysis::AnalysisService, behavior::BehaviorClassifier,
         cluster::ClusterService, metrics::ClusterMetricsService,
+        strategy_analysis::ClusterStrategyAnalysisService,
     },
 };
 
@@ -79,7 +80,10 @@ async fn behavior_classifier_marks_liquidation_when_trace_hits_known_selector() 
         registry,
         plugin_context,
         repository.clone(),
-        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+        vec![
+            "selector_presence".to_owned(),
+            "liquidation_like_scenario".to_owned(),
+        ],
     ));
     let cluster_service = ClusterService::new(repository);
 
@@ -124,7 +128,10 @@ async fn liquidation_recognizer_does_not_label_plain_swap_flow() {
         registry,
         plugin_context,
         repository,
-        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+        vec![
+            "selector_presence".to_owned(),
+            "liquidation_like_scenario".to_owned(),
+        ],
     ));
 
     let (analysis, _) = analysis_service
@@ -132,15 +139,19 @@ async fn liquidation_recognizer_does_not_label_plain_swap_flow() {
         .await
         .unwrap();
 
-    assert!(!analysis
-        .recognizer_results
-        .iter()
-        .any(|result| result.label == "liquidation_like_activity"));
-    assert!(analysis
-        .scenario_outputs
-        .get("storyline")
-        .map(|value| value.is_null())
-        .unwrap_or(true));
+    assert!(
+        !analysis
+            .recognizer_results
+            .iter()
+            .any(|result| result.label == "liquidation_like_activity")
+    );
+    assert!(
+        analysis
+            .scenario_outputs
+            .get("storyline")
+            .map(|value| value.is_null())
+            .unwrap_or(true)
+    );
 }
 
 #[tokio::test]
@@ -207,10 +218,12 @@ async fn executor_mediated_multi_leg_cycle_is_arbitrage_not_transfer() {
         .await
         .unwrap();
 
-    assert!(analysis
-        .recognizer_results
-        .iter()
-        .any(|result| result.label == "arbitrage_like_activity"));
+    assert!(
+        analysis
+            .recognizer_results
+            .iter()
+            .any(|result| result.label == "arbitrage_like_activity")
+    );
     let storyline = analysis
         .scenario_outputs
         .get("storyline")
@@ -239,7 +252,10 @@ async fn behavior_classifier_marks_morpho_liquidation_without_trace_when_event_m
         registry,
         plugin_context,
         repository.clone(),
-        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+        vec![
+            "selector_presence".to_owned(),
+            "liquidation_like_scenario".to_owned(),
+        ],
     ));
     let cluster_service = ClusterService::new(repository);
 
@@ -285,7 +301,10 @@ async fn scenario_outputs_include_liquidation_storyline_for_morpho_case() {
         registry,
         plugin_context,
         repository,
-        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+        vec![
+            "selector_presence".to_owned(),
+            "liquidation_like_scenario".to_owned(),
+        ],
     ));
 
     let (analysis, _) = analysis_service
@@ -394,7 +413,10 @@ async fn morpho_liquidation_case_derives_erc20_flows() {
         registry,
         plugin_context,
         repository,
-        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+        vec![
+            "selector_presence".to_owned(),
+            "liquidation_like_scenario".to_owned(),
+        ],
     ));
 
     let (analysis, _) = analysis_service
@@ -410,7 +432,8 @@ async fn morpho_liquidation_case_derives_erc20_flows() {
         analysis
             .derived_flows
             .iter()
-            .any(|flow| flow.token_address.as_deref() == Some("0x4200000000000000000000000000000000000006")),
+            .any(|flow| flow.token_address.as_deref()
+                == Some("0x4200000000000000000000000000000000000006")),
         "expected WETH-like transfer flow to be derived"
     );
 }
@@ -426,7 +449,10 @@ async fn flashloan_funding_source_is_labeled_in_storyline() {
         registry,
         plugin_context,
         repository,
-        vec!["selector_presence".to_owned(), "liquidation_like_scenario".to_owned()],
+        vec![
+            "selector_presence".to_owned(),
+            "liquidation_like_scenario".to_owned(),
+        ],
     ));
 
     let (analysis, _) = analysis_service
@@ -553,7 +579,10 @@ async fn metrics_and_alerts_are_computed_from_recent_classified_transactions() {
         },
     ];
 
-    repository.upsert_classified_transactions(&txs).await.unwrap();
+    repository
+        .upsert_classified_transactions(&txs)
+        .await
+        .unwrap();
 
     let snapshots = metrics_service
         .refresh_cluster_metrics(cluster.cluster_id)
@@ -572,6 +601,203 @@ async fn metrics_and_alerts_are_computed_from_recent_classified_transactions() {
         .refresh_cluster_alerts(cluster.cluster_id)
         .await
         .unwrap();
-    assert!(alerts.iter().any(|item| item.alert_type == AlertType::RoiAnomaly));
-    assert!(alerts.iter().any(|item| item.alert_type == AlertType::ExternalInflow));
+    assert!(
+        alerts
+            .iter()
+            .any(|item| item.alert_type == AlertType::RoiAnomaly)
+    );
+    assert!(
+        alerts
+            .iter()
+            .any(|item| item.alert_type == AlertType::ExternalInflow)
+    );
+}
+
+#[tokio::test]
+async fn strategy_analysis_rolls_up_cluster_arbitrage_behavior() {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let cluster_service = ClusterService::new(repository.clone());
+    let strategy_service = ClusterStrategyAnalysisService::new(repository.clone());
+
+    let cluster = cluster_service
+        .create_cluster(
+            8453,
+            "ops_team",
+            "known_searcher",
+            None,
+            vec![
+                ClusterAddress {
+                    address: "0x1111111111111111111111111111111111111111".to_owned(),
+                    label: Some("bot".to_owned()),
+                    role: Some("executor".to_owned()),
+                    metadata: json!({}),
+                },
+                ClusterAddress {
+                    address: "0x2222222222222222222222222222222222222222".to_owned(),
+                    label: Some("collector".to_owned()),
+                    role: Some("collector".to_owned()),
+                    metadata: json!({}),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let txs = vec![
+        ClassifiedTransaction {
+            cluster_id: cluster.cluster_id,
+            chain_id: 8453,
+            tx_hash: "0xarb-success".to_owned(),
+            address: "0x1111111111111111111111111111111111111111".to_owned(),
+            block_number: 200,
+            timestamp: Some(now - Duration::minutes(3)),
+            behavior_tag: BehaviorTag::Arbitrage,
+            protocol: Some("uniswap_v3".to_owned()),
+            token_in: Some("0x4200000000000000000000000000000000000006".to_owned()),
+            token_out: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_owned()),
+            amount_in: Some("1000000000000000000".to_owned()),
+            amount_out: Some("2500000000".to_owned()),
+            value_usd: Some(2500.0),
+            gas_cost_usd: Some(3.0),
+            estimated_pnl_usd: Some(12.0),
+            raw_json: json!({}),
+            created_at: now,
+            updated_at: now,
+        },
+        ClassifiedTransaction {
+            cluster_id: cluster.cluster_id,
+            chain_id: 8453,
+            tx_hash: "0xarb-failed".to_owned(),
+            address: "0x1111111111111111111111111111111111111111".to_owned(),
+            block_number: 201,
+            timestamp: Some(now - Duration::minutes(2)),
+            behavior_tag: BehaviorTag::Arbitrage,
+            protocol: Some("uniswap_v3".to_owned()),
+            token_in: Some("0x4200000000000000000000000000000000000006".to_owned()),
+            token_out: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_owned()),
+            amount_in: Some("1000000000000000000".to_owned()),
+            amount_out: Some("2490000000".to_owned()),
+            value_usd: Some(2490.0),
+            gas_cost_usd: Some(4.0),
+            estimated_pnl_usd: Some(-2.0),
+            raw_json: json!({}),
+            created_at: now,
+            updated_at: now,
+        },
+        ClassifiedTransaction {
+            cluster_id: cluster.cluster_id,
+            chain_id: 8453,
+            tx_hash: "0xliquidation".to_owned(),
+            address: "0x2222222222222222222222222222222222222222".to_owned(),
+            block_number: 202,
+            timestamp: Some(now - Duration::minutes(1)),
+            behavior_tag: BehaviorTag::Liquidation,
+            protocol: Some("aave".to_owned()),
+            token_in: None,
+            token_out: None,
+            amount_in: None,
+            amount_out: None,
+            value_usd: Some(5000.0),
+            gas_cost_usd: Some(5.0),
+            estimated_pnl_usd: Some(40.0),
+            raw_json: json!({}),
+            created_at: now,
+            updated_at: now,
+        },
+    ];
+
+    repository
+        .upsert_classified_transactions(&txs)
+        .await
+        .unwrap();
+
+    let analysis = strategy_service
+        .analyze_cluster(cluster.cluster_id, None, None)
+        .await
+        .unwrap();
+
+    assert_eq!(analysis.tx_count, 3);
+    assert_eq!(analysis.arbitrage_tx_count, 2);
+    assert_eq!(analysis.successful_arbitrage_tx_count, 1);
+    assert_eq!(analysis.failed_arbitrage_tx_count, 1);
+    assert_eq!(analysis.arbitrage_success_rate, Some(0.5));
+    assert_eq!(analysis.total_estimated_pnl_usd, Some(50.0));
+    assert_eq!(analysis.total_gas_cost_usd, Some(12.0));
+
+    let route = analysis.top_routes.first().unwrap();
+    assert_eq!(route.route, "USDC -> WETH");
+    assert_eq!(route.tx_count, 2);
+    assert_eq!(route.success_count, 1);
+    assert_eq!(route.success_rate, Some(0.5));
+
+    let uniswap = analysis
+        .top_protocols
+        .iter()
+        .find(|item| item.protocol == "uniswap_v3")
+        .unwrap();
+    assert_eq!(uniswap.tx_count, 2);
+    assert_eq!(uniswap.arbitrage_tx_count, 2);
+    assert_eq!(uniswap.success_count, 1);
+
+    let executor = analysis
+        .address_roles
+        .iter()
+        .find(|item| item.address == "0x1111111111111111111111111111111111111111")
+        .unwrap();
+    assert_eq!(executor.configured_role.as_deref(), Some("executor"));
+    assert_eq!(executor.inferred_role, "arbitrage_executor");
+    assert_eq!(executor.tx_count, 2);
+
+    let arbitrage = analysis
+        .strategy_breakdown
+        .iter()
+        .find(|item| item.strategy_type == "arbitrage")
+        .unwrap();
+    assert_eq!(arbitrage.tx_count, 2);
+    assert_eq!(arbitrage.success_count, 1);
+
+    assert_eq!(analysis.behavior_profile.primary_behavior, "arbitrage");
+    assert_eq!(analysis.behavior_profile.primary_behavior_tx_count, 2);
+    assert_eq!(
+        analysis.behavior_profile.primary_behavior_tx_share,
+        Some(2.0 / 3.0)
+    );
+    assert_eq!(analysis.behavior_profile.active_addresses_count, 2);
+
+    assert_eq!(analysis.performance.tx_count, 3);
+    assert_eq!(analysis.performance.success_count, 2);
+    assert_eq!(analysis.performance.failed_count, 1);
+    assert_eq!(analysis.performance.success_rate, Some(2.0 / 3.0));
+    assert_eq!(analysis.performance.estimated_pnl_usd, Some(50.0));
+    assert_eq!(analysis.performance.gas_cost_usd, Some(12.0));
+    assert_eq!(analysis.performance.pnl_to_gas_ratio, Some(50.0 / 12.0));
+
+    let arbitrage_report = analysis.arbitrage_report.as_ref().unwrap();
+    assert_eq!(arbitrage_report.strategy_type, "arbitrage");
+    assert_eq!(arbitrage_report.tx_count, 2);
+    assert_eq!(arbitrage_report.success_count, 1);
+    assert_eq!(arbitrage_report.failed_count, 1);
+    assert_eq!(arbitrage_report.success_rate, Some(0.5));
+    assert_eq!(arbitrage_report.estimated_pnl_usd, Some(10.0));
+    assert_eq!(arbitrage_report.gas_cost_usd, Some(7.0));
+    assert_eq!(arbitrage_report.top_routes[0].route, "USDC -> WETH");
+    assert_eq!(arbitrage_report.top_protocols[0].protocol, "uniswap_v3");
+    assert_eq!(
+        arbitrage_report.representative_transactions[0].tx_hash,
+        "0xarb-success"
+    );
+
+    let liquidation_report = analysis.liquidation_report.as_ref().unwrap();
+    assert_eq!(liquidation_report.strategy_type, "liquidation");
+    assert_eq!(liquidation_report.tx_count, 1);
+    assert_eq!(liquidation_report.success_count, 1);
+    assert_eq!(liquidation_report.estimated_pnl_usd, Some(40.0));
+    assert_eq!(liquidation_report.gas_cost_usd, Some(5.0));
+    assert_eq!(liquidation_report.top_protocols[0].protocol, "aave");
+
+    assert_eq!(
+        analysis.representative_transactions[0].tx_hash,
+        "0xliquidation"
+    );
 }

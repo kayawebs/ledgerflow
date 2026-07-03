@@ -12,6 +12,7 @@ pub mod normalization;
 pub mod plugins;
 pub mod recognition;
 pub mod repositories;
+pub mod rpc_gateway;
 pub mod scenarios;
 pub mod services;
 pub mod validation;

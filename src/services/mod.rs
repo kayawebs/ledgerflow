@@ -13,5 +13,6 @@ pub mod monitor_reporter;
 pub mod portal;
 pub mod pricing;
 pub mod seeds;
+pub mod strategy_analysis;
 pub mod token_metadata;
 pub mod trace_monitor;

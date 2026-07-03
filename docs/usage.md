@@ -39,7 +39,7 @@ LedgerFlow reads configuration from environment variables.
 | --- | --- | --- |
 | `LEDGERFLOW_BIND_ADDR` | HTTP bind address for Axum | `127.0.0.1:3000` for host runs, `0.0.0.0:8080` in Docker |
 | `LEDGERFLOW_DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@127.0.0.1:5532/ledgerflow` for host runs |
-| `LEDGERFLOW_RPC_URL` | Base RPC endpoint | `http://127.0.0.1:8545` for host runs, `http://host.docker.internal:18545` in Docker via nginx proxy |
+| `LEDGERFLOW_RPC_URL` | Base RPC endpoint | `http://127.0.0.1:18545` for host runs. Docker Compose routes containers through `http://rpc-gateway:8545` by default. |
 | `LEDGERFLOW_INDEXER_API_BASE_URL` | Indexer API base URL used by analysis-side cluster backfill | `http://127.0.0.1:8090` for host runs, `http://indexer:8090` in Docker |
 | `LEDGERFLOW_INDEXER_API_BEARER_TOKEN` | Optional Bearer token sent to the indexer API | unset |
 | `LEDGERFLOW_DEFAULT_CHAIN_ID` | Default chain for callers that omit it | `8453` |
@@ -64,6 +64,24 @@ LedgerFlow reads configuration from environment variables.
 If `LEDGERFLOW_EMAIL_DELIVERY_MODE=auto`, the web process prefers Postmark when both `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_POSTMARK_SERVER_TOKEN` are configured; otherwise it falls back to Resend when `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_RESEND_API_KEY` are configured. If neither provider is configured, it falls back to log-only mode and the auth page plus `/health` will say so explicitly. You can also use unprefixed aliases `EMAIL_FROM`, `POSTMARK_SERVER_TOKEN`, and `RESEND_API_KEY`.
 
 The checked-in `.env.example` is the easiest starting point. Copy it to `.env` before using Docker Compose, because the compose stack reads `.env` as the runtime config file.
+
+
+### RPC gateway variables
+
+Docker Compose includes an `rpc-gateway` service between LedgerFlow processes and the Base RPC tunnel. It is meant to smooth bursts from the indexer, analysis API, and workers while still allowing sustained indexing within the node's capacity.
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `LEDGERFLOW_RPC_GATEWAY_UPSTREAM_URL` | Upstream Base RPC endpoint reached by the gateway | `http://host.docker.internal:18545` |
+| `LEDGERFLOW_RPC_GATEWAY_HOST_PORT` | Optional host port for inspecting the gateway | `18555` |
+| `LEDGERFLOW_RPC_GATEWAY_MAX_IN_FLIGHT` | Maximum simultaneous upstream RPC requests | `8` |
+| `LEDGERFLOW_RPC_GATEWAY_RPS` | Token refill rate for upstream requests | `20` |
+| `LEDGERFLOW_RPC_GATEWAY_BURST` | Token bucket burst capacity | `20` |
+| `LEDGERFLOW_RPC_GATEWAY_UPSTREAM_TIMEOUT_MS` | Upstream RPC request timeout | `30000` |
+| `LEDGERFLOW_COMPOSE_RPC_URL` | Optional override for analysis/worker containers | `http://rpc-gateway:8545` |
+| `LEDGERFLOW_INDEXER_COMPOSE_RPC_URL` | Optional override for the indexer container | `http://rpc-gateway:8545` |
+
+The gateway weights expensive JSON-RPC methods more heavily: traces, block receipts, full transaction blocks, logs, and `eth_call` consume more tokens than cheap methods such as `eth_blockNumber`. This limits sudden fan-out without disabling long-running indexing.
 
 ### Standalone indexer variables
 

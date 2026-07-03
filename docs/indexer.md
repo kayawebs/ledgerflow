@@ -56,7 +56,7 @@ Administrative key issuance and revocation should stay behind the internal porta
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `LEDGERFLOW_INDEXER_BIND_ADDR` | HTTP bind address | `0.0.0.0:8090` |
-| `LEDGERFLOW_INDEXER_RPC_URL` | Base RPC endpoint used for `eth_blockNumber` and `eth_getBlockByNumber(..., true)` | `http://host.docker.internal:18545` in Docker via nginx proxy, `http://127.0.0.1:18545` on the host |
+| `LEDGERFLOW_INDEXER_RPC_URL` | Base RPC endpoint used for `eth_blockNumber` and `eth_getBlockByNumber(..., true)` | `http://rpc-gateway:8545` in Docker Compose, `http://127.0.0.1:18545` on the host |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_URL` | ClickHouse HTTP endpoint | `http://127.0.0.1:8123` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE` | ClickHouse database name | `ledgerflow_indexer` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_USER` | ClickHouse username | `ledgerflow` in Docker, `default` fallback outside Docker if unset |
@@ -76,6 +76,8 @@ Administrative key issuance and revocation should stay behind the internal porta
 | `LEDGERFLOW_INDEXER_QUERY_LIMIT_DEFAULT` | default query limit | `1000` |
 | `LEDGERFLOW_INDEXER_QUERY_LIMIT_MAX` | hard query limit cap | `10000` |
 | `LEDGERFLOW_INDEXER_INTERNAL_API_TOKEN` | internal bearer token allowed to call admin API-key endpoints and portal lookups | unset |
+
+When running with the repository Docker Compose file, indexer RPC traffic passes through the shared `rpc-gateway` service by default. Tune `LEDGERFLOW_RPC_GATEWAY_MAX_IN_FLIGHT`, `LEDGERFLOW_RPC_GATEWAY_RPS`, and `LEDGERFLOW_RPC_GATEWAY_BURST` to control instantaneous pressure without stopping sustained indexing.
 
 ## Run with Docker
 

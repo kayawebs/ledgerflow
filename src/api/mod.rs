@@ -18,16 +18,19 @@ use crate::domain::entities::{
 };
 use crate::ingestion::rpc::RpcClient;
 use crate::plugins::loader::PluginManifest;
-use crate::services::analysis::AnalysisService;
 use crate::services::alerts::ClusterAlertService;
+use crate::services::analysis::AnalysisService;
 use crate::services::cluster::ClusterService;
 use crate::services::cluster_backfill::{
     ClusterBackfillRequest as ServiceClusterBackfillRequest, ClusterBackfillResult,
     ClusterBackfillService,
 };
 use crate::services::cluster_tracking::ClusterTrackingService;
-use crate::services::discovery::{ClusterDiscoveryRequest, ClusterDiscoveryResponse, ClusterDiscoveryService};
+use crate::services::discovery::{
+    ClusterDiscoveryRequest, ClusterDiscoveryResponse, ClusterDiscoveryService,
+};
 use crate::services::metrics::ClusterMetricsService;
+use crate::services::strategy_analysis::{ClusterStrategyAnalysis, ClusterStrategyAnalysisService};
 
 #[derive(Clone)]
 pub struct ApiState {
@@ -37,6 +40,7 @@ pub struct ApiState {
     pub rpc_client: Arc<dyn RpcClient>,
     pub tracking_service: Arc<ClusterTrackingService>,
     pub metrics_service: Arc<ClusterMetricsService>,
+    pub strategy_analysis_service: Arc<ClusterStrategyAnalysisService>,
     pub alert_service: Arc<ClusterAlertService>,
     pub discovery_service: Option<Arc<ClusterDiscoveryService>>,
     pub auto_backfill_on_cluster_create: bool,
@@ -192,6 +196,9 @@ pub fn router(
     let tracking_service = Arc::new(ClusterTrackingService::new(service.repository.clone()));
     let metrics_service = Arc::new(ClusterMetricsService::new(service.repository.clone()));
     let alert_service = Arc::new(ClusterAlertService::new(service.repository.clone()));
+    let strategy_analysis_service = Arc::new(ClusterStrategyAnalysisService::new(
+        service.repository.clone(),
+    ));
     Router::new()
         .route("/health", get(health))
         .route("/analyses/tx", post(analyze_tx))
@@ -199,7 +206,10 @@ pub fn router(
         .route("/evidence-packs/{pack_id}", get(get_evidence_pack))
         .route("/recognizers", get(list_recognizers))
         .route("/addresses/intelligence", get(get_address_intelligence))
-        .route("/addresses/intelligence/enqueue", post(enqueue_address_intelligence))
+        .route(
+            "/addresses/intelligence/enqueue",
+            post(enqueue_address_intelligence),
+        )
         .route("/addresses/summary", get(get_address_summary))
         .route("/replay/tx", post(replay_tx))
         .route("/discovery/cluster", get(discover_cluster))
@@ -231,6 +241,10 @@ pub fn router(
             get(list_classified_transactions),
         )
         .route("/clusters/{cluster_id}/metrics", get(list_cluster_metrics))
+        .route(
+            "/clusters/{cluster_id}/strategy-analysis",
+            get(get_cluster_strategy_analysis),
+        )
         .route("/clusters/{cluster_id}/alerts", get(list_cluster_alerts))
         .route(
             "/clusters/{cluster_id}/alerts/{alert_id}/read",
@@ -243,6 +257,7 @@ pub fn router(
             rpc_client,
             tracking_service,
             metrics_service,
+            strategy_analysis_service,
             alert_service,
             discovery_service,
             auto_backfill_on_cluster_create,
@@ -262,7 +277,9 @@ async fn analyze_tx(
         .analyze_transaction(request.chain_id, &request.tx_hash)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(build_analysis_envelope(&state, analysis, evidence_pack).await?))
+    Ok(Json(
+        build_analysis_envelope(&state, analysis, evidence_pack).await?,
+    ))
 }
 
 async fn get_analysis(
@@ -281,7 +298,9 @@ async fn get_analysis(
         .get_evidence_pack_by_tx(chain_id, &tx_hash)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(build_analysis_envelope(&state, analysis, evidence_pack).await?))
+    Ok(Json(
+        build_analysis_envelope(&state, analysis, evidence_pack).await?,
+    ))
 }
 
 async fn get_evidence_pack(
@@ -496,7 +515,9 @@ async fn replay_tx(
         )
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(build_analysis_envelope(&state, analysis, evidence_pack).await?))
+    Ok(Json(
+        build_analysis_envelope(&state, analysis, evidence_pack).await?,
+    ))
 }
 
 async fn build_analysis_envelope(
@@ -566,7 +587,9 @@ fn normalize_address(address: &str) -> Option<String> {
 
 fn hex_quantity_to_decimal(value: &str) -> Option<String> {
     let hex = value.trim().strip_prefix("0x").unwrap_or(value.trim());
-    u128::from_str_radix(hex, 16).ok().map(|value| value.to_string())
+    u128::from_str_radix(hex, 16)
+        .ok()
+        .map(|value| value.to_string())
 }
 
 fn analysis_kind(analysis: &TransactionAnalysis) -> String {
@@ -902,6 +925,23 @@ async fn list_cluster_metrics(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(snapshots))
+}
+
+async fn get_cluster_strategy_analysis(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+    Query(query): Query<ClusterSummaryQuery>,
+) -> Result<Json<ClusterStrategyAnalysis>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let start = parse_time(query.start.as_deref())?;
+    let end = parse_time(query.end.as_deref())?;
+    let analysis = state
+        .strategy_analysis_service
+        .analyze_cluster(cluster_id, start, end)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(analysis))
 }
 
 async fn list_cluster_alerts(

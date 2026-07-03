@@ -419,6 +419,64 @@ struct ClassifiedTransactionsPagePayload {
     page_size: u32,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct ClusterStrategyAnalysisPayload {
+    tx_count: u32,
+    arbitrage_tx_count: u32,
+    successful_arbitrage_tx_count: u32,
+    failed_arbitrage_tx_count: u32,
+    arbitrage_success_rate: Option<f64>,
+    total_estimated_pnl_usd: Option<f64>,
+    total_gas_cost_usd: Option<f64>,
+    top_routes: Vec<ClusterRouteStatPayload>,
+    top_protocols: Vec<ClusterProtocolStatPayload>,
+    address_roles: Vec<ClusterAddressRoleStatPayload>,
+    strategy_breakdown: Vec<ClusterStrategyBreakdownPayload>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ClusterRouteStatPayload {
+    route: String,
+    tx_count: u32,
+    success_count: u32,
+    success_rate: Option<f64>,
+    estimated_pnl_usd: Option<f64>,
+    gas_cost_usd: Option<f64>,
+    sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ClusterProtocolStatPayload {
+    protocol: String,
+    tx_count: u32,
+    arbitrage_tx_count: u32,
+    success_count: u32,
+    success_rate: Option<f64>,
+    estimated_pnl_usd: Option<f64>,
+    gas_cost_usd: Option<f64>,
+    sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ClusterAddressRoleStatPayload {
+    address: String,
+    configured_role: Option<String>,
+    inferred_role: String,
+    tx_count: u32,
+    arbitrage_tx_count: u32,
+    success_count: u32,
+    estimated_pnl_usd: Option<f64>,
+    sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ClusterStrategyBreakdownPayload {
+    strategy_type: String,
+    tx_count: u32,
+    success_count: u32,
+    estimated_pnl_usd: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 struct ClusterLiveResponse {
     status_label: String,
@@ -428,6 +486,7 @@ struct ClusterLiveResponse {
     spend_summary: Option<ClusterSpendSummary>,
     metrics: Vec<ClusterMetricsSnapshot>,
     alerts: Vec<ClusterAlert>,
+    strategy_analysis: Option<ClusterStrategyAnalysisPayload>,
 }
 
 #[derive(Debug, Clone)]
@@ -451,6 +510,7 @@ struct ClusterDiscoveryQuery {
 enum ClusterAnalysisTab {
     Overview,
     Metrics,
+    Strategy,
     Summary,
     Activity,
 }
@@ -459,6 +519,7 @@ impl ClusterAnalysisTab {
     fn from_query(value: Option<&str>) -> Self {
         match value {
             Some("metrics") => Self::Metrics,
+            Some("strategy") => Self::Strategy,
             Some("summary") => Self::Summary,
             Some("activity") => Self::Activity,
             _ => Self::Overview,
@@ -469,6 +530,7 @@ impl ClusterAnalysisTab {
         match self {
             Self::Overview => "overview",
             Self::Metrics => "metrics",
+            Self::Strategy => "strategy",
             Self::Summary => "summary",
             Self::Activity => "activity",
         }
@@ -1783,43 +1845,53 @@ async fn render_dashboard_response(
         })
         .or_else(|| clusters.first().cloned());
 
-    let (tracking, coverage, spend_summary, metrics, alerts, cluster_status, cluster_error) =
-        if tab == DashboardTab::ClusterAnalysis {
-            if let Some(cluster) = selected_cluster.as_ref() {
-                match load_cluster_live_response(
-                    state,
-                    cluster.cluster_id,
-                    query.start.as_deref(),
-                    query.end.as_deref(),
-                    &cluster_analysis_tab,
-                )
-                .await
-                {
-                    Ok(payload) => (
-                        payload.tracking,
-                        payload.coverage,
-                        payload.spend_summary,
-                        payload.metrics,
-                        payload.alerts,
-                        Some((payload.status_label, payload.status_tone)),
-                        None::<String>,
-                    ),
-                    Err(err) => (
-                        None,
-                        None,
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                        Some(err.to_string()),
-                    ),
-                }
-            } else {
-                (None, None, None, Vec::new(), Vec::new(), None, None)
+    let (
+        tracking,
+        coverage,
+        spend_summary,
+        metrics,
+        alerts,
+        strategy_analysis,
+        cluster_status,
+        cluster_error,
+    ) = if tab == DashboardTab::ClusterAnalysis {
+        if let Some(cluster) = selected_cluster.as_ref() {
+            match load_cluster_live_response(
+                state,
+                cluster.cluster_id,
+                query.start.as_deref(),
+                query.end.as_deref(),
+                &cluster_analysis_tab,
+            )
+            .await
+            {
+                Ok(payload) => (
+                    payload.tracking,
+                    payload.coverage,
+                    payload.spend_summary,
+                    payload.metrics,
+                    payload.alerts,
+                    payload.strategy_analysis,
+                    Some((payload.status_label, payload.status_tone)),
+                    None::<String>,
+                ),
+                Err(err) => (
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    None,
+                    Some(err.to_string()),
+                ),
             }
         } else {
-            (None, None, None, Vec::new(), Vec::new(), None, None)
-        };
+            (None, None, None, Vec::new(), Vec::new(), None, None, None)
+        }
+    } else {
+        (None, None, None, Vec::new(), Vec::new(), None, None, None)
+    };
 
     let classified_page = if tab == DashboardTab::ClusterAnalysis
         && cluster_analysis_tab == ClusterAnalysisTab::Activity
@@ -1900,6 +1972,7 @@ async fn render_dashboard_response(
         spend_summary.as_ref(),
         &metrics,
         &alerts,
+        strategy_analysis.as_ref(),
         classified_page.as_ref(),
         &classified_query,
         cluster_status.as_ref(),
@@ -1948,7 +2021,8 @@ async fn load_cluster_live_response(
             )
         }
     };
-    let (coverage, tracking, spend_summary, metrics, alerts) = match selected_tab {
+    let (coverage, tracking, spend_summary, metrics, alerts, strategy_analysis) = match selected_tab
+    {
         ClusterAnalysisTab::Overview => {
             let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
             let tracking_path = format!("/clusters/{}/tracking", cluster_id);
@@ -1965,6 +2039,7 @@ async fn load_cluster_live_response(
                 None,
                 Vec::new(),
                 alerts.unwrap_or_default(),
+                None,
             )
         }
         ClusterAnalysisTab::Metrics => {
@@ -1978,6 +2053,7 @@ async fn load_cluster_live_response(
                 None,
                 metrics.unwrap_or_default(),
                 Vec::new(),
+                None,
             )
         }
         ClusterAnalysisTab::Summary => {
@@ -1990,6 +2066,38 @@ async fn load_cluster_live_response(
                 spend_summary.ok(),
                 Vec::new(),
                 Vec::new(),
+                None,
+            )
+        }
+        ClusterAnalysisTab::Strategy => {
+            let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+            let strategy_path = match (start, end) {
+                (None, None) => format!("/clusters/{}/strategy-analysis", cluster_id),
+                _ => {
+                    let mut params = Vec::new();
+                    if let Some(start) = start {
+                        params.push(format!("start={}", urlencoding::encode(start)));
+                    }
+                    if let Some(end) = end {
+                        params.push(format!("end={}", urlencoding::encode(end)));
+                    }
+                    format!(
+                        "/clusters/{}/strategy-analysis?{}",
+                        cluster_id,
+                        params.join("&")
+                    )
+                }
+            };
+            let strategy_fut =
+                api_get_json::<ClusterStrategyAnalysisPayload>(state, &strategy_path);
+            let (coverage, strategy_analysis) = tokio::join!(coverage_fut, strategy_fut);
+            (
+                coverage.ok(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                strategy_analysis.ok(),
             )
         }
         ClusterAnalysisTab::Activity => (
@@ -2000,6 +2108,7 @@ async fn load_cluster_live_response(
             None,
             Vec::new(),
             Vec::new(),
+            None,
         ),
     };
     let (status_label, status_tone) = derive_cluster_status(coverage.as_ref());
@@ -2011,6 +2120,7 @@ async fn load_cluster_live_response(
         spend_summary,
         metrics,
         alerts,
+        strategy_analysis,
     })
 }
 
@@ -2639,6 +2749,7 @@ fn render_dashboard_page(
     spend_summary: Option<&ClusterSpendSummary>,
     metrics: &[ClusterMetricsSnapshot],
     alerts: &[ClusterAlert],
+    strategy_analysis: Option<&ClusterStrategyAnalysisPayload>,
     classified_page: Option<&ClassifiedTransactionsPagePayload>,
     classified_query: &ClusterTxTableState,
     cluster_status: Option<&(String, String)>,
@@ -2703,6 +2814,11 @@ fn render_dashboard_page(
         } else {
             ""
         };
+        let strategy_active = if *cluster_analysis_tab == ClusterAnalysisTab::Strategy {
+            "active"
+        } else {
+            ""
+        };
         let summary_active = if *cluster_analysis_tab == ClusterAnalysisTab::Summary {
             "active"
         } else {
@@ -2717,6 +2833,8 @@ fn render_dashboard_page(
             cluster_analysis_tab_href(cluster.cluster_id, start, end, ClusterAnalysisTab::Overview);
         let metrics_href =
             cluster_analysis_tab_href(cluster.cluster_id, start, end, ClusterAnalysisTab::Metrics);
+        let strategy_href =
+            cluster_analysis_tab_href(cluster.cluster_id, start, end, ClusterAnalysisTab::Strategy);
         let summary_href =
             cluster_analysis_tab_href(cluster.cluster_id, start, end, ClusterAnalysisTab::Summary);
         let activity_href =
@@ -2744,6 +2862,13 @@ fn render_dashboard_page(
     </section>"#,
                 render_cluster_metrics_panel(metrics),
                 render_behavior_breakdown_panel(metrics),
+            ),
+            ClusterAnalysisTab::Strategy => format!(
+                r#"<section class="cluster-tab-panel active" data-cluster-tab-panel="strategy">
+      <h3>Strategy analysis</h3>
+      <div id="cluster-live-strategy">{}</div>
+    </section>"#,
+                render_cluster_strategy_analysis_panel(strategy_analysis),
             ),
             ClusterAnalysisTab::Summary => format!(
                 r#"<section class="cluster-tab-panel active" data-cluster-tab-panel="summary">
@@ -2781,6 +2906,7 @@ fn render_dashboard_page(
     <div class="cluster-tabbar" role="tablist" aria-label="Cluster analysis sections">
       <a class="cluster-tab {}" href="{}">Overview</a>
       <a class="cluster-tab {}" href="{}">Metrics</a>
+      <a class="cluster-tab {}" href="{}">Strategy</a>
       <a class="cluster-tab {}" href="{}">Summary</a>
       <a class="cluster-tab {}" href="{}">Activity</a>
     </div>
@@ -2803,6 +2929,8 @@ fn render_dashboard_page(
             overview_href,
             metrics_active,
             metrics_href,
+            strategy_active,
+            strategy_href,
             summary_active,
             summary_href,
             activity_active,
@@ -3610,8 +3738,14 @@ fn render_tx_report_meta_strip(
                 escape_html(&enum_label(&analysis.status))
             ),
         ),
-        render_basic_info_item("Network", &format!("<strong>{}</strong>", escape_html(network))),
-        render_basic_info_item("Block", &format!("<strong>{}</strong>", escape_html(&block))),
+        render_basic_info_item(
+            "Network",
+            &format!("<strong>{}</strong>", escape_html(network)),
+        ),
+        render_basic_info_item(
+            "Block",
+            &format!("<strong>{}</strong>", escape_html(&block)),
+        ),
         render_basic_info_item(
             "Timestamp",
             &format!("<strong>{}</strong>", escape_html(&timestamp)),
@@ -3625,7 +3759,10 @@ fn render_tx_report_meta_strip(
         ),
         render_basic_info_item(
             "Sender",
-            &format!("<strong>{}</strong>", render_copyable_code(&analysis.from_address, 12)),
+            &format!(
+                "<strong>{}</strong>",
+                render_copyable_code(&analysis.from_address, 12)
+            ),
         ),
         render_basic_info_item(
             "Receiver",
@@ -3642,7 +3779,10 @@ fn render_tx_report_meta_strip(
     if let Some(nonce) = nonce {
         basic_fields.insert(
             4,
-            render_basic_info_item("Nonce", &format!("<strong>{}</strong>", escape_html(&nonce))),
+            render_basic_info_item(
+                "Nonce",
+                &format!("<strong>{}</strong>", escape_html(&nonce)),
+            ),
         );
     }
     if let Some(tx_index) = tx_index {
@@ -3689,7 +3829,10 @@ fn render_tx_report_meta_strip(
     ));
     other_fields.push(render_basic_info_item(
         "Input Data",
-        &format!("<strong>{}</strong>", render_copyable_code(&analysis.input_data, 14)),
+        &format!(
+            "<strong>{}</strong>",
+            render_copyable_code(&analysis.input_data, 14)
+        ),
     ));
     let share_top_action = if let Some(url) = share_url {
         format!(
@@ -4292,11 +4435,8 @@ fn render_tx_storyline_panel(analysis: &TransactionAnalysis, book: &AddressDispl
         .and_then(|value| value.get("label"))
         .and_then(|value| value.as_str())
         .unwrap_or("subject scope");
-    let net_effect = render_net_effect_panel(
-        storyline.get("net_effect"),
-        subject_scope_label,
-        analysis,
-    );
+    let net_effect =
+        render_net_effect_panel(storyline.get("net_effect"), subject_scope_label, analysis);
     let execution_timeline =
         render_execution_timeline_panel(analysis, initiator, executor, protocol_contract, book);
     let step_timeline = if !execution_timeline.is_empty() {
@@ -4426,7 +4566,10 @@ fn render_flow_balance_rows(analysis: &TransactionAnalysis, book: &AddressDispla
         std::collections::BTreeMap::<String, Vec<(serde_json::Value, i128)>>::new();
     for ((address, _), (token, amount)) in rows.into_iter().filter(|(_, (_, amount))| *amount != 0)
     {
-        grouped_rows.entry(address).or_default().push((token, amount));
+        grouped_rows
+            .entry(address)
+            .or_default()
+            .push((token, amount));
     }
 
     grouped_rows
@@ -4858,7 +5001,15 @@ fn render_execution_timeline_panel(
         let rows = hidden_items
             .iter()
             .map(|item| {
-                render_execution_timeline_row(item, analysis, initiator, executor, protocol_contract, book, &mut attached_flow_ids)
+                render_execution_timeline_row(
+                    item,
+                    analysis,
+                    initiator,
+                    executor,
+                    protocol_contract,
+                    book,
+                    &mut attached_flow_ids,
+                )
             })
             .collect::<Vec<_>>()
             .join("");
@@ -4868,7 +5019,10 @@ fn render_execution_timeline_panel(
   <summary>Show {} more calls{}</summary>
   <div class="trace-timeline-list">{}</div>
 </details>"#,
-            items.len().saturating_sub(initial_limit).min(hard_limit - initial_limit),
+            items
+                .len()
+                .saturating_sub(initial_limit)
+                .min(hard_limit - initial_limit),
             if omitted > 0 {
                 format!(" · {omitted} omitted")
             } else {
@@ -4992,8 +5146,7 @@ fn render_execution_timeline_node(
   <summary>{}</summary>
   <div class="trace-children">{}</div>
 </details>"#,
-            row,
-            child_rows,
+            row, child_rows,
         )
     }
 }
@@ -5072,13 +5225,8 @@ fn render_execution_timeline_row(
         .unwrap_or("root");
     let from_roles = render_storyline_roles(from_raw, initiator, executor, protocol_contract);
     let to_roles = render_storyline_roles(to_raw, initiator, executor, protocol_contract);
-    let attachments = render_call_attached_flows(
-        analysis,
-        from_raw,
-        to_raw,
-        call_type,
-        attached_flow_ids,
-    );
+    let attachments =
+        render_call_attached_flows(analysis, from_raw, to_raw, call_type, attached_flow_ids);
     let value_line = value_raw
         .parse::<i128>()
         .ok()
@@ -5094,11 +5242,7 @@ fn render_execution_timeline_row(
         })
         .unwrap_or_default();
     let depth = depth.min(10);
-    let call_label = if kind == "tx_entry" {
-        "TX"
-    } else {
-        call_type
-    };
+    let call_label = if kind == "tx_entry" { "TX" } else { call_type };
     let attachments = if attachments.is_empty() {
         String::new()
     } else {
@@ -5201,7 +5345,12 @@ fn render_amount_stack_with_usd(display: &str, raw: &str, estimated_usd: Option<
     let display = normalize_amount_display(display, raw);
     let estimated_usd = estimated_usd
         .filter(|value| !value.is_empty())
-        .map(|value| format!("<small class=\"estimated-usd\">{}</small>", escape_html(value)))
+        .map(|value| {
+            format!(
+                "<small class=\"estimated-usd\">{}</small>",
+                escape_html(value)
+            )
+        })
         .unwrap_or_default();
     format!(
         "<div class=\"amount-stack\"><strong>{}</strong><small>raw: {}</small>{}</div>",
@@ -5252,11 +5401,7 @@ fn usd_value_for_token_amount(
     let raw = raw.parse::<f64>().ok()?;
     let amount = raw / 10f64.powi(decimals.min(38) as i32);
     let value = amount * price;
-    if value.is_finite() {
-        Some(value)
-    } else {
-        None
-    }
+    if value.is_finite() { Some(value) } else { None }
 }
 
 fn price_for_token_usd(token: &serde_json::Value, analysis: &TransactionAnalysis) -> Option<f64> {
@@ -5270,11 +5415,14 @@ fn price_for_token_usd(token: &serde_json::Value, analysis: &TransactionAnalysis
         .and_then(|value| value.as_str())
         .unwrap_or("");
     if matches_ignore_ascii_case(symbol, &["USDC", "USDT", "USDBC"])
-        || matches_ignore_ascii_case(&address, &[
-            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
-            "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
-        ])
+        || matches_ignore_ascii_case(
+            &address,
+            &[
+                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+                "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+                "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
+            ],
+        )
     {
         return Some(1.0);
     }
@@ -6084,6 +6232,157 @@ fn render_behavior_breakdown_panel(metrics: &[ClusterMetricsSnapshot]) -> String
     )
 }
 
+fn render_cluster_strategy_analysis_panel(
+    analysis: Option<&ClusterStrategyAnalysisPayload>,
+) -> String {
+    let Some(analysis) = analysis else {
+        return "<div class=\"empty-state\">Strategy analysis appears after classified transactions are available for this cluster.</div>".to_owned();
+    };
+    let route_rows = analysis
+        .top_routes
+        .iter()
+        .take(10)
+        .map(|item| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&item.route),
+                item.tx_count,
+                item.success_count,
+                format_percent_option(item.success_rate),
+                format_usd_option(item.estimated_pnl_usd),
+                format_usd_option(item.gas_cost_usd),
+                render_sample_hashes(&item.sample_tx_hashes),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let protocol_rows = analysis
+        .top_protocols
+        .iter()
+        .take(10)
+        .map(|item| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&item.protocol),
+                item.tx_count,
+                item.arbitrage_tx_count,
+                item.success_count,
+                format_percent_option(item.success_rate),
+                format_usd_option(item.estimated_pnl_usd),
+                render_sample_hashes(&item.sample_tx_hashes),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let role_rows = analysis
+        .address_roles
+        .iter()
+        .take(12)
+        .map(|item| {
+            format!(
+                "<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&truncate_middle(&item.address, 6)),
+                escape_html(item.configured_role.as_deref().unwrap_or("n/a")),
+                escape_html(&item.inferred_role),
+                item.tx_count,
+                item.arbitrage_tx_count,
+                format_usd_option(item.estimated_pnl_usd),
+                render_sample_hashes(&item.sample_tx_hashes),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let strategy_rows = analysis
+        .strategy_breakdown
+        .iter()
+        .map(|item| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&item.strategy_type),
+                item.tx_count,
+                item.success_count,
+                format_usd_option(item.estimated_pnl_usd),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    format!(
+        r#"<div class="stats-grid">
+  <div class="stat"><span>Total classified tx</span><strong>{}</strong></div>
+  <div class="stat"><span>Arbitrage tx</span><strong>{}</strong></div>
+  <div class="stat"><span>Arbitrage success</span><strong>{}</strong></div>
+  <div class="stat"><span>Failed arbitrage</span><strong>{}</strong></div>
+  <div class="stat"><span>Estimated PnL</span><strong>{}</strong></div>
+  <div class="stat"><span>Gas cost</span><strong>{}</strong></div>
+</div>
+<h3>Top routes</h3>
+{}
+<h3>Top protocols</h3>
+{}
+<h3>Address roles</h3>
+{}
+<h3>Strategy breakdown</h3>
+{}"#,
+        analysis.tx_count,
+        analysis.arbitrage_tx_count,
+        format!(
+            "{} / {} ({})",
+            analysis.successful_arbitrage_tx_count,
+            analysis.arbitrage_tx_count,
+            format_percent_option(analysis.arbitrage_success_rate)
+        ),
+        analysis.failed_arbitrage_tx_count,
+        format_usd_option(analysis.total_estimated_pnl_usd),
+        format_usd_option(analysis.total_gas_cost_usd),
+        render_table_or_empty(
+            &route_rows,
+            "No arbitrage routes have been classified yet.",
+            "<tr><th>Route</th><th>Tx</th><th>Success</th><th>Rate</th><th>PnL</th><th>Gas</th><th>Samples</th></tr>",
+        ),
+        render_table_or_empty(
+            &protocol_rows,
+            "No protocol statistics have been classified yet.",
+            "<tr><th>Protocol</th><th>Tx</th><th>Arb tx</th><th>Success</th><th>Rate</th><th>PnL</th><th>Samples</th></tr>",
+        ),
+        render_table_or_empty(
+            &role_rows,
+            "No address role statistics have been classified yet.",
+            "<tr><th>Address</th><th>Configured</th><th>Inferred</th><th>Tx</th><th>Arb tx</th><th>PnL</th><th>Samples</th></tr>",
+        ),
+        render_table_or_empty(
+            &strategy_rows,
+            "No strategy breakdown has been classified yet.",
+            "<tr><th>Strategy</th><th>Tx</th><th>Success</th><th>PnL</th></tr>",
+        ),
+    )
+}
+
+fn render_table_or_empty(rows: &str, empty_message: &str, header: &str) -> String {
+    if rows.is_empty() {
+        return format!(
+            "<div class=\"empty-state\">{}</div>",
+            escape_html(empty_message)
+        );
+    }
+    format!(
+        r#"<div class="table-shell"><table><thead>{}</thead><tbody>{}</tbody></table></div>"#,
+        header, rows
+    )
+}
+
+fn render_sample_hashes(hashes: &[String]) -> String {
+    if hashes.is_empty() {
+        return "n/a".to_owned();
+    }
+    hashes
+        .iter()
+        .take(3)
+        .map(|hash| format!("<code>{}</code>", escape_html(&truncate_middle(hash, 6))))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn render_cluster_alerts_panel(
     cluster: &DashboardClusterRecord,
     alerts: &[ClusterAlert],
@@ -6252,6 +6551,12 @@ fn format_usd_option(value: Option<f64>) -> String {
 }
 
 fn format_roi_option(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.2}%", value * 100.0))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn format_percent_option(value: Option<f64>) -> String {
     value
         .map(|value| format!("{:.2}%", value * 100.0))
         .unwrap_or_else(|| "n/a".to_owned())

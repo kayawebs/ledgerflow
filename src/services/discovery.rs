@@ -37,6 +37,11 @@ pub struct ClusterDiscoveryNode {
     pub first_seen_hop: u8,
     pub inbound_edge_count: u32,
     pub outbound_edge_count: u32,
+    pub role: String,
+    pub relation_type: String,
+    pub confidence: f32,
+    pub evidence_tx_hashes: Vec<String>,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +53,8 @@ pub struct ClusterDiscoveryEdge {
     pub sample_tx_hashes: Vec<String>,
     pub min_block_number: Option<u64>,
     pub max_block_number: Option<u64>,
+    pub relation_type: String,
+    pub confidence: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,7 +82,10 @@ impl ClusterDiscoveryService {
         }
     }
 
-    pub async fn discover(&self, request: ClusterDiscoveryRequest) -> LedgerResult<ClusterDiscoveryResponse> {
+    pub async fn discover(
+        &self,
+        request: ClusterDiscoveryRequest,
+    ) -> LedgerResult<ClusterDiscoveryResponse> {
         let seed_address = normalize_address(&request.seed_address)?;
         let max_hops = request.max_hops.clamp(1, MAX_HOPS);
 
@@ -97,6 +107,11 @@ impl ClusterDiscoveryService {
                 first_seen_hop: 0,
                 inbound_edge_count: 0,
                 outbound_edge_count: 0,
+                role: "seed".to_owned(),
+                relation_type: "seed".to_owned(),
+                confidence: 1.0,
+                evidence_tx_hashes: Vec::new(),
+                reason: "user supplied seed address".to_owned(),
             },
         );
 
@@ -115,11 +130,7 @@ impl ClusterDiscoveryService {
             }
 
             for tx_ref in unique_refs.into_values() {
-                let Some(from) = tx_ref
-                    .from_address
-                    .as_deref()
-                    .map(normalize_address_lossy)
-                else {
+                let Some(from) = tx_ref.from_address.as_deref().map(normalize_address_lossy) else {
                     warnings.push(format!(
                         "tx {} is missing top-level from/to fields in the indexer result",
                         tx_ref.tx_hash
@@ -127,7 +138,8 @@ impl ClusterDiscoveryService {
                     continue;
                 };
                 let to = tx_ref.to_address.as_deref().map(normalize_address_lossy);
-                let Some(counterparty) = resolve_counterparty(&current_address, &from, to.as_deref())
+                let Some(counterparty) =
+                    resolve_counterparty(&current_address, &from, to.as_deref())
                 else {
                     continue;
                 };
@@ -139,36 +151,58 @@ impl ClusterDiscoveryService {
                     .address_type(request.chain_id, &counterparty, &mut code_cache)
                     .await;
                 let next_hop = hop.saturating_add(1);
+                let relation = infer_relation(
+                    &seed_address,
+                    &current_address,
+                    &counterparty,
+                    &from,
+                    to.as_deref(),
+                    &counterparty_type,
+                    next_hop,
+                );
                 nodes
                     .entry(counterparty.clone())
                     .and_modify(|node| {
                         node.first_seen_hop = node.first_seen_hop.min(next_hop);
+                        node.confidence = node.confidence.max(relation.confidence);
+                        if relation.confidence >= node.confidence {
+                            node.role = relation.role.clone();
+                            node.relation_type = relation.relation_type.clone();
+                            node.reason = relation.reason.clone();
+                        }
+                        push_unique_sample(&mut node.evidence_tx_hashes, &tx_ref.tx_hash, 5);
                     })
                     .or_insert_with(|| ClusterDiscoveryNode {
                         address: counterparty.clone(),
-                        address_type: counterparty_type,
+                        address_type: counterparty_type.clone(),
                         first_seen_hop: next_hop,
                         inbound_edge_count: 0,
                         outbound_edge_count: 0,
+                        role: relation.role.clone(),
+                        relation_type: relation.relation_type.clone(),
+                        confidence: relation.confidence,
+                        evidence_tx_hashes: vec![tx_ref.tx_hash.clone()],
+                        reason: relation.reason.clone(),
                     });
 
                 let edge_key = (from.clone(), to.clone().unwrap_or_default());
-                let edge = edges.entry(edge_key.clone()).or_insert_with(|| ClusterDiscoveryEdge {
-                    from_address: edge_key.0.clone(),
-                    to_address: edge_key.1.clone(),
-                    tx_count: 0,
-                    first_seen_hop: next_hop,
-                    sample_tx_hashes: Vec::new(),
-                    min_block_number: Some(tx_ref.block_number),
-                    max_block_number: Some(tx_ref.block_number),
+                let edge = edges.entry(edge_key.clone()).or_insert_with(|| {
+                    let edge_relation = infer_edge_relation(&seed_address, &edge_key.0, &edge_key.1);
+                    ClusterDiscoveryEdge {
+                        from_address: edge_key.0.clone(),
+                        to_address: edge_key.1.clone(),
+                        tx_count: 0,
+                        first_seen_hop: next_hop,
+                        sample_tx_hashes: Vec::new(),
+                        min_block_number: Some(tx_ref.block_number),
+                        max_block_number: Some(tx_ref.block_number),
+                        relation_type: edge_relation.0,
+                        confidence: edge_relation.1,
+                    }
                 });
                 edge.tx_count += 1;
                 edge.first_seen_hop = edge.first_seen_hop.min(next_hop);
-                if edge.sample_tx_hashes.len() < 5
-                    && !edge.sample_tx_hashes.iter().any(|item| item == &tx_ref.tx_hash)
-                {
-                    edge.sample_tx_hashes.push(tx_ref.tx_hash.clone());
-                }
+                push_unique_sample(&mut edge.sample_tx_hashes, &tx_ref.tx_hash, 5);
                 edge.min_block_number = Some(
                     edge.min_block_number
                         .map(|value| value.min(tx_ref.block_number))
@@ -179,6 +213,7 @@ impl ClusterDiscoveryService {
                         .map(|value| value.max(tx_ref.block_number))
                         .unwrap_or(tx_ref.block_number),
                 );
+                edge.confidence = edge.confidence.max(edge_confidence(edge.tx_count, next_hop));
 
                 if let Some(node) = nodes.get_mut(&from) {
                     node.outbound_edge_count += 1;
@@ -266,10 +301,94 @@ impl ClusterDiscoveryService {
             let Some(next_to_block) = min_block.and_then(|value| value.checked_sub(1)) else {
                 break;
             };
-            to_block = Some(next_to_block as u64);
+            to_block = Some(next_to_block);
         }
 
         Ok(collected)
+    }
+}
+
+#[derive(Clone)]
+struct InferredRelation {
+    role: String,
+    relation_type: String,
+    confidence: f32,
+    reason: String,
+}
+
+fn infer_relation(
+    seed_address: &str,
+    current_address: &str,
+    counterparty: &str,
+    from: &str,
+    to: Option<&str>,
+    counterparty_type: &DiscoveredAddressType,
+    hop: u8,
+) -> InferredRelation {
+    let counterparty_is_from = from.eq_ignore_ascii_case(counterparty);
+    let counterparty_is_to = to
+        .map(|value| value.eq_ignore_ascii_case(counterparty))
+        .unwrap_or(false);
+    let seed_is_to = to
+        .map(|value| value.eq_ignore_ascii_case(seed_address))
+        .unwrap_or(false);
+    let seed_is_from = from.eq_ignore_ascii_case(seed_address);
+    let current_is_seed = current_address.eq_ignore_ascii_case(seed_address);
+    let base_confidence = (0.9 - (hop.saturating_sub(1) as f32 * 0.12)).max(0.45);
+
+    if current_is_seed && counterparty_is_from && seed_is_to {
+        return InferredRelation {
+            role: "source_or_executor".to_owned(),
+            relation_type: "inbound_to_seed".to_owned(),
+            confidence: base_confidence,
+            reason: "address sent funds or proceeds directly to the seed address".to_owned(),
+        };
+    }
+    if current_is_seed && counterparty_is_to && seed_is_from {
+        return InferredRelation {
+            role: match counterparty_type {
+                DiscoveredAddressType::Contract => "protocol_or_executor".to_owned(),
+                _ => "recipient_or_funded_address".to_owned(),
+            },
+            relation_type: "outbound_from_seed".to_owned(),
+            confidence: (base_confidence - 0.05).max(0.4),
+            reason: "seed address sent funds or interacted with this address".to_owned(),
+        };
+    }
+    if matches!(counterparty_type, DiscoveredAddressType::Contract) {
+        return InferredRelation {
+            role: "contract_counterparty".to_owned(),
+            relation_type: "shared_contract_interaction".to_owned(),
+            confidence: (base_confidence - 0.2).max(0.35),
+            reason: "address appears as a contract counterparty in the discovered graph".to_owned(),
+        };
+    }
+    InferredRelation {
+        role: "counterparty".to_owned(),
+        relation_type: "transaction_counterparty".to_owned(),
+        confidence: (base_confidence - 0.15).max(0.35),
+        reason: "address is connected by top-level transactions in the discovered graph".to_owned(),
+    }
+}
+
+fn infer_edge_relation(seed_address: &str, from: &str, to: &str) -> (String, f32) {
+    if to.eq_ignore_ascii_case(seed_address) {
+        ("inbound_to_seed".to_owned(), 0.9)
+    } else if from.eq_ignore_ascii_case(seed_address) {
+        ("outbound_from_seed".to_owned(), 0.85)
+    } else {
+        ("transaction_edge".to_owned(), 0.65)
+    }
+}
+
+fn edge_confidence(tx_count: u32, hop: u8) -> f32 {
+    let count_bonus = (tx_count.min(10) as f32) * 0.02;
+    (0.55 + count_bonus - (hop.saturating_sub(1) as f32 * 0.08)).clamp(0.35, 0.95)
+}
+
+fn push_unique_sample(items: &mut Vec<String>, value: &str, limit: usize) {
+    if items.len() < limit && !items.iter().any(|item| item == value) {
+        items.push(value.to_owned());
     }
 }
 
