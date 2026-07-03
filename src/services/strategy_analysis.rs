@@ -4,7 +4,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
@@ -22,7 +22,7 @@ pub struct ClusterStrategyAnalysisService {
     repository: Arc<dyn AnalysisRepository>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClusterStrategyAnalysis {
     pub cluster_id: Uuid,
     pub chain_id: u64,
@@ -47,7 +47,7 @@ pub struct ClusterStrategyAnalysis {
     pub representative_transactions: Vec<RepresentativeTransaction>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClusterBehaviorProfile {
     pub primary_behavior: String,
     pub primary_behavior_tx_count: u32,
@@ -56,7 +56,7 @@ pub struct ClusterBehaviorProfile {
     pub behavior_breakdown: Vec<StrategyBreakdownRow>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BotPerformanceSummary {
     pub tx_count: u32,
     pub success_count: u32,
@@ -69,7 +69,7 @@ pub struct BotPerformanceSummary {
     pub pnl_to_gas_ratio: Option<f64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StrategyDetailReport {
     pub strategy_type: String,
     pub tx_count: u32,
@@ -86,7 +86,7 @@ pub struct StrategyDetailReport {
     pub representative_transactions: Vec<RepresentativeTransaction>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StrategyProtocolStat {
     pub protocol: String,
     pub tx_count: u32,
@@ -97,7 +97,7 @@ pub struct StrategyProtocolStat {
     pub sample_tx_hashes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RepresentativeTransaction {
     pub tx_hash: String,
     pub behavior_tag: String,
@@ -112,7 +112,7 @@ pub struct RepresentativeTransaction {
     pub route: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RouteStat {
     pub route: String,
     pub tx_count: u32,
@@ -123,7 +123,7 @@ pub struct RouteStat {
     pub sample_tx_hashes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProtocolStat {
     pub protocol: String,
     pub tx_count: u32,
@@ -135,7 +135,7 @@ pub struct ProtocolStat {
     pub sample_tx_hashes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AddressRoleStat {
     pub address: String,
     pub configured_role: Option<String>,
@@ -147,7 +147,7 @@ pub struct AddressRoleStat {
     pub sample_tx_hashes: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StrategyBreakdownRow {
     pub strategy_type: String,
     pub tx_count: u32,

@@ -17,8 +17,14 @@ use ledgerflow::{
     recognition::registry::RecognizerRegistry,
     repositories::memory::InMemoryAnalysisRepository,
     services::{
-        alerts::ClusterAlertService, analysis::AnalysisService, behavior::BehaviorClassifier,
-        cluster::ClusterService, metrics::ClusterMetricsService,
+        alerts::ClusterAlertService,
+        analysis::AnalysisService,
+        behavior::BehaviorClassifier,
+        cluster::ClusterService,
+        metrics::ClusterMetricsService,
+        report_agent::{
+            ReportAgentFilters, ReportAgentQuery, ReportAgentSection, ReportAgentService,
+        },
         strategy_analysis::ClusterStrategyAnalysisService,
     },
 };
@@ -820,4 +826,185 @@ async fn strategy_analysis_rolls_up_cluster_arbitrage_behavior() {
         .unwrap();
     assert_eq!(cached.snapshot_id, snapshot.snapshot_id);
     assert_eq!(cached.report_json["tx_count"], json!(3));
+}
+
+#[tokio::test]
+async fn report_agent_reads_bounded_cached_cluster_report() {
+    let (strategy_service, cluster_id) = seeded_strategy_report_snapshot().await;
+    let agent_service = ReportAgentService::new(strategy_service);
+
+    let response = agent_service
+        .query_cluster_report(ReportAgentQuery {
+            cluster_id,
+            window_start: None,
+            window_end: None,
+            all_time: true,
+            sections: vec![
+                ReportAgentSection::Overview,
+                ReportAgentSection::Arbitrage,
+                ReportAgentSection::Samples,
+            ],
+            filters: ReportAgentFilters {
+                strategy: Some("arbitrage".to_owned()),
+                ..Default::default()
+            },
+            row_limit: 2,
+            cost_budget: 50,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.plan.allowed_sources,
+        vec!["cluster_strategy_report_snapshots".to_owned()]
+    );
+    assert!(response.plan.estimated_cost <= 50);
+    assert!(response.answer.contains("Arbitrage"));
+    assert!(
+        response
+            .rows
+            .iter()
+            .any(|row| row.item_type == "strategy_summary")
+    );
+    assert!(
+        response
+            .citations
+            .iter()
+            .any(|citation| citation.source == "cluster_strategy_report_snapshots")
+    );
+    assert!(
+        response
+            .rows
+            .iter()
+            .filter(|row| row.section == "samples")
+            .count()
+            <= 2
+    );
+}
+
+#[tokio::test]
+async fn report_agent_requires_explicit_window_scope() {
+    let (strategy_service, cluster_id) = seeded_strategy_report_snapshot().await;
+    let agent_service = ReportAgentService::new(strategy_service);
+
+    let err = agent_service
+        .query_cluster_report(ReportAgentQuery {
+            cluster_id,
+            window_start: None,
+            window_end: None,
+            all_time: false,
+            sections: vec![ReportAgentSection::Overview],
+            filters: ReportAgentFilters::default(),
+            row_limit: 5,
+            cost_budget: 20,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("bounded window"));
+}
+
+#[tokio::test]
+async fn report_agent_rejects_queries_over_cost_budget() {
+    let (strategy_service, cluster_id) = seeded_strategy_report_snapshot().await;
+    let agent_service = ReportAgentService::new(strategy_service);
+
+    let err = agent_service
+        .query_cluster_report(ReportAgentQuery {
+            cluster_id,
+            window_start: None,
+            window_end: None,
+            all_time: true,
+            sections: vec![
+                ReportAgentSection::Overview,
+                ReportAgentSection::Performance,
+                ReportAgentSection::Arbitrage,
+                ReportAgentSection::Routes,
+                ReportAgentSection::Samples,
+            ],
+            filters: ReportAgentFilters::default(),
+            row_limit: 10,
+            cost_budget: 1,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("exceeds budget"));
+}
+
+async fn seeded_strategy_report_snapshot() -> (Arc<ClusterStrategyAnalysisService>, uuid::Uuid) {
+    let repository = Arc::new(InMemoryAnalysisRepository::default());
+    let cluster_service = ClusterService::new(repository.clone());
+    let strategy_service = Arc::new(ClusterStrategyAnalysisService::new(repository.clone()));
+
+    let cluster = cluster_service
+        .create_cluster(
+            8453,
+            "ops_team",
+            "agent_cluster",
+            None,
+            vec![ClusterAddress {
+                address: "0x1111111111111111111111111111111111111111".to_owned(),
+                label: Some("bot".to_owned()),
+                role: Some("executor".to_owned()),
+                metadata: json!({}),
+            }],
+        )
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let txs = vec![
+        ClassifiedTransaction {
+            cluster_id: cluster.cluster_id,
+            chain_id: 8453,
+            tx_hash: "0xagent-arb-success".to_owned(),
+            address: "0x1111111111111111111111111111111111111111".to_owned(),
+            block_number: 300,
+            timestamp: Some(now - Duration::minutes(2)),
+            behavior_tag: BehaviorTag::Arbitrage,
+            protocol: Some("uniswap_v3".to_owned()),
+            token_in: Some("0x4200000000000000000000000000000000000006".to_owned()),
+            token_out: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_owned()),
+            amount_in: Some("1000000000000000000".to_owned()),
+            amount_out: Some("2500000000".to_owned()),
+            value_usd: Some(2500.0),
+            gas_cost_usd: Some(3.0),
+            estimated_pnl_usd: Some(12.0),
+            raw_json: json!({}),
+            created_at: now,
+            updated_at: now,
+        },
+        ClassifiedTransaction {
+            cluster_id: cluster.cluster_id,
+            chain_id: 8453,
+            tx_hash: "0xagent-arb-loss".to_owned(),
+            address: "0x1111111111111111111111111111111111111111".to_owned(),
+            block_number: 301,
+            timestamp: Some(now - Duration::minutes(1)),
+            behavior_tag: BehaviorTag::Arbitrage,
+            protocol: Some("uniswap_v3".to_owned()),
+            token_in: Some("0x4200000000000000000000000000000000000006".to_owned()),
+            token_out: Some("0x833589fcd6edb6e08f4c7c32d4f71b54bda02913".to_owned()),
+            amount_in: Some("1000000000000000000".to_owned()),
+            amount_out: Some("2490000000".to_owned()),
+            value_usd: Some(2490.0),
+            gas_cost_usd: Some(4.0),
+            estimated_pnl_usd: Some(-2.0),
+            raw_json: json!({}),
+            created_at: now,
+            updated_at: now,
+        },
+    ];
+
+    repository
+        .upsert_classified_transactions(&txs)
+        .await
+        .unwrap();
+    strategy_service
+        .refresh_cluster_report_snapshot(cluster.cluster_id, None, None)
+        .await
+        .unwrap();
+
+    (strategy_service, cluster.cluster_id)
 }

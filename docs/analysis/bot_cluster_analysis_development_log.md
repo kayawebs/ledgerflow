@@ -240,3 +240,60 @@ The Strategy tab now leads with the user-facing bot questions:
 - which routes, protocols, addresses, and sample transactions explain the behavior
 
 The UI still uses the request-time report endpoint for now. The Phase 3 snapshot endpoint is available for a later refresh/read-through flow.
+
+## 2026-07-03 Phase 5 Start
+
+### Implemented
+
+Added the first constrained report-agent substrate:
+
+- `ReportAgentService`
+- typed `ReportAgentQuery`
+- allowlisted sections:
+  - `overview`
+  - `behavior_profile`
+  - `performance`
+  - `arbitrage`
+  - `liquidation`
+  - `routes`
+  - `protocols`
+  - `addresses`
+  - `samples`
+- filters for strategy, protocol, route, and address
+- mandatory window scope, either explicit start/end or `all_time=true`
+- mandatory `cost_budget`
+- bounded `row_limit`, max 50
+- deterministic answer rendering with cited rows
+- sample transaction de-duplication across requested sections
+- API endpoint:
+  - `POST /clusters/{cluster_id}/report-agent/query`
+
+The service only reads `cluster_strategy_report_snapshots`; it does not call RPC, trigger backfills, scan traces, run free-form SQL, or access secrets.
+
+### API Shape
+
+Example body:
+
+```json
+{
+  "all_time": true,
+  "sections": ["overview", "performance", "arbitrage", "samples"],
+  "filters": {
+    "strategy": "arbitrage"
+  },
+  "row_limit": 10,
+  "cost_budget": 50
+}
+```
+
+For bounded windows, use `window_start` and/or `window_end` instead of `all_time=true`. The query reads a matching report snapshot, so the caller must refresh/create the snapshot first.
+
+### Verification Results
+
+Passed:
+
+- `cargo check --bins --locked`
+- `cargo test report_agent --locked`
+- `cargo test strategy_analysis_rolls_up_cluster_arbitrage_behavior --locked`
+
+No test performs RPC, Docker, backfill, trace, or indexer work.

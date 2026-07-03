@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod monitor_reporter;
 pub mod portal;
 pub mod pricing;
+pub mod report_agent;
 pub mod seeds;
 pub mod strategy_analysis;
 pub mod strategy_facts;

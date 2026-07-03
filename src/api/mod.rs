@@ -30,6 +30,10 @@ use crate::services::discovery::{
     ClusterDiscoveryRequest, ClusterDiscoveryResponse, ClusterDiscoveryService,
 };
 use crate::services::metrics::ClusterMetricsService;
+use crate::services::report_agent::{
+    ReportAgentFilters, ReportAgentQuery, ReportAgentResponse, ReportAgentSection,
+    ReportAgentService,
+};
 use crate::services::strategy_analysis::{ClusterStrategyAnalysis, ClusterStrategyAnalysisService};
 
 #[derive(Clone)]
@@ -41,6 +45,7 @@ pub struct ApiState {
     pub tracking_service: Arc<ClusterTrackingService>,
     pub metrics_service: Arc<ClusterMetricsService>,
     pub strategy_analysis_service: Arc<ClusterStrategyAnalysisService>,
+    pub report_agent_service: Arc<ReportAgentService>,
     pub alert_service: Arc<ClusterAlertService>,
     pub discovery_service: Option<Arc<ClusterDiscoveryService>>,
     pub auto_backfill_on_cluster_create: bool,
@@ -102,6 +107,17 @@ pub struct ClusterBackfillRequest {
     pub end_block: Option<u64>,
     pub force_reanalyze: Option<bool>,
     pub query_limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReportAgentQueryRequest {
+    pub window_start: Option<String>,
+    pub window_end: Option<String>,
+    pub all_time: Option<bool>,
+    pub sections: Option<Vec<ReportAgentSection>>,
+    pub filters: Option<ReportAgentFilters>,
+    pub row_limit: Option<u32>,
+    pub cost_budget: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,6 +215,7 @@ pub fn router(
     let strategy_analysis_service = Arc::new(ClusterStrategyAnalysisService::new(
         service.repository.clone(),
     ));
+    let report_agent_service = Arc::new(ReportAgentService::new(strategy_analysis_service.clone()));
     Router::new()
         .route("/health", get(health))
         .route("/analyses/tx", post(analyze_tx))
@@ -253,6 +270,10 @@ pub fn router(
             "/clusters/{cluster_id}/strategy-analysis/refresh",
             post(refresh_cluster_strategy_analysis_snapshot),
         )
+        .route(
+            "/clusters/{cluster_id}/report-agent/query",
+            post(query_cluster_report_agent),
+        )
         .route("/clusters/{cluster_id}/alerts", get(list_cluster_alerts))
         .route(
             "/clusters/{cluster_id}/alerts/{alert_id}/read",
@@ -266,6 +287,7 @@ pub fn router(
             tracking_service,
             metrics_service,
             strategy_analysis_service,
+            report_agent_service,
             alert_service,
             discovery_service,
             auto_backfill_on_cluster_create,
@@ -991,6 +1013,34 @@ async fn refresh_cluster_strategy_analysis_snapshot(
     Ok(Json(snapshot))
 }
 
+async fn query_cluster_report_agent(
+    State(state): State<ApiState>,
+    Path(cluster_id): Path<String>,
+    Json(request): Json<ReportAgentQueryRequest>,
+) -> Result<Json<ReportAgentResponse>, ApiError> {
+    let cluster_id = Uuid::parse_str(&cluster_id)
+        .map_err(|err| ApiError::conflict(format!("invalid cluster id: {err}")))?;
+    let cost_budget = request
+        .cost_budget
+        .ok_or_else(|| ApiError::bad_request("cost_budget is required".to_owned()))?;
+    let query = ReportAgentQuery {
+        cluster_id,
+        window_start: parse_time(request.window_start.as_deref())?,
+        window_end: parse_time(request.window_end.as_deref())?,
+        all_time: request.all_time.unwrap_or(false),
+        sections: request.sections.unwrap_or_default(),
+        filters: request.filters.unwrap_or_default(),
+        row_limit: request.row_limit.unwrap_or(10),
+        cost_budget,
+    };
+    let response = state
+        .report_agent_service
+        .query_cluster_report(query)
+        .await
+        .map_err(report_agent_api_error)?;
+    Ok(Json(response))
+}
+
 async fn list_cluster_alerts(
     State(state): State<ApiState>,
     Path(cluster_id): Path<String>,
@@ -1089,6 +1139,13 @@ impl From<LedgerError> for ApiError {
                 message,
             },
         }
+    }
+}
+
+fn report_agent_api_error(value: LedgerError) -> ApiError {
+    match value {
+        LedgerError::AnalysisInvariant(message) => ApiError::conflict(message),
+        other => ApiError::from(other),
     }
 }
 
