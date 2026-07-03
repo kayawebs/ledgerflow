@@ -421,6 +421,11 @@ struct ClassifiedTransactionsPagePayload {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ClusterStrategyAnalysisPayload {
+    cluster_id: String,
+    chain_id: u64,
+    generated_at: String,
+    window_start: Option<String>,
+    window_end: Option<String>,
     tx_count: u32,
     arbitrage_tx_count: u32,
     successful_arbitrage_tx_count: u32,
@@ -432,6 +437,76 @@ struct ClusterStrategyAnalysisPayload {
     top_protocols: Vec<ClusterProtocolStatPayload>,
     address_roles: Vec<ClusterAddressRoleStatPayload>,
     strategy_breakdown: Vec<ClusterStrategyBreakdownPayload>,
+    behavior_profile: ClusterBehaviorProfilePayload,
+    performance: BotPerformanceSummaryPayload,
+    arbitrage_report: Option<StrategyDetailReportPayload>,
+    liquidation_report: Option<StrategyDetailReportPayload>,
+    representative_transactions: Vec<RepresentativeTransactionPayload>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ClusterBehaviorProfilePayload {
+    primary_behavior: String,
+    primary_behavior_tx_count: u32,
+    primary_behavior_tx_share: Option<f64>,
+    active_addresses_count: u32,
+    behavior_breakdown: Vec<ClusterStrategyBreakdownPayload>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BotPerformanceSummaryPayload {
+    tx_count: u32,
+    success_count: u32,
+    failed_count: u32,
+    success_rate: Option<f64>,
+    estimated_pnl_usd: Option<f64>,
+    gas_cost_usd: Option<f64>,
+    avg_estimated_pnl_usd: Option<f64>,
+    avg_gas_cost_usd: Option<f64>,
+    pnl_to_gas_ratio: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StrategyDetailReportPayload {
+    strategy_type: String,
+    tx_count: u32,
+    success_count: u32,
+    failed_count: u32,
+    success_rate: Option<f64>,
+    estimated_pnl_usd: Option<f64>,
+    gas_cost_usd: Option<f64>,
+    avg_estimated_pnl_usd: Option<f64>,
+    avg_gas_cost_usd: Option<f64>,
+    pnl_to_gas_ratio: Option<f64>,
+    top_routes: Vec<ClusterRouteStatPayload>,
+    top_protocols: Vec<StrategyProtocolStatPayload>,
+    representative_transactions: Vec<RepresentativeTransactionPayload>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct StrategyProtocolStatPayload {
+    protocol: String,
+    tx_count: u32,
+    success_count: u32,
+    success_rate: Option<f64>,
+    estimated_pnl_usd: Option<f64>,
+    gas_cost_usd: Option<f64>,
+    sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RepresentativeTransactionPayload {
+    tx_hash: String,
+    behavior_tag: String,
+    strategy_subtype: String,
+    protocol: Option<String>,
+    protocol_family: Option<String>,
+    address: String,
+    block_number: u64,
+    timestamp: Option<String>,
+    estimated_pnl_usd: Option<f64>,
+    gas_cost_usd: Option<f64>,
+    route: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -6238,38 +6313,25 @@ fn render_cluster_strategy_analysis_panel(
     let Some(analysis) = analysis else {
         return "<div class=\"empty-state\">Strategy analysis appears after classified transactions are available for this cluster.</div>".to_owned();
     };
-    let route_rows = analysis
-        .top_routes
+    let profile = &analysis.behavior_profile;
+    let performance = &analysis.performance;
+    let behavior_rows = analysis
+        .behavior_profile
+        .behavior_breakdown
         .iter()
-        .take(10)
         .map(|item| {
+            let share = if analysis.tx_count == 0 {
+                None
+            } else {
+                Some(item.tx_count as f64 / analysis.tx_count as f64)
+            };
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape_html(&item.route),
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><div class=\"meter\"><span style=\"width:{:.1}%\"></span></div></td></tr>",
+                escape_html(&item.strategy_type),
                 item.tx_count,
                 item.success_count,
-                format_percent_option(item.success_rate),
                 format_usd_option(item.estimated_pnl_usd),
-                format_usd_option(item.gas_cost_usd),
-                render_sample_hashes(&item.sample_tx_hashes),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    let protocol_rows = analysis
-        .top_protocols
-        .iter()
-        .take(10)
-        .map(|item| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape_html(&item.protocol),
-                item.tx_count,
-                item.arbitrage_tx_count,
-                item.success_count,
-                format_percent_option(item.success_rate),
-                format_usd_option(item.estimated_pnl_usd),
-                render_sample_hashes(&item.sample_tx_hashes),
+                share.unwrap_or_default() * 100.0,
             )
         })
         .collect::<Vec<_>>()
@@ -6292,56 +6354,107 @@ fn render_cluster_strategy_analysis_panel(
         })
         .collect::<Vec<_>>()
         .join("");
-    let strategy_rows = analysis
-        .strategy_breakdown
-        .iter()
-        .map(|item| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                escape_html(&item.strategy_type),
-                item.tx_count,
-                item.success_count,
-                format_usd_option(item.estimated_pnl_usd),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let representative_rows = render_representative_transaction_rows(
+        &analysis.representative_transactions,
+        analysis.chain_id,
+        12,
+    );
 
     format!(
-        r#"<div class="stats-grid">
-  <div class="stat"><span>Total classified tx</span><strong>{}</strong></div>
-  <div class="stat"><span>Arbitrage tx</span><strong>{}</strong></div>
-  <div class="stat"><span>Arbitrage success</span><strong>{}</strong></div>
-  <div class="stat"><span>Failed arbitrage</span><strong>{}</strong></div>
-  <div class="stat"><span>Estimated PnL</span><strong>{}</strong></div>
-  <div class="stat"><span>Gas cost</span><strong>{}</strong></div>
-</div>
-<h3>Top routes</h3>
-{}
-<h3>Top protocols</h3>
-{}
-<h3>Address roles</h3>
-{}
-<h3>Strategy breakdown</h3>
-{}"#,
-        analysis.tx_count,
+        r#"<div class="strategy-report-shell">
+  <div class="strategy-report-meta">
+    <span>Generated {}</span>
+    <span>Window {}</span>
+    <span>Cluster {}</span>
+  </div>
+  <div class="stats-grid">
+    <div class="stat"><span>Primary behavior</span><strong>{}</strong><small>{} tx, {}</small></div>
+    <div class="stat"><span>Success rate</span><strong>{}</strong><small>{} success / {} failed</small></div>
+    <div class="stat"><span>Estimated PnL</span><strong>{}</strong><small>avg {}</small></div>
+    <div class="stat"><span>Gas cost</span><strong>{}</strong><small>avg {}</small></div>
+    <div class="stat"><span>PnL / gas</span><strong>{}</strong><small>{} classified tx</small></div>
+    <div class="stat"><span>Active addresses</span><strong>{}</strong><small>{} arbitrage tx</small></div>
+  </div>
+  <section class="strategy-report-section">
+    <div class="section-head">
+      <h3>Behavior profile</h3>
+      <span class="badge">cluster</span>
+    </div>
+    {}
+  </section>
+  <div class="strategy-detail-grid">
+    {}
+    {}
+  </div>
+  <section class="strategy-report-section">
+    <div class="section-head">
+      <h3>Representative transactions</h3>
+      <span class="badge">samples</span>
+    </div>
+    {}
+  </section>
+  <section class="strategy-report-section">
+    <div class="section-head">
+      <h3>Global route and protocol drilldowns</h3>
+      <span class="badge">all strategies</span>
+    </div>
+    <h4>Top routes</h4>
+    {}
+    <h4>Top protocols</h4>
+    {}
+    <h4>Address roles</h4>
+    {}
+  </section>
+</div>"#,
+        escape_html(&analysis.generated_at),
+        escape_html(&report_window_label(
+            analysis.window_start.as_deref(),
+            analysis.window_end.as_deref()
+        )),
+        render_copyable_code(&analysis.cluster_id, 6),
+        escape_html(&profile.primary_behavior),
+        profile.primary_behavior_tx_count,
+        format_percent_option(profile.primary_behavior_tx_share),
+        format_percent_option(performance.success_rate),
+        performance.success_count,
+        performance.failed_count,
+        format_usd_option(performance.estimated_pnl_usd),
+        format_usd_option(performance.avg_estimated_pnl_usd),
+        format_usd_option(performance.gas_cost_usd),
+        format_usd_option(performance.avg_gas_cost_usd),
+        format_ratio_option(performance.pnl_to_gas_ratio),
+        performance.tx_count,
+        profile.active_addresses_count,
         analysis.arbitrage_tx_count,
-        format!(
-            "{} / {} ({})",
-            analysis.successful_arbitrage_tx_count,
-            analysis.arbitrage_tx_count,
-            format_percent_option(analysis.arbitrage_success_rate)
-        ),
-        analysis.failed_arbitrage_tx_count,
-        format_usd_option(analysis.total_estimated_pnl_usd),
-        format_usd_option(analysis.total_gas_cost_usd),
         render_table_or_empty(
-            &route_rows,
-            "No arbitrage routes have been classified yet.",
+            &behavior_rows,
+            "No behavior profile has been classified yet.",
+            "<tr><th>Behavior</th><th>Tx</th><th>Success</th><th>PnL</th><th>Share</th></tr>",
+        ),
+        render_strategy_detail_report(
+            "Arbitrage report",
+            analysis.arbitrage_report.as_ref(),
+            "No arbitrage behavior has been classified for this cluster.",
+            analysis.chain_id,
+        ),
+        render_strategy_detail_report(
+            "Liquidation report",
+            analysis.liquidation_report.as_ref(),
+            "No liquidation behavior has been classified for this cluster.",
+            analysis.chain_id,
+        ),
+        render_table_or_empty(
+            &representative_rows,
+            "No representative transactions are available yet.",
+            "<tr><th>Tx</th><th>Behavior</th><th>Subtype</th><th>Protocol</th><th>Address</th><th>Route</th><th>PnL</th><th>Gas</th><th>Block / time</th></tr>",
+        ),
+        render_table_or_empty(
+            &render_route_rows(&analysis.top_routes, 10),
+            "No route statistics have been classified yet.",
             "<tr><th>Route</th><th>Tx</th><th>Success</th><th>Rate</th><th>PnL</th><th>Gas</th><th>Samples</th></tr>",
         ),
         render_table_or_empty(
-            &protocol_rows,
+            &render_cluster_protocol_rows(&analysis.top_protocols, 10),
             "No protocol statistics have been classified yet.",
             "<tr><th>Protocol</th><th>Tx</th><th>Arb tx</th><th>Success</th><th>Rate</th><th>PnL</th><th>Samples</th></tr>",
         ),
@@ -6350,12 +6463,187 @@ fn render_cluster_strategy_analysis_panel(
             "No address role statistics have been classified yet.",
             "<tr><th>Address</th><th>Configured</th><th>Inferred</th><th>Tx</th><th>Arb tx</th><th>PnL</th><th>Samples</th></tr>",
         ),
+    )
+}
+
+fn render_strategy_detail_report(
+    title: &str,
+    report: Option<&StrategyDetailReportPayload>,
+    empty_message: &str,
+    chain_id: u64,
+) -> String {
+    let Some(report) = report else {
+        return format!(
+            r#"<section class="strategy-detail-report"><div class="section-head"><h3>{}</h3><span class="badge">none</span></div><div class="empty-state">{}</div></section>"#,
+            escape_html(title),
+            escape_html(empty_message)
+        );
+    };
+    format!(
+        r#"<section class="strategy-detail-report">
+  <div class="section-head">
+    <h3>{}</h3>
+    <span class="badge">{}</span>
+  </div>
+  <div class="stats-grid compact-stats-grid">
+    <div class="stat"><span>Tx</span><strong>{}</strong><small>{} success / {} failed</small></div>
+    <div class="stat"><span>Success rate</span><strong>{}</strong><small>strategy only</small></div>
+    <div class="stat"><span>Estimated PnL</span><strong>{}</strong><small>avg {}</small></div>
+    <div class="stat"><span>Gas cost</span><strong>{}</strong><small>avg {}</small></div>
+    <div class="stat"><span>PnL / gas</span><strong>{}</strong><small>strategy only</small></div>
+  </div>
+  <div class="report-table-group">
+    <h4>Routes</h4>
+    {}
+    <h4>Protocols</h4>
+    {}
+    <h4>Sample transactions</h4>
+    {}
+  </div>
+</section>"#,
+        escape_html(title),
+        escape_html(&report.strategy_type),
+        report.tx_count,
+        report.success_count,
+        report.failed_count,
+        format_percent_option(report.success_rate),
+        format_usd_option(report.estimated_pnl_usd),
+        format_usd_option(report.avg_estimated_pnl_usd),
+        format_usd_option(report.gas_cost_usd),
+        format_usd_option(report.avg_gas_cost_usd),
+        format_ratio_option(report.pnl_to_gas_ratio),
         render_table_or_empty(
-            &strategy_rows,
-            "No strategy breakdown has been classified yet.",
-            "<tr><th>Strategy</th><th>Tx</th><th>Success</th><th>PnL</th></tr>",
+            &render_route_rows(&report.top_routes, 6),
+            "No routes have been classified for this strategy.",
+            "<tr><th>Route</th><th>Tx</th><th>Success</th><th>Rate</th><th>PnL</th><th>Gas</th><th>Samples</th></tr>",
+        ),
+        render_table_or_empty(
+            &render_strategy_protocol_rows(&report.top_protocols, 6),
+            "No protocol statistics have been classified for this strategy.",
+            "<tr><th>Protocol</th><th>Tx</th><th>Success</th><th>Rate</th><th>PnL</th><th>Gas</th><th>Samples</th></tr>",
+        ),
+        render_table_or_empty(
+            &render_representative_transaction_rows(
+                &report.representative_transactions,
+                chain_id,
+                6
+            ),
+            "No representative transactions are available for this strategy.",
+            "<tr><th>Tx</th><th>Behavior</th><th>Subtype</th><th>Protocol</th><th>Address</th><th>Route</th><th>PnL</th><th>Gas</th><th>Block / time</th></tr>",
         ),
     )
+}
+
+fn render_route_rows(routes: &[ClusterRouteStatPayload], limit: usize) -> String {
+    routes
+        .iter()
+        .take(limit)
+        .map(|item| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&item.route),
+                item.tx_count,
+                item.success_count,
+                format_percent_option(item.success_rate),
+                format_usd_option(item.estimated_pnl_usd),
+                format_usd_option(item.gas_cost_usd),
+                render_sample_hashes(&item.sample_tx_hashes),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_cluster_protocol_rows(protocols: &[ClusterProtocolStatPayload], limit: usize) -> String {
+    protocols
+        .iter()
+        .take(limit)
+        .map(|item| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&item.protocol),
+                item.tx_count,
+                item.arbitrage_tx_count,
+                item.success_count,
+                format_percent_option(item.success_rate),
+                format_usd_option(item.estimated_pnl_usd),
+                render_sample_hashes(&item.sample_tx_hashes),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_strategy_protocol_rows(
+    protocols: &[StrategyProtocolStatPayload],
+    limit: usize,
+) -> String {
+    protocols
+        .iter()
+        .take(limit)
+        .map(|item| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape_html(&item.protocol),
+                item.tx_count,
+                item.success_count,
+                format_percent_option(item.success_rate),
+                format_usd_option(item.estimated_pnl_usd),
+                format_usd_option(item.gas_cost_usd),
+                render_sample_hashes(&item.sample_tx_hashes),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_representative_transaction_rows(
+    transactions: &[RepresentativeTransactionPayload],
+    chain_id: u64,
+    limit: usize,
+) -> String {
+    transactions
+        .iter()
+        .take(limit)
+        .map(|tx| {
+            let protocol = tx.protocol.as_deref().unwrap_or("n/a");
+            let family = tx.protocol_family.as_deref().unwrap_or("n/a");
+            let timestamp = tx.timestamp.as_deref().unwrap_or("n/a");
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td><strong>{}</strong><small>{}</small></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><strong>{}</strong><small>{}</small></td></tr>",
+                render_tx_hash_action(&tx.tx_hash, chain_id),
+                escape_html(&tx.behavior_tag),
+                escape_html(&tx.strategy_subtype),
+                escape_html(protocol),
+                escape_html(family),
+                render_copyable_code(&tx.address, 6),
+                escape_html(&tx.route),
+                format_usd_option(tx.estimated_pnl_usd),
+                format_usd_option(tx.gas_cost_usd),
+                tx.block_number,
+                escape_html(timestamp),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_tx_hash_action(tx_hash: &str, chain_id: u64) -> String {
+    format!(
+        r#"<div class="tx-hash-action">{}<form class="inline-action-form compact" method="post" action="/app/tx-analysis/run"><input type="hidden" name="chain_id" value="{}"><input type="hidden" name="tx_hash" value="{}"><button class="copy-button" type="submit" name="mode" value="analyze">Open</button></form></div>"#,
+        render_copyable_code(tx_hash, 8),
+        chain_id,
+        escape_html(tx_hash),
+    )
+}
+
+fn report_window_label(start: Option<&str>, end: Option<&str>) -> String {
+    match (start, end) {
+        (None, None) => "all time".to_owned(),
+        (Some(start), None) => format!("from {start}"),
+        (None, Some(end)) => format!("until {end}"),
+        (Some(start), Some(end)) => format!("{start} to {end}"),
+    }
 }
 
 fn render_table_or_empty(rows: &str, empty_message: &str, header: &str) -> String {
@@ -6553,6 +6841,12 @@ fn format_usd_option(value: Option<f64>) -> String {
 fn format_roi_option(value: Option<f64>) -> String {
     value
         .map(|value| format!("{:.2}%", value * 100.0))
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn format_ratio_option(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.2}x"))
         .unwrap_or_else(|| "n/a".to_owned())
 }
 
@@ -7556,6 +7850,17 @@ textarea { min-height: 140px; resize: vertical; }
 .stat { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 10px; }
 .stat span { display: block; color: var(--muted); font-size: .82rem; text-transform: uppercase; letter-spacing: .08em; }
 .stat strong { display: block; margin-top: 8px; font-size: 1.05rem; line-height: 1.3; overflow-wrap: anywhere; }
+.stat small { display: block; margin-top: 6px; color: var(--muted); line-height: 1.35; }
+.strategy-report-shell { display: grid; gap: 14px; min-width: 0; }
+.strategy-report-meta { display: flex; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: .82rem; }
+.strategy-report-meta span { padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.strategy-report-section, .strategy-detail-report, .report-table-group { display: grid; gap: 10px; min-width: 0; }
+.strategy-detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; align-items: start; }
+.strategy-detail-report { padding-top: 4px; border-top: 1px solid var(--line); }
+.compact-stats-grid { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); margin-bottom: 4px; }
+.strategy-report-section h4, .report-table-group h4 { margin: 4px 0 0; font-size: .92rem; color: var(--muted); }
+.tx-hash-action { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; min-width: 0; }
+.inline-action-form.compact { margin: 0; display: inline-flex; gap: 4px; align-items: center; }
 .cluster-tabbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 12px; }
 .cluster-tab { border: 1px solid var(--line); background: #fff; color: var(--muted); border-radius: 8px; padding: 8px 12px; font: inherit; font-weight: 600; cursor: pointer; }
 .cluster-tab.active { background: #eef5ff; color: var(--ink); border-color: rgba(31,111,235,.24); }

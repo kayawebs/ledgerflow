@@ -213,3 +213,30 @@ This avoids nullable unique-index behavior differences and gives the future work
 ### Deferred
 
 The report worker is still deferred. The current refresh endpoint is explicit and bounded by cluster/window. It reads existing classified transactions only and does not trigger RPC, backfill, trace, or indexer work.
+
+## 2026-07-03 Phase 4 Start
+
+### Implemented
+
+Started the report-first cluster strategy UI:
+
+- expanded the web `ClusterStrategyAnalysisPayload` to consume the full typed report contract
+- added behavior profile and performance KPI rendering
+- added dedicated arbitrage and liquidation report sections
+- added route/protocol/sample transaction tables inside each strategy report
+- kept global route/protocol/address drilldowns for cross-strategy inspection
+- added sample transaction actions that post to the existing single-tx analysis flow
+
+This is still server-rendered HTML inside the existing dashboard. It does not create new workers, does not request RPC, and does not trigger backfill or trace analysis by itself.
+
+### Product Semantics
+
+The Strategy tab now leads with the user-facing bot questions:
+
+- what the cluster mainly does
+- how reliable it is
+- estimated PnL and gas cost
+- PnL-to-gas ratio
+- which routes, protocols, addresses, and sample transactions explain the behavior
+
+The UI still uses the request-time report endpoint for now. The Phase 3 snapshot endpoint is available for a later refresh/read-through flow.
