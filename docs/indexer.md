@@ -66,6 +66,7 @@ Administrative key issuance and revocation should stay behind the internal porta
 | `LEDGERFLOW_INDEXER_END_BLOCK` | optional stop block for bounded backfills | unset |
 | `LEDGERFLOW_INDEXER_BATCH_SIZE` | number of blocks claimed and committed per batch | `200` |
 | `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | number of blocks fetched in parallel inside a batch | `4` |
+| `LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE` | number of block requests packed into one JSON-RPC batch request, without increasing total block concurrency | `1` |
 | `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS` | per-request delay before each block fetch task runs | `25` |
 | `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | base retry backoff after rate-limit errors | `1000` |
 | `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | maximum retry backoff | `15000` |
@@ -105,6 +106,7 @@ export LEDGERFLOW_INDEXER_RPC_URL=http://127.0.0.1:18545
 export LEDGERFLOW_INDEXER_BIND_ADDR=0.0.0.0:8090
 export LEDGERFLOW_INDEXER_BATCH_SIZE=200
 export LEDGERFLOW_INDEXER_RPC_CONCURRENCY=4
+export LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE=1
 export LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=25
 ```
 
@@ -234,13 +236,17 @@ The main throughput knobs are:
 
 - `LEDGERFLOW_INDEXER_BATCH_SIZE`
 - `LEDGERFLOW_INDEXER_RPC_CONCURRENCY`
+- `LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE`
 - `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS`
 
 For a self-hosted Base node behind the local nginx proxy, a reasonable starting point is:
 
 - `LEDGERFLOW_INDEXER_BATCH_SIZE=200`
 - `LEDGERFLOW_INDEXER_RPC_CONCURRENCY=4`
+- `LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE=1`
 - `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=25`
+
+`LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE` reduces HTTP round trips by packing multiple block requests into one JSON-RPC batch. It does not increase total block concurrency; for example, concurrency `8` with request size `4` runs two upstream HTTP batch requests at a time.
 
 Then increase concurrency gradually to `16` or `32` if your node and disk can absorb it.
 

@@ -11,7 +11,7 @@ use crate::core::errors::{LedgerError, LedgerResult};
 use crate::indexer::clickhouse::ClickHouseClient;
 use crate::indexer::config::IndexerConfig;
 use crate::indexer::models::{
-    AddressTxDirection, AddressTxHashesResponse, AddressTxQueryResponse,
+    AddressTxDirection, AddressTxHashesResponse, AddressTxQueryResponse, AddressTxRef,
     CreateIndexerApiKeyRequest, CreateIndexerApiKeyResponse, IndexerApiKeyRecord,
     IndexerApiKeyStatus, RevokeIndexerApiKeyRequest, extract_block_refs, normalize_address,
 };
@@ -68,7 +68,10 @@ impl IndexerService {
                     return;
                 }
                 Ok(processed) => {
-                    info!(processed_rows = processed, "indexer endpoint backfill batch");
+                    info!(
+                        processed_rows = processed,
+                        "indexer endpoint backfill batch"
+                    );
                     if self.config.rpc_request_delay_ms > 0 {
                         sleep(Duration::from_millis(self.config.rpc_request_delay_ms)).await;
                     }
@@ -181,7 +184,11 @@ impl IndexerService {
         &self,
         request: CreateIndexerApiKeyRequest,
     ) -> LedgerResult<CreateIndexerApiKeyResponse> {
-        let api_key = format!("lf_idx_{}_{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let api_key = format!(
+            "lf_idx_{}_{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        );
         let now = Utc::now();
         let record = IndexerApiKeyRecord {
             key_id: Uuid::new_v4().to_string(),
@@ -201,7 +208,10 @@ impl IndexerService {
         Ok(CreateIndexerApiKeyResponse { record, api_key })
     }
 
-    pub async fn list_api_keys(&self, owner_user_id: &str) -> LedgerResult<Vec<IndexerApiKeyRecord>> {
+    pub async fn list_api_keys(
+        &self,
+        owner_user_id: &str,
+    ) -> LedgerResult<Vec<IndexerApiKeyRecord>> {
         self.clickhouse.list_api_keys(owner_user_id).await
     }
 
@@ -253,6 +263,7 @@ impl IndexerService {
                 start_block = next_block,
                 end_block = batch_end,
                 concurrency = self.config.rpc_concurrency,
+                rpc_batch_request_size = self.config.rpc_batch_request_size.max(1),
                 "index batch"
             );
             let refs = self.fetch_batch_refs(next_block, batch_end).await?;
@@ -304,22 +315,33 @@ impl IndexerService {
         Ok(updated_refs.len())
     }
 
-    async fn fetch_batch_refs(&self, start_block: u64, end_block: u64) -> LedgerResult<Vec<crate::indexer::models::AddressTxRef>> {
-        let concurrency = self.config.rpc_concurrency.max(1);
+    async fn fetch_batch_refs(
+        &self,
+        start_block: u64,
+        end_block: u64,
+    ) -> LedgerResult<Vec<AddressTxRef>> {
+        let block_concurrency = self.config.rpc_concurrency.max(1);
+        let request_size = self
+            .config
+            .rpc_batch_request_size
+            .max(1)
+            .min(block_concurrency);
+        let request_concurrency = (block_concurrency / request_size).max(1);
         let mut join_set = JoinSet::new();
         let mut refs = Vec::new();
         let mut next_to_spawn = start_block;
 
         while next_to_spawn <= end_block || !join_set.is_empty() {
-            while next_to_spawn <= end_block && join_set.len() < concurrency {
+            while next_to_spawn <= end_block && join_set.len() < request_concurrency {
                 let rpc = self.rpc.clone();
                 let config = self.config.clone();
                 let chain_id = self.config.chain_id;
-                let block_number = next_to_spawn;
+                let group_end = end_block.min(next_to_spawn + request_size as u64 - 1);
+                let block_numbers = (next_to_spawn..=group_end).collect::<Vec<_>>();
                 join_set.spawn(async move {
-                    fetch_block_refs_with_retry(rpc, config, chain_id, block_number).await
+                    fetch_block_group_refs_with_retry(rpc, config, chain_id, block_numbers).await
                 });
-                next_to_spawn += 1;
+                next_to_spawn = group_end + 1;
             }
 
             match join_set.join_next().await {
@@ -361,7 +383,6 @@ impl IndexerService {
             }
         }
     }
-
 }
 
 fn hash_api_key(token: &str) -> String {
@@ -370,36 +391,41 @@ fn hash_api_key(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn fetch_block_refs_with_retry(
+async fn fetch_block_group_refs_with_retry(
     rpc: Arc<IndexerRpcClient>,
     config: IndexerConfig,
     chain_id: u32,
-    block_number: u64,
-) -> LedgerResult<Vec<crate::indexer::models::AddressTxRef>> {
+    block_numbers: Vec<u64>,
+) -> LedgerResult<Vec<AddressTxRef>> {
     let mut attempt = 0_u32;
     loop {
         if config.rpc_request_delay_ms > 0 {
             sleep(Duration::from_millis(config.rpc_request_delay_ms)).await;
         }
-        match rpc.get_block_with_transactions(block_number).await {
-            Ok(block_payload) => {
-                if block_payload.is_null() {
-                    warn!(block_number, "block payload missing, retry later");
-                    return Err(LedgerError::TransientIngestion(format!(
-                        "block {block_number} returned null payload"
-                    )));
+        match rpc.get_blocks_with_transactions(&block_numbers).await {
+            Ok(block_payloads) => {
+                let mut refs = Vec::new();
+                for (block_number, block_payload) in block_payloads {
+                    if block_payload.is_null() {
+                        warn!(block_number, "block payload missing, retry later");
+                        return Err(LedgerError::TransientIngestion(format!(
+                            "block {block_number} returned null payload"
+                        )));
+                    }
+                    refs.extend(extract_block_refs(chain_id, &block_payload)?);
                 }
-                return extract_block_refs(chain_id, &block_payload);
+                return Ok(refs);
             }
             Err(err) if is_rate_limit_error(&err) && attempt < config.rpc_max_retries => {
                 let delay_ms =
                     retry_delay_ms(config.rpc_retry_base_ms, config.rpc_retry_max_ms, attempt);
                 warn!(
-                    block_number,
+                    start_block = block_numbers.first().copied().unwrap_or_default(),
+                    end_block = block_numbers.last().copied().unwrap_or_default(),
                     attempt = attempt + 1,
                     delay_ms,
                     error = %err,
-                    "block fetch hit rate limit, retrying"
+                    "block group fetch hit rate limit, retrying"
                 );
                 sleep(Duration::from_millis(delay_ms)).await;
                 attempt += 1;

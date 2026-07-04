@@ -99,6 +99,7 @@ If you are running only `ledgerflow indexer`, the main variables are:
 | `LEDGERFLOW_INDEXER_END_BLOCK` | Optional bounded stop block | unset |
 | `LEDGERFLOW_INDEXER_BATCH_SIZE` | Blocks claimed and committed per indexing batch | `200` |
 | `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | Parallel block fetch count inside a batch | `4` |
+| `LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE` | Block requests packed into one JSON-RPC batch request, without increasing total block concurrency | `1` |
 | `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS` | Per-request delay before a block fetch task runs | `25` |
 | `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | Base retry delay after rate-limit responses | `1000` |
 | `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | Maximum retry delay | `15000` |
@@ -183,6 +184,7 @@ export LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD=ledgerflow
 export LEDGERFLOW_INDEXER_RPC_URL=http://127.0.0.1:18545
 export LEDGERFLOW_INDEXER_BATCH_SIZE=200
 export LEDGERFLOW_INDEXER_RPC_CONCURRENCY=4
+export LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE=1
 export LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=25
 make run-indexer
 ```

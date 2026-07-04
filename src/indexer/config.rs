@@ -14,6 +14,7 @@ pub struct IndexerConfig {
     pub end_block: Option<u64>,
     pub batch_size: u64,
     pub rpc_concurrency: usize,
+    pub rpc_batch_request_size: usize,
     pub rpc_request_delay_ms: u64,
     pub rpc_retry_base_ms: u64,
     pub rpc_retry_max_ms: u64,
@@ -48,12 +49,11 @@ impl IndexerConfig {
             end_block: parse_u64("LEDGERFLOW_INDEXER_END_BLOCK"),
             batch_size: parse_u64("LEDGERFLOW_INDEXER_BATCH_SIZE").unwrap_or(500),
             rpc_concurrency: parse_usize("LEDGERFLOW_INDEXER_RPC_CONCURRENCY").unwrap_or(8),
-            rpc_request_delay_ms: parse_u64("LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS")
-                .unwrap_or(0),
-            rpc_retry_base_ms: parse_u64("LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS")
-                .unwrap_or(500),
-            rpc_retry_max_ms: parse_u64("LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS")
-                .unwrap_or(10_000),
+            rpc_batch_request_size: parse_usize("LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE")
+                .unwrap_or(1),
+            rpc_request_delay_ms: parse_u64("LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS").unwrap_or(0),
+            rpc_retry_base_ms: parse_u64("LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS").unwrap_or(500),
+            rpc_retry_max_ms: parse_u64("LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS").unwrap_or(10_000),
             rpc_max_retries: parse_u32("LEDGERFLOW_INDEXER_RPC_MAX_RETRIES").unwrap_or(8),
             live_follow: parse_bool("LEDGERFLOW_INDEXER_LIVE_FOLLOW").unwrap_or(true),
             poll_interval_ms: parse_u64("LEDGERFLOW_INDEXER_POLL_INTERVAL_MS").unwrap_or(2_000),
@@ -64,8 +64,10 @@ impl IndexerConfig {
             query_limit_max: parse_u32("LEDGERFLOW_INDEXER_QUERY_LIMIT_MAX").unwrap_or(10_000),
             endpoint_backfill_enabled: parse_bool("LEDGERFLOW_INDEXER_ENDPOINT_BACKFILL_ENABLED")
                 .unwrap_or(true),
-            endpoint_backfill_batch_size: parse_u32("LEDGERFLOW_INDEXER_ENDPOINT_BACKFILL_BATCH_SIZE")
-                .unwrap_or(2_000),
+            endpoint_backfill_batch_size: parse_u32(
+                "LEDGERFLOW_INDEXER_ENDPOINT_BACKFILL_BATCH_SIZE",
+            )
+            .unwrap_or(2_000),
         }
     }
 }
