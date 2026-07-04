@@ -17,7 +17,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 #[derive(Clone, Debug)]
 pub struct RpcGatewayConfig {
@@ -40,8 +40,12 @@ impl RpcGatewayConfig {
                 .or_else(|_| env::var("LEDGERFLOW_RPC_UPSTREAM_URL"))
                 .unwrap_or_else(|_| "http://host.docker.internal:18545".to_owned()),
             max_in_flight: parse_usize("LEDGERFLOW_RPC_GATEWAY_MAX_IN_FLIGHT").unwrap_or(8),
-            rps: parse_f64("LEDGERFLOW_RPC_GATEWAY_RPS").unwrap_or(20.0).max(0.1),
-            burst: parse_f64("LEDGERFLOW_RPC_GATEWAY_BURST").unwrap_or(20.0).max(1.0),
+            rps: parse_f64("LEDGERFLOW_RPC_GATEWAY_RPS")
+                .unwrap_or(20.0)
+                .max(0.1),
+            burst: parse_f64("LEDGERFLOW_RPC_GATEWAY_BURST")
+                .unwrap_or(20.0)
+                .max(1.0),
             upstream_timeout_ms: parse_u64("LEDGERFLOW_RPC_GATEWAY_UPSTREAM_TIMEOUT_MS")
                 .unwrap_or(30_000)
                 .max(1_000),
@@ -153,7 +157,7 @@ async fn proxy_rpc(State(state): State<RpcGatewayState>, body: Bytes) -> Respons
                 }
             };
             if wait_ms > 0 || request_profile.cost > 1.0 {
-                info!(
+                debug!(
                     methods = %request_profile.methods,
                     cost = request_profile.cost,
                     wait_ms,
@@ -299,7 +303,8 @@ impl TokenBucket {
                 let now = Instant::now();
                 let elapsed = now.duration_since(state.last_refill).as_secs_f64();
                 if elapsed > 0.0 {
-                    state.tokens = (state.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+                    state.tokens =
+                        (state.tokens + elapsed * self.refill_per_sec).min(self.capacity);
                     state.last_refill = now;
                 }
                 if state.tokens >= cost {
