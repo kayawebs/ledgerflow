@@ -604,6 +604,7 @@ impl TraceMonitorService {
                         timeout_secs = 2,
                         "rpc-log arbitrage candidate endpoint enrichment timed out"
                     );
+                    break;
                 }
             }
         }
