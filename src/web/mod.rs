@@ -1288,7 +1288,7 @@ async fn arbitrage_api(
     headers: HeaderMap,
     Query(query): Query<ArbitragePageQuery>,
 ) -> Result<Response, WebError> {
-    let Some(_user) = current_user(&state, &headers).await? else {
+    if !has_arbitrage_api_access(&state, &headers).await? {
         return Ok((
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "auth required"})),
@@ -1337,6 +1337,44 @@ async fn arbitrage_api(
         })).collect::<Vec<_>>(),
     }))
     .into_response())
+}
+
+async fn has_arbitrage_api_access(state: &WebState, headers: &HeaderMap) -> Result<bool, WebError> {
+    if current_user(state, headers).await?.is_some() {
+        return Ok(true);
+    }
+    let Some(indexer_api_base_url) = state.indexer_api_base_url.as_deref() else {
+        return Ok(false);
+    };
+    let Some(api_key) = headers
+        .get(header::AUTHORIZATION)
+        .or_else(|| headers.get("x-api-key"))
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    let request = if headers.contains_key(header::AUTHORIZATION) {
+        state
+            .client
+            .get(format!(
+                "{}/progress",
+                indexer_api_base_url.trim_end_matches('/')
+            ))
+            .header(header::AUTHORIZATION, api_key)
+    } else {
+        state
+            .client
+            .get(format!(
+                "{}/progress",
+                indexer_api_base_url.trim_end_matches('/')
+            ))
+            .header("x-api-key", api_key)
+    };
+    Ok(request
+        .send()
+        .await
+        .map(|response| response.status().is_success())
+        .unwrap_or(false))
 }
 
 async fn swaps_block_range_api(

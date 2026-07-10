@@ -380,10 +380,10 @@ The web portal exposes the same local data at `/app/arbitrage`, plus a session-p
 
 ```bash
 curl "http://127.0.0.1:3001/api/arbitrage?minutes=60&limit=50" \
-  -H "Cookie: ledgerflow_session=<session>" | jq
+  -H "Authorization: Bearer <indexer_api_key>" | jq
 ```
 
-It returns `recent_candidates`, `hot_pools`, and `hot_routes`. `minutes` is limited to 1-1,440 and `limit` to 10-200.
+It returns `recent_candidates`, `hot_pools`, and `hot_routes`. `minutes` is limited to 1-1,440 and `limit` to 10-200. The endpoint accepts either a logged-in `ledgerflow_session` cookie or an active Indexer API key through `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
 When `rpc_logs` is active, the monitor fetches transaction endpoints only for up to 16 newly discovered candidates per block range, sequentially through the RPC gateway. This fills `sender_address` and `entry_contract` without a parallel request spike. Candidates written before this behavior was deployed retain null endpoints unless they are later reprocessed.
 
