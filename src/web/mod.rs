@@ -3602,7 +3602,7 @@ fn render_arbitrage_page(
   <td>{}</td>
   <td>{}</td>
 </tr>"#,
-                render_copyable_code(&item.tx_hash, 8),
+                render_copyable_code(&item.tx_hash, 10),
                 item.block_number,
                 item.block_timestamp
                     .map(|value| value.format("%H:%M:%S").to_string())
@@ -3610,11 +3610,11 @@ fn render_arbitrage_page(
                 render_arbitrage_status(&item.confirmation_status),
                 item.sender_address
                     .as_deref()
-                    .map(|value| render_copyable_code(value, 6))
+                    .map(|value| render_copyable_code(value, 10))
                     .unwrap_or_else(|| "n/a".to_owned()),
                 item.entry_contract
                     .as_deref()
-                    .map(|value| render_copyable_code(value, 6))
+                    .map(|value| render_copyable_code(value, 10))
                     .unwrap_or_else(|| "n/a".to_owned()),
                 item.swap_log_count,
                 item.distinct_pool_count,
@@ -3637,7 +3637,7 @@ fn render_arbitrage_page(
   <td>{}</td>
   <td>{}</td>
 </tr>"#,
-                render_copyable_code(&item.pool_address, 6),
+                render_copyable_code(&item.pool_address, 10),
                 item.tx_count,
                 item.swap_log_count,
                 item.unique_senders,
@@ -3663,7 +3663,7 @@ fn render_arbitrage_page(
   <td>{}</td>
   <td>{}</td>
 </tr>"#,
-                render_copyable_code(&item.route_fingerprint, 10),
+                render_copyable_code(&item.route_fingerprint, 12),
                 render_route_compact(&item.route, 6),
                 item.tx_count,
                 item.swap_log_count,
@@ -3716,23 +3716,19 @@ fn render_arbitrage_page(
             <button class="cta secondary" type="submit">Refresh</button>
           </form>
         </section>
-        <section class="dashboard-grid">
-          <div class="main-column">
-            <section class="panel">
-              <div class="panel-head"><h2>Recent candidates</h2><span class="badge">{}</span></div>
-              <div class="panel-body">{}</div>
-            </section>
-            <section class="panel">
-              <div class="panel-head"><h2>Hot routes</h2><span class="badge">{}</span></div>
-              <div class="panel-body">{}</div>
-            </section>
-          </div>
-          <div class="side-column">
-            <section class="panel">
-              <div class="panel-head"><h2>Hot pools</h2><span class="badge">{}</span></div>
-              <div class="panel-body">{}</div>
-            </section>
-          </div>
+        <section class="arbitrage-table-stack">
+          <section class="panel">
+            <div class="panel-head"><h2>Recent candidates</h2><span class="badge">{}</span></div>
+            <div class="panel-body">{}</div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2>Hot pools</h2><span class="badge">{}</span></div>
+            <div class="panel-body">{}</div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2>Hot routes</h2><span class="badge">{}</span></div>
+            <div class="panel-body">{}</div>
+          </section>
         </section>
       </main>
     </div>
@@ -3745,22 +3741,22 @@ fn render_arbitrage_page(
         minutes,
         limit,
         recent.len(),
-        render_table_or_empty(
+        render_arbitrage_table_or_empty(
             &recent_rows,
             "No arbitrage candidates in this window.",
             "<tr><th>Tx</th><th>Block</th><th>Time</th><th>Status</th><th>Sender</th><th>Entry</th><th>Swaps/Pools</th><th>Profit</th><th>Route</th></tr>",
         ),
-        hot_routes.len(),
-        render_table_or_empty(
-            &route_rows,
-            "No repeated routes in this window.",
-            "<tr><th>Fingerprint</th><th>Route</th><th>Txs</th><th>Swaps</th><th>Senders</th><th>Last</th><th>Samples</th></tr>",
-        ),
         hot_pools.len(),
-        render_table_or_empty(
+        render_arbitrage_table_or_empty(
             &pool_rows,
             "No pool activity in this window.",
             "<tr><th>Pool</th><th>Txs</th><th>Swaps</th><th>Senders</th><th>Routes</th><th>Last</th><th>Samples</th></tr>",
+        ),
+        hot_routes.len(),
+        render_arbitrage_table_or_empty(
+            &route_rows,
+            "No repeated routes in this window.",
+            "<tr><th>Fingerprint</th><th>Route</th><th>Txs</th><th>Swaps</th><th>Senders</th><th>Last</th><th>Samples</th></tr>",
         ),
     )
 }
@@ -7238,6 +7234,19 @@ fn render_table_or_empty(rows: &str, empty_message: &str, header: &str) -> Strin
     )
 }
 
+fn render_arbitrage_table_or_empty(rows: &str, empty_message: &str, header: &str) -> String {
+    if rows.is_empty() {
+        return format!(
+            "<div class=\"empty-state\">{}</div>",
+            escape_html(empty_message)
+        );
+    }
+    format!(
+        r#"<div class="table-shell arbitrage-table-shell"><table class="arbitrage-table"><thead>{}</thead><tbody>{}</tbody></table></div>"#,
+        header, rows
+    )
+}
+
 fn render_sample_hashes(hashes: &[String]) -> String {
     if hashes.is_empty() {
         return "n/a".to_owned();
@@ -8969,6 +8978,17 @@ code, .copy-button { font-size: .72rem; }
 .trace-call-pill, .trace-method, .trace-value-chip, .trace-transfer-group span { color: #111; border-color: var(--line); background: #fff; }
 .trace-arrow-inline, .timeline-arrow-inline, .story-arrow { color: var(--accent); }
 .tx-conclusion-icon { background: #111; color: #fff; border-radius: 12px; }
+.dashboard-shell { width: 100%; min-height: 100vh; margin: 0; grid-template-columns: 228px minmax(0, 1fr); gap: 0; padding: 0; }
+.sidebar { top: 0; align-self: start; min-height: 100vh; padding: 14px 12px; background: #ececec; border-right: 1px solid #d8d8d8; }
+.sidebar .brand { padding: 0 4px; }
+.sidebar .user-card { background: #f7f7f7; }
+.dashboard-main { padding: 12px 14px 18px; }
+.arbitrage-table-stack { display: grid; gap: 10px; min-width: 0; }
+.arbitrage-table-shell { overflow-x: auto; }
+.arbitrage-table { width: 100%; min-width: 1180px; table-layout: auto; }
+.arbitrage-table th, .arbitrage-table td { white-space: nowrap; overflow-wrap: normal; }
+.arbitrage-table .badge, .arbitrage-table .copy-code { white-space: nowrap; }
+.arbitrage-table td:last-child { min-width: 260px; white-space: normal; }
 @media (max-width: 960px) {
   .hero, .dashboard-shell, .dashboard-grid, .tx-report-hero { grid-template-columns: 1fr; }
   .tx-search-form, .tx-meta-strip, .tx-conclusion-grid, .timeline-step, .timeline-flow { grid-template-columns: 1fr; }
@@ -8979,7 +8999,8 @@ code, .copy-button { font-size: .72rem; }
   .tx-meta-strip div:last-child { border-bottom: 0; }
   .tx-conclusion-cell { border-left: 0; border-top: 1px solid var(--line); padding: 12px 0; }
   .tx-conclusion-icon { margin-bottom: 8px; }
-  .sidebar { position: static; }
+  .sidebar { position: static; min-height: 0; padding: 12px; border-right: 0; border-bottom: 1px solid #d8d8d8; }
+  .dashboard-main { padding: 12px; }
   .storyline-main-path { grid-template-columns: 1fr; }
   .story-arrow { transform: rotate(90deg); padding: 4px 0; }
   .timeline-head { border-bottom: 1px solid var(--line); }
