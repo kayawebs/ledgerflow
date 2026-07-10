@@ -868,6 +868,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/tx-analysis/share", post(create_tx_analysis_share))
         .route("/share/tx/{share_id}", get(public_tx_analysis_share))
         .route("/app/arbitrage", get(arbitrage_page))
+        .route("/api/arbitrage", get(arbitrage_api))
         .route("/api/swaps/block-range", get(swaps_block_range_api))
         .route("/app/cluster-graph", get(cluster_graph_page))
         .route("/app/indexer/progress", get(indexer_progress_page))
@@ -1279,6 +1280,62 @@ async fn arbitrage_page(
         &hot_pools,
         &hot_routes,
     ))
+    .into_response())
+}
+
+async fn arbitrage_api(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<ArbitragePageQuery>,
+) -> Result<Response, WebError> {
+    let Some(_user) = current_user(&state, &headers).await? else {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "auth required"})),
+        )
+            .into_response());
+    };
+    let minutes = query.minutes.unwrap_or(60).clamp(1, 24 * 60);
+    let limit = query.limit.unwrap_or(50).clamp(10, 200);
+    let recent = load_arbitrage_recent(&state, minutes, limit).await?;
+    let hot_pools = load_arbitrage_hot_pools(&state, minutes, 25).await?;
+    let hot_routes = load_arbitrage_hot_routes(&state, minutes, 25).await?;
+    Ok(Json(json!({
+        "chain_id": state.default_chain_id,
+        "window_minutes": minutes,
+        "recent_limit": limit,
+        "recent_candidates": recent.iter().map(|item| json!({
+            "tx_hash": item.tx_hash,
+            "block_number": item.block_number,
+            "block_timestamp": item.block_timestamp,
+            "sender_address": item.sender_address,
+            "entry_contract": item.entry_contract,
+            "swap_log_count": item.swap_log_count,
+            "distinct_pool_count": item.distinct_pool_count,
+            "route": item.route,
+            "confirmation_status": item.confirmation_status,
+            "profit_token_address": item.profit_token_address,
+            "profit_amount_raw": item.profit_amount_raw,
+        })).collect::<Vec<_>>(),
+        "hot_pools": hot_pools.iter().map(|item| json!({
+            "pool_address": item.pool_address,
+            "tx_count": item.tx_count,
+            "swap_log_count": item.swap_log_count,
+            "unique_senders": item.unique_senders,
+            "unique_routes": item.unique_routes,
+            "last_seen": item.last_seen,
+            "sample_tx_hashes": item.sample_tx_hashes,
+        })).collect::<Vec<_>>(),
+        "hot_routes": hot_routes.iter().map(|item| json!({
+            "route_fingerprint": item.route_fingerprint,
+            "route": item.route,
+            "tx_count": item.tx_count,
+            "swap_log_count": item.swap_log_count,
+            "unique_senders": item.unique_senders,
+            "last_seen": item.last_seen,
+            "sample_tx_hashes": item.sample_tx_hashes,
+        })).collect::<Vec<_>>(),
+    }))
     .into_response())
 }
 

@@ -376,7 +376,16 @@ curl "http://127.0.0.1:3010/arbitrage/hot-routes?minutes=60&limit=25" | jq
 - `candidate`: multiple known DEX swap events across distinct pools in one transaction. This is not proof of realized profit.
 - `confirmed_stable_surplus_to_sender`: the transaction sender has positive USDC/USDbC ERC20 Transfer net flow inside the same tx, with no USDC/USDbC net outflow. This is intentionally incomplete but high-confidence.
 
-The web portal exposes the same local data at `/app/arbitrage`.
+The web portal exposes the same local data at `/app/arbitrage`, plus a session-protected JSON aggregation endpoint:
+
+```bash
+curl "http://127.0.0.1:3001/api/arbitrage?minutes=60&limit=50" \
+  -H "Cookie: ledgerflow_session=<session>" | jq
+```
+
+It returns `recent_candidates`, `hot_pools`, and `hot_routes`. `minutes` is limited to 1-1,440 and `limit` to 10-200.
+
+When `rpc_logs` is active, the monitor fetches transaction endpoints only for up to 16 newly discovered candidates per block range, sequentially through the RPC gateway. This fills `sender_address` and `entry_contract` without a parallel request spike. Candidates written before this behavior was deployed retain null endpoints unless they are later reprocessed.
 
 The web portal also exposes a CryptoHouse-backed block range swap API through the web port:
 

@@ -36,6 +36,7 @@ const BASE_USDBC: &str = "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca";
 const FAST_ARBITRAGE_SOURCE_RPC_LOGS: &str = "rpc_logs";
 const FAST_ARBITRAGE_SOURCE_CRYPTOHOUSE: &str = "cryptohouse";
 const DEFAULT_CRYPTOHOUSE_URL: &str = "https://crypto-clickhouse.clickhouse.com/?user=crypto";
+const FAST_ARBITRAGE_RPC_ENRICHMENT_MAX_PER_RANGE: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct TraceMonitorConfig {
@@ -529,7 +530,9 @@ impl TraceMonitorService {
             .get_logs_by_topics(start_block, end_block, &DEX_SWAP_TOPICS)
             .await?;
         let min_swaps = self.config.fast_arbitrage_min_swaps.max(2);
-        let (swap_logs, candidates) = fast_arbitrage_candidates_from_logs(logs, min_swaps);
+        let (swap_logs, mut candidates) = fast_arbitrage_candidates_from_logs(logs, min_swaps);
+        self.enrich_rpc_log_arbitrage_endpoints(&mut candidates)
+            .await;
         let mut block_timestamps = BTreeMap::<u64, Option<DateTime<Utc>>>::new();
         let mut candidate_rows = 0_u64;
         let mut candidate_txs = 0_u64;
@@ -558,6 +561,43 @@ impl TraceMonitorService {
             candidate_txs,
             candidate_rows,
         })
+    }
+
+    async fn enrich_rpc_log_arbitrage_endpoints(&self, candidates: &mut [FastSwapAccumulator]) {
+        for candidate in candidates
+            .iter_mut()
+            .take(FAST_ARBITRAGE_RPC_ENRICHMENT_MAX_PER_RANGE)
+        {
+            match self
+                .rpc_client
+                .get_transaction_by_hash(&candidate.tx_hash)
+                .await
+            {
+                Ok(transaction) => {
+                    candidate.sender_address = transaction
+                        .get("from")
+                        .and_then(Value::as_str)
+                        .map(|value| value.to_ascii_lowercase());
+                    candidate.entry_contract = transaction
+                        .get("to")
+                        .and_then(Value::as_str)
+                        .map(|value| value.to_ascii_lowercase());
+                    candidate.tx_index = candidate.tx_index.or_else(|| {
+                        transaction
+                            .get("transactionIndex")
+                            .and_then(Value::as_str)
+                            .and_then(parse_hex_u64)
+                    });
+                }
+                Err(error) => {
+                    warn!(
+                        tx_hash = %candidate.tx_hash,
+                        error = %error,
+                        "could not enrich rpc-log arbitrage candidate endpoints"
+                    );
+                }
+            }
+        }
     }
 
     async fn process_cryptohouse_arbitrage_range(
