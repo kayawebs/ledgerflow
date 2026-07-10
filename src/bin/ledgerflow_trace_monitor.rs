@@ -55,6 +55,9 @@ async fn main() {
             confirmations: config.trace_monitor_confirmations,
             block_batch_size: config.trace_monitor_block_batch_size,
             retention_days: config.trace_monitor_retention_days,
+            fast_arbitrage_enabled: config.trace_monitor_fast_arbitrage_enabled,
+            fast_arbitrage_min_swaps: config.trace_monitor_fast_arbitrage_min_swaps,
+            light_deltas_enabled: config.trace_monitor_light_deltas_enabled,
         },
     );
     let service = Arc::new(service);
@@ -93,6 +96,9 @@ async fn main() {
         poll_interval_ms = poll_interval.as_millis(),
         block_batch_size = config.trace_monitor_block_batch_size,
         retention_days = config.trace_monitor_retention_days,
+        fast_arbitrage_enabled = config.trace_monitor_fast_arbitrage_enabled,
+        fast_arbitrage_min_swaps = config.trace_monitor_fast_arbitrage_min_swaps,
+        light_deltas_enabled = config.trace_monitor_light_deltas_enabled,
         report_enabled = config.trace_monitor_report_enabled,
         report_interval_ms = config.trace_monitor_report_interval_ms,
         report_top_n = config.trace_monitor_report_top_n,

@@ -38,6 +38,9 @@ pub struct AppConfig {
     pub trace_monitor_poll_interval_ms: u64,
     pub trace_monitor_retention_days: i64,
     pub trace_monitor_bind_addr: String,
+    pub trace_monitor_fast_arbitrage_enabled: bool,
+    pub trace_monitor_fast_arbitrage_min_swaps: u32,
+    pub trace_monitor_light_deltas_enabled: bool,
     pub trace_monitor_report_enabled: bool,
     pub trace_monitor_report_interval_ms: u64,
     pub trace_monitor_report_window_minutes: i64,
@@ -128,6 +131,22 @@ impl AppConfig {
                 .unwrap_or(7),
             trace_monitor_bind_addr: env::var("LEDGERFLOW_TRACE_MONITOR_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:3010".to_owned()),
+            trace_monitor_fast_arbitrage_enabled: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_ENABLED",
+            )
+            .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+            .unwrap_or(true),
+            trace_monitor_fast_arbitrage_min_swaps: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_MIN_SWAPS",
+            )
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(2),
+            trace_monitor_light_deltas_enabled: env::var(
+                "LEDGERFLOW_TRACE_MONITOR_LIGHT_DELTAS_ENABLED",
+            )
+            .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
+            .unwrap_or(true),
             trace_monitor_report_enabled: env::var("LEDGERFLOW_TRACE_MONITOR_REPORT_ENABLED")
                 .map(|v| matches!(v.as_str(), "true" | "1" | "yes"))
                 .unwrap_or(true),

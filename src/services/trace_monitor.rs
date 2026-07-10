@@ -16,13 +16,18 @@ use crate::{
     domain::{enums::AssetType, interfaces::AnalysisRepository, value_objects::AssetFlow},
     flows::derivation::derive_basic_flows,
     indexer::rpc::IndexerRpcClient,
-    ingestion::rpc::HttpRpcClient,
+    ingestion::rpc::{HttpRpcClient, RpcClient},
     ingestion::{fetchers::TransactionBundleFetcher, models::RawTransactionBundle},
     repositories::sqlx::SqlxAnalysisRepository,
 };
 
 const CLEANUP_INTERVAL_SECS: i64 = 15 * 60;
 const CLEANUP_BATCH_ROWS: i64 = 10_000;
+const UNISWAP_V2_SWAP_TOPIC: &str =
+    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const UNISWAP_V3_SWAP_TOPIC: &str =
+    "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f";
+const DEX_SWAP_TOPICS: [&str; 2] = [UNISWAP_V2_SWAP_TOPIC, UNISWAP_V3_SWAP_TOPIC];
 
 #[derive(Clone, Debug)]
 pub struct TraceMonitorConfig {
@@ -32,6 +37,9 @@ pub struct TraceMonitorConfig {
     pub confirmations: u64,
     pub block_batch_size: u64,
     pub retention_days: i64,
+    pub fast_arbitrage_enabled: bool,
+    pub fast_arbitrage_min_swaps: u32,
+    pub light_deltas_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -77,6 +85,25 @@ struct LightMonitorCandidate {
     dex_swap_count: u32,
     liquidation_event_count: u32,
     metadata: Value,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FastArbitrageScan {
+    swap_logs: u64,
+    candidate_txs: u64,
+    candidate_rows: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FastSwapAccumulator {
+    tx_hash: String,
+    block_number: u64,
+    tx_index: Option<u64>,
+    swap_log_count: u32,
+    v2_swap_count: u32,
+    v3_swap_count: u32,
+    pools: BTreeSet<String>,
+    log_indexes: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -175,6 +202,33 @@ impl TraceMonitorService {
                 .saturating_sub(1),
         );
         iteration.end_block = Some(end_block);
+
+        if self.config.fast_arbitrage_enabled {
+            let fast_scan = self
+                .process_fast_arbitrage_range(start_block, end_block)
+                .await?;
+            debug!(
+                start_block,
+                end_block,
+                swap_logs = fast_scan.swap_logs,
+                candidate_txs = fast_scan.candidate_txs,
+                candidate_rows = fast_scan.candidate_rows,
+                "trace monitor fast arbitrage scan completed"
+            );
+            iteration.processed_txs = iteration
+                .processed_txs
+                .saturating_add(fast_scan.candidate_txs);
+            iteration.candidate_rows = iteration
+                .candidate_rows
+                .saturating_add(fast_scan.candidate_rows);
+        }
+
+        if !self.config.light_deltas_enabled {
+            self.upsert_progress(Some(end_block)).await?;
+            iteration.processed_blocks = end_block.saturating_sub(start_block).saturating_add(1);
+            self.cleanup_expired_rows_if_due().await?;
+            return Ok(iteration);
+        }
 
         let clusters = self.load_cluster_scopes().await?;
         for block_number in start_block..=end_block {
@@ -277,6 +331,55 @@ impl TraceMonitorService {
             .await?;
         let candidate_rows = self.upsert_candidates(&bundle, &candidates).await?;
         Ok((address_rows, cluster_rows, candidate_rows))
+    }
+
+    async fn process_fast_arbitrage_range(
+        &self,
+        start_block: u64,
+        end_block: u64,
+    ) -> LedgerResult<FastArbitrageScan> {
+        let logs = self
+            .block_receipt_rpc
+            .get_logs_by_topics(start_block, end_block, &DEX_SWAP_TOPICS)
+            .await?;
+        let min_swaps = self.config.fast_arbitrage_min_swaps.max(2);
+        let (swap_logs, candidates) = fast_arbitrage_candidates_from_logs(logs, min_swaps);
+        let mut block_timestamps = BTreeMap::<u64, Option<DateTime<Utc>>>::new();
+        let mut candidate_rows = 0_u64;
+        let mut candidate_txs = 0_u64;
+        for candidate in &candidates {
+            let block_timestamp =
+                if let Some(timestamp) = block_timestamps.get(&candidate.block_number) {
+                    *timestamp
+                } else {
+                    let timestamp = self.block_timestamp(candidate.block_number).await?;
+                    block_timestamps.insert(candidate.block_number, timestamp);
+                    timestamp
+                };
+            candidate_rows = candidate_rows.saturating_add(
+                self.upsert_fast_arbitrage_candidate(candidate, block_timestamp)
+                    .await?,
+            );
+            candidate_txs = candidate_txs.saturating_add(1);
+        }
+
+        Ok(FastArbitrageScan {
+            swap_logs,
+            candidate_txs,
+            candidate_rows,
+        })
+    }
+
+    async fn block_timestamp(&self, block_number: u64) -> LedgerResult<Option<DateTime<Utc>>> {
+        let block = self
+            .block_receipt_rpc
+            .get_block(self.config.chain_id, block_number)
+            .await?;
+        Ok(block
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_hex_u64)
+            .and_then(|value| Utc.timestamp_opt(value as i64, 0).single()))
     }
 
     pub async fn top_address_deltas(
@@ -643,6 +746,60 @@ impl TraceMonitorService {
         Ok(rows)
     }
 
+    async fn upsert_fast_arbitrage_candidate(
+        &self,
+        candidate: &FastSwapAccumulator,
+        block_timestamp: Option<DateTime<Utc>>,
+    ) -> LedgerResult<u64> {
+        let score = 80_i32
+            .saturating_add(i32::try_from(candidate.swap_log_count.min(20)).unwrap_or_default())
+            .saturating_add(i32::try_from(candidate.pools.len().min(20)).unwrap_or_default());
+        sqlx::query(
+            r#"
+            insert into trace_monitor_candidates (
+              chain_id, tx_hash, candidate_kind, block_number, block_timestamp,
+              score, dex_swap_count, liquidation_event_count, metadata, created_at, updated_at
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,0,$8,now(),now())
+            on conflict (chain_id, tx_hash, candidate_kind) do update set
+              block_number = excluded.block_number,
+              block_timestamp = excluded.block_timestamp,
+              score = greatest(trace_monitor_candidates.score, excluded.score),
+              dex_swap_count = excluded.dex_swap_count,
+              metadata = excluded.metadata,
+              updated_at = now()
+            "#,
+        )
+        .bind(self.config.chain_id as i64)
+        .bind(&candidate.tx_hash)
+        .bind("arbitrage_candidate")
+        .bind(candidate.block_number as i64)
+        .bind(block_timestamp)
+        .bind(score)
+        .bind(candidate.swap_log_count as i32)
+        .bind(Json(json!({
+            "detection": "eth_getLogs_swap_topics",
+            "candidate_reason": "multiple dex swap events across distinct pools in one transaction",
+            "swap_log_count": candidate.swap_log_count,
+            "v2_swap_count": candidate.v2_swap_count,
+            "v3_swap_count": candidate.v3_swap_count,
+            "distinct_pool_count": candidate.pools.len(),
+            "pool_addresses": candidate.pools.iter().cloned().collect::<Vec<_>>(),
+            "log_indexes": candidate.log_indexes,
+            "tx_index": candidate.tx_index,
+            "coverage": {
+                "uses_receipt": false,
+                "uses_trace": false,
+                "uses_full_block": false,
+                "label": "candidate_not_confirmed_pnl"
+            }
+        })))
+        .execute(self.repository.pool())
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(1)
+    }
+
     async fn cleanup_expired_rows_if_due(&self) -> LedgerResult<()> {
         let now = Utc::now().timestamp();
         let next_cleanup_at = self.next_cleanup_at_unix.load(Ordering::SeqCst);
@@ -798,6 +955,92 @@ fn parse_amount_i128(value: &str) -> i128 {
     value.parse::<i128>().unwrap_or_default()
 }
 
+fn parse_hex_u64(value: &str) -> Option<u64> {
+    u64::from_str_radix(value.trim_start_matches("0x"), 16).ok()
+}
+
+fn fast_arbitrage_candidates_from_logs(
+    logs: Vec<Value>,
+    min_swaps: u32,
+) -> (u64, Vec<FastSwapAccumulator>) {
+    let mut grouped = BTreeMap::<String, FastSwapAccumulator>::new();
+    let mut swap_logs = 0_u64;
+
+    for log in logs {
+        if log.get("removed").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let Some(tx_hash) = log
+            .get("transactionHash")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+        else {
+            continue;
+        };
+        let Some(block_number) = log
+            .get("blockNumber")
+            .and_then(Value::as_str)
+            .and_then(parse_hex_u64)
+        else {
+            continue;
+        };
+        let topic0 = log
+            .get("topics")
+            .and_then(Value::as_array)
+            .and_then(|topics| topics.first())
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !is_dex_swap_topic(&topic0) {
+            continue;
+        }
+        let pool = log
+            .get("address")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let tx_index = log
+            .get("transactionIndex")
+            .and_then(Value::as_str)
+            .and_then(parse_hex_u64);
+        let log_index = log
+            .get("logIndex")
+            .and_then(Value::as_str)
+            .and_then(parse_hex_u64)
+            .unwrap_or_default();
+
+        let entry = grouped
+            .entry(tx_hash.clone())
+            .or_insert_with(|| FastSwapAccumulator {
+                tx_hash,
+                block_number,
+                tx_index,
+                swap_log_count: 0,
+                v2_swap_count: 0,
+                v3_swap_count: 0,
+                pools: BTreeSet::new(),
+                log_indexes: Vec::new(),
+            });
+        entry.swap_log_count = entry.swap_log_count.saturating_add(1);
+        entry.block_number = entry.block_number.min(block_number);
+        entry.tx_index = entry.tx_index.or(tx_index);
+        entry.pools.insert(pool);
+        entry.log_indexes.push(log_index);
+        if topic0 == UNISWAP_V2_SWAP_TOPIC {
+            entry.v2_swap_count = entry.v2_swap_count.saturating_add(1);
+        } else if topic0 == UNISWAP_V3_SWAP_TOPIC {
+            entry.v3_swap_count = entry.v3_swap_count.saturating_add(1);
+        }
+        swap_logs = swap_logs.saturating_add(1);
+    }
+
+    let candidates = grouped
+        .into_values()
+        .filter(|candidate| candidate.swap_log_count >= min_swaps && candidate.pools.len() >= 2)
+        .collect::<Vec<_>>();
+    (swap_logs, candidates)
+}
+
 fn detect_light_candidates(
     bundle: &RawTransactionBundle,
     flows: &[AssetFlow],
@@ -862,8 +1105,7 @@ fn detect_light_candidates(
 fn is_dex_swap_topic(topic: &str) -> bool {
     matches!(
         topic.to_ascii_lowercase().as_str(),
-        "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
-            | "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f"
+        UNISWAP_V2_SWAP_TOPIC | UNISWAP_V3_SWAP_TOPIC
     )
 }
 
@@ -1028,5 +1270,63 @@ mod tests {
                 .any(|item| item.kind == "liquidation_event")
         );
         assert!(candidates.iter().any(|item| item.kind == "dex_multi_swap"));
+    }
+
+    #[test]
+    fn fast_arbitrage_detector_requires_multiple_distinct_pools() {
+        let tx_hash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let log = |pool: &str, topic: &str, log_index: &str| {
+            json!({
+                "transactionHash": tx_hash,
+                "blockNumber": "0x64",
+                "transactionIndex": "0x2",
+                "logIndex": log_index,
+                "address": pool,
+                "topics": [topic],
+                "removed": false,
+            })
+        };
+        let logs = vec![
+            log(
+                "0x1111111111111111111111111111111111111111",
+                UNISWAP_V3_SWAP_TOPIC,
+                "0x1",
+            ),
+            log(
+                "0x1111111111111111111111111111111111111111",
+                UNISWAP_V3_SWAP_TOPIC,
+                "0x2",
+            ),
+            log(
+                "0x2222222222222222222222222222222222222222",
+                UNISWAP_V2_SWAP_TOPIC,
+                "0x3",
+            ),
+        ];
+
+        let (swap_logs, candidates) = fast_arbitrage_candidates_from_logs(logs, 2);
+        assert_eq!(swap_logs, 3);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].swap_log_count, 3);
+        assert_eq!(candidates[0].pools.len(), 2);
+        assert_eq!(candidates[0].v2_swap_count, 1);
+        assert_eq!(candidates[0].v3_swap_count, 2);
+
+        let (_, single_pool_candidates) = fast_arbitrage_candidates_from_logs(
+            vec![
+                log(
+                    "0x3333333333333333333333333333333333333333",
+                    UNISWAP_V3_SWAP_TOPIC,
+                    "0x4",
+                ),
+                log(
+                    "0x3333333333333333333333333333333333333333",
+                    UNISWAP_V3_SWAP_TOPIC,
+                    "0x5",
+                ),
+            ],
+            2,
+        );
+        assert!(single_pool_candidates.is_empty());
     }
 }

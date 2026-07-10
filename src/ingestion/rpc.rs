@@ -55,12 +55,40 @@ impl HttpRpcClient {
 
     pub async fn get_block_receipts(&self, block_number: u64) -> LedgerResult<Vec<Value>> {
         let result = self
-            .call("eth_getBlockReceipts", json!([format!("0x{block_number:x}")]))
+            .call(
+                "eth_getBlockReceipts",
+                json!([format!("0x{block_number:x}")]),
+            )
             .await?;
         result.as_array().cloned().ok_or_else(|| {
             LedgerError::MalformedEvidence(
                 "eth_getBlockReceipts response was not an array".to_owned(),
             )
+        })
+    }
+
+    pub async fn get_logs_by_topics(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        topic0s: &[&str],
+    ) -> LedgerResult<Vec<Value>> {
+        let topics = topic0s
+            .iter()
+            .map(|topic| Value::String((*topic).to_owned()))
+            .collect::<Vec<_>>();
+        let result = self
+            .call(
+                "eth_getLogs",
+                json!([{
+                    "fromBlock": format!("0x{from_block:x}"),
+                    "toBlock": format!("0x{to_block:x}"),
+                    "topics": [topics],
+                }]),
+            )
+            .await?;
+        result.as_array().cloned().ok_or_else(|| {
+            LedgerError::MalformedEvidence("eth_getLogs response was not an array".to_owned())
         })
     }
 
