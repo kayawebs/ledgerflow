@@ -29,6 +29,10 @@ const UNISWAP_V2_SWAP_TOPIC: &str =
 const UNISWAP_V3_SWAP_TOPIC: &str =
     "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
 const DEX_SWAP_TOPICS: [&str; 2] = [UNISWAP_V2_SWAP_TOPIC, UNISWAP_V3_SWAP_TOPIC];
+const ERC20_TRANSFER_TOPIC_HEX: &str =
+    "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const BASE_USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+const BASE_USDBC: &str = "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca";
 const FAST_ARBITRAGE_SOURCE_RPC_LOGS: &str = "rpc_logs";
 const FAST_ARBITRAGE_SOURCE_CRYPTOHOUSE: &str = "cryptohouse";
 const DEFAULT_CRYPTOHOUSE_URL: &str = "https://crypto-clickhouse.clickhouse.com/?user=crypto";
@@ -114,6 +118,7 @@ struct FastSwapAccumulator {
     pools: BTreeSet<String>,
     pool_stats: BTreeMap<String, FastPoolStat>,
     log_indexes: Vec<u64>,
+    confirmation: FastArbitrageConfirmation,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -123,6 +128,39 @@ struct FastPoolStat {
     swap_log_count: u32,
     v2_swap_count: u32,
     v3_swap_count: u32,
+}
+
+#[derive(Clone, Debug)]
+struct FastArbitrageConfirmation {
+    status: String,
+    profit_recipient: Option<String>,
+    profit_token_address: Option<String>,
+    profit_amount_raw: Option<String>,
+    metadata: Value,
+}
+
+#[derive(Clone, Debug)]
+struct Erc20TransferLite {
+    tx_hash: String,
+    token_address: String,
+    from_address: String,
+    to_address: String,
+    amount_raw: i128,
+}
+
+impl Default for FastArbitrageConfirmation {
+    fn default() -> Self {
+        Self {
+            status: "candidate".to_owned(),
+            profit_recipient: None,
+            profit_token_address: None,
+            profit_amount_raw: None,
+            metadata: json!({
+                "method": "not_confirmed",
+                "reason": "candidate has not met conservative stable-surplus confirmation"
+            }),
+        }
+    }
 }
 
 impl FastSwapAccumulator {
@@ -200,6 +238,7 @@ pub struct RecentArbitrageQuery {
     pub minutes: Option<i64>,
     pub limit: Option<u32>,
     pub min_swaps: Option<u32>,
+    pub confirmed_only: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -224,6 +263,10 @@ pub struct RecentArbitrageCandidate {
     pub route: String,
     pub route_fingerprint: String,
     pub pool_addresses: Vec<String>,
+    pub confirmation_status: String,
+    pub profit_recipient: Option<String>,
+    pub profit_token_address: Option<String>,
+    pub profit_amount_raw: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -543,7 +586,9 @@ impl TraceMonitorService {
             )));
         }
 
-        let (swap_logs, candidates) = fast_arbitrage_candidates_from_cryptohouse_rows(&body)?;
+        let (swap_logs, mut candidates) = fast_arbitrage_candidates_from_cryptohouse_rows(&body)?;
+        self.enrich_cryptohouse_arbitrage_confirmations(start_block, end_block, &mut candidates)
+            .await?;
         let mut candidate_rows = 0_u64;
         let mut candidate_txs = 0_u64;
         for (candidate, block_timestamp) in &candidates {
@@ -563,6 +608,55 @@ impl TraceMonitorService {
             candidate_txs,
             candidate_rows,
         })
+    }
+
+    async fn enrich_cryptohouse_arbitrage_confirmations(
+        &self,
+        start_block: u64,
+        end_block: u64,
+        candidates: &mut [(FastSwapAccumulator, Option<DateTime<Utc>>)],
+    ) -> LedgerResult<()> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let tx_hashes = candidates
+            .iter()
+            .map(|(candidate, _)| sql_string(&candidate.tx_hash))
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = cryptohouse_transfer_logs_query(start_block, end_block, &tx_hashes);
+        let response = self
+            .cryptohouse_client
+            .post(self.cryptohouse_url())
+            .body(query)
+            .send()
+            .await
+            .map_err(|err| LedgerError::TransientIngestion(err.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| LedgerError::TransientIngestion(err.to_string()))?;
+        if !status.is_success() {
+            return Err(LedgerError::TransientIngestion(format!(
+                "cryptohouse transfer query failed with status {status}: {}",
+                truncate_for_error(&body, 500)
+            )));
+        }
+
+        let transfers = erc20_transfers_from_cryptohouse_rows(&body)?;
+        let mut by_tx = BTreeMap::<String, Vec<Erc20TransferLite>>::new();
+        for transfer in transfers {
+            by_tx
+                .entry(transfer.tx_hash.clone())
+                .or_default()
+                .push(transfer);
+        }
+        for (candidate, _) in candidates {
+            candidate.confirmation =
+                conservative_arbitrage_confirmation(candidate, by_tx.get(&candidate.tx_hash));
+        }
+        Ok(())
     }
 
     fn fast_arbitrage_source(&self) -> String {
@@ -892,17 +986,21 @@ impl TraceMonitorService {
         let minutes = query.minutes.unwrap_or(60).clamp(1, 24 * 60);
         let limit = query.limit.unwrap_or(50).clamp(1, 500) as i64;
         let min_swaps = query.min_swaps.unwrap_or(2).max(2) as i32;
+        let confirmed_only = query.confirmed_only.unwrap_or(false);
         let rows = sqlx::query(
             r#"
             select
               tx_hash, block_number, block_timestamp, detection_source,
               sender_address, entry_contract, score, swap_log_count,
               distinct_pool_count, route, route_fingerprint,
-              metadata -> 'pool_addresses' as pool_addresses
+              metadata -> 'pool_addresses' as pool_addresses,
+              confirmation_status, profit_recipient, profit_token_address,
+              profit_amount_raw
             from arbitrage_candidates
             where chain_id = $1
               and block_timestamp >= now() - ($2::text || ' minutes')::interval
               and swap_log_count >= $3
+              and ($5 = false or confirmation_status <> 'candidate')
             order by block_timestamp desc nulls last, block_number desc, score desc
             limit $4
             "#,
@@ -911,6 +1009,7 @@ impl TraceMonitorService {
         .bind(minutes)
         .bind(min_swaps)
         .bind(limit)
+        .bind(confirmed_only)
         .fetch_all(self.repository.pool())
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
@@ -941,6 +1040,10 @@ impl TraceMonitorService {
                         })
                     })
                     .unwrap_or_default(),
+                confirmation_status: row.get("confirmation_status"),
+                profit_recipient: row.get("profit_recipient"),
+                profit_token_address: row.get("profit_token_address"),
+                profit_amount_raw: row.get("profit_amount_raw"),
             })
             .collect())
     }
@@ -1243,9 +1346,11 @@ impl TraceMonitorService {
               chain_id, tx_hash, block_number, block_timestamp, detection_source,
               sender_address, entry_contract, tx_index, score, swap_log_count,
               v2_swap_count, v3_swap_count, distinct_pool_count, route,
-              route_fingerprint, metadata, created_at, updated_at
+              route_fingerprint, confirmation_status, profit_recipient,
+              profit_token_address, profit_amount_raw, confirmation_metadata,
+              metadata, created_at, updated_at
             )
-            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now(),now())
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,now(),now())
             on conflict (chain_id, tx_hash) do update set
               block_number = excluded.block_number,
               block_timestamp = excluded.block_timestamp,
@@ -1260,6 +1365,11 @@ impl TraceMonitorService {
               distinct_pool_count = excluded.distinct_pool_count,
               route = excluded.route,
               route_fingerprint = excluded.route_fingerprint,
+              confirmation_status = excluded.confirmation_status,
+              profit_recipient = excluded.profit_recipient,
+              profit_token_address = excluded.profit_token_address,
+              profit_amount_raw = excluded.profit_amount_raw,
+              confirmation_metadata = excluded.confirmation_metadata,
               metadata = excluded.metadata,
               updated_at = now()
             "#,
@@ -1279,11 +1389,17 @@ impl TraceMonitorService {
         .bind(candidate.pools.len() as i32)
         .bind(route)
         .bind(route_fingerprint)
+        .bind(candidate.confirmation.status.as_str())
+        .bind(candidate.confirmation.profit_recipient.as_deref())
+        .bind(candidate.confirmation.profit_token_address.as_deref())
+        .bind(candidate.confirmation.profit_amount_raw.as_deref())
+        .bind(Json(candidate.confirmation.metadata.clone()))
         .bind(Json(json!({
             "pool_addresses": candidate.pool_addresses(),
             "log_indexes": candidate.log_indexes,
             "candidate_reason": "multiple dex swap events across distinct pools in one transaction",
             "confirmed_pnl": false,
+            "confirmation_status": candidate.confirmation.status.as_str(),
         })))
         .execute(self.repository.pool())
         .await
@@ -1567,6 +1683,7 @@ fn fast_arbitrage_candidates_from_logs(
                 pools: BTreeSet::new(),
                 pool_stats: BTreeMap::new(),
                 log_indexes: Vec::new(),
+                confirmation: FastArbitrageConfirmation::default(),
             });
         entry.block_number = entry.block_number.min(block_number);
         entry.tx_index = entry.tx_index.or(tx_index);
@@ -1614,6 +1731,26 @@ HAVING swap_log_count >= {min_swaps}
    AND distinct_pool_count >= 2
 ORDER BY l.block_number, l.transaction_hash
 LIMIT 10000
+FORMAT JSONEachRow
+"#
+    )
+}
+
+fn cryptohouse_transfer_logs_query(start_block: u64, end_block: u64, tx_hashes: &str) -> String {
+    format!(
+        r#"
+SELECT
+  transaction_hash,
+  address AS token_address,
+  concat('0x', right(arrayElement(splitByChar(',', topics), 2), 40)) AS from_address,
+  concat('0x', right(arrayElement(splitByChar(',', topics), 3), 40)) AS to_address,
+  data
+FROM base.logs
+WHERE block_number BETWEEN {start_block} AND {end_block}
+  AND transaction_hash IN ({tx_hashes})
+  AND position(topics, '{ERC20_TRANSFER_TOPIC_HEX}') > 0
+  AND length(arrayElement(splitByChar(',', topics), 2)) >= 40
+  AND length(arrayElement(splitByChar(',', topics), 3)) >= 40
 FORMAT JSONEachRow
 "#
     )
@@ -1678,6 +1815,7 @@ fn fast_arbitrage_candidates_from_cryptohouse_rows(
             pools: BTreeSet::new(),
             pool_stats: BTreeMap::new(),
             log_indexes: Vec::new(),
+            confirmation: FastArbitrageConfirmation::default(),
         };
         for (index, pool) in pool_logs.iter().enumerate() {
             let topic0 = topic0s.get(index).map(String::as_str).unwrap_or_default();
@@ -1695,6 +1833,155 @@ fn fast_arbitrage_candidates_from_cryptohouse_rows(
     }
 
     Ok((swap_logs, candidates))
+}
+
+fn erc20_transfers_from_cryptohouse_rows(body: &str) -> LedgerResult<Vec<Erc20TransferLite>> {
+    let mut transfers = Vec::new();
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let row: Value = serde_json::from_str(line).map_err(|err| {
+            LedgerError::MalformedEvidence(format!(
+                "cryptohouse transfer JSONEachRow parse failed: {err}; row={}",
+                truncate_for_error(line, 300)
+            ))
+        })?;
+        let Some(amount_raw) = row
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(parse_erc20_amount_i128)
+        else {
+            continue;
+        };
+        transfers.push(Erc20TransferLite {
+            tx_hash: row
+                .get("transaction_hash")
+                .and_then(Value::as_str)
+                .map(normalize_hash)
+                .ok_or_else(|| {
+                    LedgerError::MalformedEvidence(
+                        "cryptohouse transfer row missing transaction_hash".to_owned(),
+                    )
+                })?,
+            token_address: row
+                .get("token_address")
+                .and_then(Value::as_str)
+                .map(normalize_hash)
+                .ok_or_else(|| {
+                    LedgerError::MalformedEvidence(
+                        "cryptohouse transfer row missing token_address".to_owned(),
+                    )
+                })?,
+            from_address: row
+                .get("from_address")
+                .and_then(Value::as_str)
+                .map(normalize_hash)
+                .ok_or_else(|| {
+                    LedgerError::MalformedEvidence(
+                        "cryptohouse transfer row missing from_address".to_owned(),
+                    )
+                })?,
+            to_address: row
+                .get("to_address")
+                .and_then(Value::as_str)
+                .map(normalize_hash)
+                .ok_or_else(|| {
+                    LedgerError::MalformedEvidence(
+                        "cryptohouse transfer row missing to_address".to_owned(),
+                    )
+                })?,
+            amount_raw,
+        });
+    }
+    Ok(transfers)
+}
+
+fn conservative_arbitrage_confirmation(
+    candidate: &FastSwapAccumulator,
+    transfers: Option<&Vec<Erc20TransferLite>>,
+) -> FastArbitrageConfirmation {
+    let Some(sender) = candidate.sender_address.as_deref() else {
+        return FastArbitrageConfirmation {
+            metadata: json!({
+                "method": "erc20_transfer_net_to_sender",
+                "reason": "transaction sender is unavailable"
+            }),
+            ..Default::default()
+        };
+    };
+    let mut stable_token_nets = BTreeMap::<String, i128>::new();
+    for transfer in transfers.into_iter().flatten() {
+        if !is_conservative_profit_token(&transfer.token_address) {
+            continue;
+        }
+        let entry = stable_token_nets
+            .entry(transfer.token_address.clone())
+            .or_default();
+        if transfer.to_address == sender {
+            *entry = entry.saturating_add(transfer.amount_raw);
+        }
+        if transfer.from_address == sender {
+            *entry = entry.saturating_sub(transfer.amount_raw);
+        }
+    }
+
+    let stable_token_nets_json = stable_token_nets
+        .iter()
+        .map(|(token, net)| (token.clone(), net.to_string()))
+        .collect::<BTreeMap<_, _>>();
+    let has_negative_stable_net = stable_token_nets.values().any(|net| *net < 0);
+    let best_profit = stable_token_nets
+        .iter()
+        .filter(|(_, net)| **net > 0)
+        .max_by_key(|(_, net)| **net);
+
+    if !has_negative_stable_net {
+        if let Some((token, net)) = best_profit {
+            return FastArbitrageConfirmation {
+                status: "confirmed_stable_surplus_to_sender".to_owned(),
+                profit_recipient: Some(sender.to_owned()),
+                profit_token_address: Some(token.clone()),
+                profit_amount_raw: Some(net.to_string()),
+                metadata: json!({
+                    "method": "erc20_transfer_net_to_sender",
+                    "scope": "usdc_and_usdbc_only",
+                    "reason": "sender has positive stable-token net transfer and no stable-token net outflow",
+                    "stable_token_nets": stable_token_nets_json
+                }),
+            };
+        }
+    }
+
+    FastArbitrageConfirmation {
+        metadata: json!({
+            "method": "erc20_transfer_net_to_sender",
+            "scope": "usdc_and_usdbc_only",
+            "reason": if has_negative_stable_net {
+                "sender has stable-token net outflow"
+            } else {
+                "no positive stable-token net transfer to sender"
+            },
+            "stable_token_nets": stable_token_nets_json
+        }),
+        ..Default::default()
+    }
+}
+
+fn is_conservative_profit_token(token_address: &str) -> bool {
+    matches!(token_address, BASE_USDC | BASE_USDBC)
+}
+
+fn parse_erc20_amount_i128(value: &str) -> Option<i128> {
+    let value = value.trim().trim_start_matches("0x");
+    if value.is_empty() {
+        return None;
+    }
+    let value = if value.len() > 64 {
+        &value[value.len().saturating_sub(64)..]
+    } else {
+        value
+    };
+    u128::from_str_radix(value, 16)
+        .ok()
+        .and_then(|amount| i128::try_from(amount).ok())
 }
 
 fn json_u64(value: Option<&Value>) -> Option<u64> {
@@ -1737,6 +2024,10 @@ fn normalize_hash(value: &str) -> String {
     } else {
         format!("0x{value}")
     }
+}
+
+fn sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn candidate_route(candidate: &FastSwapAccumulator) -> String {

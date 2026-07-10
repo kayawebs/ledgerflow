@@ -11,6 +11,7 @@ WORKDIR /app
 COPY --from=release /ledgerflow /usr/local/bin/ledgerflow
 COPY --from=release /web /usr/local/bin/web
 COPY --from=release /ledgerflow_indexer /usr/local/bin/ledgerflow_indexer
+COPY --from=release /ledgerflow_cryptohouse_indexer_backfill /usr/local/bin/ledgerflow_cryptohouse_indexer_backfill
 COPY --from=release /ledgerflow_backfill_worker /usr/local/bin/ledgerflow_backfill_worker
 COPY --from=release /ledgerflow_price_worker /usr/local/bin/ledgerflow_price_worker
 COPY --from=release /ledgerflow_address_worker /usr/local/bin/ledgerflow_address_worker

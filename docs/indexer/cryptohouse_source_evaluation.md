@@ -42,3 +42,25 @@ Add a separate worker/source mode instead of replacing the existing indexer:
 - range checkpoints must be independent from RPC indexer checkpoints.
 
 This gives us speed without making public infrastructure a hard dependency for every product path.
+
+## Implemented path
+
+The first production path is `ledgerflow_cryptohouse_indexer_backfill`.
+
+It imports `base.transactions` into the existing local ClickHouse `address_tx_refs` table and records progress under a separate worker id. It does not replace the normal RPC indexer and it does not update the canonical RPC worker checkpoint.
+
+Operational controls:
+
+| Env var | Purpose |
+| --- | --- |
+| `LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_ENABLED` | must be `true` before the worker imports rows |
+| `LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_START_BLOCK` | lower bound for historical fill |
+| `LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_END_BLOCK` | upper bound; required for bounded runs |
+| `LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_BATCH_SIZE` | block window per CryptoHouse query, default `500` |
+| `LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_REQUEST_DELAY_MS` | delay between batches, default `100` |
+| `LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_QUOTA_BACKOFF_SECS` | retry backoff after public endpoint quota errors, default `600` |
+| `LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_WORKER_ID` | independent checkpoint id |
+
+The imported shape is intentionally limited to top-level transaction `from`/`to` address refs, because that is the current indexer contract. Logs, receipts, and token-accounting evidence should be added as separate tables before promoting CryptoHouse to a broader historical evidence source.
+
+The public `crypto` user is useful for validation but has a small hourly query quota. Full historical completion should use a dedicated ClickHouse/CryptoHouse credential, a larger batch size proven by load tests, or a bulk export path.

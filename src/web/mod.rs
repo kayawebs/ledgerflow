@@ -36,6 +36,11 @@ use crate::{
 };
 
 const DEFAULT_PRICE_ETH: &str = "0.5";
+const SWAP_BLOCK_RANGE_MAX_BLOCKS: u64 = 2_000;
+const UNISWAP_V2_SWAP_TOPIC_HEX: &str =
+    "d78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const UNISWAP_V3_SWAP_TOPIC_HEX: &str =
+    "c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
 
 #[derive(Clone)]
 pub struct WebState {
@@ -48,6 +53,7 @@ pub struct WebState {
     pub session_cookie_name: String,
     pub pool: PgPool,
     pub client: Client,
+    pub cryptohouse_url: String,
     pub auth_service: Arc<AuthService>,
     pub portal_service: Arc<PortalService>,
     pub email_delivery_mode: &'static str,
@@ -79,6 +85,7 @@ pub struct WebConfig {
     pub email_delivery_mode: EmailDeliveryMode,
     pub verification_ttl_minutes: i64,
     pub session_ttl_days: i64,
+    pub cryptohouse_url: String,
 }
 
 impl WebConfig {
@@ -119,6 +126,10 @@ impl WebConfig {
                 .ok()
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(30),
+            cryptohouse_url: std::env::var("LEDGERFLOW_TRACE_MONITOR_CRYPTOHOUSE_URL")
+                .unwrap_or_else(|_| {
+                    "https://crypto-clickhouse.clickhouse.com/?user=crypto".to_owned()
+                }),
         }
     }
 }
@@ -214,6 +225,15 @@ struct ArbitragePageQuery {
     limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SwapBlockRangeQuery {
+    from_block: u64,
+    to_block: u64,
+    min_swaps: Option<u32>,
+    tx_limit: Option<u32>,
+    pool_limit: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 struct ArbitrageRecentRow {
     tx_hash: String,
@@ -224,6 +244,9 @@ struct ArbitrageRecentRow {
     swap_log_count: i32,
     distinct_pool_count: i32,
     route: String,
+    confirmation_status: String,
+    profit_token_address: Option<String>,
+    profit_amount_raw: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -794,6 +817,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         session_cookie_name: config.session_cookie_name.clone(),
         pool: pool.clone(),
         client: Client::new(),
+        cryptohouse_url: config.cryptohouse_url.clone(),
         auth_service: Arc::new(AuthService::new(
             pool.clone(),
             sender,
@@ -844,6 +868,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/tx-analysis/share", post(create_tx_analysis_share))
         .route("/share/tx/{share_id}", get(public_tx_analysis_share))
         .route("/app/arbitrage", get(arbitrage_page))
+        .route("/api/swaps/block-range", get(swaps_block_range_api))
         .route("/app/cluster-graph", get(cluster_graph_page))
         .route("/app/indexer/progress", get(indexer_progress_page))
         .route("/app/indexer/address-lookup", get(indexer_lookup_page))
@@ -1257,6 +1282,174 @@ async fn arbitrage_page(
     .into_response())
 }
 
+async fn swaps_block_range_api(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<SwapBlockRangeQuery>,
+) -> Result<Response, WebError> {
+    let Some(_user) = current_user(&state, &headers).await? else {
+        return Ok((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "auth required"})),
+        )
+            .into_response());
+    };
+    if query.from_block > query.to_block {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "from_block must be <= to_block"})),
+        )
+            .into_response());
+    }
+    let block_count = query
+        .to_block
+        .saturating_sub(query.from_block)
+        .saturating_add(1);
+    if block_count > SWAP_BLOCK_RANGE_MAX_BLOCKS {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("block range too large; max {SWAP_BLOCK_RANGE_MAX_BLOCKS} blocks")
+            })),
+        )
+            .into_response());
+    }
+    let min_swaps = query.min_swaps.unwrap_or(1).clamp(1, 100);
+    let tx_limit = query.tx_limit.unwrap_or(100).clamp(1, 500);
+    let pool_limit = query.pool_limit.unwrap_or(50).clamp(1, 200);
+    let summary_query = cryptohouse_swaps_summary_query(query.from_block, query.to_block);
+    let txs_query =
+        cryptohouse_swap_txs_query(query.from_block, query.to_block, min_swaps, tx_limit);
+    let pools_query =
+        cryptohouse_hot_swap_pools_query(query.from_block, query.to_block, pool_limit);
+    let summary = cryptohouse_json_each_row(&state, &summary_query).await?;
+    let swap_txs = cryptohouse_json_each_row(&state, &txs_query).await?;
+    let hot_pools = cryptohouse_json_each_row(&state, &pools_query).await?;
+    Ok(Json(json!({
+        "from_block": query.from_block,
+        "to_block": query.to_block,
+        "block_count": block_count,
+        "min_swaps": min_swaps,
+        "tx_limit": tx_limit,
+        "pool_limit": pool_limit,
+        "summary": summary.first().cloned().unwrap_or_else(|| json!({})),
+        "swap_txs": swap_txs,
+        "hot_pools": hot_pools,
+    }))
+    .into_response())
+}
+
+async fn cryptohouse_json_each_row(
+    state: &WebState,
+    sql: &str,
+) -> Result<Vec<serde_json::Value>, WebError> {
+    let response = state
+        .client
+        .post(&state.cryptohouse_url)
+        .body(sql.to_owned())
+        .send()
+        .await
+        .map_err(WebError::upstream)?;
+    let status = response.status();
+    let body = response.text().await.map_err(WebError::upstream)?;
+    if !status.is_success() {
+        return Err(WebError::bad_gateway(format!(
+            "cryptohouse query failed: {status} {}",
+            truncate_for_display(&body, 300)
+        )));
+    }
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).map_err(|err| WebError::internal(err.to_string())))
+        .collect()
+}
+
+fn cryptohouse_swaps_summary_query(from_block: u64, to_block: u64) -> String {
+    format!(
+        r#"
+SELECT
+  count() AS swap_log_count,
+  uniqExact(transaction_hash) AS swap_tx_count,
+  uniqExact(address) AS pool_count,
+  min(block_timestamp) AS first_seen,
+  max(block_timestamp) AS last_seen
+FROM base.logs
+WHERE block_number BETWEEN {from_block} AND {to_block}
+  AND (
+    position(topics, '{UNISWAP_V2_SWAP_TOPIC_HEX}') > 0
+    OR position(topics, '{UNISWAP_V3_SWAP_TOPIC_HEX}') > 0
+  )
+FORMAT JSONEachRow
+"#
+    )
+}
+
+fn cryptohouse_swap_txs_query(
+    from_block: u64,
+    to_block: u64,
+    min_swaps: u32,
+    limit: u32,
+) -> String {
+    format!(
+        r#"
+SELECT
+  l.block_number,
+  l.transaction_hash,
+  count() AS swap_log_count,
+  countIf(position(l.topics, '{UNISWAP_V2_SWAP_TOPIC_HEX}') > 0) AS v2_swap_count,
+  countIf(position(l.topics, '{UNISWAP_V3_SWAP_TOPIC_HEX}') > 0) AS v3_swap_count,
+  uniqExact(l.address) AS distinct_pool_count,
+  groupUniqArray(64)(l.address) AS pool_addresses,
+  groupArray(128)(l.log_index) AS log_indexes,
+  any(t.from_address) AS sender_address,
+  any(t.to_address) AS entry_contract,
+  toString(max(l.block_timestamp)) AS block_timestamp
+FROM base.logs AS l
+LEFT JOIN base.transactions AS t
+  ON t.block_number = l.block_number
+ AND t.hash = l.transaction_hash
+WHERE l.block_number BETWEEN {from_block} AND {to_block}
+  AND (
+    position(l.topics, '{UNISWAP_V2_SWAP_TOPIC_HEX}') > 0
+    OR position(l.topics, '{UNISWAP_V3_SWAP_TOPIC_HEX}') > 0
+  )
+GROUP BY l.block_number, l.transaction_hash
+HAVING swap_log_count >= {min_swaps}
+ORDER BY swap_log_count DESC, l.block_number DESC
+LIMIT {limit}
+FORMAT JSONEachRow
+"#
+    )
+}
+
+fn cryptohouse_hot_swap_pools_query(from_block: u64, to_block: u64, limit: u32) -> String {
+    format!(
+        r#"
+SELECT
+  address AS pool_address,
+  count() AS swap_log_count,
+  uniqExact(transaction_hash) AS tx_count,
+  uniqExact(block_number) AS block_count,
+  min(block_number) AS first_block,
+  max(block_number) AS last_block,
+  min(block_timestamp) AS first_seen,
+  max(block_timestamp) AS last_seen,
+  groupUniqArray(8)(transaction_hash) AS sample_tx_hashes
+FROM base.logs
+WHERE block_number BETWEEN {from_block} AND {to_block}
+  AND (
+    position(topics, '{UNISWAP_V2_SWAP_TOPIC_HEX}') > 0
+    OR position(topics, '{UNISWAP_V3_SWAP_TOPIC_HEX}') > 0
+  )
+GROUP BY address
+ORDER BY tx_count DESC, swap_log_count DESC, last_block DESC
+LIMIT {limit}
+FORMAT JSONEachRow
+"#
+    )
+}
+
 async fn load_arbitrage_recent(
     state: &WebState,
     minutes: i64,
@@ -1265,7 +1458,8 @@ async fn load_arbitrage_recent(
     let rows = sqlx::query(
         r#"
         select tx_hash, block_number, block_timestamp, sender_address, entry_contract,
-               swap_log_count, distinct_pool_count, route
+               swap_log_count, distinct_pool_count, route,
+               confirmation_status, profit_token_address, profit_amount_raw
         from arbitrage_candidates
         where chain_id = $1
           and block_timestamp >= now() - ($2::text || ' minutes')::interval
@@ -1290,6 +1484,9 @@ async fn load_arbitrage_recent(
             swap_log_count: row.get("swap_log_count"),
             distinct_pool_count: row.get("distinct_pool_count"),
             route: row.get("route"),
+            confirmation_status: row.get("confirmation_status"),
+            profit_token_address: row.get("profit_token_address"),
+            profit_amount_raw: row.get("profit_amount_raw"),
         })
         .collect())
 }
@@ -3400,7 +3597,9 @@ fn render_arbitrage_page(
   <td>{}</td>
   <td>{}</td>
   <td>{}</td>
+  <td>{}</td>
   <td>{}/{}</td>
+  <td>{}</td>
   <td>{}</td>
 </tr>"#,
                 render_copyable_code(&item.tx_hash, 8),
@@ -3408,6 +3607,7 @@ fn render_arbitrage_page(
                 item.block_timestamp
                     .map(|value| value.format("%H:%M:%S").to_string())
                     .unwrap_or_else(|| "n/a".to_owned()),
+                render_arbitrage_status(&item.confirmation_status),
                 item.sender_address
                     .as_deref()
                     .map(|value| render_copyable_code(value, 6))
@@ -3418,6 +3618,7 @@ fn render_arbitrage_page(
                     .unwrap_or_else(|| "n/a".to_owned()),
                 item.swap_log_count,
                 item.distinct_pool_count,
+                render_arbitrage_profit(item),
                 render_route_compact(&item.route, 4),
             )
         })
@@ -3547,7 +3748,7 @@ fn render_arbitrage_page(
         render_table_or_empty(
             &recent_rows,
             "No arbitrage candidates in this window.",
-            "<tr><th>Tx</th><th>Block</th><th>Time</th><th>Sender</th><th>Entry</th><th>Swaps/Pools</th><th>Route</th></tr>",
+            "<tr><th>Tx</th><th>Block</th><th>Time</th><th>Status</th><th>Sender</th><th>Entry</th><th>Swaps/Pools</th><th>Profit</th><th>Route</th></tr>",
         ),
         hot_routes.len(),
         render_table_or_empty(
@@ -3584,6 +3785,29 @@ fn render_route_compact(route: &str, limit: usize) -> String {
         ));
     }
     rendered.join("<span class=\"route-arrow\">→</span>")
+}
+
+fn render_arbitrage_status(status: &str) -> String {
+    let label = match status {
+        "confirmed_stable_surplus_to_sender" => "confirmed stable",
+        "candidate" => "candidate",
+        other => other,
+    };
+    format!("<span class=\"badge\">{}</span>", escape_html(label))
+}
+
+fn render_arbitrage_profit(item: &ArbitrageRecentRow) -> String {
+    match (
+        item.profit_amount_raw.as_deref(),
+        item.profit_token_address.as_deref(),
+    ) {
+        (Some(amount), Some(token)) => format!(
+            "<span>{}</span> {}",
+            escape_html(amount),
+            render_copyable_code(token, 5)
+        ),
+        _ => "n/a".to_owned(),
+    }
 }
 
 fn render_cluster_management_panel(
@@ -8319,6 +8543,10 @@ fn truncate_middle(value: &str, keep: usize) -> String {
         return value.to_owned();
     }
     format!("{}...{}", &value[..keep], &value[value.len() - keep..])
+}
+
+fn truncate_for_display(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn enum_label<T: Serialize>(value: &T) -> String {

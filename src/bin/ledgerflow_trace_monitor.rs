@@ -187,7 +187,12 @@ async fn main() {
             }
             Err(err) => {
                 error!(error = %err, "trace monitor iteration failed");
-                tokio::time::sleep(poll_interval).await;
+                let retry_interval = if err.to_string().contains("QUOTA_EXCEEDED") {
+                    Duration::from_secs(600)
+                } else {
+                    poll_interval
+                };
+                tokio::time::sleep(retry_interval).await;
             }
         }
     }

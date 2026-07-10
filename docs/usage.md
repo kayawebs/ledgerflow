@@ -364,11 +364,26 @@ Trace monitor exposes read-only arbitrage endpoints:
 
 ```bash
 curl "http://127.0.0.1:3010/arbitrage/recent?minutes=60&limit=50" | jq
+curl "http://127.0.0.1:3010/arbitrage/recent?minutes=60&limit=50&confirmed_only=true" | jq
 curl "http://127.0.0.1:3010/arbitrage/hot-pools?minutes=60&limit=25" | jq
 curl "http://127.0.0.1:3010/arbitrage/hot-routes?minutes=60&limit=25" | jq
 ```
 
+`arbitrage_candidates.confirmation_status` separates fast candidates from conservative confirmations:
+
+- `candidate`: multiple known DEX swap events across distinct pools in one transaction. This is not proof of realized profit.
+- `confirmed_stable_surplus_to_sender`: the transaction sender has positive USDC/USDbC ERC20 Transfer net flow inside the same tx, with no USDC/USDbC net outflow. This is intentionally incomplete but high-confidence.
+
 The web portal exposes the same local data at `/app/arbitrage`.
+
+The web portal also exposes a CryptoHouse-backed block range swap API through the web port:
+
+```bash
+curl "http://127.0.0.1:3001/api/swaps/block-range?from_block=48428000&to_block=48428500&min_swaps=1&tx_limit=100&pool_limit=50" \
+  -H "Cookie: ledgerflow_session=<session>" | jq
+```
+
+The API returns `summary`, `swap_txs`, and `hot_pools`. Block ranges are capped at 2,000 blocks per request so ad-hoc UI/API usage does not produce unbounded CryptoHouse scans.
 
 The broader net-delta path is controlled by `LEDGERFLOW_TRACE_MONITOR_LIGHT_DELTAS_ENABLED`. When enabled, the monitor also fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. For a high-throughput candidate-only live detector, set it to `false`.
 
@@ -381,6 +396,31 @@ The broader net-delta path is controlled by `LEDGERFLOW_TRACE_MONITOR_LIGHT_DELT
 The default retention is 7 days. It is configured by `LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS`. Cleanup is intentionally low-priority: the live monitor performs bounded cleanup batches roughly every 15 minutes instead of deleting old rows on every scan iteration.
 
 The monitor intentionally does not call trace RPC. When you need transaction interpretation or internal native movement, pass the returned tx hashes to the transaction analysis API.
+
+### CryptoHouse historical indexer backfill
+
+`ledgerflow_cryptohouse_indexer_backfill` fills the existing local ClickHouse `address_tx_refs` table from CryptoHouse `base.transactions`. It does not call Base RPC and it writes its own checkpoint, defaulting to `base_mainnet_cryptohouse_backfill`, so it can run alongside the canonical RPC indexer.
+
+It is disabled by default. Enable it with a bounded range:
+
+```bash
+LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_ENABLED=true
+LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_START_BLOCK=0
+LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_END_BLOCK=48430000
+LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_BATCH_SIZE=500
+LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_REQUEST_DELAY_MS=100
+LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_QUOTA_BACKOFF_SECS=600
+```
+
+Then run:
+
+```bash
+docker compose up -d cryptohouse-indexer-backfill
+```
+
+The worker imports top-level `from` and `to` address refs only, matching the current indexer table shape. It is intended to accelerate historical address lookup coverage; detailed receipts, logs, traces, and PnL evidence still come from the analysis/monitor paths.
+
+The public CryptoHouse endpoint currently enforces a small hourly query quota. When the worker receives `QUOTA_EXCEEDED`, it backs off instead of restarting in a tight loop.
 
 ### Confirmed alert delivery
 
