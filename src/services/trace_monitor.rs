@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI64, Ordering},
 };
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Row, types::Json};
@@ -26,8 +26,11 @@ const CLEANUP_BATCH_ROWS: i64 = 10_000;
 const UNISWAP_V2_SWAP_TOPIC: &str =
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const UNISWAP_V3_SWAP_TOPIC: &str =
-    "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f";
+    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
 const DEX_SWAP_TOPICS: [&str; 2] = [UNISWAP_V2_SWAP_TOPIC, UNISWAP_V3_SWAP_TOPIC];
+const FAST_ARBITRAGE_SOURCE_RPC_LOGS: &str = "rpc_logs";
+const FAST_ARBITRAGE_SOURCE_CRYPTOHOUSE: &str = "cryptohouse";
+const DEFAULT_CRYPTOHOUSE_URL: &str = "https://crypto-clickhouse.clickhouse.com/?user=crypto";
 
 #[derive(Clone, Debug)]
 pub struct TraceMonitorConfig {
@@ -38,7 +41,10 @@ pub struct TraceMonitorConfig {
     pub block_batch_size: u64,
     pub retention_days: i64,
     pub fast_arbitrage_enabled: bool,
+    pub fast_arbitrage_source: String,
     pub fast_arbitrage_min_swaps: u32,
+    pub fast_arbitrage_source_lag_blocks: u64,
+    pub cryptohouse_url: String,
     pub light_deltas_enabled: bool,
 }
 
@@ -111,6 +117,7 @@ pub struct TraceMonitorService {
     repository: SqlxAnalysisRepository,
     rpc_client: Arc<IndexerRpcClient>,
     block_receipt_rpc: Arc<HttpRpcClient>,
+    cryptohouse_client: reqwest::Client,
     light_fetcher: TransactionBundleFetcher,
     config: TraceMonitorConfig,
     startup_anchor_initialized: Arc<AtomicBool>,
@@ -156,6 +163,10 @@ impl TraceMonitorService {
             repository,
             rpc_client,
             block_receipt_rpc,
+            cryptohouse_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             light_fetcher,
             config,
             startup_anchor_initialized: Arc::new(AtomicBool::new(false)),
@@ -167,7 +178,9 @@ impl TraceMonitorService {
 
     pub async fn process_once(&self) -> LedgerResult<TraceMonitorIteration> {
         let latest_block = self.rpc_client.get_latest_block_number().await?;
-        let target_block = latest_block.saturating_sub(self.config.confirmations);
+        let target_block = latest_block
+            .saturating_sub(self.config.confirmations)
+            .saturating_sub(self.fast_arbitrage_source_lag_blocks());
         let skip_history_on_startup = !self.startup_anchor_initialized.swap(true, Ordering::SeqCst);
         let last_processed = if skip_history_on_startup {
             None
@@ -262,7 +275,9 @@ impl TraceMonitorService {
 
     pub async fn anchor_to_live_start(&self) -> LedgerResult<(u64, u64)> {
         let latest_block = self.rpc_client.get_latest_block_number().await?;
-        let target_block = latest_block.saturating_sub(self.config.confirmations);
+        let target_block = latest_block
+            .saturating_sub(self.config.confirmations)
+            .saturating_sub(self.fast_arbitrage_source_lag_blocks());
         self.upsert_progress(Some(target_block)).await?;
         self.startup_anchor_initialized
             .store(true, Ordering::SeqCst);
@@ -338,6 +353,23 @@ impl TraceMonitorService {
         start_block: u64,
         end_block: u64,
     ) -> LedgerResult<FastArbitrageScan> {
+        match self.fast_arbitrage_source().as_str() {
+            FAST_ARBITRAGE_SOURCE_CRYPTOHOUSE => {
+                self.process_cryptohouse_arbitrage_range(start_block, end_block)
+                    .await
+            }
+            _ => {
+                self.process_rpc_log_arbitrage_range(start_block, end_block)
+                    .await
+            }
+        }
+    }
+
+    async fn process_rpc_log_arbitrage_range(
+        &self,
+        start_block: u64,
+        end_block: u64,
+    ) -> LedgerResult<FastArbitrageScan> {
         let logs = self
             .block_receipt_rpc
             .get_logs_by_topics(start_block, end_block, &DEX_SWAP_TOPICS)
@@ -357,8 +389,12 @@ impl TraceMonitorService {
                     timestamp
                 };
             candidate_rows = candidate_rows.saturating_add(
-                self.upsert_fast_arbitrage_candidate(candidate, block_timestamp)
-                    .await?,
+                self.upsert_fast_arbitrage_candidate(
+                    candidate,
+                    block_timestamp,
+                    "rpc_logs_swap_topics",
+                )
+                .await?,
             );
             candidate_txs = candidate_txs.saturating_add(1);
         }
@@ -368,6 +404,93 @@ impl TraceMonitorService {
             candidate_txs,
             candidate_rows,
         })
+    }
+
+    async fn process_cryptohouse_arbitrage_range(
+        &self,
+        start_block: u64,
+        end_block: u64,
+    ) -> LedgerResult<FastArbitrageScan> {
+        let min_swaps = self.config.fast_arbitrage_min_swaps.max(2);
+        let query = cryptohouse_fast_arbitrage_query(start_block, end_block, min_swaps);
+        let response = self
+            .cryptohouse_client
+            .post(self.cryptohouse_url())
+            .body(query)
+            .send()
+            .await
+            .map_err(|err| LedgerError::TransientIngestion(err.to_string()))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|err| LedgerError::TransientIngestion(err.to_string()))?;
+        if !status.is_success() {
+            return Err(LedgerError::TransientIngestion(format!(
+                "cryptohouse query failed with status {status}: {}",
+                truncate_for_error(&body, 500)
+            )));
+        }
+
+        let (swap_logs, candidates) = fast_arbitrage_candidates_from_cryptohouse_rows(&body)?;
+        let mut candidate_rows = 0_u64;
+        let mut candidate_txs = 0_u64;
+        for (candidate, block_timestamp) in &candidates {
+            candidate_rows = candidate_rows.saturating_add(
+                self.upsert_fast_arbitrage_candidate(
+                    candidate,
+                    *block_timestamp,
+                    "cryptohouse_swap_topics",
+                )
+                .await?,
+            );
+            candidate_txs = candidate_txs.saturating_add(1);
+        }
+
+        Ok(FastArbitrageScan {
+            swap_logs,
+            candidate_txs,
+            candidate_rows,
+        })
+    }
+
+    fn fast_arbitrage_source(&self) -> String {
+        match self
+            .config
+            .fast_arbitrage_source
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            FAST_ARBITRAGE_SOURCE_CRYPTOHOUSE => FAST_ARBITRAGE_SOURCE_CRYPTOHOUSE.to_owned(),
+            FAST_ARBITRAGE_SOURCE_RPC_LOGS | "" => FAST_ARBITRAGE_SOURCE_RPC_LOGS.to_owned(),
+            other => {
+                warn!(
+                    configured_source = other,
+                    fallback_source = FAST_ARBITRAGE_SOURCE_RPC_LOGS,
+                    "unknown trace monitor fast arbitrage source"
+                );
+                FAST_ARBITRAGE_SOURCE_RPC_LOGS.to_owned()
+            }
+        }
+    }
+
+    fn fast_arbitrage_source_lag_blocks(&self) -> u64 {
+        if self.config.fast_arbitrage_enabled
+            && self.fast_arbitrage_source() == FAST_ARBITRAGE_SOURCE_CRYPTOHOUSE
+        {
+            self.config.fast_arbitrage_source_lag_blocks
+        } else {
+            0
+        }
+    }
+
+    fn cryptohouse_url(&self) -> &str {
+        let url = self.config.cryptohouse_url.trim();
+        if url.is_empty() {
+            DEFAULT_CRYPTOHOUSE_URL
+        } else {
+            url
+        }
     }
 
     async fn block_timestamp(&self, block_number: u64) -> LedgerResult<Option<DateTime<Utc>>> {
@@ -750,6 +873,7 @@ impl TraceMonitorService {
         &self,
         candidate: &FastSwapAccumulator,
         block_timestamp: Option<DateTime<Utc>>,
+        detection: &str,
     ) -> LedgerResult<u64> {
         let score = 80_i32
             .saturating_add(i32::try_from(candidate.swap_log_count.min(20)).unwrap_or_default())
@@ -778,7 +902,7 @@ impl TraceMonitorService {
         .bind(score)
         .bind(candidate.swap_log_count as i32)
         .bind(Json(json!({
-            "detection": "eth_getLogs_swap_topics",
+            "detection": detection,
             "candidate_reason": "multiple dex swap events across distinct pools in one transaction",
             "swap_log_count": candidate.swap_log_count,
             "v2_swap_count": candidate.v2_swap_count,
@@ -1041,6 +1165,153 @@ fn fast_arbitrage_candidates_from_logs(
     (swap_logs, candidates)
 }
 
+fn cryptohouse_fast_arbitrage_query(start_block: u64, end_block: u64, min_swaps: u32) -> String {
+    let v2_topic = UNISWAP_V2_SWAP_TOPIC.trim_start_matches("0x");
+    let v3_topic = UNISWAP_V3_SWAP_TOPIC.trim_start_matches("0x");
+    format!(
+        r#"
+SELECT
+  block_number,
+  transaction_hash,
+  count() AS swap_log_count,
+  countIf(position(topics, '{v2_topic}') > 0) AS v2_swap_count,
+  countIf(position(topics, '{v3_topic}') > 0) AS v3_swap_count,
+  uniqExact(address) AS distinct_pool_count,
+  groupUniqArray(32)(address) AS pool_addresses,
+  groupArray(64)(log_index) AS log_indexes,
+  min(transaction_index) AS tx_index,
+  toString(max(block_timestamp)) AS block_timestamp
+FROM base.logs
+WHERE block_number BETWEEN {start_block} AND {end_block}
+  AND (
+    position(topics, '{v2_topic}') > 0
+    OR position(topics, '{v3_topic}') > 0
+  )
+GROUP BY block_number, transaction_hash
+HAVING swap_log_count >= {min_swaps}
+   AND distinct_pool_count >= 2
+ORDER BY block_number, transaction_hash
+LIMIT 10000
+FORMAT JSONEachRow
+"#
+    )
+}
+
+fn fast_arbitrage_candidates_from_cryptohouse_rows(
+    body: &str,
+) -> LedgerResult<(u64, Vec<(FastSwapAccumulator, Option<DateTime<Utc>>)>)> {
+    let mut swap_logs = 0_u64;
+    let mut candidates = Vec::new();
+
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let row: Value = serde_json::from_str(line).map_err(|err| {
+            LedgerError::MalformedEvidence(format!(
+                "cryptohouse JSONEachRow parse failed: {err}; row={}",
+                truncate_for_error(line, 300)
+            ))
+        })?;
+        let tx_hash = row
+            .get("transaction_hash")
+            .and_then(Value::as_str)
+            .map(normalize_hash)
+            .ok_or_else(|| {
+                LedgerError::MalformedEvidence(
+                    "cryptohouse row missing transaction_hash".to_owned(),
+                )
+            })?;
+        let block_number = json_u64(row.get("block_number")).ok_or_else(|| {
+            LedgerError::MalformedEvidence("cryptohouse row missing block_number".to_owned())
+        })?;
+        let swap_log_count = json_u64(row.get("swap_log_count")).unwrap_or_default() as u32;
+        let v2_swap_count = json_u64(row.get("v2_swap_count")).unwrap_or_default() as u32;
+        let v3_swap_count = json_u64(row.get("v3_swap_count")).unwrap_or_default() as u32;
+        let tx_index = json_u64(row.get("tx_index"));
+        let pools = json_string_array(row.get("pool_addresses"))
+            .into_iter()
+            .map(|pool| normalize_hash(&pool))
+            .collect::<BTreeSet<_>>();
+        let log_indexes = json_u64_array(row.get("log_indexes"));
+        let block_timestamp = row
+            .get("block_timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_clickhouse_timestamp);
+
+        swap_logs = swap_logs.saturating_add(u64::from(swap_log_count));
+        candidates.push((
+            FastSwapAccumulator {
+                tx_hash,
+                block_number,
+                tx_index,
+                swap_log_count,
+                v2_swap_count,
+                v3_swap_count,
+                pools,
+                log_indexes,
+            },
+            block_timestamp,
+        ));
+    }
+
+    Ok((swap_logs, candidates))
+}
+
+fn json_u64(value: Option<&Value>) -> Option<u64> {
+    match value {
+        Some(Value::Number(number)) => number.as_u64(),
+        Some(Value::String(value)) => value.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn json_u64_array(value: Option<&Value>) -> Vec<u64> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| json_u64(Some(item)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_hash(value: &str) -> String {
+    let value = value.trim().to_ascii_lowercase();
+    if value.starts_with("0x") {
+        value
+    } else {
+        format!("0x{value}")
+    }
+}
+
+fn parse_clickhouse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|timestamp| Utc.from_utc_datetime(&timestamp))
+        })
+}
+
+fn truncate_for_error(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 fn detect_light_candidates(
     bundle: &RawTransactionBundle,
     flows: &[AssetFlow],
@@ -1232,7 +1503,7 @@ mod tests {
                         log_index: 1,
                         address: "0xpool1".to_owned(),
                         topics: vec![
-                            "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f"
+                            "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
                                 .to_owned(),
                         ],
                         data: "0x".to_owned(),
@@ -1328,5 +1599,28 @@ mod tests {
             2,
         );
         assert!(single_pool_candidates.is_empty());
+    }
+
+    #[test]
+    fn cryptohouse_fast_arbitrage_parser_keeps_candidate_shape() {
+        let body = r#"{"block_number":48428766,"transaction_hash":"da749791a102579224bbfce9bd95b49c8276dd31ac5833a3bfcc46bb2d7d5cfa","swap_log_count":4,"v2_swap_count":1,"v3_swap_count":3,"distinct_pool_count":3,"pool_addresses":["0x1111111111111111111111111111111111111111","2222222222222222222222222222222222222222"],"log_indexes":[1,"2",3],"tx_index":12,"block_timestamp":"2026-07-10 01:02:03"}"#;
+        let (swap_logs, candidates) =
+            fast_arbitrage_candidates_from_cryptohouse_rows(body).expect("parser should work");
+
+        assert_eq!(swap_logs, 4);
+        assert_eq!(candidates.len(), 1);
+        let (candidate, block_timestamp) = &candidates[0];
+        assert_eq!(
+            candidate.tx_hash,
+            "0xda749791a102579224bbfce9bd95b49c8276dd31ac5833a3bfcc46bb2d7d5cfa"
+        );
+        assert_eq!(candidate.block_number, 48_428_766);
+        assert_eq!(candidate.swap_log_count, 4);
+        assert_eq!(candidate.v2_swap_count, 1);
+        assert_eq!(candidate.v3_swap_count, 3);
+        assert_eq!(candidate.pools.len(), 2);
+        assert_eq!(candidate.log_indexes, vec![1, 2, 3]);
+        assert_eq!(candidate.tx_index, Some(12));
+        assert!(block_timestamp.is_some());
     }
 }

@@ -346,7 +346,12 @@ The response is intentionally small. Each item contains the address, asset type,
 
 On every process start, the monitor anchors its progress to the current confirmed block and only scans blocks that arrive after startup. It does not replay an old persisted monitor position.
 
-The fast arbitrage path is enabled by `LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_ENABLED=true`. It scans new block ranges with one `eth_getLogs` call for known DEX swap topics, groups logs by transaction hash, and writes `arbitrage_candidate` rows when one transaction has at least `LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_MIN_SWAPS` swap logs across distinct pools. These rows are fast candidate labels, not confirmed PnL.
+The fast arbitrage path is enabled by `LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_ENABLED=true`. It scans new block ranges for known DEX swap topics, groups logs by transaction hash, and writes `arbitrage_candidate` rows when one transaction has at least `LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_MIN_SWAPS` swap logs across distinct pools. These rows are fast candidate labels, not confirmed PnL.
+
+`LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_SOURCE` controls the log source:
+
+- `rpc_logs`: self-hosted fallback. The monitor uses one `eth_getLogs` call per block range. This is simple but can be slow on Reth when the node must generate filtered logs live.
+- `cryptohouse`: high-throughput mode. The monitor queries CryptoHouse ClickHouse logs, aggregates candidate txs there, and only writes compact candidate rows locally. Set `LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_SOURCE_LAG_BLOCKS` to keep the scan behind the RPC head until the external log source has ingested the block.
 
 The broader net-delta path is controlled by `LEDGERFLOW_TRACE_MONITOR_LIGHT_DELTAS_ENABLED`. When enabled, the monitor also fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. For a high-throughput candidate-only live detector, set it to `false`.
 

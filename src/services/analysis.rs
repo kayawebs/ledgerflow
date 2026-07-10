@@ -377,7 +377,7 @@ fn is_dex_event_log(log: &serde_json::Value) -> bool {
     const UNI_V2_SYNC: &str = "0x1c411e9a96e0712416f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1";
     const UNI_V2_MINT: &str = "0x4c209b5fc8ad50758f13e2e1088ba56f10dff1ff73af114a4f0efc9c4b1d797";
     const UNI_V2_BURN: &str = "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496";
-    const UNI_V3_SWAP: &str = "0xc42079f94a6350d7e6235f291749249f928cc2ac818eb64b52398e603a73a2f";
+    const UNI_V3_SWAP: &str = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67";
     const UNI_V3_MINT: &str = "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488daaf0c7f8d9d54eaf";
     const UNI_V3_BURN: &str = "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c";
     const UNI_V3_COLLECT: &str =
