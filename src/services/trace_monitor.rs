@@ -3,6 +3,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicI64, Ordering},
 };
+use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -568,12 +569,13 @@ impl TraceMonitorService {
             .iter_mut()
             .take(FAST_ARBITRAGE_RPC_ENRICHMENT_MAX_PER_RANGE)
         {
-            match self
-                .rpc_client
-                .get_transaction_by_hash(&candidate.tx_hash)
-                .await
+            match tokio::time::timeout(
+                StdDuration::from_secs(2),
+                self.rpc_client.get_transaction_by_hash(&candidate.tx_hash),
+            )
+            .await
             {
-                Ok(transaction) => {
+                Ok(Ok(transaction)) => {
                     candidate.sender_address = transaction
                         .get("from")
                         .and_then(Value::as_str)
@@ -589,11 +591,18 @@ impl TraceMonitorService {
                             .and_then(parse_hex_u64)
                     });
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     warn!(
                         tx_hash = %candidate.tx_hash,
                         error = %error,
                         "could not enrich rpc-log arbitrage candidate endpoints"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        tx_hash = %candidate.tx_hash,
+                        timeout_secs = 2,
+                        "rpc-log arbitrage candidate endpoint enrichment timed out"
                     );
                 }
             }
