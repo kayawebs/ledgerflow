@@ -7,6 +7,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
@@ -205,6 +206,46 @@ struct IndexerLookupQuery {
     to_block: Option<u64>,
     direction: Option<String>,
     notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArbitragePageQuery {
+    minutes: Option<i64>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct ArbitrageRecentRow {
+    tx_hash: String,
+    block_number: i64,
+    block_timestamp: Option<DateTime<Utc>>,
+    sender_address: Option<String>,
+    entry_contract: Option<String>,
+    swap_log_count: i32,
+    distinct_pool_count: i32,
+    route: String,
+}
+
+#[derive(Debug, Clone)]
+struct ArbitrageHotPoolRow {
+    pool_address: String,
+    tx_count: i64,
+    swap_log_count: i64,
+    unique_senders: i64,
+    unique_routes: i64,
+    last_seen: Option<DateTime<Utc>>,
+    sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ArbitrageHotRouteRow {
+    route_fingerprint: String,
+    route: String,
+    tx_count: i64,
+    swap_log_count: i64,
+    unique_senders: i64,
+    last_seen: Option<DateTime<Utc>>,
+    sample_tx_hashes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -802,6 +843,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/tx-analysis/run", post(run_tx_analysis))
         .route("/app/tx-analysis/share", post(create_tx_analysis_share))
         .route("/share/tx/{share_id}", get(public_tx_analysis_share))
+        .route("/app/arbitrage", get(arbitrage_page))
         .route("/app/cluster-graph", get(cluster_graph_page))
         .route("/app/indexer/progress", get(indexer_progress_page))
         .route("/app/indexer/address-lookup", get(indexer_lookup_page))
@@ -1188,6 +1230,158 @@ async fn tx_analysis_page(
         None,
     )
     .await
+}
+
+async fn arbitrage_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<ArbitragePageQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let minutes = query.minutes.unwrap_or(60).clamp(1, 24 * 60);
+    let limit = query.limit.unwrap_or(50).clamp(10, 200);
+    let recent = load_arbitrage_recent(&state, minutes, limit).await?;
+    let hot_pools = load_arbitrage_hot_pools(&state, minutes, 25).await?;
+    let hot_routes = load_arbitrage_hot_routes(&state, minutes, 25).await?;
+    Ok(Html(render_arbitrage_page(
+        &state,
+        &user,
+        minutes,
+        limit,
+        &recent,
+        &hot_pools,
+        &hot_routes,
+    ))
+    .into_response())
+}
+
+async fn load_arbitrage_recent(
+    state: &WebState,
+    minutes: i64,
+    limit: i64,
+) -> Result<Vec<ArbitrageRecentRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select tx_hash, block_number, block_timestamp, sender_address, entry_contract,
+               swap_log_count, distinct_pool_count, route
+        from arbitrage_candidates
+        where chain_id = $1
+          and block_timestamp >= now() - ($2::text || ' minutes')::interval
+        order by block_timestamp desc nulls last, block_number desc, score desc
+        limit $3
+        "#,
+    )
+    .bind(state.default_chain_id as i64)
+    .bind(minutes)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(err.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ArbitrageRecentRow {
+            tx_hash: row.get("tx_hash"),
+            block_number: row.get("block_number"),
+            block_timestamp: row.get("block_timestamp"),
+            sender_address: row.get("sender_address"),
+            entry_contract: row.get("entry_contract"),
+            swap_log_count: row.get("swap_log_count"),
+            distinct_pool_count: row.get("distinct_pool_count"),
+            route: row.get("route"),
+        })
+        .collect())
+}
+
+async fn load_arbitrage_hot_pools(
+    state: &WebState,
+    minutes: i64,
+    limit: i64,
+) -> Result<Vec<ArbitrageHotPoolRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select
+          p.pool_address,
+          count(distinct p.tx_hash)::bigint as tx_count,
+          coalesce(sum(p.swap_log_count), 0)::bigint as swap_log_count,
+          count(distinct c.sender_address)::bigint as unique_senders,
+          count(distinct c.route_fingerprint)::bigint as unique_routes,
+          max(p.block_timestamp) as last_seen,
+          coalesce(jsonb_agg(distinct p.tx_hash) filter (where p.tx_hash is not null), '[]'::jsonb) as sample_tx_hashes
+        from arbitrage_candidate_pools p
+        join arbitrage_candidates c on c.chain_id = p.chain_id and c.tx_hash = p.tx_hash
+        where p.chain_id = $1
+          and p.block_timestamp >= now() - ($2::text || ' minutes')::interval
+        group by p.pool_address
+        order by tx_count desc, swap_log_count desc, last_seen desc
+        limit $3
+        "#,
+    )
+    .bind(state.default_chain_id as i64)
+    .bind(minutes)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(err.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ArbitrageHotPoolRow {
+            pool_address: row.get("pool_address"),
+            tx_count: row.get("tx_count"),
+            swap_log_count: row.get("swap_log_count"),
+            unique_senders: row.get("unique_senders"),
+            unique_routes: row.get("unique_routes"),
+            last_seen: row.get("last_seen"),
+            sample_tx_hashes: json_value_strings(
+                row.get::<Option<serde_json::Value>, _>("sample_tx_hashes"),
+            ),
+        })
+        .collect())
+}
+
+async fn load_arbitrage_hot_routes(
+    state: &WebState,
+    minutes: i64,
+    limit: i64,
+) -> Result<Vec<ArbitrageHotRouteRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select route_fingerprint, route,
+               count(*)::bigint as tx_count,
+               coalesce(sum(swap_log_count), 0)::bigint as swap_log_count,
+               count(distinct sender_address)::bigint as unique_senders,
+               max(block_timestamp) as last_seen,
+               coalesce(jsonb_agg(tx_hash order by block_timestamp desc) filter (where tx_hash is not null), '[]'::jsonb) as sample_tx_hashes
+        from arbitrage_candidates
+        where chain_id = $1
+          and block_timestamp >= now() - ($2::text || ' minutes')::interval
+          and route_fingerprint <> ''
+        group by route_fingerprint, route
+        order by tx_count desc, swap_log_count desc, last_seen desc
+        limit $3
+        "#,
+    )
+    .bind(state.default_chain_id as i64)
+    .bind(minutes)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(err.to_string()))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ArbitrageHotRouteRow {
+            route_fingerprint: row.get("route_fingerprint"),
+            route: row.get("route"),
+            tx_count: row.get("tx_count"),
+            swap_log_count: row.get("swap_log_count"),
+            unique_senders: row.get("unique_senders"),
+            last_seen: row.get("last_seen"),
+            sample_tx_hashes: json_value_strings(
+                row.get::<Option<serde_json::Value>, _>("sample_tx_hashes"),
+            ),
+        })
+        .collect())
 }
 
 async fn cluster_graph_page(
@@ -3140,6 +3334,7 @@ fn render_dashboard_page(
           <a class="{}" href="/app/cluster-graph">Cluster graph</a>
           <a class="{}" href="/app/address-analysis">Address analysis</a>
           <a class="{}" href="/app/tx-analysis">Single tx analysis</a>
+          <a class="" href="/app/arbitrage">Arbitrage</a>
           <a class="{}" href="/app/indexer/progress">Indexer progress</a>
           <a class="{}" href="/app/indexer/address-lookup">Indexer address lookup</a>
           <a class="{}" href="/app/indexer/api-keys">Indexer API keys</a>
@@ -3184,6 +3379,211 @@ fn render_dashboard_page(
         content_layout,
         render_cluster_autorefresh_script(selected_cluster, start, end, cluster_analysis_tab)
     )
+}
+
+fn render_arbitrage_page(
+    state: &WebState,
+    user: &AppUser,
+    minutes: i64,
+    limit: i64,
+    recent: &[ArbitrageRecentRow],
+    hot_pools: &[ArbitrageHotPoolRow],
+    hot_routes: &[ArbitrageHotRouteRow],
+) -> String {
+    let recent_rows = recent
+        .iter()
+        .map(|item| {
+            format!(
+                r#"<tr>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}/{}</td>
+  <td>{}</td>
+</tr>"#,
+                render_copyable_code(&item.tx_hash, 8),
+                item.block_number,
+                item.block_timestamp
+                    .map(|value| value.format("%H:%M:%S").to_string())
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                item.sender_address
+                    .as_deref()
+                    .map(|value| render_copyable_code(value, 6))
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                item.entry_contract
+                    .as_deref()
+                    .map(|value| render_copyable_code(value, 6))
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                item.swap_log_count,
+                item.distinct_pool_count,
+                render_route_compact(&item.route, 4),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let pool_rows = hot_pools
+        .iter()
+        .map(|item| {
+            format!(
+                r#"<tr>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+</tr>"#,
+                render_copyable_code(&item.pool_address, 6),
+                item.tx_count,
+                item.swap_log_count,
+                item.unique_senders,
+                item.unique_routes,
+                item.last_seen
+                    .map(|value| value.format("%H:%M:%S").to_string())
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                render_sample_hashes(&item.sample_tx_hashes),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let route_rows = hot_routes
+        .iter()
+        .map(|item| {
+            format!(
+                r#"<tr>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+  <td>{}</td>
+</tr>"#,
+                render_copyable_code(&item.route_fingerprint, 10),
+                render_route_compact(&item.route, 6),
+                item.tx_count,
+                item.swap_log_count,
+                item.unique_senders,
+                item.last_seen
+                    .map(|value| value.format("%H:%M:%S").to_string())
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                render_sample_hashes(&item.sample_tx_hashes),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LedgerFlow Arbitrage</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
+    <style>{}</style>
+  </head>
+  <body class="dashboard-body">
+    <div class="dashboard-shell">
+      <aside class="sidebar">
+        <a class="brand" href="/">{}</a>
+        <div class="user-card">
+          <span class="eyebrow">Signed in</span>
+          <strong>{}</strong>
+          <small>Chain {}</small>
+        </div>
+        <nav class="side-nav">
+          <a href="/app/clusters">Cluster management</a>
+          <a href="/app/address-analysis">Address analysis</a>
+          <a href="/app/tx-analysis">Single tx analysis</a>
+          <a class="active" href="/app/arbitrage">Arbitrage</a>
+          <a href="/app/indexer/progress">Indexer progress</a>
+        </nav>
+        <form method="post" action="/auth/logout">
+          <button class="cta ghost" type="submit">Sign out</button>
+        </form>
+      </aside>
+      <main class="dashboard-main">
+        <section class="dashboard-hero">
+          <span class="eyebrow">Live monitor</span>
+          <h1>Arbitrage</h1>
+          <form class="inline-form" method="get" action="/app/arbitrage">
+            <label>Window minutes<input type="number" min="1" max="1440" name="minutes" value="{}"></label>
+            <label>Recent limit<input type="number" min="10" max="200" name="limit" value="{}"></label>
+            <button class="cta secondary" type="submit">Refresh</button>
+          </form>
+        </section>
+        <section class="dashboard-grid">
+          <div class="main-column">
+            <section class="panel">
+              <div class="panel-head"><h2>Recent candidates</h2><span class="badge">{}</span></div>
+              <div class="panel-body">{}</div>
+            </section>
+            <section class="panel">
+              <div class="panel-head"><h2>Hot routes</h2><span class="badge">{}</span></div>
+              <div class="panel-body">{}</div>
+            </section>
+          </div>
+          <div class="side-column">
+            <section class="panel">
+              <div class="panel-head"><h2>Hot pools</h2><span class="badge">{}</span></div>
+              <div class="panel-body">{}</div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>"#,
+        shared_styles(),
+        brand_wordmark_html(),
+        escape_html(&user.email),
+        state.default_chain_id,
+        minutes,
+        limit,
+        recent.len(),
+        render_table_or_empty(
+            &recent_rows,
+            "No arbitrage candidates in this window.",
+            "<tr><th>Tx</th><th>Block</th><th>Time</th><th>Sender</th><th>Entry</th><th>Swaps/Pools</th><th>Route</th></tr>",
+        ),
+        hot_routes.len(),
+        render_table_or_empty(
+            &route_rows,
+            "No repeated routes in this window.",
+            "<tr><th>Fingerprint</th><th>Route</th><th>Txs</th><th>Swaps</th><th>Senders</th><th>Last</th><th>Samples</th></tr>",
+        ),
+        hot_pools.len(),
+        render_table_or_empty(
+            &pool_rows,
+            "No pool activity in this window.",
+            "<tr><th>Pool</th><th>Txs</th><th>Swaps</th><th>Senders</th><th>Routes</th><th>Last</th><th>Samples</th></tr>",
+        ),
+    )
+}
+
+fn render_route_compact(route: &str, limit: usize) -> String {
+    let pools = route
+        .split('>')
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if pools.is_empty() {
+        return "n/a".to_owned();
+    }
+    let mut rendered = pools
+        .iter()
+        .take(limit)
+        .map(|pool| render_copyable_code(pool, 5))
+        .collect::<Vec<_>>();
+    if pools.len() > limit {
+        rendered.push(format!(
+            "<span class=\"badge\">+{}</span>",
+            pools.len().saturating_sub(limit)
+        ));
+    }
+    rendered.join("<span class=\"route-arrow\">→</span>")
 }
 
 fn render_cluster_management_panel(
@@ -6624,6 +7024,20 @@ fn render_sample_hashes(hashes: &[String]) -> String {
         .map(|hash| format!("<code>{}</code>", escape_html(&truncate_middle(hash, 6))))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn json_value_strings(value: Option<serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|value| {
+            value.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 fn render_cluster_alerts_panel(

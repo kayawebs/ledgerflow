@@ -353,6 +353,23 @@ The fast arbitrage path is enabled by `LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_E
 - `rpc_logs`: self-hosted fallback. The monitor uses one `eth_getLogs` call per block range. This is simple but can be slow on Reth when the node must generate filtered logs live.
 - `cryptohouse`: high-throughput mode. The monitor queries CryptoHouse ClickHouse logs, aggregates candidate txs there, and only writes compact candidate rows locally. Set `LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_SOURCE_LAG_BLOCKS` to keep the scan behind the RPC head until the external log source has ingested the block.
 
+The structured arbitrage tables are:
+
+| Table | Purpose |
+| --- | --- |
+| `arbitrage_candidates` | one row per candidate tx, including sender, entry contract, swap count, pool count, route, and route fingerprint |
+| `arbitrage_candidate_pools` | one row per candidate tx/pool pair, including first log index and per-pool swap counts |
+
+Trace monitor exposes read-only arbitrage endpoints:
+
+```bash
+curl "http://127.0.0.1:3010/arbitrage/recent?minutes=60&limit=50" | jq
+curl "http://127.0.0.1:3010/arbitrage/hot-pools?minutes=60&limit=25" | jq
+curl "http://127.0.0.1:3010/arbitrage/hot-routes?minutes=60&limit=25" | jq
+```
+
+The web portal exposes the same local data at `/app/arbitrage`.
+
 The broader net-delta path is controlled by `LEDGERFLOW_TRACE_MONITOR_LIGHT_DELTAS_ENABLED`. When enabled, the monitor also fetches each transaction and receipt without trace, derives visible top-level native transfers plus ERC20 transfer logs, and writes those deltas for broad coverage. For a high-throughput candidate-only live detector, set it to `false`.
 
 | Table | Purpose |

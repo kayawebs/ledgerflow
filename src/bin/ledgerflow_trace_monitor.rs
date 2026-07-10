@@ -16,7 +16,10 @@ use ledgerflow::{
     services::{
         monitor_reporter::{MonitorReporter, MonitorReporterConfig},
         seeds::seed_known_metadata,
-        trace_monitor::{TopAddressDeltasQuery, TraceMonitorConfig, TraceMonitorService},
+        trace_monitor::{
+            HotArbitragePoolsQuery, RecentArbitrageQuery, TopAddressDeltasQuery,
+            TraceMonitorConfig, TraceMonitorService,
+        },
     },
 };
 use serde_json::json;
@@ -225,6 +228,9 @@ fn trace_monitor_router(service: Arc<TraceMonitorService>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/top-address-deltas", get(top_address_deltas))
+        .route("/arbitrage/recent", get(recent_arbitrage))
+        .route("/arbitrage/hot-pools", get(hot_arbitrage_pools))
+        .route("/arbitrage/hot-routes", get(hot_arbitrage_routes))
         .with_state(service)
 }
 
@@ -241,6 +247,45 @@ async fn top_address_deltas(
         "start": query.start,
         "end": query.end,
         "top_n": query.top_n.unwrap_or(25).clamp(1, 200),
+        "items": rows
+    })))
+}
+
+async fn recent_arbitrage(
+    State(service): State<Arc<TraceMonitorService>>,
+    Query(query): Query<RecentArbitrageQuery>,
+) -> Result<Json<serde_json::Value>, TraceMonitorApiError> {
+    let rows = service.recent_arbitrage(&query).await?;
+    Ok(Json(json!({
+        "minutes": query.minutes.unwrap_or(60).clamp(1, 24 * 60),
+        "limit": query.limit.unwrap_or(50).clamp(1, 500),
+        "min_swaps": query.min_swaps.unwrap_or(2).max(2),
+        "items": rows
+    })))
+}
+
+async fn hot_arbitrage_pools(
+    State(service): State<Arc<TraceMonitorService>>,
+    Query(query): Query<HotArbitragePoolsQuery>,
+) -> Result<Json<serde_json::Value>, TraceMonitorApiError> {
+    let rows = service.hot_arbitrage_pools(&query).await?;
+    Ok(Json(json!({
+        "minutes": query.minutes.unwrap_or(60).clamp(1, 24 * 60),
+        "limit": query.limit.unwrap_or(25).clamp(1, 200),
+        "min_txs": query.min_txs.unwrap_or(1).max(1),
+        "items": rows
+    })))
+}
+
+async fn hot_arbitrage_routes(
+    State(service): State<Arc<TraceMonitorService>>,
+    Query(query): Query<HotArbitragePoolsQuery>,
+) -> Result<Json<serde_json::Value>, TraceMonitorApiError> {
+    let rows = service.hot_arbitrage_routes(&query).await?;
+    Ok(Json(json!({
+        "minutes": query.minutes.unwrap_or(60).clamp(1, 24 * 60),
+        "limit": query.limit.unwrap_or(25).clamp(1, 200),
+        "min_txs": query.min_txs.unwrap_or(1).max(1),
         "items": rows
     })))
 }

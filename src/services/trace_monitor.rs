@@ -7,6 +7,7 @@ use std::sync::{
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, types::Json};
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -105,11 +106,65 @@ struct FastSwapAccumulator {
     tx_hash: String,
     block_number: u64,
     tx_index: Option<u64>,
+    sender_address: Option<String>,
+    entry_contract: Option<String>,
     swap_log_count: u32,
     v2_swap_count: u32,
     v3_swap_count: u32,
     pools: BTreeSet<String>,
+    pool_stats: BTreeMap<String, FastPoolStat>,
     log_indexes: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FastPoolStat {
+    pool_address: String,
+    first_log_index: u64,
+    swap_log_count: u32,
+    v2_swap_count: u32,
+    v3_swap_count: u32,
+}
+
+impl FastSwapAccumulator {
+    fn record_swap_log(&mut self, pool: String, topic0: &str, log_index: u64) {
+        self.swap_log_count = self.swap_log_count.saturating_add(1);
+        self.pools.insert(pool.clone());
+        self.log_indexes.push(log_index);
+        let pool_stat = self
+            .pool_stats
+            .entry(pool.clone())
+            .or_insert_with(|| FastPoolStat {
+                pool_address: pool,
+                first_log_index: log_index,
+                ..Default::default()
+            });
+        pool_stat.first_log_index = pool_stat.first_log_index.min(log_index);
+        pool_stat.swap_log_count = pool_stat.swap_log_count.saturating_add(1);
+        if topic0 == UNISWAP_V2_SWAP_TOPIC {
+            self.v2_swap_count = self.v2_swap_count.saturating_add(1);
+            pool_stat.v2_swap_count = pool_stat.v2_swap_count.saturating_add(1);
+        } else if topic0 == UNISWAP_V3_SWAP_TOPIC {
+            self.v3_swap_count = self.v3_swap_count.saturating_add(1);
+            pool_stat.v3_swap_count = pool_stat.v3_swap_count.saturating_add(1);
+        }
+    }
+
+    fn pool_addresses(&self) -> Vec<String> {
+        self.route_pool_stats()
+            .into_iter()
+            .map(|pool| pool.pool_address)
+            .collect()
+    }
+
+    fn route_pool_stats(&self) -> Vec<FastPoolStat> {
+        let mut pools = self.pool_stats.values().cloned().collect::<Vec<_>>();
+        pools.sort_by(|left, right| {
+            left.first_log_index
+                .cmp(&right.first_log_index)
+                .then_with(|| left.pool_address.cmp(&right.pool_address))
+        });
+        pools
+    }
 }
 
 #[derive(Clone)]
@@ -137,6 +192,62 @@ pub struct TopAddressDeltasQuery {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub top_n: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RecentArbitrageQuery {
+    pub chain_id: Option<u64>,
+    pub minutes: Option<i64>,
+    pub limit: Option<u32>,
+    pub min_swaps: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct HotArbitragePoolsQuery {
+    pub chain_id: Option<u64>,
+    pub minutes: Option<i64>,
+    pub limit: Option<u32>,
+    pub min_txs: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RecentArbitrageCandidate {
+    pub tx_hash: String,
+    pub block_number: u64,
+    pub block_timestamp: Option<DateTime<Utc>>,
+    pub detection_source: String,
+    pub sender_address: Option<String>,
+    pub entry_contract: Option<String>,
+    pub score: i32,
+    pub swap_log_count: u32,
+    pub distinct_pool_count: u32,
+    pub route: String,
+    pub route_fingerprint: String,
+    pub pool_addresses: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HotArbitragePool {
+    pub pool_address: String,
+    pub tx_count: u64,
+    pub swap_log_count: u64,
+    pub unique_senders: u64,
+    pub unique_routes: u64,
+    pub first_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub sample_tx_hashes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HotArbitrageRoute {
+    pub route_fingerprint: String,
+    pub route: String,
+    pub tx_count: u64,
+    pub swap_log_count: u64,
+    pub unique_senders: u64,
+    pub first_seen: Option<DateTime<Utc>>,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub sample_tx_hashes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -773,6 +884,183 @@ impl TraceMonitorService {
         Ok(rows)
     }
 
+    pub async fn recent_arbitrage(
+        &self,
+        query: &RecentArbitrageQuery,
+    ) -> LedgerResult<Vec<RecentArbitrageCandidate>> {
+        let chain_id = query.chain_id.unwrap_or(self.config.chain_id) as i64;
+        let minutes = query.minutes.unwrap_or(60).clamp(1, 24 * 60);
+        let limit = query.limit.unwrap_or(50).clamp(1, 500) as i64;
+        let min_swaps = query.min_swaps.unwrap_or(2).max(2) as i32;
+        let rows = sqlx::query(
+            r#"
+            select
+              tx_hash, block_number, block_timestamp, detection_source,
+              sender_address, entry_contract, score, swap_log_count,
+              distinct_pool_count, route, route_fingerprint,
+              metadata -> 'pool_addresses' as pool_addresses
+            from arbitrage_candidates
+            where chain_id = $1
+              and block_timestamp >= now() - ($2::text || ' minutes')::interval
+              and swap_log_count >= $3
+            order by block_timestamp desc nulls last, block_number desc, score desc
+            limit $4
+            "#,
+        )
+        .bind(chain_id)
+        .bind(minutes)
+        .bind(min_swaps)
+        .bind(limit)
+        .fetch_all(self.repository.pool())
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| RecentArbitrageCandidate {
+                tx_hash: row.get::<String, _>("tx_hash"),
+                block_number: row.get::<i64, _>("block_number").max(0) as u64,
+                block_timestamp: row.get("block_timestamp"),
+                detection_source: row.get("detection_source"),
+                sender_address: row.get("sender_address"),
+                entry_contract: row.get("entry_contract"),
+                score: row.get("score"),
+                swap_log_count: row.get::<i32, _>("swap_log_count").max(0) as u32,
+                distinct_pool_count: row.get::<i32, _>("distinct_pool_count").max(0) as u32,
+                route: row.get("route"),
+                route_fingerprint: row.get("route_fingerprint"),
+                pool_addresses: row
+                    .get::<Option<Value>, _>("pool_addresses")
+                    .and_then(|value| {
+                        value.as_array().map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(ToOwned::to_owned)
+                                .collect()
+                        })
+                    })
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    pub async fn hot_arbitrage_pools(
+        &self,
+        query: &HotArbitragePoolsQuery,
+    ) -> LedgerResult<Vec<HotArbitragePool>> {
+        let chain_id = query.chain_id.unwrap_or(self.config.chain_id) as i64;
+        let minutes = query.minutes.unwrap_or(60).clamp(1, 24 * 60);
+        let limit = query.limit.unwrap_or(25).clamp(1, 200) as i64;
+        let min_txs = query.min_txs.unwrap_or(1).max(1) as i64;
+        let rows = sqlx::query(
+            r#"
+            select
+              p.pool_address,
+              count(distinct p.tx_hash)::bigint as tx_count,
+              coalesce(sum(p.swap_log_count), 0)::bigint as swap_log_count,
+              count(distinct c.sender_address)::bigint as unique_senders,
+              count(distinct c.route_fingerprint)::bigint as unique_routes,
+              min(p.block_timestamp) as first_seen,
+              max(p.block_timestamp) as last_seen,
+              coalesce(jsonb_agg(distinct p.tx_hash) filter (where p.tx_hash is not null), '[]'::jsonb) as sample_tx_hashes
+            from arbitrage_candidate_pools p
+            join arbitrage_candidates c
+              on c.chain_id = p.chain_id
+             and c.tx_hash = p.tx_hash
+            where p.chain_id = $1
+              and p.block_timestamp >= now() - ($2::text || ' minutes')::interval
+            group by p.pool_address
+            having count(distinct p.tx_hash) >= $3
+            order by tx_count desc, swap_log_count desc, last_seen desc
+            limit $4
+            "#,
+        )
+        .bind(chain_id)
+        .bind(minutes)
+        .bind(min_txs)
+        .bind(limit)
+        .fetch_all(self.repository.pool())
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| HotArbitragePool {
+                pool_address: row.get("pool_address"),
+                tx_count: row.get::<i64, _>("tx_count").max(0) as u64,
+                swap_log_count: row.get::<i64, _>("swap_log_count").max(0) as u64,
+                unique_senders: row.get::<i64, _>("unique_senders").max(0) as u64,
+                unique_routes: row.get::<i64, _>("unique_routes").max(0) as u64,
+                first_seen: row.get("first_seen"),
+                last_seen: row.get("last_seen"),
+                sample_tx_hashes: json_string_array(
+                    row.get::<Option<Value>, _>("sample_tx_hashes").as_ref(),
+                )
+                .into_iter()
+                .take(5)
+                .collect(),
+            })
+            .collect())
+    }
+
+    pub async fn hot_arbitrage_routes(
+        &self,
+        query: &HotArbitragePoolsQuery,
+    ) -> LedgerResult<Vec<HotArbitrageRoute>> {
+        let chain_id = query.chain_id.unwrap_or(self.config.chain_id) as i64;
+        let minutes = query.minutes.unwrap_or(60).clamp(1, 24 * 60);
+        let limit = query.limit.unwrap_or(25).clamp(1, 200) as i64;
+        let min_txs = query.min_txs.unwrap_or(1).max(1) as i64;
+        let rows = sqlx::query(
+            r#"
+            select
+              route_fingerprint,
+              route,
+              count(*)::bigint as tx_count,
+              coalesce(sum(swap_log_count), 0)::bigint as swap_log_count,
+              count(distinct sender_address)::bigint as unique_senders,
+              min(block_timestamp) as first_seen,
+              max(block_timestamp) as last_seen,
+              coalesce(jsonb_agg(tx_hash order by block_timestamp desc) filter (where tx_hash is not null), '[]'::jsonb) as sample_tx_hashes
+            from arbitrage_candidates
+            where chain_id = $1
+              and block_timestamp >= now() - ($2::text || ' minutes')::interval
+              and route_fingerprint <> ''
+            group by route_fingerprint, route
+            having count(*) >= $3
+            order by tx_count desc, swap_log_count desc, last_seen desc
+            limit $4
+            "#,
+        )
+        .bind(chain_id)
+        .bind(minutes)
+        .bind(min_txs)
+        .bind(limit)
+        .fetch_all(self.repository.pool())
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| HotArbitrageRoute {
+                route_fingerprint: row.get("route_fingerprint"),
+                route: row.get("route"),
+                tx_count: row.get::<i64, _>("tx_count").max(0) as u64,
+                swap_log_count: row.get::<i64, _>("swap_log_count").max(0) as u64,
+                unique_senders: row.get::<i64, _>("unique_senders").max(0) as u64,
+                first_seen: row.get("first_seen"),
+                last_seen: row.get("last_seen"),
+                sample_tx_hashes: json_string_array(
+                    row.get::<Option<Value>, _>("sample_tx_hashes").as_ref(),
+                )
+                .into_iter()
+                .take(5)
+                .collect(),
+            })
+            .collect())
+    }
+
     async fn upsert_cluster_deltas(
         &self,
         tx_hash: &str,
@@ -878,6 +1166,9 @@ impl TraceMonitorService {
         let score = 80_i32
             .saturating_add(i32::try_from(candidate.swap_log_count.min(20)).unwrap_or_default())
             .saturating_add(i32::try_from(candidate.pools.len().min(20)).unwrap_or_default());
+        let route = candidate_route(candidate);
+        let route_fingerprint = route_fingerprint(&route);
+        let pool_addresses = candidate.pool_addresses();
         sqlx::query(
             r#"
             insert into trace_monitor_candidates (
@@ -908,9 +1199,13 @@ impl TraceMonitorService {
             "v2_swap_count": candidate.v2_swap_count,
             "v3_swap_count": candidate.v3_swap_count,
             "distinct_pool_count": candidate.pools.len(),
-            "pool_addresses": candidate.pools.iter().cloned().collect::<Vec<_>>(),
+            "pool_addresses": pool_addresses,
             "log_indexes": candidate.log_indexes,
             "tx_index": candidate.tx_index,
+            "sender_address": candidate.sender_address,
+            "entry_contract": candidate.entry_contract,
+            "route": route,
+            "route_fingerprint": route_fingerprint,
             "coverage": {
                 "uses_receipt": false,
                 "uses_trace": false,
@@ -921,7 +1216,132 @@ impl TraceMonitorService {
         .execute(self.repository.pool())
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        self.upsert_structured_arbitrage_candidate(
+            candidate,
+            block_timestamp,
+            detection,
+            score,
+            &route,
+            &route_fingerprint,
+        )
+        .await?;
         Ok(1)
+    }
+
+    async fn upsert_structured_arbitrage_candidate(
+        &self,
+        candidate: &FastSwapAccumulator,
+        block_timestamp: Option<DateTime<Utc>>,
+        detection: &str,
+        score: i32,
+        route: &str,
+        route_fingerprint: &str,
+    ) -> LedgerResult<()> {
+        sqlx::query(
+            r#"
+            insert into arbitrage_candidates (
+              chain_id, tx_hash, block_number, block_timestamp, detection_source,
+              sender_address, entry_contract, tx_index, score, swap_log_count,
+              v2_swap_count, v3_swap_count, distinct_pool_count, route,
+              route_fingerprint, metadata, created_at, updated_at
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now(),now())
+            on conflict (chain_id, tx_hash) do update set
+              block_number = excluded.block_number,
+              block_timestamp = excluded.block_timestamp,
+              detection_source = excluded.detection_source,
+              sender_address = excluded.sender_address,
+              entry_contract = excluded.entry_contract,
+              tx_index = excluded.tx_index,
+              score = greatest(arbitrage_candidates.score, excluded.score),
+              swap_log_count = excluded.swap_log_count,
+              v2_swap_count = excluded.v2_swap_count,
+              v3_swap_count = excluded.v3_swap_count,
+              distinct_pool_count = excluded.distinct_pool_count,
+              route = excluded.route,
+              route_fingerprint = excluded.route_fingerprint,
+              metadata = excluded.metadata,
+              updated_at = now()
+            "#,
+        )
+        .bind(self.config.chain_id as i64)
+        .bind(&candidate.tx_hash)
+        .bind(candidate.block_number as i64)
+        .bind(block_timestamp)
+        .bind(detection)
+        .bind(candidate.sender_address.as_deref())
+        .bind(candidate.entry_contract.as_deref())
+        .bind(candidate.tx_index.map(|value| value as i64))
+        .bind(score)
+        .bind(candidate.swap_log_count as i32)
+        .bind(candidate.v2_swap_count as i32)
+        .bind(candidate.v3_swap_count as i32)
+        .bind(candidate.pools.len() as i32)
+        .bind(route)
+        .bind(route_fingerprint)
+        .bind(Json(json!({
+            "pool_addresses": candidate.pool_addresses(),
+            "log_indexes": candidate.log_indexes,
+            "candidate_reason": "multiple dex swap events across distinct pools in one transaction",
+            "confirmed_pnl": false,
+        })))
+        .execute(self.repository.pool())
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        sqlx::query(
+            r#"
+            delete from arbitrage_candidate_pools
+            where chain_id = $1 and tx_hash = $2
+            "#,
+        )
+        .bind(self.config.chain_id as i64)
+        .bind(&candidate.tx_hash)
+        .execute(self.repository.pool())
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        for (position, pool) in candidate.route_pool_stats().iter().enumerate() {
+            sqlx::query(
+                r#"
+                insert into arbitrage_candidate_pools (
+                  chain_id, tx_hash, pool_address, block_number, block_timestamp,
+                  first_log_index, swap_log_count, v2_swap_count, v3_swap_count,
+                  route_position, metadata, created_at, updated_at
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),now())
+                on conflict (chain_id, tx_hash, pool_address) do update set
+                  block_number = excluded.block_number,
+                  block_timestamp = excluded.block_timestamp,
+                  first_log_index = excluded.first_log_index,
+                  swap_log_count = excluded.swap_log_count,
+                  v2_swap_count = excluded.v2_swap_count,
+                  v3_swap_count = excluded.v3_swap_count,
+                  route_position = excluded.route_position,
+                  metadata = excluded.metadata,
+                  updated_at = now()
+                "#,
+            )
+            .bind(self.config.chain_id as i64)
+            .bind(&candidate.tx_hash)
+            .bind(&pool.pool_address)
+            .bind(candidate.block_number as i64)
+            .bind(block_timestamp)
+            .bind(pool.first_log_index as i64)
+            .bind(pool.swap_log_count as i32)
+            .bind(pool.v2_swap_count as i32)
+            .bind(pool.v3_swap_count as i32)
+            .bind(position as i32)
+            .bind(Json(json!({
+                "tx_index": candidate.tx_index,
+                "sender_address": candidate.sender_address,
+                "entry_contract": candidate.entry_contract,
+            })))
+            .execute(self.repository.pool())
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        }
+        Ok(())
     }
 
     async fn cleanup_expired_rows_if_due(&self) -> LedgerResult<()> {
@@ -1139,22 +1559,18 @@ fn fast_arbitrage_candidates_from_logs(
                 tx_hash,
                 block_number,
                 tx_index,
+                sender_address: None,
+                entry_contract: None,
                 swap_log_count: 0,
                 v2_swap_count: 0,
                 v3_swap_count: 0,
                 pools: BTreeSet::new(),
+                pool_stats: BTreeMap::new(),
                 log_indexes: Vec::new(),
             });
-        entry.swap_log_count = entry.swap_log_count.saturating_add(1);
         entry.block_number = entry.block_number.min(block_number);
         entry.tx_index = entry.tx_index.or(tx_index);
-        entry.pools.insert(pool);
-        entry.log_indexes.push(log_index);
-        if topic0 == UNISWAP_V2_SWAP_TOPIC {
-            entry.v2_swap_count = entry.v2_swap_count.saturating_add(1);
-        } else if topic0 == UNISWAP_V3_SWAP_TOPIC {
-            entry.v3_swap_count = entry.v3_swap_count.saturating_add(1);
-        }
+        entry.record_swap_log(pool, &topic0, log_index);
         swap_logs = swap_logs.saturating_add(1);
     }
 
@@ -1171,26 +1587,32 @@ fn cryptohouse_fast_arbitrage_query(start_block: u64, end_block: u64, min_swaps:
     format!(
         r#"
 SELECT
-  block_number,
-  transaction_hash,
+  l.block_number,
+  l.transaction_hash,
   count() AS swap_log_count,
-  countIf(position(topics, '{v2_topic}') > 0) AS v2_swap_count,
-  countIf(position(topics, '{v3_topic}') > 0) AS v3_swap_count,
-  uniqExact(address) AS distinct_pool_count,
-  groupUniqArray(32)(address) AS pool_addresses,
-  groupArray(64)(log_index) AS log_indexes,
-  min(transaction_index) AS tx_index,
-  toString(max(block_timestamp)) AS block_timestamp
-FROM base.logs
-WHERE block_number BETWEEN {start_block} AND {end_block}
+  countIf(position(l.topics, '{v2_topic}') > 0) AS v2_swap_count,
+  countIf(position(l.topics, '{v3_topic}') > 0) AS v3_swap_count,
+  uniqExact(l.address) AS distinct_pool_count,
+  groupArray(128)(l.address) AS pool_addresses,
+  groupArray(128)(l.log_index) AS log_indexes,
+  groupArray(128)(arrayElement(splitByChar(',', l.topics), 1)) AS topic0s,
+  min(l.transaction_index) AS tx_index,
+  toString(max(l.block_timestamp)) AS block_timestamp,
+  any(t.from_address) AS sender_address,
+  any(t.to_address) AS entry_contract
+FROM base.logs AS l
+LEFT JOIN base.transactions AS t
+  ON t.block_number = l.block_number
+ AND t.hash = l.transaction_hash
+WHERE l.block_number BETWEEN {start_block} AND {end_block}
   AND (
-    position(topics, '{v2_topic}') > 0
-    OR position(topics, '{v3_topic}') > 0
+    position(l.topics, '{v2_topic}') > 0
+    OR position(l.topics, '{v3_topic}') > 0
   )
-GROUP BY block_number, transaction_hash
+GROUP BY l.block_number, l.transaction_hash
 HAVING swap_log_count >= {min_swaps}
    AND distinct_pool_count >= 2
-ORDER BY block_number, transaction_hash
+ORDER BY l.block_number, l.transaction_hash
 LIMIT 10000
 FORMAT JSONEachRow
 "#
@@ -1226,30 +1648,50 @@ fn fast_arbitrage_candidates_from_cryptohouse_rows(
         let v2_swap_count = json_u64(row.get("v2_swap_count")).unwrap_or_default() as u32;
         let v3_swap_count = json_u64(row.get("v3_swap_count")).unwrap_or_default() as u32;
         let tx_index = json_u64(row.get("tx_index"));
-        let pools = json_string_array(row.get("pool_addresses"))
-            .into_iter()
-            .map(|pool| normalize_hash(&pool))
-            .collect::<BTreeSet<_>>();
+        let sender_address = row
+            .get("sender_address")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(normalize_hash);
+        let entry_contract = row
+            .get("entry_contract")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(normalize_hash);
+        let pool_logs = json_string_array(row.get("pool_addresses"));
         let log_indexes = json_u64_array(row.get("log_indexes"));
+        let topic0s = json_string_array(row.get("topic0s"));
         let block_timestamp = row
             .get("block_timestamp")
             .and_then(Value::as_str)
             .and_then(parse_clickhouse_timestamp);
 
+        let mut candidate = FastSwapAccumulator {
+            tx_hash,
+            block_number,
+            tx_index,
+            sender_address,
+            entry_contract,
+            swap_log_count: 0,
+            v2_swap_count: 0,
+            v3_swap_count: 0,
+            pools: BTreeSet::new(),
+            pool_stats: BTreeMap::new(),
+            log_indexes: Vec::new(),
+        };
+        for (index, pool) in pool_logs.iter().enumerate() {
+            let topic0 = topic0s.get(index).map(String::as_str).unwrap_or_default();
+            let log_index = log_indexes.get(index).copied().unwrap_or_default();
+            candidate.record_swap_log(normalize_hash(pool), &normalize_hash(topic0), log_index);
+        }
+        if candidate.swap_log_count == 0 {
+            candidate.swap_log_count = swap_log_count;
+            candidate.v2_swap_count = v2_swap_count;
+            candidate.v3_swap_count = v3_swap_count;
+            candidate.log_indexes = log_indexes;
+        }
         swap_logs = swap_logs.saturating_add(u64::from(swap_log_count));
-        candidates.push((
-            FastSwapAccumulator {
-                tx_hash,
-                block_number,
-                tx_index,
-                swap_log_count,
-                v2_swap_count,
-                v3_swap_count,
-                pools,
-                log_indexes,
-            },
-            block_timestamp,
-        ));
+        candidates.push((candidate, block_timestamp));
     }
 
     Ok((swap_logs, candidates))
@@ -1295,6 +1737,19 @@ fn normalize_hash(value: &str) -> String {
     } else {
         format!("0x{value}")
     }
+}
+
+fn candidate_route(candidate: &FastSwapAccumulator) -> String {
+    candidate.pool_addresses().join(">")
+}
+
+fn route_fingerprint(route: &str) -> String {
+    if route.is_empty() {
+        return String::new();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(route.as_bytes());
+    format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 fn parse_clickhouse_timestamp(value: &str) -> Option<DateTime<Utc>> {
@@ -1603,11 +2058,11 @@ mod tests {
 
     #[test]
     fn cryptohouse_fast_arbitrage_parser_keeps_candidate_shape() {
-        let body = r#"{"block_number":48428766,"transaction_hash":"da749791a102579224bbfce9bd95b49c8276dd31ac5833a3bfcc46bb2d7d5cfa","swap_log_count":4,"v2_swap_count":1,"v3_swap_count":3,"distinct_pool_count":3,"pool_addresses":["0x1111111111111111111111111111111111111111","2222222222222222222222222222222222222222"],"log_indexes":[1,"2",3],"tx_index":12,"block_timestamp":"2026-07-10 01:02:03"}"#;
+        let body = r#"{"block_number":48428766,"transaction_hash":"da749791a102579224bbfce9bd95b49c8276dd31ac5833a3bfcc46bb2d7d5cfa","swap_log_count":3,"v2_swap_count":1,"v3_swap_count":2,"distinct_pool_count":2,"pool_addresses":["0x1111111111111111111111111111111111111111","2222222222222222222222222222222222222222","0x1111111111111111111111111111111111111111"],"log_indexes":[1,"2",3],"topic0s":["0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822","0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67","0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"],"tx_index":12,"block_timestamp":"2026-07-10 01:02:03","sender_address":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","entry_contract":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
         let (swap_logs, candidates) =
             fast_arbitrage_candidates_from_cryptohouse_rows(body).expect("parser should work");
 
-        assert_eq!(swap_logs, 4);
+        assert_eq!(swap_logs, 3);
         assert_eq!(candidates.len(), 1);
         let (candidate, block_timestamp) = &candidates[0];
         assert_eq!(
@@ -1615,12 +2070,25 @@ mod tests {
             "0xda749791a102579224bbfce9bd95b49c8276dd31ac5833a3bfcc46bb2d7d5cfa"
         );
         assert_eq!(candidate.block_number, 48_428_766);
-        assert_eq!(candidate.swap_log_count, 4);
+        assert_eq!(candidate.swap_log_count, 3);
         assert_eq!(candidate.v2_swap_count, 1);
-        assert_eq!(candidate.v3_swap_count, 3);
+        assert_eq!(candidate.v3_swap_count, 2);
         assert_eq!(candidate.pools.len(), 2);
         assert_eq!(candidate.log_indexes, vec![1, 2, 3]);
         assert_eq!(candidate.tx_index, Some(12));
+        assert_eq!(
+            candidate.sender_address.as_deref(),
+            Some("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            candidate.entry_contract.as_deref(),
+            Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            candidate_route(candidate),
+            "0x1111111111111111111111111111111111111111>0x2222222222222222222222222222222222222222"
+        );
+        assert!(route_fingerprint(&candidate_route(candidate)).starts_with("sha256:"));
         assert!(block_timestamp.is_some());
     }
 }
