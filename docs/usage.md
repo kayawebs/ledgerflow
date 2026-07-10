@@ -353,6 +353,8 @@ The fast arbitrage path is enabled by `LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_E
 - `rpc_logs`: self-hosted fallback. The monitor uses one `eth_getLogs` call per block range. This is simple but can be slow on Reth when the node must generate filtered logs live.
 - `cryptohouse`: high-throughput mode. The monitor queries CryptoHouse ClickHouse logs, aggregates candidate txs there, and only writes compact candidate rows locally. Set `LEDGERFLOW_TRACE_MONITOR_FAST_ARBITRAGE_SOURCE_LAG_BLOCKS` to keep the scan behind the RPC head until the external log source has ingested the block.
 
+Docker Compose defaults the live arbitrage monitor to `rpc_logs` through `LEDGERFLOW_TRACE_MONITOR_COMPOSE_FAST_ARBITRAGE_SOURCE=rpc_logs`, so live capture does not depend on the public CryptoHouse quota.
+
 The structured arbitrage tables are:
 
 | Table | Purpose |
@@ -396,31 +398,6 @@ The broader net-delta path is controlled by `LEDGERFLOW_TRACE_MONITOR_LIGHT_DELT
 The default retention is 7 days. It is configured by `LEDGERFLOW_TRACE_MONITOR_RETENTION_DAYS`. Cleanup is intentionally low-priority: the live monitor performs bounded cleanup batches roughly every 15 minutes instead of deleting old rows on every scan iteration.
 
 The monitor intentionally does not call trace RPC. When you need transaction interpretation or internal native movement, pass the returned tx hashes to the transaction analysis API.
-
-### CryptoHouse historical indexer backfill
-
-`ledgerflow_cryptohouse_indexer_backfill` fills the existing local ClickHouse `address_tx_refs` table from CryptoHouse `base.transactions`. It does not call Base RPC and it writes its own checkpoint, defaulting to `base_mainnet_cryptohouse_backfill`, so it can run alongside the canonical RPC indexer.
-
-It is disabled by default. Enable it with a bounded range:
-
-```bash
-LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_ENABLED=true
-LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_START_BLOCK=0
-LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_END_BLOCK=48430000
-LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_BATCH_SIZE=500
-LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_REQUEST_DELAY_MS=100
-LEDGERFLOW_CRYPTOHOUSE_INDEXER_BACKFILL_QUOTA_BACKOFF_SECS=600
-```
-
-Then run:
-
-```bash
-docker compose up -d cryptohouse-indexer-backfill
-```
-
-The worker imports top-level `from` and `to` address refs only, matching the current indexer table shape. It is intended to accelerate historical address lookup coverage; detailed receipts, logs, traces, and PnL evidence still come from the analysis/monitor paths.
-
-The public CryptoHouse endpoint currently enforces a small hourly query quota. When the worker receives `QUOTA_EXCEEDED`, it backs off instead of restarting in a tight loop.
 
 ### Confirmed alert delivery
 
