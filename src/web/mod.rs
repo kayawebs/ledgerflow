@@ -432,6 +432,14 @@ struct IndexerProgressPayload {
     worker_id: String,
     last_indexed_block: u64,
     #[serde(default)]
+    contiguous_indexed_through_block: Option<u64>,
+    #[serde(default)]
+    max_stored_indexed_block: Option<u64>,
+    #[serde(default)]
+    lazy_enabled: bool,
+    #[serde(default)]
+    pending_indexing_requests: u64,
+    #[serde(default)]
     endpoint_backfill_pending_rows: Option<u64>,
 }
 
@@ -439,6 +447,16 @@ struct IndexerProgressPayload {
 struct IndexerAddressRefsPayload {
     address: String,
     refs: Vec<IndexerAddressRef>,
+    coverage: Option<IndexerLazyCoveragePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexerLazyCoveragePayload {
+    from_block: u64,
+    to_block: u64,
+    requested_block_count: u64,
+    indexed_block_count: u64,
+    complete: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7818,7 +7836,10 @@ fn render_indexer_progress_panel(progress: Option<&IndexerProgressPayload>) -> S
                 r#"<div class="stats-grid">
   <div class="stat"><span>Chain ID</span><strong>{}</strong></div>
   <div class="stat"><span>Worker ID</span><strong>{}</strong></div>
-  <div class="stat"><span>Last indexed block</span><strong>{}</strong></div>
+  <div class="stat"><span>Query target block</span><strong>{}</strong></div>
+  <div class="stat"><span>Max stored block</span><strong>{}</strong></div>
+  <div class="stat"><span>Contiguous through</span><strong>{}</strong></div>
+  <div class="stat"><span>Lazy queue</span><strong>{}</strong><small>{} pending</small></div>
   <div class="stat"><span>Pending from/to backfill rows</span><strong>{}</strong></div>
 </div>
 <div class="panel-copy">This portal keeps indexer and analysis separate. The indexer discovers address-level transaction references; the analysis stack consumes those references for cluster backfill, tx interpretation, and spend attribution.</div>
@@ -7829,6 +7850,10 @@ fn render_indexer_progress_panel(progress: Option<&IndexerProgressPayload>) -> S
                 progress.chain_id,
                 escape_html(&progress.worker_id),
                 progress.last_indexed_block,
+                progress.max_stored_indexed_block.unwrap_or(0),
+                progress.contiguous_indexed_through_block.unwrap_or(0),
+                if progress.lazy_enabled { "enabled" } else { "disabled" },
+                progress.pending_indexing_requests,
                 progress.endpoint_backfill_pending_rows.unwrap_or(0)
             )
         })
@@ -7970,12 +7995,43 @@ fn render_indexer_lookup_panel(
         .unwrap_or_default();
     let results = lookup
         .map(|payload| {
+            let coverage = payload
+                .coverage
+                .as_ref()
+                .map(|coverage| {
+                    let tone = if coverage.complete {
+                        "success"
+                    } else {
+                        "warning"
+                    };
+                    format!(
+                        r#"<div class="notice {}">Block coverage: {} / {} ({}-{})</div>"#,
+                        tone,
+                        coverage.indexed_block_count,
+                        coverage.requested_block_count,
+                        coverage.from_block,
+                        coverage.to_block
+                    )
+                })
+                .unwrap_or_default();
             if payload.refs.is_empty() {
-                return "<div class=\"empty-state\">No top-level transaction references matched this query.</div>"
-                    .to_owned();
+                let message = if payload
+                    .coverage
+                    .as_ref()
+                    .map(|coverage| coverage.complete)
+                    .unwrap_or(true)
+                {
+                    "No top-level transaction references matched this query."
+                } else {
+                    "Indexing is queued. No stored references are available yet."
+                };
+                return format!(
+                    "{}<div class=\"empty-state\">{}</div>",
+                    coverage, message
+                );
             }
             format!(
-                r#"<div class="stats-grid">
+                r#"{}<div class="stats-grid">
   <div class="stat"><span>Address</span><strong><code>{}</code></strong></div>
   <div class="stat"><span>Hits returned</span><strong>{}</strong></div>
 </div>
@@ -7995,6 +8051,7 @@ fn render_indexer_lookup_panel(
     </tbody>
   </table>
 </div>"#,
+                coverage,
                 escape_html(&payload.address),
                 payload.refs.len(),
                 payload

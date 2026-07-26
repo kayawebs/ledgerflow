@@ -85,3 +85,18 @@ This table is optimized for `address -> tx hashes` lookups rather than full tran
 ### `indexer_progress`
 
 Stores the last fully indexed block per worker id so backfills and live follow can resume deterministically.
+
+In lazy mode this remains legacy contiguous coverage and is not advanced by sparse
+query-driven indexing.
+
+### `indexed_blocks`
+
+Stores one global completion marker per successfully indexed block, including empty
+blocks. Address queries share these markers, so overlapping requests only fetch blocks
+that have not already been completed.
+
+### `indexing_requests`
+
+Stores durable lazy range requests and their next-block cursor. Requests are keyed by a
+deterministic chain/range id; the requested address is retained only for operator
+context because the indexed block output is shared by every address.

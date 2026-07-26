@@ -19,6 +19,7 @@ pub struct IndexerConfig {
     pub rpc_retry_base_ms: u64,
     pub rpc_retry_max_ms: u64,
     pub rpc_max_retries: u32,
+    pub lazy_enabled: bool,
     pub live_follow: bool,
     pub poll_interval_ms: u64,
     pub worker_id: String,
@@ -55,6 +56,7 @@ impl IndexerConfig {
             rpc_retry_base_ms: parse_u64("LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS").unwrap_or(500),
             rpc_retry_max_ms: parse_u64("LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS").unwrap_or(10_000),
             rpc_max_retries: parse_u32("LEDGERFLOW_INDEXER_RPC_MAX_RETRIES").unwrap_or(8),
+            lazy_enabled: parse_bool("LEDGERFLOW_INDEXER_LAZY_ENABLED").unwrap_or(true),
             live_follow: parse_bool("LEDGERFLOW_INDEXER_LIVE_FOLLOW").unwrap_or(true),
             poll_interval_ms: parse_u64("LEDGERFLOW_INDEXER_POLL_INTERVAL_MS").unwrap_or(2_000),
             worker_id: env::var("LEDGERFLOW_INDEXER_WORKER_ID")

@@ -3,8 +3,8 @@ use serde_json::Value;
 
 use crate::core::errors::{LedgerError, LedgerResult};
 use crate::indexer::models::{
-    AddressTxDirection, AddressTxRef, IndexerApiKeyRecord, IndexerApiKeyStatus,
-    normalize_address,
+    AddressTxDirection, AddressTxRef, IndexedBlock, IndexerApiKeyRecord, IndexerApiKeyStatus,
+    LazyIndexingRequest, normalize_address,
 };
 
 #[derive(Clone)]
@@ -17,12 +17,7 @@ pub struct ClickHouseClient {
 }
 
 impl ClickHouseClient {
-    pub fn new(
-        base_url: String,
-        database: String,
-        user: String,
-        password: Option<String>,
-    ) -> Self {
+    pub fn new(base_url: String, database: String, user: String, password: Option<String>) -> Self {
         Self {
             base_url,
             database,
@@ -75,6 +70,40 @@ impl ClickHouseClient {
             )
             ENGINE = ReplacingMergeTree(updated_at)
             ORDER BY (chain_id, worker_id)
+            "#,
+            self.database
+        ))
+        .await?;
+        self.execute(&format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {}.indexed_blocks (
+              chain_id UInt32,
+              block_number UInt32,
+              block_hash String,
+              indexed_at DateTime64(3) DEFAULT now64(3)
+            )
+            ENGINE = ReplacingMergeTree(indexed_at)
+            PARTITION BY intDiv(block_number, 1000000)
+            ORDER BY (chain_id, block_number)
+            "#,
+            self.database
+        ))
+        .await?;
+        self.execute(&format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {}.indexing_requests (
+              request_id String,
+              chain_id UInt32,
+              requested_address String,
+              from_block UInt32,
+              to_block UInt32,
+              next_block UInt32,
+              status LowCardinality(String),
+              last_error String,
+              updated_at DateTime64(3) DEFAULT now64(3)
+            )
+            ENGINE = ReplacingMergeTree(updated_at)
+            ORDER BY (chain_id, request_id)
             "#,
             self.database
         ))
@@ -164,6 +193,203 @@ impl ClickHouseClient {
         self.raw_post(&body)
             .await
             .map_err(|err| LedgerError::Persistence(err.to_string()))
+    }
+
+    pub async fn insert_indexed_blocks(&self, blocks: &[IndexedBlock]) -> LedgerResult<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let mut body = format!(
+            "INSERT INTO {}.indexed_blocks FORMAT JSONEachRow\n",
+            self.database
+        );
+        for block in blocks {
+            body.push_str(
+                &serde_json::to_string(block)
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+            );
+            body.push('\n');
+        }
+        self.raw_post(&body)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))
+    }
+
+    pub async fn indexed_block_numbers(
+        &self,
+        chain_id: u32,
+        from_block: u32,
+        to_block: u32,
+    ) -> LedgerResult<Vec<u32>> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT block_number
+                FROM {}.indexed_blocks FINAL
+                WHERE chain_id = {}
+                  AND block_number BETWEEN {} AND {}
+                ORDER BY block_number
+                FORMAT JSON
+                "#,
+                self.database, chain_id, from_block, to_block
+            ))
+            .await?;
+        Ok(payload["data"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| {
+                row.get("block_number")
+                    .and_then(value_as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+            })
+            .collect())
+    }
+
+    pub async fn count_indexed_blocks(
+        &self,
+        chain_id: u32,
+        from_block: u32,
+        to_block: u32,
+        excluded_range: Option<(u32, u32)>,
+    ) -> LedgerResult<u64> {
+        let exclusion = excluded_range
+            .map(|(start, end)| format!("AND NOT (block_number BETWEEN {start} AND {end})"))
+            .unwrap_or_default();
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT count() AS indexed_block_count
+                FROM {}.indexed_blocks FINAL
+                WHERE chain_id = {}
+                  AND block_number BETWEEN {} AND {}
+                  {}
+                FORMAT JSON
+                "#,
+                self.database, chain_id, from_block, to_block, exclusion
+            ))
+            .await?;
+        Ok(payload["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("indexed_block_count"))
+            .and_then(value_as_u64)
+            .unwrap_or(0))
+    }
+
+    pub async fn max_indexed_block(&self, chain_id: u32) -> LedgerResult<Option<u64>> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT max(block_number) AS max_indexed_block
+                FROM {}.indexed_blocks FINAL
+                WHERE chain_id = {}
+                FORMAT JSON
+                "#,
+                self.database, chain_id
+            ))
+            .await?;
+        Ok(payload["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("max_indexed_block"))
+            .and_then(value_as_u64))
+    }
+
+    pub async fn get_indexing_request(
+        &self,
+        chain_id: u32,
+        request_id: &str,
+    ) -> LedgerResult<Option<LazyIndexingRequest>> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT request_id, chain_id, requested_address, from_block, to_block,
+                       next_block, status, last_error
+                FROM {}.indexing_requests FINAL
+                WHERE chain_id = {}
+                  AND request_id = '{}'
+                LIMIT 1
+                FORMAT JSON
+                "#,
+                self.database,
+                chain_id,
+                escape_sql(request_id)
+            ))
+            .await?;
+        payload["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .map(|item| {
+                serde_json::from_value(item)
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))
+            })
+            .transpose()
+    }
+
+    pub async fn next_indexing_request(
+        &self,
+        chain_id: u32,
+    ) -> LedgerResult<Option<LazyIndexingRequest>> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT request_id, chain_id, requested_address, from_block, to_block,
+                       next_block, status, last_error
+                FROM {}.indexing_requests FINAL
+                WHERE chain_id = {}
+                  AND status IN ('queued', 'running')
+                ORDER BY updated_at ASC, request_id ASC
+                LIMIT 1
+                FORMAT JSON
+                "#,
+                self.database, chain_id
+            ))
+            .await?;
+        payload["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .cloned()
+            .map(|item| {
+                serde_json::from_value(item)
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))
+            })
+            .transpose()
+    }
+
+    pub async fn upsert_indexing_request(&self, request: &LazyIndexingRequest) -> LedgerResult<()> {
+        let body = format!(
+            "INSERT INTO {}.indexing_requests FORMAT JSONEachRow\n{}",
+            self.database,
+            serde_json::to_string(request)
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+        );
+        self.raw_post(&body)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))
+    }
+
+    pub async fn count_pending_indexing_requests(&self, chain_id: u32) -> LedgerResult<u64> {
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT count() AS pending_request_count
+                FROM {}.indexing_requests FINAL
+                WHERE chain_id = {}
+                  AND status IN ('queued', 'running')
+                FORMAT JSON
+                "#,
+                self.database, chain_id
+            ))
+            .await?;
+        Ok(payload["data"]
+            .as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("pending_request_count"))
+            .and_then(value_as_u64)
+            .unwrap_or(0))
     }
 
     pub async fn query_address_refs(
@@ -300,7 +526,11 @@ impl ClickHouseClient {
             .unwrap_or(0))
     }
 
-    pub async fn insert_api_key(&self, record: &IndexerApiKeyRecord, token_hash: &str) -> LedgerResult<()> {
+    pub async fn insert_api_key(
+        &self,
+        record: &IndexerApiKeyRecord,
+        token_hash: &str,
+    ) -> LedgerResult<()> {
         let token_hash = if token_hash.is_empty() {
             record.token_hash.as_deref().unwrap_or_default()
         } else {
@@ -333,7 +563,10 @@ impl ClickHouseClient {
             .map_err(|err| LedgerError::Persistence(err.to_string()))
     }
 
-    pub async fn list_api_keys(&self, owner_user_id: &str) -> LedgerResult<Vec<IndexerApiKeyRecord>> {
+    pub async fn list_api_keys(
+        &self,
+        owner_user_id: &str,
+    ) -> LedgerResult<Vec<IndexerApiKeyRecord>> {
         let payload = self
             .query_json(&format!(
                 r#"
@@ -360,7 +593,10 @@ impl ClickHouseClient {
             .collect()
     }
 
-    pub async fn get_api_key_by_id(&self, key_id: &str) -> LedgerResult<Option<IndexerApiKeyRecord>> {
+    pub async fn get_api_key_by_id(
+        &self,
+        key_id: &str,
+    ) -> LedgerResult<Option<IndexerApiKeyRecord>> {
         let payload = self
             .query_json(&format!(
                 r#"
@@ -379,7 +615,10 @@ impl ClickHouseClient {
             .as_array()
             .and_then(|rows| rows.first())
             .cloned()
-            .map(|item| serde_json::from_value(item).map_err(|err| LedgerError::Persistence(err.to_string())))
+            .map(|item| {
+                serde_json::from_value(item)
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))
+            })
             .transpose()
     }
 
@@ -406,7 +645,10 @@ impl ClickHouseClient {
             .as_array()
             .and_then(|rows| rows.first())
             .cloned()
-            .map(|item| serde_json::from_value(item).map_err(|err| LedgerError::Persistence(err.to_string())))
+            .map(|item| {
+                serde_json::from_value(item)
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))
+            })
             .transpose()
     }
 
@@ -467,6 +709,12 @@ impl ClickHouseClient {
 
 fn escape_sql(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
 }
 
 fn build_conditions(

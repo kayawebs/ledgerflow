@@ -4,6 +4,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -11,9 +12,8 @@ use serde_json::json;
 
 use crate::core::errors::LedgerError;
 use crate::indexer::models::{
-    AddressTxDirection, AddressTxHashesResponse, AddressTxQueryResponse,
-    CreateIndexerApiKeyRequest, CreateIndexerApiKeyResponse, IndexerApiKeyRecord,
-    RevokeIndexerApiKeyRequest,
+    AddressTxDirection, AddressTxQueryResponse, CreateIndexerApiKeyRequest,
+    CreateIndexerApiKeyResponse, IndexerApiKeyRecord, RevokeIndexerApiKeyRequest,
 };
 use crate::indexer::service::IndexerService;
 
@@ -62,7 +62,28 @@ async fn progress(
         .authorize_public_token(extract_api_token(&headers))
         .await
         .map_err(ApiError::from)?;
-    let progress = state.service.get_progress().await.map_err(ApiError::from)?;
+    let contiguous_progress = state.service.get_progress().await.map_err(ApiError::from)?;
+    let last_indexed_block = if state.service.lazy_enabled() {
+        Some(
+            state
+                .service
+                .get_query_target_block()
+                .await
+                .map_err(ApiError::from)?,
+        )
+    } else {
+        contiguous_progress
+    };
+    let max_stored_indexed_block = state
+        .service
+        .get_max_indexed_block()
+        .await
+        .map_err(ApiError::from)?;
+    let pending_indexing_requests = state
+        .service
+        .get_pending_indexing_request_count()
+        .await
+        .map_err(ApiError::from)?;
     let endpoint_backfill_pending_rows = state
         .service
         .get_endpoint_backfill_pending_rows()
@@ -71,7 +92,11 @@ async fn progress(
     Ok(Json(json!({
         "chain_id": state.service.config.chain_id,
         "worker_id": state.service.config.worker_id,
-        "last_indexed_block": progress,
+        "last_indexed_block": last_indexed_block,
+        "contiguous_indexed_through_block": contiguous_progress,
+        "max_stored_indexed_block": max_stored_indexed_block,
+        "lazy_enabled": state.service.lazy_enabled(),
+        "pending_indexing_requests": pending_indexing_requests,
         "endpoint_backfill_pending_rows": endpoint_backfill_pending_rows,
     })))
 }
@@ -81,7 +106,7 @@ async fn query_address_txs(
     headers: HeaderMap,
     Path(address): Path<String>,
     Query(query): Query<AddressTxQuery>,
-) -> Result<Json<AddressTxQueryResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     state
         .service
         .authorize_public_token(extract_api_token(&headers))
@@ -99,7 +124,7 @@ async fn query_address_txs(
         )
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(response))
+    Ok(address_query_response(response))
 }
 
 async fn query_address_tx_hashes(
@@ -107,7 +132,7 @@ async fn query_address_tx_hashes(
     headers: HeaderMap,
     Path(address): Path<String>,
     Query(query): Query<AddressTxQuery>,
-) -> Result<Json<AddressTxHashesResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     state
         .service
         .authorize_public_token(extract_api_token(&headers))
@@ -125,7 +150,31 @@ async fn query_address_tx_hashes(
         )
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(response))
+    let status = if response
+        .coverage
+        .as_ref()
+        .map(|coverage| !coverage.complete)
+        .unwrap_or(false)
+    {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(response)).into_response())
+}
+
+fn address_query_response(response: AddressTxQueryResponse) -> Response {
+    let status = if response
+        .coverage
+        .as_ref()
+        .map(|coverage| !coverage.complete)
+        .unwrap_or(false)
+    {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(response)).into_response()
 }
 
 async fn list_api_keys(
@@ -187,7 +236,11 @@ fn extract_api_token(headers: &HeaderMap) -> Option<&str> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .or_else(|| headers.get("x-api-key").and_then(|value| value.to_str().ok()))
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
 }
 
 fn require_internal_access(state: &IndexerApiState, headers: &HeaderMap) -> Result<(), ApiError> {

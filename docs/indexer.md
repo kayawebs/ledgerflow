@@ -62,7 +62,7 @@ Administrative key issuance and revocation should stay behind the internal porta
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_USER` | ClickHouse username | `ledgerflow` in Docker, `default` fallback outside Docker if unset |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD` | ClickHouse password | `ledgerflow` in Docker |
 | `LEDGERFLOW_INDEXER_CHAIN_ID` | chain id stored in rows | `8453` |
-| `LEDGERFLOW_INDEXER_START_BLOCK` | initial backfill block when no progress exists | `0` |
+| `LEDGERFLOW_INDEXER_START_BLOCK` | default lower bound for lazy queries; continuous-scan start when lazy mode is disabled | `0` |
 | `LEDGERFLOW_INDEXER_END_BLOCK` | optional stop block for bounded backfills | unset |
 | `LEDGERFLOW_INDEXER_BATCH_SIZE` | number of blocks claimed and committed per batch | `200` |
 | `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | number of blocks fetched in parallel inside a batch | `4` |
@@ -71,7 +71,8 @@ Administrative key issuance and revocation should stay behind the internal porta
 | `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | base retry backoff after rate-limit errors | `1000` |
 | `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | maximum retry backoff | `15000` |
 | `LEDGERFLOW_INDEXER_RPC_MAX_RETRIES` | retry count for rate-limit errors | `10` |
-| `LEDGERFLOW_INDEXER_LIVE_FOLLOW` | keep polling after catch-up | `true` |
+| `LEDGERFLOW_INDEXER_LAZY_ENABLED` | queue missing block ranges from address queries instead of scanning history on startup | `true` |
+| `LEDGERFLOW_INDEXER_LIVE_FOLLOW` | keep polling after catch-up when lazy mode is disabled | `true` |
 | `LEDGERFLOW_INDEXER_POLL_INTERVAL_MS` | polling delay when caught up or retrying | `2000` |
 | `LEDGERFLOW_INDEXER_WORKER_ID` | progress row key | `base_mainnet_top_level` |
 | `LEDGERFLOW_INDEXER_QUERY_LIMIT_DEFAULT` | default query limit | `1000` |
@@ -116,14 +117,17 @@ export LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS=25
 make run-indexer
 ```
 
-On startup the indexer will:
+With the default `LEDGERFLOW_INDEXER_LAZY_ENABLED=true`, startup will:
 
 1. create the ClickHouse database if needed
-2. create `address_tx_refs` and `indexer_progress` if needed
-3. resume from `indexer_progress` if a row exists
-4. otherwise start from `LEDGERFLOW_INDEXER_START_BLOCK`
-5. backfill until head
-6. continue polling if `LEDGERFLOW_INDEXER_LIVE_FOLLOW=true`
+2. create the reference, global block coverage, and durable request tables
+3. reuse any old contiguous `indexer_progress` coverage
+4. wait for address queries without calling block RPC methods
+5. process only missing blocks from queued query ranges
+
+Set `LEDGERFLOW_INDEXER_LAZY_ENABLED=false` to retain the old behavior that resumes
+from `indexer_progress`, scans from `LEDGERFLOW_INDEXER_START_BLOCK`, and follows
+the chain head.
 
 ## Query API
 
@@ -145,9 +149,17 @@ Example response:
 {
   "chain_id": 8453,
   "worker_id": "base_mainnet_top_level",
-  "last_indexed_block": 44740000
+  "last_indexed_block": 44740000,
+  "contiguous_indexed_through_block": null,
+  "max_stored_indexed_block": 44739900,
+  "lazy_enabled": true,
+  "pending_indexing_requests": 1
 }
 ```
+
+In lazy mode, `last_indexed_block` is the current query target/head for compatibility.
+It does not claim continuous historical coverage. The other progress fields expose
+stored and contiguous coverage explicitly.
 
 ### Query deduplicated transaction hashes for an address
 
@@ -156,6 +168,11 @@ curl "http://localhost:8090/addresses/0x1111111111111111111111111111111111111111
 ```
 
 This endpoint returns a deduplicated tx hash list for the address, ordered by newest block first.
+
+Address queries also request lazy coverage. A fully indexed range returns `200 OK`.
+An incomplete range returns `202 Accepted`, partial stored results, and a `coverage`
+object. Retry the same fixed `from_block` and `to_block` until `coverage.complete`
+is true.
 
 Optional filters:
 
@@ -173,7 +190,15 @@ Example response shape:
   "tx_hashes": [
     "0xabc...",
     "0xdef..."
-  ]
+  ],
+  "coverage": {
+    "from_block": 44000000,
+    "to_block": 44700000,
+    "requested_block_count": 700001,
+    "indexed_block_count": 700001,
+    "complete": true,
+    "request_id": null
+  }
 }
 ```
 
@@ -224,11 +249,16 @@ Example response shape:
 - If your node is on another machine or port, override `LEDGERFLOW_INDEXER_RPC_URL`.
 - The worker uses HTTP RPC polling right now, not WebSocket subscriptions.
 - Backfill fetches are concurrent within each batch; block order does not matter as long as every block is covered.
+- Lazy requests share global block completion markers, so later addresses do not refetch completed blocks.
+- Empty blocks receive completion markers even though they produce no address reference rows.
 - It indexes only top-level transaction `from` and `to`.
 - Contract creation transactions emit only the `from` row.
 - Self-sends emit two rows for the same address with different `direction` values.
 - `/tx-hashes` deduplicates self-sends down to one transaction hash.
 - If a block fetch returns `null`, the worker does not advance progress for that range. It retries later instead of silently skipping coverage.
+
+The full lazy indexing contract is documented in
+[docs/indexer/lazy_indexing.md](indexer/lazy_indexing.md).
 
 ## Throughput tuning
 

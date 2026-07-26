@@ -11,10 +11,11 @@ Indexer-owned areas:
 - `src/indexer/**`
 - `src/bin/ledgerflow_indexer.rs`
 - ClickHouse schema for `address_tx_refs` and `indexer_progress`
+- lazy block coverage and range queue tables
 - indexer worker progress, retry, concurrency, and RPC fetch behavior
 - indexer API endpoints:
   - `GET /health`
-  - `GET /progress`
+- `GET /progress`
   - `GET /addresses/{address}/txs`
   - `GET /addresses/{address}/tx-hashes`
 - Docker/runtime settings prefixed with `LEDGERFLOW_INDEXER_`
@@ -70,6 +71,9 @@ The indexer optimizes one primitive:
 Given an address and optional block range, return the top-level transactions that touched that address.
 
 This enables fast cluster backfill without rescanning historical blocks for every new user or address set.
+
+Historical coverage is lazy by default. An address query requests its block range, but
+the resulting block index is global. Once a block is complete, all addresses reuse it.
 
 ## Engineering Rules
 

@@ -95,7 +95,7 @@ If you are running only `ledgerflow indexer`, the main variables are:
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE` | ClickHouse database name | `ledgerflow_indexer` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_USER` | ClickHouse username | `ledgerflow` in Docker |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD` | ClickHouse password | `ledgerflow` in Docker |
-| `LEDGERFLOW_INDEXER_START_BLOCK` | Initial backfill block | `0` |
+| `LEDGERFLOW_INDEXER_START_BLOCK` | Default lazy-query lower bound, or continuous-scan start when lazy mode is disabled | `0` |
 | `LEDGERFLOW_INDEXER_END_BLOCK` | Optional bounded stop block | unset |
 | `LEDGERFLOW_INDEXER_BATCH_SIZE` | Blocks claimed and committed per indexing batch | `200` |
 | `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | Parallel block fetch count inside a batch | `4` |
@@ -104,7 +104,8 @@ If you are running only `ledgerflow indexer`, the main variables are:
 | `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | Base retry delay after rate-limit responses | `1000` |
 | `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | Maximum retry delay | `15000` |
 | `LEDGERFLOW_INDEXER_RPC_MAX_RETRIES` | Retry count for rate-limit responses | `10` |
-| `LEDGERFLOW_INDEXER_LIVE_FOLLOW` | Continue following new blocks | `true` |
+| `LEDGERFLOW_INDEXER_LAZY_ENABLED` | Queue block ranges from address queries and avoid cold-start history scans | `true` |
+| `LEDGERFLOW_INDEXER_LIVE_FOLLOW` | Continue following new blocks when lazy mode is disabled | `true` |
 | `LEDGERFLOW_INDEXER_WORKER_ID` | Progress key | `base_mainnet_top_level` |
 
 ## Run with Docker

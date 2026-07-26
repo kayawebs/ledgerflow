@@ -1,6 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use chrono::{DateTime, Utc};
 
 use crate::core::errors::{LedgerError, LedgerResult};
 
@@ -27,12 +27,45 @@ pub struct AddressTxRef {
 pub struct AddressTxQueryResponse {
     pub address: String,
     pub refs: Vec<AddressTxRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<LazyIndexCoverage>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AddressTxHashesResponse {
     pub address: String,
     pub tx_hashes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<LazyIndexCoverage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LazyIndexCoverage {
+    pub from_block: u32,
+    pub to_block: u32,
+    pub requested_block_count: u64,
+    pub indexed_block_count: u64,
+    pub complete: bool,
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LazyIndexingRequest {
+    pub request_id: String,
+    pub chain_id: u32,
+    pub requested_address: String,
+    pub from_block: u32,
+    pub to_block: u32,
+    pub next_block: u32,
+    pub status: String,
+    pub last_error: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexedBlock {
+    pub chain_id: u32,
+    pub block_number: u32,
+    pub block_hash: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
