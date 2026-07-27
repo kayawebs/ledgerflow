@@ -2,6 +2,13 @@
 
 LedgerFlow is a Rust backend starter for evidence-first EVM transaction analysis, initially focused on Base (`chain_id=8453`). It is intentionally narrow in semantic coverage for v0, but the architecture is built so recognizers, protocol adapters, validators, and accounting policies can expand steadily without breaking the stable core schema.
 
+The target multi-chain deployment uses a central web/control plane and one
+isolated data plane per chain. See
+[docs/multichain_architecture.md](docs/multichain_architecture.md) and
+[ops/multichain/README.md](ops/multichain/README.md). The current runtime still
+has single-upstream web assumptions, so follow the documented phased rollout
+instead of pointing the web process directly at remote chain databases.
+
 It now ships with a separate `web` process that fronts the API with a product-shaped operator UI: homepage, pricing page, passwordless email auth, and a dashboard split across cluster management, cluster analysis, and single-tx analysis.
 
 Passwordless auth supports real email delivery through Postmark or Resend. If the web process starts without email credentials, it now stays in explicit log-only mode instead of silently pretending mail is enabled; the auth page and `/health` surface that status.

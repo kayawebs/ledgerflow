@@ -1,5 +1,11 @@
 # Architecture
 
+LedgerFlow's target production topology is a central control plane with one
+isolated data plane per chain. See
+[Multi-Chain Architecture](multichain_architecture.md) for the service
+boundaries, API contract, cluster model, and rollout plan. The modular-monolith
+pipeline below describes the internals of each chain data plane.
+
 ## Goal
 
 LedgerFlow is a Rust modular monolith for evidence-first transaction analysis. It treats raw EVM evidence as the source of truth, derives stable facts from that evidence, and only then applies recognizers and scenario interpretation.
@@ -44,4 +50,3 @@ Determinism is enforced through:
 ## Why scenario-driven instead of pretending to be fully generic
 
 LedgerFlow is meant to become pseudo-general through layered recognition, not by claiming to understand every transaction up front. Narrow recognizers and adapters are safer, easier to version, and easier to replay.
-
