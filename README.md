@@ -179,3 +179,6 @@ tests/
 ## Design stance
 
 LedgerFlow is scenario-extendable, not magical. It is designed to look more general over time by accumulating stable evidence facts and layering narrow recognizers and adapters safely.
+
+Address labels, curated seeds, source trust, and versioned intelligence imports
+are documented in [Address Intelligence V2](docs/address_intelligence_v2.md).

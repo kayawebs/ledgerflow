@@ -128,6 +128,12 @@ Chain API credentials should be injected by the secret manager and selected by
 
 ## Chain Server Configuration
 
+Address seeds are not loaded implicitly by any service. Apply the data-plane
+migrations, then import a reviewed versioned intelligence dataset as described
+in [Address Intelligence V2](../../docs/address_intelligence_v2.md). Each
+dataset declares exactly one immutable `chain_id` and must be imported only
+into that chain's PostgreSQL database.
+
 Every chain server receives one immutable identity:
 
 ```text
@@ -160,23 +166,38 @@ only after the API, databases, RPC gateway, and chain identity checks pass.
 
 Create a disabled registry row first:
 
-```json
-{
-  "chain_id": 8453,
-  "slug": "base",
-  "display_name": "Base",
-  "native_symbol": "ETH",
-  "explorer_base_url": "https://basescan.org",
-  "api_base_url": "https://ledgerflow-base.internal",
-  "enabled": false,
-  "capabilities": {
-    "address_index": true,
-    "cluster_analysis": true,
-    "asset_changes": true,
-    "arbitrage_monitor": true
-  }
-}
+```sql
+insert into chain_registry (
+  chain_id,
+  slug,
+  display_name,
+  native_symbol,
+  explorer_base_url,
+  api_base_url,
+  indexer_api_base_url,
+  enabled,
+  capabilities,
+  sort_order,
+  config_version
+) values (
+  8453,
+  'base',
+  'Base',
+  'ETH',
+  'https://basescan.org',
+  'https://ledgerflow-base.internal',
+  'https://ledgerflow-base.internal/indexer',
+  false,
+  '{"address_index":true,"cluster_analysis":true,"asset_changes":true,"arbitrage_monitor":true}'::jsonb,
+  10,
+  1
+);
 ```
+
+Inject service credentials separately as
+`LEDGERFLOW_CHAIN_API_BEARER_TOKEN_8453` and
+`LEDGERFLOW_CHAIN_INDEXER_BEARER_TOKEN_8453`. Never write either token to
+`chain_registry`.
 
 Before enabling it:
 

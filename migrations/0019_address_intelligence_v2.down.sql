@@ -1,0 +1,10 @@
+drop view if exists effective_address_labels;
+drop table if exists protocol_deployments;
+drop table if exists protocols;
+drop table if exists assertion_evidence;
+drop table if exists address_label_assertions;
+drop table if exists intelligence_datasets;
+drop table if exists label_definitions;
+drop table if exists address_contract_states;
+drop table if exists intelligence_sources;
+drop table if exists chain_addresses;

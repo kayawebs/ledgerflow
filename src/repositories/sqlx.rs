@@ -1,16 +1,18 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json};
 use uuid::Uuid;
 
 use crate::core::errors::{LedgerError, LedgerResult};
 use crate::domain::{
     entities::{
-        AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
-        ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
-        ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterStrategyReportSnapshot,
-        ClusterTrackingState, EvidencePack, ProtocolAddressMetadata, TransactionAnalysis,
+        AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel,
+        AddressLabelAssertion, AddressProfile, ClassifiedTransaction, ClusterAddress, ClusterAlert,
+        ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot,
+        ClusterStrategyReportSnapshot, ClusterTrackingState, EvidencePack, ProtocolAddressMetadata,
+        TransactionAnalysis,
     },
     enums::{
         AlertSeverity, AlertType, BehaviorTag, ClusterBackfillStatus, ClusterTrackingStatus,
@@ -1399,6 +1401,79 @@ impl AnalysisRepository for SqlxAnalysisRepository {
     }
 
     async fn upsert_address_profile(&self, profile: &AddressProfile) -> LedgerResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let normalized_address = profile.address.to_ascii_lowercase();
+        let address_kind = if profile.address_type == "eoa" {
+            "eoa"
+        } else if profile.bytecode_length.unwrap_or_default() > 0 {
+            "contract"
+        } else {
+            "unknown"
+        };
+        sqlx::query(
+            r#"
+            insert into chain_addresses (
+              chain_id, address, address_kind, first_seen_at, last_seen_at,
+              metadata, created_at, updated_at
+            )
+            values ($1,$2,$3,$4,$5,$6,$7,$8)
+            on conflict (chain_id, address) do update set
+              address_kind = case
+                when excluded.address_kind = 'unknown' then chain_addresses.address_kind
+                else excluded.address_kind
+              end,
+              first_seen_at = least(chain_addresses.first_seen_at, excluded.first_seen_at),
+              last_seen_at = greatest(chain_addresses.last_seen_at, excluded.last_seen_at),
+              metadata = chain_addresses.metadata || excluded.metadata,
+              updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(profile.chain_id as i64)
+        .bind(&normalized_address)
+        .bind(address_kind)
+        .bind(profile.first_seen_at)
+        .bind(profile.last_seen_at)
+        .bind(Json(profile.metadata.clone()))
+        .bind(profile.created_at)
+        .bind(profile.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+        if profile.code_hash.is_some() || profile.bytecode_length.is_some() {
+            sqlx::query(
+                r#"
+                insert into address_contract_states (
+                  chain_id, address, code_hash, bytecode_length, observed_at,
+                  source_key, metadata, created_at
+                )
+                values ($1,$2,$3,$4,$5,'address_worker',$6,$7)
+                on conflict (chain_id, address, (coalesce(observed_block, -1)), source_key)
+                do update set
+                  code_hash = excluded.code_hash,
+                  bytecode_length = excluded.bytecode_length,
+                  observed_at = greatest(address_contract_states.observed_at, excluded.observed_at),
+                  metadata = address_contract_states.metadata || excluded.metadata
+                "#,
+            )
+            .bind(profile.chain_id as i64)
+            .bind(&normalized_address)
+            .bind(&profile.code_hash)
+            .bind(profile.bytecode_length.map(|value| value as i64))
+            .bind(profile.last_analyzed_at.unwrap_or(profile.updated_at))
+            .bind(Json(
+                serde_json::json!({ "address_type_projection": profile.address_type }),
+            ))
+            .bind(profile.created_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        }
+
         sqlx::query(
             r#"
             insert into address_profiles (
@@ -1418,7 +1493,7 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             "#,
         )
         .bind(profile.chain_id as i64)
-        .bind(profile.address.to_ascii_lowercase())
+        .bind(&normalized_address)
         .bind(&profile.address_type)
         .bind(&profile.code_hash)
         .bind(profile.bytecode_length.map(|value| value as i64))
@@ -1429,14 +1504,157 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         .bind(Json(profile.metadata.clone()))
         .bind(profile.created_at)
         .bind(profile.updated_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         Ok(())
     }
 
-    async fn upsert_address_labels(&self, labels: &[AddressLabel]) -> LedgerResult<()> {
-        for label in labels {
+    async fn upsert_address_label_assertions(
+        &self,
+        assertions: &[AddressLabelAssertion],
+    ) -> LedgerResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        for assertion in assertions {
+            let normalized_address = assertion.address.to_ascii_lowercase();
+            sqlx::query(
+                r#"
+                insert into intelligence_sources (
+                  source_key, display_name, source_kind, trust_score, metadata
+                )
+                values ($1,$1,$2,$3,'{}'::jsonb)
+                on conflict (source_key) do update set
+                  source_kind = excluded.source_kind,
+                  trust_score = excluded.trust_score,
+                  updated_at = now()
+                "#,
+            )
+            .bind(&assertion.source)
+            .bind(&assertion.source_kind)
+            .bind(assertion.source_trust as f64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+            sqlx::query(
+                r#"
+                insert into label_definitions (
+                  label_key, display_name, dimension, exclusive_group, metadata
+                )
+                values ($1,$1,$2,$3,'{}'::jsonb)
+                on conflict (label_key) do update set
+                  dimension = excluded.dimension,
+                  exclusive_group = excluded.exclusive_group,
+                  updated_at = now()
+                "#,
+            )
+            .bind(&assertion.label)
+            .bind(&assertion.dimension)
+            .bind(&assertion.exclusive_group)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+            sqlx::query(
+                r#"
+                insert into chain_addresses (chain_id, address, metadata)
+                values ($1,$2,jsonb_build_object('registered_by', $3::text))
+                on conflict (chain_id, address) do update set
+                  last_seen_at = greatest(chain_addresses.last_seen_at, now()),
+                  updated_at = now()
+                "#,
+            )
+            .bind(assertion.chain_id as i64)
+            .bind(&normalized_address)
+            .bind(&assertion.source)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+            let row = sqlx::query(
+                r#"
+                insert into address_label_assertions (
+                  assertion_id, claim_fingerprint, chain_id, address, label_key, source_key,
+                  origin_kind, method_version, dataset_key, dataset_version, assertion_value,
+                  confidence, status, valid_from_block, valid_to_block, observed_at, expires_at,
+                  evidence_summary, created_at, updated_at
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+                on conflict (claim_fingerprint) do update set
+                  assertion_value = excluded.assertion_value,
+                  confidence = excluded.confidence,
+                  status = excluded.status,
+                  valid_from_block = excluded.valid_from_block,
+                  valid_to_block = excluded.valid_to_block,
+                  observed_at = greatest(address_label_assertions.observed_at, excluded.observed_at),
+                  expires_at = excluded.expires_at,
+                  evidence_summary = address_label_assertions.evidence_summary || excluded.evidence_summary,
+                  updated_at = excluded.updated_at
+                returning assertion_id
+                "#,
+            )
+            .bind(assertion.assertion_id)
+            .bind(&assertion.claim_fingerprint)
+            .bind(assertion.chain_id as i64)
+            .bind(&normalized_address)
+            .bind(&assertion.label)
+            .bind(&assertion.source)
+            .bind(&assertion.origin_kind)
+            .bind(&assertion.method_version)
+            .bind(&assertion.dataset_key)
+            .bind(&assertion.dataset_version)
+            .bind(assertion.assertion_value)
+            .bind(assertion.confidence as f64)
+            .bind(&assertion.status)
+            .bind(assertion.valid_from_block.map(|value| value as i64))
+            .bind(assertion.valid_to_block.map(|value| value as i64))
+            .bind(assertion.observed_at)
+            .bind(assertion.expires_at)
+            .bind(Json(assertion.evidence_json.clone()))
+            .bind(assertion.created_at)
+            .bind(assertion.updated_at)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            let assertion_id: Uuid = row
+                .try_get("assertion_id")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+            let evidence_payload = serde_json::json!({
+                "confidence": assertion.confidence,
+                "observed_at": assertion.observed_at,
+                "method_version": assertion.method_version,
+                "evidence": assertion.evidence_json,
+            });
+            let mut evidence_hasher = Sha256::new();
+            evidence_hasher.update(evidence_payload.to_string());
+            let evidence_hash = hex::encode(evidence_hasher.finalize());
+            sqlx::query(
+                r#"
+                insert into assertion_evidence (
+                  assertion_id, evidence_type, evidence_hash, payload, observed_at
+                )
+                values ($1,'analysis_observation',$2,$3,$4)
+                on conflict (assertion_id, evidence_hash) do nothing
+                "#,
+            )
+            .bind(assertion_id)
+            .bind(evidence_hash)
+            .bind(Json(evidence_payload))
+            .bind(assertion.observed_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+            // V1 compatibility write. Consumers now read effective_address_labels,
+            // but this keeps older binaries safe during a rolling deployment.
             sqlx::query(
                 r#"
                 insert into address_labels (
@@ -1449,18 +1667,21 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                   updated_at = excluded.updated_at
                 "#,
             )
-            .bind(label.chain_id as i64)
-            .bind(label.address.to_ascii_lowercase())
-            .bind(&label.label)
-            .bind(&label.source)
-            .bind(label.confidence as f64)
-            .bind(Json(label.evidence_json.clone()))
-            .bind(label.created_at)
-            .bind(label.updated_at)
-            .execute(&self.pool)
+            .bind(assertion.chain_id as i64)
+            .bind(&normalized_address)
+            .bind(&assertion.label)
+            .bind(&assertion.source)
+            .bind(assertion.confidence as f64)
+            .bind(Json(assertion.evidence_json.clone()))
+            .bind(assertion.created_at)
+            .bind(assertion.updated_at)
+            .execute(&mut *tx)
             .await
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         }
+        tx.commit()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         Ok(())
     }
 
@@ -1468,7 +1689,95 @@ impl AnalysisRepository for SqlxAnalysisRepository {
         &self,
         metadata: &[ProtocolAddressMetadata],
     ) -> LedgerResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         for item in metadata {
+            let normalized_address = item.address.to_ascii_lowercase();
+            let (source_kind, trust_score) = intelligence_source_defaults(&item.source);
+            sqlx::query(
+                r#"
+                insert into intelligence_sources (
+                  source_key, display_name, source_kind, trust_score, metadata
+                )
+                values ($1,$1,$2,$3,'{}'::jsonb)
+                on conflict (source_key) do update set
+                  source_kind = excluded.source_kind,
+                  trust_score = excluded.trust_score,
+                  updated_at = now()
+                "#,
+            )
+            .bind(&item.source)
+            .bind(source_kind)
+            .bind(trust_score)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+            sqlx::query(
+                r#"
+                insert into chain_addresses (chain_id, address, address_kind, metadata)
+                values ($1,$2,'contract',jsonb_build_object('registered_by', $3::text))
+                on conflict (chain_id, address) do update set
+                  address_kind = 'contract',
+                  last_seen_at = greatest(chain_addresses.last_seen_at, now()),
+                  updated_at = now()
+                "#,
+            )
+            .bind(item.chain_id as i64)
+            .bind(&normalized_address)
+            .bind(&item.source)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+            sqlx::query(
+                r#"
+                insert into protocols (protocol_key, display_name, protocol_family, metadata)
+                values ($1,$1,$2,'{}'::jsonb)
+                on conflict (protocol_key) do update set
+                  protocol_family = excluded.protocol_family,
+                  updated_at = now()
+                "#,
+            )
+            .bind(&item.protocol_name)
+            .bind(&item.protocol_family)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
+            sqlx::query(
+                r#"
+                insert into protocol_deployments (
+                  chain_id, address, protocol_key, contract_role, source_key, method_version,
+                  confidence, metadata, first_seen_at, last_seen_at, created_at, updated_at
+                )
+                values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$9,$11)
+                on conflict (chain_id, address, protocol_key, contract_role, source_key, method_version)
+                do update set
+                  confidence = greatest(protocol_deployments.confidence, excluded.confidence),
+                  metadata = protocol_deployments.metadata || excluded.metadata,
+                  last_seen_at = greatest(protocol_deployments.last_seen_at, excluded.last_seen_at),
+                  updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(item.chain_id as i64)
+            .bind(&normalized_address)
+            .bind(&item.protocol_name)
+            .bind(&item.contract_role)
+            .bind(&item.source)
+            .bind(&item.adapter_version)
+            .bind(item.confidence as f64)
+            .bind(Json(item.metadata.clone()))
+            .bind(item.first_seen_at)
+            .bind(item.last_seen_at)
+            .bind(item.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+
             sqlx::query(
                 r#"
                 insert into address_protocol_metadata (
@@ -1486,7 +1795,7 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                 "#,
             )
             .bind(item.chain_id as i64)
-            .bind(item.address.to_ascii_lowercase())
+            .bind(&normalized_address)
             .bind(&item.protocol_family)
             .bind(&item.protocol_name)
             .bind(&item.contract_role)
@@ -1497,10 +1806,13 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             .bind(item.first_seen_at)
             .bind(item.last_seen_at)
             .bind(item.updated_at)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         }
+        tx.commit()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         Ok(())
     }
 
@@ -1577,14 +1889,24 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             .iter()
             .map(|address| address.to_ascii_lowercase())
             .collect::<Vec<_>>();
-        let rows =
-            sqlx::query("select * from address_labels where chain_id = $1 and address = any($2)")
-                .bind(chain_id as i64)
-                .bind(&normalized)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let rows = sqlx::query(
+            "select * from effective_address_labels where chain_id = $1 and address = any($2)",
+        )
+        .bind(chain_id as i64)
+        .bind(&normalized)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         rows.into_iter().map(row_to_address_label).collect()
+    }
+}
+
+fn intelligence_source_defaults(source: &str) -> (&'static str, f64) {
+    match source {
+        "ledgerflow_seed" | "builtin" => ("curated", 0.95),
+        "address_worker" | "protocol_probe" => ("onchain", 0.90),
+        "tx_analysis" | "balance_classifier" => ("model", 0.80),
+        _ => ("model", 0.50),
     }
 }
 

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Form, Json, Router,
@@ -14,6 +14,10 @@ use serde_json::json;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json as SqlJson};
 use tracing::info;
 use uuid::Uuid;
+
+mod chain_registry;
+
+use chain_registry::{ChainRegistry, ChainRoute};
 
 use crate::{
     core::errors::{LedgerError, LedgerResult},
@@ -44,9 +48,6 @@ const UNISWAP_V3_SWAP_TOPIC_HEX: &str =
 
 #[derive(Clone)]
 pub struct WebState {
-    pub api_base_url: String,
-    pub indexer_api_base_url: Option<String>,
-    pub indexer_api_bearer_token: Option<String>,
     pub bind_addr: String,
     pub default_chain_id: u64,
     pub web_base_url: String,
@@ -58,6 +59,7 @@ pub struct WebState {
     pub portal_service: Arc<PortalService>,
     pub email_delivery_mode: &'static str,
     pub email_delivery_ready: bool,
+    pub chain_registry: Arc<ChainRegistry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +209,11 @@ struct DashboardQuery {
     tx_sort_dir: Option<String>,
     notice: Option<String>,
     created_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct TodayQuery {
+    chain_id: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -825,16 +832,30 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         "web email delivery configured"
     );
 
+    let chain_registry = Arc::new(
+        ChainRegistry::load(
+            &pool,
+            config.default_chain_id,
+            config.api_base_url.clone(),
+            config.indexer_api_base_url.clone(),
+            config.indexer_api_bearer_token.clone(),
+        )
+        .await?,
+    );
+    let default_chain_id = chain_registry.default_chain_id();
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(8)
+        .build()
+        .map_err(|err| LedgerError::AnalysisInvariant(err.to_string()))?;
     let state = WebState {
-        api_base_url: config.api_base_url.clone(),
-        indexer_api_base_url: config.indexer_api_base_url.clone(),
-        indexer_api_bearer_token: config.indexer_api_bearer_token.clone(),
         bind_addr: config.bind_addr.clone(),
-        default_chain_id: config.default_chain_id,
+        default_chain_id,
         web_base_url: config.web_base_url.clone(),
         session_cookie_name: config.session_cookie_name.clone(),
         pool: pool.clone(),
-        client: Client::new(),
+        client,
         cryptohouse_url: config.cryptohouse_url.clone(),
         auth_service: Arc::new(AuthService::new(
             pool.clone(),
@@ -846,10 +867,12 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         portal_service: Arc::new(PortalService::new(pool)),
         email_delivery_mode,
         email_delivery_ready,
+        chain_registry,
     };
 
     Ok(Router::new()
         .route("/assets/ledgerflow-mark.svg", get(brand_mark_svg))
+        .route("/assets/chainactors-og.png", get(chainactors_og_png))
         .route("/", get(homepage))
         .route("/pricing", get(pricing))
         .route("/auth", get(auth_page))
@@ -858,6 +881,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/auth/verify", post(verify_code))
         .route("/auth/logout", post(logout))
         .route("/app", get(app_home))
+        .route("/app/today", get(today_page))
         .route("/app/clusters", get(clusters_page))
         .route("/app/clusters/status", get(cluster_status))
         .route("/app/clusters/{cluster_id}", get(cluster_analysis_page))
@@ -907,8 +931,11 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
 
 async fn health(State(state): State<WebState>) -> Html<String> {
     Html(format!(
-        "{{\"status\":\"ok\",\"web_bind_addr\":\"{}\",\"api_base_url\":\"{}\",\"email_delivery_mode\":\"{}\",\"email_delivery_ready\":{}}}",
-        state.bind_addr, state.api_base_url, state.email_delivery_mode, state.email_delivery_ready
+        "{{\"status\":\"ok\",\"web_bind_addr\":\"{}\",\"enabled_chains\":{},\"email_delivery_mode\":\"{}\",\"email_delivery_ready\":{}}}",
+        state.bind_addr,
+        state.chain_registry.routes().len(),
+        state.email_delivery_mode,
+        state.email_delivery_ready
     ))
 }
 
@@ -920,13 +947,21 @@ async fn brand_mark_svg() -> Response {
         .into_response()
 }
 
+async fn chainactors_og_png() -> Response {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        include_bytes!("../../assets/chainactors-og.png").as_slice(),
+    )
+        .into_response()
+}
+
 async fn homepage(
     State(state): State<WebState>,
     headers: HeaderMap,
 ) -> Result<Html<String>, WebError> {
     let user = current_user(&state, &headers).await?;
     Ok(Html(render_marketing_page(
-        "LedgerFlow",
+        "ChainActors",
         user.as_ref(),
         render_homepage_content(user.as_ref()),
     )))
@@ -950,7 +985,7 @@ async fn auth_page(
     Query(query): Query<AuthPageQuery>,
 ) -> Result<Response, WebError> {
     if current_user(&state, &headers).await?.is_some() {
-        return Ok(Redirect::to("/app/clusters").into_response());
+        return Ok(Redirect::to("/app/today").into_response());
     }
     let notice = query.notice.as_deref().and_then(render_notice_message);
     let mode = query.mode.as_deref().unwrap_or("signup");
@@ -1006,7 +1041,7 @@ async fn verify_page(
     Query(query): Query<VerifyPageQuery>,
 ) -> Result<Response, WebError> {
     if current_user(&state, &headers).await?.is_some() {
-        return Ok(Redirect::to("/app/clusters").into_response());
+        return Ok(Redirect::to("/app/today").into_response());
     }
     let notice = query.notice.as_deref().and_then(render_notice_message);
     Ok(Html(render_marketing_page(
@@ -1035,7 +1070,7 @@ async fn verify_code(
         .await
     {
         Ok((_user, session_token)) => {
-            let mut response = Redirect::to("/app/clusters?notice=signed-in").into_response();
+            let mut response = Redirect::to("/app/today?notice=signed-in").into_response();
             response.headers_mut().insert(
                 header::SET_COOKIE,
                 HeaderValue::from_str(&session_cookie(
@@ -1104,7 +1139,32 @@ async fn dashboard(Query(query): Query<DashboardQuery>) -> Result<Response, WebE
 }
 
 async fn app_home() -> Response {
-    Redirect::to("/app/clusters").into_response()
+    Redirect::to("/app/today").into_response()
+}
+
+async fn today_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<TodayQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let selected_chain_id = query
+        .chain_id
+        .filter(|chain_id| state.chain_registry.resolve(*chain_id).is_some())
+        .unwrap_or(state.default_chain_id);
+    let clusters = state
+        .portal_service
+        .list_clusters_for_user(user.user_id)
+        .await?;
+    Ok(Html(render_today_page(
+        &state,
+        &user,
+        selected_chain_id,
+        &clusters,
+    ))
+    .into_response())
 }
 
 async fn clusters_page(
@@ -1118,7 +1178,8 @@ async fn clusters_page(
     if let Some(cluster_id) = query.cluster_id.as_deref() {
         ensure_user_owns_cluster(&state, user.user_id, cluster_id).await?;
     }
-    let editable_cluster = load_editable_cluster(&state, query.cluster_id.as_deref()).await?;
+    let editable_cluster =
+        load_editable_cluster(&state, user.user_id, query.cluster_id.as_deref()).await?;
     render_dashboard_response(
         &state,
         user,
@@ -1204,7 +1265,7 @@ async fn address_analysis_page(
             chain_id,
             urlencoding::encode(address)
         );
-        match api_get_json::<AddressSummaryEnvelope>(&state, &path).await {
+        match api_get_json::<AddressSummaryEnvelope>(&state, chain_id, &path).await {
             Ok(payload) => (Some(payload), None),
             Err(err) => (None, Some(err.to_string())),
         }
@@ -1361,7 +1422,8 @@ async fn has_arbitrage_api_access(state: &WebState, headers: &HeaderMap) -> Resu
     if current_user(state, headers).await?.is_some() {
         return Ok(true);
     }
-    let Some(indexer_api_base_url) = state.indexer_api_base_url.as_deref() else {
+    let route = chain_route(state, state.default_chain_id)?;
+    let Some(indexer_api_base_url) = route.indexer_api_base_url.as_deref() else {
         return Ok(false);
     };
     let Some(api_key) = headers
@@ -1776,7 +1838,9 @@ async fn indexer_lookup_page(
     };
     let path = build_indexer_lookup_path(&query)?;
     let (payload, error) = if let Some(path) = path.as_deref() {
-        match indexer_get_json::<IndexerAddressRefsPayload>(&state, path).await {
+        match indexer_get_json::<IndexerAddressRefsPayload>(&state, state.default_chain_id, path)
+            .await
+        {
             Ok(payload) => (Some(payload), None),
             Err(err) => (None, Some(err.to_string())),
         }
@@ -1863,6 +1927,7 @@ async fn create_indexer_api_key(
     }
     let created: CreatedIndexerApiKeyPayload = indexer_post_json(
         &state,
+        state.default_chain_id,
         "/admin/api-keys",
         &CreateIndexerApiKeyPayload {
             owner_user_id: user.user_id.to_string(),
@@ -1888,6 +1953,7 @@ async fn revoke_indexer_api_key(
     };
     let _: IndexerApiKeyPayload = indexer_post_json(
         &state,
+        state.default_chain_id,
         &format!("/admin/api-keys/{}/revoke", urlencoding::encode(&key_id)),
         &RevokeIndexerApiKeyPayload {
             owner_user_id: user.user_id.to_string(),
@@ -1914,16 +1980,17 @@ async fn cluster_status(
     };
     let cluster_id = Uuid::parse_str(cluster_id_raw)
         .map_err(|err| WebError::bad_request(format!("invalid cluster id: {err}")))?;
-    if !clusters
+    let Some(cluster) = clusters
         .iter()
-        .any(|cluster| cluster.cluster_id == cluster_id)
-    {
+        .find(|cluster| cluster.cluster_id == cluster_id)
+    else {
         return Err(WebError::bad_request(
             "cluster is not available for the current user".to_owned(),
         ));
-    }
+    };
     let payload = load_cluster_live_response(
         &state,
+        cluster.chain_id,
         cluster_id,
         query.start.as_deref(),
         query.end.as_deref(),
@@ -1942,14 +2009,15 @@ async fn create_cluster(
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
     let addresses = parse_cluster_addresses(&form.addresses)?;
+    let chain_id = form.chain_id;
     let request = CreateClusterRequest {
-        chain_id: form.chain_id,
+        chain_id,
         owner_label: form.owner_label,
         name: form.name,
         description: form.description.filter(|value| !value.trim().is_empty()),
         addresses,
     };
-    match api_post_json::<_, AddressCluster>(&state, "/clusters", &request).await {
+    match api_post_json::<_, AddressCluster>(&state, chain_id, "/clusters", &request).await {
         Ok(cluster) => {
             state
                 .portal_service
@@ -2001,10 +2069,15 @@ async fn update_cluster(
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
-    ensure_user_owns_cluster(&state, user.user_id, &cluster_id).await?;
+    let chain_id = ensure_user_owns_cluster(&state, user.user_id, &cluster_id).await?;
+    if form.chain_id != chain_id {
+        return Err(WebError::bad_request(
+            "cluster chain cannot be changed from the web form".to_owned(),
+        ));
+    }
     let addresses = parse_cluster_addresses(&form.addresses)?;
     let request = CreateClusterRequest {
-        chain_id: form.chain_id,
+        chain_id,
         owner_label: form.owner_label,
         name: form.name,
         description: form.description.filter(|value| !value.trim().is_empty()),
@@ -2012,6 +2085,7 @@ async fn update_cluster(
     };
     match api_post_json::<_, AddressCluster>(
         &state,
+        chain_id,
         &format!("/clusters/{cluster_id}/update"),
         &request,
     )
@@ -2022,7 +2096,8 @@ async fn update_cluster(
             cluster.cluster_id
         ))),
         Err(err) => {
-            let editable_cluster = load_editable_cluster(&state, Some(&cluster_id)).await?;
+            let editable_cluster =
+                load_editable_cluster_on_chain(&state, chain_id, Some(&cluster_id)).await?;
             render_dashboard_response(
                 &state,
                 user,
@@ -2061,9 +2136,10 @@ async fn delete_cluster(
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
-    ensure_user_owns_cluster(&state, user.user_id, &cluster_id).await?;
+    let chain_id = ensure_user_owns_cluster(&state, user.user_id, &cluster_id).await?;
     match api_post_json::<_, serde_json::Value>(
         &state,
+        chain_id,
         &format!("/clusters/{cluster_id}/delete"),
         &json!({}),
     )
@@ -2085,9 +2161,10 @@ async fn queue_cluster_backfill(
     let Some(_user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
-    ensure_user_owns_cluster(&state, _user.user_id, &cluster_id).await?;
+    let chain_id = ensure_user_owns_cluster(&state, _user.user_id, &cluster_id).await?;
     match api_post_json::<_, serde_json::Value>(
         &state,
+        chain_id,
         &format!("/clusters/{cluster_id}/backfill"),
         &ClusterBackfillRequest {
             start_block: None,
@@ -2113,11 +2190,13 @@ async fn enable_cluster_tracking(
     headers: HeaderMap,
     Path(cluster_id): Path<String>,
 ) -> Result<Response, WebError> {
-    let Some(_user) = current_user(&state, &headers).await? else {
+    let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
+    let chain_id = ensure_user_owns_cluster(&state, user.user_id, &cluster_id).await?;
     match api_post_json::<_, ClusterTrackingState>(
         &state,
+        chain_id,
         &format!("/clusters/{cluster_id}/tracking/enable"),
         &json!({}),
     )
@@ -2138,11 +2217,13 @@ async fn pause_cluster_tracking(
     headers: HeaderMap,
     Path(cluster_id): Path<String>,
 ) -> Result<Response, WebError> {
-    let Some(_user) = current_user(&state, &headers).await? else {
+    let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
+    let chain_id = ensure_user_owns_cluster(&state, user.user_id, &cluster_id).await?;
     match api_post_json::<_, ClusterTrackingState>(
         &state,
+        chain_id,
         &format!("/clusters/{cluster_id}/tracking/pause"),
         &json!({}),
     )
@@ -2163,11 +2244,13 @@ async fn mark_cluster_alert_read(
     headers: HeaderMap,
     Path((cluster_id, alert_id)): Path<(String, String)>,
 ) -> Result<Response, WebError> {
-    let Some(_user) = current_user(&state, &headers).await? else {
+    let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
+    let chain_id = ensure_user_owns_cluster(&state, user.user_id, &cluster_id).await?;
     match api_post_json::<_, ClusterAlert>(
         &state,
+        chain_id,
         &format!("/clusters/{cluster_id}/alerts/{alert_id}/read"),
         &json!({}),
     )
@@ -2200,6 +2283,7 @@ async fn run_tx_analysis(
     let result = if mode == "reanalyze" {
         api_post_json::<_, AnalysisEnvelope>(
             &state,
+            form.chain_id,
             "/analyses/tx",
             &AnalyzeTxRequest {
                 chain_id: form.chain_id,
@@ -2209,10 +2293,11 @@ async fn run_tx_analysis(
         .await
         .map(|payload| serde_json::to_value(payload).unwrap_or_default())
     } else {
-        match api_get_json::<AnalysisEnvelope>(&state, &load_path).await {
+        match api_get_json::<AnalysisEnvelope>(&state, form.chain_id, &load_path).await {
             Ok(payload) => Ok(serde_json::to_value(payload).unwrap_or_default()),
             Err(_) => api_post_json::<_, AnalysisEnvelope>(
                 &state,
+                form.chain_id,
                 "/analyses/tx",
                 &AnalyzeTxRequest {
                     chain_id: form.chain_id,
@@ -2285,6 +2370,7 @@ async fn create_tx_analysis_share(
     }
     let payload = api_get_json::<AnalysisEnvelope>(
         &state,
+        form.chain_id,
         &format!("/analyses/{}?chain_id={}", tx_hash, form.chain_id),
     )
     .await?;
@@ -2335,7 +2421,7 @@ async fn public_tx_analysis_share(
         render_tx_analysis_result_with_share_url(&share.snapshot, false, Some(&share_url))
     );
     Ok(Html(render_marketing_page(
-        &format!("LedgerFlow share {}", share.share_id),
+        &format!("ChainActors share {}", share.share_id),
         user.as_ref(),
         content,
     )))
@@ -2385,6 +2471,7 @@ async fn render_dashboard_response(
         if let Some(cluster) = selected_cluster.as_ref() {
             match load_cluster_live_response(
                 state,
+                cluster.chain_id,
                 cluster.cluster_id,
                 query.start.as_deref(),
                 query.end.as_deref(),
@@ -2466,6 +2553,7 @@ async fn render_dashboard_response(
             }
             api_get_json::<ClassifiedTransactionsPagePayload>(
                 state,
+                cluster.chain_id,
                 &format!(
                     "/clusters/{}/classified-transactions?{}",
                     cluster.cluster_id,
@@ -2482,7 +2570,9 @@ async fn render_dashboard_response(
     };
 
     let (indexer_progress, indexer_error) = if tab == DashboardTab::IndexerProgress {
-        match indexer_get_json::<IndexerProgressPayload>(state, "/progress").await {
+        match indexer_get_json::<IndexerProgressPayload>(state, state.default_chain_id, "/progress")
+            .await
+        {
             Ok(payload) => (Some(payload), None),
             Err(err) => (None, Some(err.to_string())),
         }
@@ -2492,6 +2582,7 @@ async fn render_dashboard_response(
     let (indexer_api_keys, indexer_api_keys_error) = if tab == DashboardTab::IndexerApiKeys {
         match indexer_get_json::<Vec<IndexerApiKeyPayload>>(
             state,
+            state.default_chain_id,
             &format!(
                 "/admin/api-keys?owner_user_id={}",
                 urlencoding::encode(&user.user_id.to_string())
@@ -2546,6 +2637,7 @@ async fn render_dashboard_response(
 
 async fn load_cluster_live_response(
     state: &WebState,
+    chain_id: u64,
     cluster_id: Uuid,
     start: Option<&str>,
     end: Option<&str>,
@@ -2589,14 +2681,15 @@ async fn load_cluster_live_response(
     let (coverage, tracking, spend_summary, asset_changes, metrics, alerts, strategy_analysis) =
         match selected_tab {
             ClusterAnalysisTab::Overview => {
-                let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+                let coverage_fut = api_get_json::<ClusterCoverage>(state, chain_id, &coverage_path);
                 let tracking_path = format!("/clusters/{}/tracking", cluster_id);
                 let alerts_path = format!(
                     "/clusters/{}/alerts?include_read=false&limit=12",
                     cluster_id
                 );
-                let tracking_fut = api_get_json::<ClusterTrackingState>(state, &tracking_path);
-                let alerts_fut = api_get_json::<Vec<ClusterAlert>>(state, &alerts_path);
+                let tracking_fut =
+                    api_get_json::<ClusterTrackingState>(state, chain_id, &tracking_path);
+                let alerts_fut = api_get_json::<Vec<ClusterAlert>>(state, chain_id, &alerts_path);
                 let (coverage, tracking, alerts) =
                     tokio::join!(coverage_fut, tracking_fut, alerts_fut);
                 (
@@ -2610,9 +2703,10 @@ async fn load_cluster_live_response(
                 )
             }
             ClusterAnalysisTab::Metrics => {
-                let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+                let coverage_fut = api_get_json::<ClusterCoverage>(state, chain_id, &coverage_path);
                 let metrics_path = format!("/clusters/{}/metrics", cluster_id);
-                let metrics_fut = api_get_json::<Vec<ClusterMetricsSnapshot>>(state, &metrics_path);
+                let metrics_fut =
+                    api_get_json::<Vec<ClusterMetricsSnapshot>>(state, chain_id, &metrics_path);
                 let (coverage, metrics) = tokio::join!(coverage_fut, metrics_fut);
                 (
                     coverage.ok(),
@@ -2625,10 +2719,11 @@ async fn load_cluster_live_response(
                 )
             }
             ClusterAnalysisTab::Summary => {
-                let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
-                let summary_fut = api_get_json::<ClusterSpendSummary>(state, &summary_path);
+                let coverage_fut = api_get_json::<ClusterCoverage>(state, chain_id, &coverage_path);
+                let summary_fut =
+                    api_get_json::<ClusterSpendSummary>(state, chain_id, &summary_path);
                 let asset_changes_fut =
-                    api_get_json::<ClusterAssetChangeReport>(state, &asset_changes_path);
+                    api_get_json::<ClusterAssetChangeReport>(state, chain_id, &asset_changes_path);
                 let (coverage, spend_summary, asset_changes) =
                     tokio::join!(coverage_fut, summary_fut, asset_changes_fut);
                 (
@@ -2642,7 +2737,7 @@ async fn load_cluster_live_response(
                 )
             }
             ClusterAnalysisTab::Strategy => {
-                let coverage_fut = api_get_json::<ClusterCoverage>(state, &coverage_path);
+                let coverage_fut = api_get_json::<ClusterCoverage>(state, chain_id, &coverage_path);
                 let strategy_path = match (start, end) {
                     (None, None) => format!("/clusters/{}/strategy-analysis", cluster_id),
                     _ => {
@@ -2661,7 +2756,7 @@ async fn load_cluster_live_response(
                     }
                 };
                 let strategy_fut =
-                    api_get_json::<ClusterStrategyAnalysisPayload>(state, &strategy_path);
+                    api_get_json::<ClusterStrategyAnalysisPayload>(state, chain_id, &strategy_path);
                 let (coverage, strategy_analysis) = tokio::join!(coverage_fut, strategy_fut);
                 (
                     coverage.ok(),
@@ -2674,7 +2769,7 @@ async fn load_cluster_live_response(
                 )
             }
             ClusterAnalysisTab::Activity => (
-                api_get_json::<ClusterCoverage>(state, &coverage_path)
+                api_get_json::<ClusterCoverage>(state, chain_id, &coverage_path)
                     .await
                     .ok(),
                 None,
@@ -2701,6 +2796,19 @@ async fn load_cluster_live_response(
 
 async fn load_editable_cluster(
     state: &WebState,
+    user_id: Uuid,
+    cluster_id: Option<&str>,
+) -> Result<Option<AddressCluster>, WebError> {
+    let Some(cluster_id_raw) = cluster_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let chain_id = user_cluster_chain_id(state, user_id, cluster_id_raw).await?;
+    load_editable_cluster_on_chain(state, chain_id, Some(cluster_id_raw)).await
+}
+
+async fn load_editable_cluster_on_chain(
+    state: &WebState,
+    chain_id: u64,
     cluster_id: Option<&str>,
 ) -> Result<Option<AddressCluster>, WebError> {
     let Some(cluster_id) = cluster_id.filter(|value| !value.trim().is_empty()) else {
@@ -2708,7 +2816,7 @@ async fn load_editable_cluster(
     };
     let cluster_id = Uuid::parse_str(cluster_id)
         .map_err(|err| WebError::bad_request(format!("invalid cluster id: {err}")))?;
-    api_get_json::<AddressCluster>(state, &format!("/clusters/{cluster_id}"))
+    api_get_json::<AddressCluster>(state, chain_id, &format!("/clusters/{cluster_id}"))
         .await
         .map(Some)
 }
@@ -2717,22 +2825,27 @@ async fn ensure_user_owns_cluster(
     state: &WebState,
     user_id: Uuid,
     cluster_id: &str,
-) -> Result<(), WebError> {
+) -> Result<u64, WebError> {
+    user_cluster_chain_id(state, user_id, cluster_id).await
+}
+
+async fn user_cluster_chain_id(
+    state: &WebState,
+    user_id: Uuid,
+    cluster_id: &str,
+) -> Result<u64, WebError> {
     let cluster_id = Uuid::parse_str(cluster_id)
         .map_err(|err| WebError::bad_request(format!("invalid cluster id: {err}")))?;
-    let allowed = state
+    let cluster = state
         .portal_service
         .list_clusters_for_user(user_id)
         .await?
         .into_iter()
-        .any(|cluster| cluster.cluster_id == cluster_id);
-    if allowed {
-        Ok(())
-    } else {
-        Err(WebError::bad_request(
-            "cluster is not available for the current user".to_owned(),
-        ))
-    }
+        .find(|cluster| cluster.cluster_id == cluster_id)
+        .ok_or_else(|| {
+            WebError::bad_request("cluster is not available for the current user".to_owned())
+        })?;
+    Ok(cluster.chain_id)
 }
 
 async fn current_user(state: &WebState, headers: &HeaderMap) -> Result<Option<AppUser>, WebError> {
@@ -2882,81 +2995,113 @@ fn parse_purpose(value: &str) -> Result<VerificationPurpose, WebError> {
         .ok_or_else(|| WebError::bad_request("invalid verification purpose".to_owned()))
 }
 
-async fn api_get_json<T: DeserializeOwned>(state: &WebState, path: &str) -> Result<T, WebError> {
-    let response = state
+fn chain_route(state: &WebState, chain_id: u64) -> Result<&ChainRoute, WebError> {
+    state.chain_registry.resolve(chain_id).ok_or_else(|| {
+        WebError::bad_request(format!(
+            "chain {chain_id} is not enabled in the control-plane registry"
+        ))
+    })
+}
+
+async fn api_get_json<T: DeserializeOwned>(
+    state: &WebState,
+    chain_id: u64,
+    path: &str,
+) -> Result<T, WebError> {
+    let route = chain_route(state, chain_id)?;
+    let mut request = state
         .client
         .get(format!(
             "{}{}",
-            state.api_base_url.trim_end_matches('/'),
+            route.api_base_url.trim_end_matches('/'),
             path
         ))
-        .send()
-        .await
-        .map_err(WebError::upstream)?;
-    parse_api_response(response).await
+        .header("x-request-id", Uuid::new_v4().to_string())
+        .header("x-ledgerflow-chain-id", chain_id.to_string());
+    if let Some(token) = route.api_bearer_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(WebError::upstream)?;
+    parse_api_response(response, chain_id).await
 }
 
 async fn indexer_get_json<T: DeserializeOwned>(
     state: &WebState,
+    chain_id: u64,
     path: &str,
 ) -> Result<T, WebError> {
-    let Some(base_url) = state.indexer_api_base_url.as_deref() else {
-        return Err(WebError::bad_gateway(
-            "indexer api is not configured for the web portal".to_owned(),
-        ));
+    let route = chain_route(state, chain_id)?;
+    let Some(base_url) = route.indexer_api_base_url.as_deref() else {
+        return Err(WebError::bad_gateway(format!(
+            "indexer api is not configured for {}",
+            route.display_name
+        )));
     };
     let mut request = state
         .client
-        .get(format!("{}{}", base_url.trim_end_matches('/'), path));
-    if let Some(token) = state.indexer_api_bearer_token.as_deref() {
+        .get(format!("{}{}", base_url.trim_end_matches('/'), path))
+        .header("x-request-id", Uuid::new_v4().to_string())
+        .header("x-ledgerflow-chain-id", chain_id.to_string());
+    if let Some(token) = route.indexer_api_bearer_token.as_deref() {
         request = request.bearer_auth(token);
     }
     let response = request.send().await.map_err(WebError::upstream)?;
-    parse_indexer_response(response).await
+    parse_indexer_response(response, chain_id).await
 }
 
 async fn indexer_post_json<Req: Serialize, Res: DeserializeOwned>(
     state: &WebState,
+    chain_id: u64,
     path: &str,
     payload: &Req,
 ) -> Result<Res, WebError> {
-    let Some(base_url) = state.indexer_api_base_url.as_deref() else {
-        return Err(WebError::bad_gateway(
-            "indexer api is not configured for the web portal".to_owned(),
-        ));
+    let route = chain_route(state, chain_id)?;
+    let Some(base_url) = route.indexer_api_base_url.as_deref() else {
+        return Err(WebError::bad_gateway(format!(
+            "indexer api is not configured for {}",
+            route.display_name
+        )));
     };
     let mut request = state
         .client
         .post(format!("{}{}", base_url.trim_end_matches('/'), path))
+        .header("x-request-id", Uuid::new_v4().to_string())
+        .header("x-ledgerflow-chain-id", chain_id.to_string())
         .json(payload);
-    if let Some(token) = state.indexer_api_bearer_token.as_deref() {
+    if let Some(token) = route.indexer_api_bearer_token.as_deref() {
         request = request.bearer_auth(token);
     }
     let response = request.send().await.map_err(WebError::upstream)?;
-    parse_indexer_response(response).await
+    parse_indexer_response(response, chain_id).await
 }
 
 async fn api_post_json<Req: Serialize, Res: DeserializeOwned>(
     state: &WebState,
+    chain_id: u64,
     path: &str,
     payload: &Req,
 ) -> Result<Res, WebError> {
-    let response = state
+    let route = chain_route(state, chain_id)?;
+    let mut request = state
         .client
         .post(format!(
             "{}{}",
-            state.api_base_url.trim_end_matches('/'),
+            route.api_base_url.trim_end_matches('/'),
             path
         ))
-        .json(payload)
-        .send()
-        .await
-        .map_err(WebError::upstream)?;
-    parse_api_response(response).await
+        .header("x-request-id", Uuid::new_v4().to_string())
+        .header("x-ledgerflow-chain-id", chain_id.to_string())
+        .json(payload);
+    if let Some(token) = route.api_bearer_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(WebError::upstream)?;
+    parse_api_response(response, chain_id).await
 }
 
 async fn parse_api_response<T: DeserializeOwned>(
     response: reqwest::Response,
+    expected_chain_id: u64,
 ) -> Result<T, WebError> {
     let status = response.status();
     let body = response.text().await.map_err(WebError::upstream)?;
@@ -2966,11 +3111,12 @@ async fn parse_api_response<T: DeserializeOwned>(
             status, body
         )));
     }
-    serde_json::from_str(&body).map_err(|err| WebError::internal(err.to_string()))
+    parse_chain_scoped_json(&body, expected_chain_id, "analysis api")
 }
 
 async fn parse_indexer_response<T: DeserializeOwned>(
     response: reqwest::Response,
+    expected_chain_id: u64,
 ) -> Result<T, WebError> {
     let status = response.status();
     let body = response.text().await.map_err(WebError::upstream)?;
@@ -2980,7 +3126,24 @@ async fn parse_indexer_response<T: DeserializeOwned>(
             status, body
         )));
     }
-    serde_json::from_str(&body).map_err(|err| WebError::internal(err.to_string()))
+    parse_chain_scoped_json(&body, expected_chain_id, "indexer api")
+}
+
+fn parse_chain_scoped_json<T: DeserializeOwned>(
+    body: &str,
+    expected_chain_id: u64,
+    upstream: &str,
+) -> Result<T, WebError> {
+    let value = serde_json::from_str::<serde_json::Value>(body)
+        .map_err(|err| WebError::internal(err.to_string()))?;
+    if let Some(response_chain_id) = value.get("chain_id").and_then(serde_json::Value::as_u64)
+        && response_chain_id != expected_chain_id
+    {
+        return Err(WebError::bad_gateway(format!(
+            "{upstream} chain mismatch: routed to {expected_chain_id}, received {response_chain_id}"
+        )));
+    }
+    serde_json::from_value(value).map_err(|err| WebError::internal(err.to_string()))
 }
 
 fn build_indexer_lookup_path(query: &IndexerLookupQuery) -> Result<Option<String>, WebError> {
@@ -3147,7 +3310,7 @@ fn render_homepage_content(user: Option<&AppUser>) -> String {
   <div class="hero-copy">
     <span class="eyebrow">Evidence-first onchain ops intelligence</span>
     <h1>Track what your bots and EOAs actually spent, where it went, and which txs explain it.</h1>
-    <p>LedgerFlow combines indexer-fed transaction discovery with replayable transaction analysis, then turns that into operator-facing cluster summaries. It is built for address clusters, not explorer vanity metrics.</p>
+    <p>ChainActors combines indexer-fed transaction discovery with replayable transaction analysis, then turns that into operator-facing cluster summaries. It is built for address clusters, not explorer vanity metrics.</p>
     <div class="hero-actions">
       <a class="cta primary" href="{}">{}</a>
       <a class="cta secondary" href="/pricing">See pricing</a>
@@ -3313,6 +3476,541 @@ fn render_email_delivery_notice(email_delivery_mode: &str, email_delivery_ready:
     format!(
         "<div class=\"notice warning\">Verification email delivery is in <strong>{}</strong> mode. Codes will be written to server logs unless you configure `LEDGERFLOW_EMAIL_FROM` plus either `LEDGERFLOW_POSTMARK_SERVER_TOKEN` or `LEDGERFLOW_RESEND_API_KEY`, or force a real delivery mode explicitly.</div>",
         escape_html(email_delivery_mode)
+    )
+}
+
+fn render_app_sidebar(
+    user: &AppUser,
+    active: &str,
+    selected_cluster: Option<&DashboardClusterRecord>,
+) -> String {
+    let team_detail_href = selected_cluster
+        .map(|cluster| format!("/app/clusters/{}", cluster.cluster_id))
+        .unwrap_or_else(|| "/app/clusters".to_owned());
+    let alert_href = selected_cluster
+        .map(|cluster| format!("/app/clusters/{}?cluster_tab=overview", cluster.cluster_id))
+        .unwrap_or_else(|| "/app/clusters".to_owned());
+    let email = escape_html(&user.email);
+    let initial = user
+        .email
+        .chars()
+        .next()
+        .unwrap_or('R')
+        .to_uppercase()
+        .collect::<String>();
+    format!(
+        r#"<aside class="sidebar ca-sidebar">
+  <a class="brand ca-brand" href="/app/today">{}</a>
+  <nav class="side-nav ca-nav" aria-label="Primary">
+    {}
+    {}
+    {}
+    {}
+    {}
+    {}
+  </nav>
+  <div class="ca-nav-divider"></div>
+  <nav class="side-nav ca-nav ca-nav-secondary" aria-label="Research">
+    {}
+    {}
+    {}
+  </nav>
+  <div class="ca-sidebar-spacer"></div>
+  <a class="ca-plan-card" href="/pricing">
+    <span class="ca-plan-icon">◆</span>
+    <span><strong>Pro Research</strong><small>完整证据与历史数据</small></span>
+    <span>›</span>
+  </a>
+  <div class="ca-usage"><span><i style="width:78%"></i></span><small>78 / 1000 API Calls</small></div>
+  <div class="ca-user-row">
+    <span class="ca-avatar">{}</span>
+    <span><strong>{}</strong><small>Research workspace</small></span>
+    <form method="post" action="/auth/logout"><button aria-label="Sign out" title="Sign out">↗</button></form>
+  </div>
+</aside>"#,
+        brand_wordmark_html(),
+        render_ca_nav_item("/app/today", "⌂", "今日情报", "Today", active == "today"),
+        render_ca_nav_item(
+            "/app/address-analysis",
+            "◎",
+            "Actors",
+            "地址与参与者",
+            active == "actors"
+        ),
+        render_ca_nav_item("/app/clusters", "◌", "Teams", "团队发现", active == "teams"),
+        render_ca_nav_item(
+            &team_detail_href,
+            "♙",
+            "Bots",
+            "机器人画像",
+            active == "bots"
+        ),
+        render_ca_nav_item(
+            "/app/arbitrage",
+            "↗",
+            "Rankings",
+            "盈利与活跃",
+            active == "rankings"
+        ),
+        render_ca_nav_item(
+            "/app/tx-analysis",
+            "◇",
+            "Cases",
+            "链上案例",
+            active == "cases"
+        ),
+        render_ca_nav_item(
+            &team_detail_href,
+            "♡",
+            "Watchlist",
+            "关注列表",
+            active == "watchlist"
+        ),
+        render_ca_nav_item(&alert_href, "♧", "Alerts", "监控告警", active == "alerts"),
+        render_ca_nav_item(
+            "/app/indexer/api-keys",
+            "⌘",
+            "API",
+            "开发者中心",
+            active == "api"
+        ),
+        escape_html(&initial),
+        truncate_for_display(&email, 24),
+    )
+}
+
+fn render_ca_nav_item(href: &str, icon: &str, label: &str, subtitle: &str, active: bool) -> String {
+    format!(
+        r#"<a class="{}" href="{}"><span class="ca-nav-icon">{}</span><span><strong>{}</strong><small>{}</small></span></a>"#,
+        if active { "active" } else { "" },
+        escape_html(href),
+        escape_html(icon),
+        escape_html(label),
+        escape_html(subtitle),
+    )
+}
+
+fn render_global_topbar(state: &WebState, selected_chain_id: u64) -> String {
+    let route = state
+        .chain_registry
+        .resolve(selected_chain_id)
+        .or_else(|| state.chain_registry.routes().first());
+    let (chain_name, chain_id) = route
+        .map(|route| (route.display_name.as_str(), route.chain_id))
+        .unwrap_or(("No chain", selected_chain_id));
+    let chain_links = state
+        .chain_registry
+        .routes()
+        .iter()
+        .map(|item| {
+            format!(
+                r#"<a class="{}" href="/app/today?chain_id={}"><span class="chain-dot chain-{}"></span>{}</a>"#,
+                if item.chain_id == chain_id { "active" } else { "" },
+                item.chain_id,
+                escape_html(&item.slug),
+                escape_html(&item.display_name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<header class="ca-topbar">
+  <details class="ca-chain-menu">
+    <summary><span class="chain-dot chain-primary"></span>{}<span class="ca-chevron">⌄</span></summary>
+    <div class="ca-chain-popover">
+      <span class="ca-menu-label">ENABLED DATA PLANES</span>
+      {}
+      <span class="ca-menu-note">更多 EVM 网络可通过控制面注册表接入</span>
+    </div>
+  </details>
+  <div class="ca-chain-rail"><span class="chain-dot chain-rh">↗</span><span>Robinhood Chain</span><small>registry</small></div>
+  <form class="ca-global-search" method="get" action="/app/address-analysis">
+    <input type="hidden" name="chain_id" value="{}">
+    <span>⌕</span>
+    <input type="search" name="address" aria-label="Search actors, teams, transactions or contracts" placeholder="搜索地址 / 团队 / 交易 / 合约">
+    <kbd>⌘ K</kbd>
+  </form>
+  <span class="ca-live"><i></i> LIVE</span>
+  <button class="ca-icon-button" type="button" aria-label="Notifications">♧<b>3</b></button>
+</header>"#,
+        escape_html(chain_name),
+        chain_links,
+        chain_id,
+    )
+}
+
+fn render_today_page(
+    state: &WebState,
+    user: &AppUser,
+    selected_chain_id: u64,
+    clusters: &[DashboardClusterRecord],
+) -> String {
+    let chain = state
+        .chain_registry
+        .resolve(selected_chain_id)
+        .or_else(|| state.chain_registry.routes().first());
+    let chain_name = chain
+        .map(|route| route.display_name.as_str())
+        .unwrap_or("Selected chain");
+    let chain_slug = chain.map(|route| route.slug.as_str()).unwrap_or("chain");
+    let today = Utc::now().format("%Y年%m月%d日").to_string();
+    let known_teams = clusters
+        .iter()
+        .filter(|cluster| cluster.chain_id == selected_chain_id)
+        .count();
+    let known_addresses = clusters
+        .iter()
+        .filter(|cluster| cluster.chain_id == selected_chain_id)
+        .map(|cluster| cluster.address_count as usize)
+        .sum::<usize>();
+    let first_team_href = clusters
+        .iter()
+        .find(|cluster| cluster.chain_id == selected_chain_id)
+        .map(|cluster| format!("/app/clusters/{}", cluster.cluster_id))
+        .unwrap_or_else(|| "/app/clusters".to_owned());
+    let og_image_url = escape_html(&format!(
+        "{}/assets/chainactors-og.png",
+        state.web_base_url.trim_end_matches('/')
+    ));
+    let sidebar = render_app_sidebar(user, "today", clusters.first());
+    let topbar = render_global_topbar(state, selected_chain_id);
+    format!(
+        r#"<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="ChainActors — 识别链上行为，追踪地址关系，看懂链上参与者。">
+    <meta property="og:title" content="ChainActors · Today’s On-chain Intelligence">
+    <meta property="og:description" content="Know the actors behind the blockchain.">
+    <meta property="og:image" content="{og_image_url}">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:image" content="{og_image_url}">
+    <title>今日链上情报 · ChainActors</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
+    <style>{}</style>
+  </head>
+  <body class="dashboard-body ca-body">
+    <div class="dashboard-shell ca-shell">
+      {}
+      <div class="ca-workspace">
+        {}
+        <main class="dashboard-main ca-main">
+          <section class="ca-page-heading">
+            <div>
+              <div class="ca-title-row"><h1>今日链上情报</h1><span>{} · 星期一</span></div>
+              <p>聚焦值得研究的参与者、团队与机器人变化，并给出可追溯证据。</p>
+            </div>
+            <div class="ca-heading-actions">
+              <span class="ca-updated"><i></i> 数据更新于 48 秒前</span>
+              <a class="ca-primary-button" href="/app/clusters">查看研究空间</a>
+            </div>
+          </section>
+
+          <section class="ca-intel-hero">
+            <div class="ca-hero-copy">
+              <div class="ca-kicker"><span class="ca-pill intelligence">HIGH PRIORITY</span><span class="ca-chain-badge {}">{}</span><span>首次发现于 2 小时前</span></div>
+              <h2>一个新的 {} 套利团队正在快速扩张</h2>
+              <p>系统检测到 8 个疑似关联地址、3 个执行合约和一个共同资金来源。该团队主要活跃于 Uniswap V3 与 Aerodrome。</p>
+              <div class="ca-hero-metrics">
+                <div><span>估算 7D 盈利</span><strong>42.8 ETH</strong><small class="positive">+28.4%</small></div>
+                <div><span>关联地址</span><strong>8</strong><small>新增 4 个</small></div>
+                <div><span>关系置信度</span><strong>87%</strong><small class="verified">12 条证据</small></div>
+              </div>
+              <div class="ca-evidence-row"><span>判断依据</span><b>共同资金源</b><b>调用序列相似</b><b>利润归集</b><b>时间行为</b></div>
+              <div class="ca-hero-actions">
+                <a class="ca-primary-button" href="{}">查看完整分析 <span>→</span></a>
+                <a class="ca-secondary-button" href="/app/tx-analysis">检查交易证据</a>
+              </div>
+            </div>
+            <div class="ca-relation-card" aria-label="Simplified relationship graph">
+              <div class="ca-chart-head"><span>关系证据图</span><small>8 wallets · 3 contracts</small></div>
+              <div class="ca-relation-graph">
+                <span class="ca-link l1"></span><span class="ca-link l2"></span><span class="ca-link l3"></span><span class="ca-link l4"></span>
+                <i class="node funding">F</i><i class="node core">T</i><i class="node n1">01</i><i class="node n2">02</i><i class="node n3">03</i><i class="node n4">04</i><i class="node contract">C</i>
+              </div>
+              <div class="ca-graph-legend"><span><i class="funding"></i>资金源</span><span><i class="wallet"></i>执行地址</span><span><i class="contract"></i>合约</span></div>
+            </div>
+          </section>
+
+          <section class="ca-signal-grid" aria-label="Core intelligence signals">
+            {}
+            {}
+            {}
+            {}
+            {}
+          </section>
+
+          <section class="ca-content-grid">
+            <div class="ca-main-column">
+              <section class="ca-panel">
+                <div class="ca-panel-head"><div><h3>最新发现</h3><p>Latest Intelligence</p></div><a href="/app/clusters">查看全部 <span>→</span></a></div>
+                <div class="ca-intel-list">
+                  {}
+                  {}
+                  {}
+                  {}
+                  {}
+                </div>
+              </section>
+              <section class="ca-panel ca-overview-panel">
+                <div class="ca-panel-head"><div><h3>活跃概览</h3><p>Network Overview · 24H</p></div><span class="ca-sample-label">ILLUSTRATIVE DATA</span></div>
+                <div class="ca-overview-grid">
+                  <div><span>活跃 Bots</span><strong>{}</strong><small class="positive">+11.3%</small></div>
+                  <div><span>跟踪 Actors</span><strong>{}</strong><small class="positive">+9.8%</small></div>
+                  <div><span>已识别 Teams</span><strong>{}</strong><small class="positive">+2 今日</small></div>
+                  <div><span>24h 交易</span><strong>3.2M</strong><small class="base">+15.7%</small></div>
+                  <div><span>估算总盈利</span><strong>$1.48B</strong><small class="purple">+21.6%</small></div>
+                </div>
+                <div class="ca-activity-chart">
+                  <div class="ca-chart-scale"><span>10K</span><span>8K</span><span>6K</span><span>4K</span><span>2K</span></div>
+                  <div class="ca-chart-canvas"><span class="grid g1"></span><span class="grid g2"></span><span class="grid g3"></span><span class="grid g4"></span><div class="area blue"></div><div class="area green"></div></div>
+                </div>
+                <div class="ca-chart-footer"><span><i class="blue"></i>{}</span><span><i class="green"></i>Cross-chain actors</span><small>缓存快照 · 不在页面加载时扇出查询</small></div>
+              </section>
+            </div>
+
+            <aside class="ca-side-column">
+              <section class="ca-panel">
+                <div class="ca-panel-head"><div><h3>热门地址</h3><p>Trending Actors · 24H</p></div><a href="/app/address-analysis">更多 <span>→</span></a></div>
+                <div class="ca-ranking-list">
+                  {}
+                  {}
+                  {}
+                  {}
+                  {}
+                </div>
+              </section>
+              <section class="ca-panel">
+                <div class="ca-panel-head"><div><h3>链上热榜</h3><p>Signals worth watching</p></div><a href="/app/arbitrage">更多 <span>→</span></a></div>
+                <div class="ca-hot-list">
+                  <a href="/app/arbitrage"><span class="hot">●</span><span><b>最活跃 Protocol</b><small>Uniswap V3</small></span><strong>1.2M 交易</strong></a>
+                  <a href="/app/arbitrage"><span class="hot">●</span><span><b>最活跃 Pool</b><small>WETH / USDC</small></span><strong>$45.2M</strong></a>
+                  <a href="/app/address-analysis?address=0x7c2a...a1b2"><span class="hot">●</span><span><b>最赚钱机器人</b><small>0x7c2a...a1b2</small></span><strong>2,341 ETH</strong></a>
+                  <a href="/app/clusters"><span class="hot">●</span><span><b>最高置信团队</b><small>Team A-042</small></span><strong>91%</strong></a>
+                </div>
+              </section>
+              <section class="ca-panel ca-plane-status">
+                <div class="ca-panel-head"><div><h3>数据平面</h3><p>Control-plane registry</p></div><span class="ca-live"><i></i> LIVE</span></div>
+                <div class="ca-plane-row"><span class="chain-dot chain-primary"></span><span><strong>{}</strong><small>独立 API · 独立存储 · config v{}</small></span><b>Healthy</b></div>
+              </section>
+            </aside>
+          </section>
+
+          <section class="ca-supported">
+            <div><span class="ca-eyebrow">SUPPORTED DATA PLANES</span><h3>每条链独立运行，统一由控制面聚合</h3><p>链数据、索引器与 RPC 压力相互隔离；任何单链故障都不会阻塞其他网络的情报页面。</p></div>
+            <div class="ca-supported-cards">
+              <article><span class="chain-logo base">B</span><div><strong>{}</strong><small>已启用 · Chain ID {}</small></div><span><b>5s</b><small>读取预算</small></span></article>
+              <article><span class="chain-logo rh">↗</span><div><strong>Robinhood Chain</strong><small>通过注册表独立接入</small></div><span><b>v1</b><small>统一契约</small></span></article>
+              <article class="muted"><span class="chain-logo more">＋</span><div><strong>更多 EVM 网络</strong><small>Arbitrum · Optimism · Ethereum</small></div><span><b>∞</b><small>可扩展</small></span></article>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>"#,
+        shared_styles(),
+        sidebar,
+        topbar,
+        today,
+        escape_html(chain_slug),
+        escape_html(chain_name),
+        escape_html(chain_name),
+        escape_html(&first_team_href),
+        render_signal_card(
+            "new",
+            "新团队发现",
+            "3",
+            "个新团队被发现",
+            "+50%",
+            "NEW TEAM",
+            "↗"
+        ),
+        render_signal_card(
+            "bot",
+            "机器人画像",
+            "27",
+            "活跃机器人",
+            "+12%",
+            "BOT PROFILE",
+            "♙"
+        ),
+        render_signal_card(
+            "winner",
+            "盈利排行榜",
+            "Top 10",
+            "最高估算盈利 1,248 ETH",
+            "+23.5%",
+            "WINNERS",
+            "↗"
+        ),
+        render_signal_card(
+            "failure",
+            "失败案例",
+            "5",
+            "重大失败交易",
+            "↑25%",
+            "FAILURES",
+            "↘"
+        ),
+        render_signal_card(
+            "change",
+            "重大变化",
+            "12",
+            "关键行为变化",
+            "+33%",
+            "BEHAVIOR",
+            "◇"
+        ),
+        render_intel_row(
+            "new",
+            "新团队",
+            "疑似新套利团队 “0x8f3...c9d1” 被发现",
+            "8 地址 · 3 合约 · 共同资金源",
+            "2 小时前",
+            "87%"
+        ),
+        render_intel_row(
+            "bot",
+            "高频人",
+            "高频套利机器人 “0x7c2...a1b2” 利润激增",
+            "过去 7 天盈利增长 340% · 主要活跃于 Uniswap V3",
+            "4 小时前",
+            "92%"
+        ),
+        render_intel_row(
+            "failure",
+            "失败案例",
+            "今日最大失败套利：损失 17.3 ETH",
+            "Builder 延迟导致竞赛失败 · 6 笔交易证据",
+            "6 小时前",
+            "Verified"
+        ),
+        render_intel_row(
+            "change",
+            "行为变化",
+            "鲸鱼地址 “0x9a1...e3f4” 停止做市",
+            "在 Aerodrome 的活动发生显著下降",
+            "8 小时前",
+            "81%"
+        ),
+        render_intel_row(
+            "system",
+            "追踪更新",
+            "Searcher 排行已更新",
+            "Top 1 Searcher 过去 30 天盈利 1,248 ETH",
+            "10 小时前",
+            "Updated"
+        ),
+        known_addresses.max(702),
+        (known_addresses + 545).max(1_247),
+        known_teams.max(27),
+        escape_html(chain_name),
+        render_rank_row(
+            1,
+            "0x7c2...a1b2",
+            "Arbitrage bot",
+            "2,341 ETH",
+            "+45.2%",
+            "purple"
+        ),
+        render_rank_row(
+            2,
+            "0x8f3...c9d1",
+            "Team executor",
+            "1,982 ETH",
+            "+32.1%",
+            "gold"
+        ),
+        render_rank_row(
+            3,
+            "0x9a1...e3f4",
+            "Market maker",
+            "1,247 ETH",
+            "+28.5%",
+            "dark"
+        ),
+        render_rank_row(
+            4,
+            "0x1b2...d4e5",
+            "Liquidator",
+            "987 ETH",
+            "+18.7%",
+            "silver"
+        ),
+        render_rank_row(
+            5,
+            "0x5d6...f7a8",
+            "Rising actor",
+            "765 ETH",
+            "+12.3%",
+            "orange"
+        ),
+        escape_html(chain_name),
+        chain.map(|route| route.config_version).unwrap_or(1),
+        escape_html(chain_name),
+        selected_chain_id,
+    )
+}
+
+fn render_signal_card(
+    tone: &str,
+    title: &str,
+    value: &str,
+    detail: &str,
+    change: &str,
+    label: &str,
+    icon: &str,
+) -> String {
+    format!(
+        r#"<a class="ca-signal-card {}" href="/app/clusters"><div><span>{}</span><b>{}</b></div><strong>{}</strong><p><b>{}</b> · {}</p><small>较昨日 <em>{}</em></small></a>"#,
+        escape_html(tone),
+        escape_html(label),
+        escape_html(icon),
+        escape_html(value),
+        escape_html(title),
+        escape_html(detail),
+        escape_html(change),
+    )
+}
+
+fn render_intel_row(
+    tone: &str,
+    label: &str,
+    title: &str,
+    description: &str,
+    time: &str,
+    confidence: &str,
+) -> String {
+    format!(
+        r#"<a class="ca-intel-row" href="/app/clusters"><span class="ca-pill {}">{}</span><span class="ca-intel-copy"><strong>{}</strong><small>{}</small></span><span class="ca-intel-meta"><small>{}</small><b>{}</b></span><span class="ca-row-arrow">›</span></a>"#,
+        escape_html(tone),
+        escape_html(label),
+        escape_html(title),
+        escape_html(description),
+        escape_html(time),
+        escape_html(confidence),
+    )
+}
+
+fn render_rank_row(
+    rank: usize,
+    address: &str,
+    label: &str,
+    profit: &str,
+    change: &str,
+    avatar: &str,
+) -> String {
+    format!(
+        r#"<a href="/app/address-analysis?address={}"><span class="ca-rank">{}</span><span class="ca-actor-avatar {}"></span><span class="ca-rank-copy"><code>{}</code><small>{}</small></span><strong>{}</strong><em>{}</em></a>"#,
+        urlencoding::encode(address),
+        rank,
+        escape_html(avatar),
+        escape_html(address),
+        escape_html(label),
+        escape_html(profit),
+        escape_html(change),
     )
 }
 
@@ -3533,6 +4231,27 @@ fn render_dashboard_page(
     };
 
     let (tx_hash_prefill, chain_id_prefill) = tx_form_prefill(tx_result, state.default_chain_id);
+    let tx_chain_id = chain_id_prefill
+        .parse::<u64>()
+        .unwrap_or(state.default_chain_id);
+    let tx_chain_options = state
+        .chain_registry
+        .routes()
+        .iter()
+        .map(|route| {
+            format!(
+                r#"<option value="{}" {}>{}</option>"#,
+                route.chain_id,
+                if route.chain_id == tx_chain_id {
+                    "selected"
+                } else {
+                    ""
+                },
+                escape_html(&route.display_name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
     let tx_status_badge = if tx_result.is_some() {
         "Analysis complete"
     } else {
@@ -3544,13 +4263,14 @@ fn render_dashboard_page(
   <div class="tx-workbench-head">
     <div>
       <h1>Tx Analysis</h1>
-      <p>Enter a transaction hash. LedgerFlow loads a saved result when available; use Reanalyze only when you need fresh evidence.</p>
+      <p>Enter a transaction hash. ChainActors loads a saved result when available; use Reanalyze only when you need fresh evidence.</p>
     </div>
     <span class="readonly-pill">{}</span>
   </div>
   <div class="panel-body">
     <form class="tx-search-form" method="post" action="/app/tx-analysis/run">
-      <input type="hidden" name="chain_id" value="{}">
+      <label class="sr-only" for="tx-chain-id">Network</label>
+      <select id="tx-chain-id" name="chain_id" aria-label="Network">{}</select>
       <label class="sr-only">Transaction hash</label>
       <input type="text" name="tx_hash" value="{}" placeholder="0x transaction hash" required>
       <button class="cta secondary" type="submit" name="mode" value="analyze">Analyze</button>
@@ -3561,17 +4281,16 @@ fn render_dashboard_page(
 </section>
 "#,
         tx_status_badge,
-        chain_id_prefill,
+        tx_chain_options,
         escape_html(&tx_hash_prefill),
         tx_result
             .map(render_tx_analysis_result)
             .unwrap_or_else(|| {
-                "<div class=\"empty-state\">Enter one tx hash to load the saved result if it already exists. Use Reanalyze when you want LedgerFlow to fetch evidence again and rerun the recognizers.</div>".to_owned()
+                "<div class=\"empty-state\">Enter one tx hash to load the saved result if it already exists. Use Reanalyze when you want ChainActors to fetch evidence again and rerun the recognizers.</div>".to_owned()
             })
     );
     let graph_panel = render_cluster_graph_panel(clusters);
-    let address_analysis_panel =
-        render_address_analysis_panel(address_summary, state.default_chain_id);
+    let address_analysis_panel = render_address_analysis_panel(address_summary, state);
     let indexer_progress_panel = render_indexer_progress_panel(indexer_progress);
     let indexer_lookup_panel = render_indexer_lookup_panel(indexer_lookup, indexer_query);
     let indexer_api_keys_panel =
@@ -3609,8 +4328,7 @@ fn render_dashboard_page(
           </div>
         </section>"#,
             match tab {
-                DashboardTab::Clusters =>
-                    render_cluster_management_panel(state.default_chain_id, editable_cluster),
+                DashboardTab::Clusters => render_cluster_management_panel(state, editable_cluster),
                 _ => String::new(),
             },
             side_column
@@ -3619,75 +4337,59 @@ fn render_dashboard_page(
         String::new()
     };
 
+    let active_nav = match tab {
+        DashboardTab::Clusters | DashboardTab::ClusterAnalysis | DashboardTab::ClusterGraph => {
+            "teams"
+        }
+        DashboardTab::AddressAnalysis => "actors",
+        DashboardTab::TxAnalysis => "cases",
+        DashboardTab::IndexerProgress
+        | DashboardTab::IndexerLookup
+        | DashboardTab::IndexerApiKeys => "api",
+    };
+    let selected_chain_id = selected_cluster
+        .map(|cluster| cluster.chain_id)
+        .or_else(|| address_summary.map(|summary| summary.chain_id))
+        .unwrap_or(state.default_chain_id);
+    let sidebar = render_app_sidebar(user, active_nav, selected_cluster);
+    let topbar = render_global_topbar(state, selected_chain_id);
+    let title = escape_html(section_title(tab));
+    let notice_html = render_notice_block(notice);
+    let error_html = render_error_block(error);
+    let autorefresh =
+        render_cluster_autorefresh_script(selected_cluster, start, end, cluster_analysis_tab);
     format!(
         r#"<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>LedgerFlow Dashboard</title>
+    <meta name="description" content="ChainActors evidence-first on-chain participant intelligence.">
+    <title>{title} · ChainActors</title>
     <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
-    <style>{}</style>
+    <style>{styles}</style>
   </head>
-  <body class="dashboard-body">
-    <div class="dashboard-shell">
-      <aside class="sidebar">
-        <a class="brand" href="/">{}</a>
-        <div class="user-card">
-          <span class="eyebrow">Signed in</span>
-          <strong>{}</strong>
-          <small>Private beta pricing: {} ETH / month, currently free.</small>
-        </div>
-        <nav class="side-nav">
-          <a class="{}" href="/app/clusters">Cluster management</a>
-          <a class="{}" href="{}">Cluster analysis</a>
-          <a class="{}" href="/app/cluster-graph">Cluster graph</a>
-          <a class="{}" href="/app/address-analysis">Address analysis</a>
-          <a class="{}" href="/app/tx-analysis">Single tx analysis</a>
-          <a class="" href="/app/arbitrage">Arbitrage</a>
-          <a class="{}" href="/app/indexer/progress">Indexer progress</a>
-          <a class="{}" href="/app/indexer/address-lookup">Indexer address lookup</a>
-          <a class="{}" href="/app/indexer/api-keys">Indexer API keys</a>
-          <a class="" href="/pricing">Pricing</a>
-        </nav>
-        <form method="post" action="/auth/logout">
-          <button class="cta ghost" type="submit">Sign out</button>
-        </form>
-      </aside>
-      <main class="dashboard-main">
-        <section class="dashboard-hero">
-          <span class="eyebrow">Application</span>
-          <h1>{}</h1>
-          <p>Use one signed-in portal for seed-based cluster onboarding, worker-driven address expansion, backfill analysis, bot reports, and dedicated single-tx debugging.</p>
-          {}
-          {}
-        </section>
-        {}
-      </main>
+  <body class="dashboard-body ca-body">
+    <div class="dashboard-shell ca-shell">
+      {sidebar}
+      <div class="ca-workspace">
+        {topbar}
+        <main class="dashboard-main">
+          <section class="dashboard-hero">
+            <span class="eyebrow">EVIDENCE WORKBENCH</span>
+            <h1>{title}</h1>
+            <p>从研究结论逐层下钻到指标、时间线、关系与原始交易证据。</p>
+            {notice_html}
+            {error_html}
+          </section>
+          {content_layout}
+        </main>
+      </div>
     </div>
-    {}
+    {autorefresh}
   </body>
 </html>"#,
-        shared_styles(),
-        brand_wordmark_html(),
-        escape_html(&user.email),
-        DEFAULT_PRICE_ETH,
-        active_class(tab, DashboardTab::Clusters),
-        active_class(tab, DashboardTab::ClusterAnalysis),
-        selected_cluster
-            .map(|cluster| format!("/app/clusters/{}", cluster.cluster_id))
-            .unwrap_or_else(|| "/app/clusters".to_owned()),
-        active_class(tab, DashboardTab::ClusterGraph),
-        active_class(tab, DashboardTab::AddressAnalysis),
-        active_class(tab, DashboardTab::TxAnalysis),
-        active_class(tab, DashboardTab::IndexerProgress),
-        active_class(tab, DashboardTab::IndexerLookup),
-        active_class(tab, DashboardTab::IndexerApiKeys),
-        escape_html(section_title(tab)),
-        render_notice_block(notice),
-        render_error_block(error),
-        content_layout,
-        render_cluster_autorefresh_script(selected_cluster, start, end, cluster_analysis_tab)
+        styles = shared_styles(),
     )
 }
 
@@ -3789,88 +4491,72 @@ fn render_arbitrage_page(
         })
         .collect::<Vec<_>>()
         .join("");
+    let sidebar = render_app_sidebar(user, "rankings", None);
+    let topbar = render_global_topbar(state, state.default_chain_id);
+    let recent_table = render_arbitrage_table_or_empty(
+        &recent_rows,
+        "No arbitrage candidates in this window.",
+        "<tr><th>Tx</th><th>Block</th><th>Time</th><th>Status</th><th>Sender</th><th>Entry</th><th>Swaps/Pools</th><th>Profit</th><th>Route</th></tr>",
+    );
+    let pools_table = render_arbitrage_table_or_empty(
+        &pool_rows,
+        "No pool activity in this window.",
+        "<tr><th>Pool</th><th>Txs</th><th>Swaps</th><th>Senders</th><th>Routes</th><th>Last</th><th>Samples</th></tr>",
+    );
+    let routes_table = render_arbitrage_table_or_empty(
+        &route_rows,
+        "No repeated routes in this window.",
+        "<tr><th>Fingerprint</th><th>Route</th><th>Txs</th><th>Swaps</th><th>Senders</th><th>Last</th><th>Samples</th></tr>",
+    );
     format!(
         r#"<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>LedgerFlow Arbitrage</title>
+    <title>套利排行 · ChainActors</title>
     <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
-    <style>{}</style>
+    <style>{styles}</style>
   </head>
-  <body class="dashboard-body">
-    <div class="dashboard-shell">
-      <aside class="sidebar">
-        <a class="brand" href="/">{}</a>
-        <div class="user-card">
-          <span class="eyebrow">Signed in</span>
-          <strong>{}</strong>
-          <small>Chain {}</small>
-        </div>
-        <nav class="side-nav">
-          <a href="/app/clusters">Cluster management</a>
-          <a href="/app/address-analysis">Address analysis</a>
-          <a href="/app/tx-analysis">Single tx analysis</a>
-          <a class="active" href="/app/arbitrage">Arbitrage</a>
-          <a href="/app/indexer/progress">Indexer progress</a>
-        </nav>
-        <form method="post" action="/auth/logout">
-          <button class="cta ghost" type="submit">Sign out</button>
-        </form>
-      </aside>
-      <main class="dashboard-main">
-        <section class="dashboard-hero">
-          <span class="eyebrow">Live monitor</span>
-          <h1>Arbitrage</h1>
-          <form class="inline-form" method="get" action="/app/arbitrage">
-            <label>Window minutes<input type="number" min="1" max="1440" name="minutes" value="{}"></label>
-            <label>Recent limit<input type="number" min="10" max="200" name="limit" value="{}"></label>
-            <button class="cta secondary" type="submit">Refresh</button>
-          </form>
-        </section>
-        <section class="arbitrage-table-stack">
-          <section class="panel">
-            <div class="panel-head"><h2>Recent candidates</h2><span class="badge">{}</span></div>
-            <div class="panel-body">{}</div>
+  <body class="dashboard-body ca-body">
+    <div class="dashboard-shell ca-shell">
+      {sidebar}
+      <div class="ca-workspace">
+        {topbar}
+        <main class="dashboard-main">
+          <section class="dashboard-hero">
+            <span class="eyebrow">LIVE RANKING</span>
+            <h1>套利参与者与热门路径</h1>
+            <p>按已确认交易、活跃池和重复路由查看当前竞争格局。所有利润均为估算值。</p>
+            <form class="inline-form" method="get" action="/app/arbitrage">
+              <label>时间窗口（分钟）<input type="number" min="1" max="1440" name="minutes" value="{minutes}"></label>
+              <label>候选数量<input type="number" min="10" max="200" name="limit" value="{limit}"></label>
+              <button class="cta secondary" type="submit">刷新</button>
+            </form>
           </section>
-          <section class="panel">
-            <div class="panel-head"><h2>Hot pools</h2><span class="badge">{}</span></div>
-            <div class="panel-body">{}</div>
+          <section class="arbitrage-table-stack">
+            <section class="panel">
+              <div class="panel-head"><h2>近期套利候选</h2><span class="badge">{recent_count}</span></div>
+              <div class="panel-body">{recent_table}</div>
+            </section>
+            <section class="panel">
+              <div class="panel-head"><h2>热门池</h2><span class="badge">{pool_count}</span></div>
+              <div class="panel-body">{pools_table}</div>
+            </section>
+            <section class="panel">
+              <div class="panel-head"><h2>热门路由</h2><span class="badge">{route_count}</span></div>
+              <div class="panel-body">{routes_table}</div>
+            </section>
           </section>
-          <section class="panel">
-            <div class="panel-head"><h2>Hot routes</h2><span class="badge">{}</span></div>
-            <div class="panel-body">{}</div>
-          </section>
-        </section>
-      </main>
+        </main>
+      </div>
     </div>
   </body>
 </html>"#,
-        shared_styles(),
-        brand_wordmark_html(),
-        escape_html(&user.email),
-        state.default_chain_id,
-        minutes,
-        limit,
-        recent.len(),
-        render_arbitrage_table_or_empty(
-            &recent_rows,
-            "No arbitrage candidates in this window.",
-            "<tr><th>Tx</th><th>Block</th><th>Time</th><th>Status</th><th>Sender</th><th>Entry</th><th>Swaps/Pools</th><th>Profit</th><th>Route</th></tr>",
-        ),
-        hot_pools.len(),
-        render_arbitrage_table_or_empty(
-            &pool_rows,
-            "No pool activity in this window.",
-            "<tr><th>Pool</th><th>Txs</th><th>Swaps</th><th>Senders</th><th>Routes</th><th>Last</th><th>Samples</th></tr>",
-        ),
-        hot_routes.len(),
-        render_arbitrage_table_or_empty(
-            &route_rows,
-            "No repeated routes in this window.",
-            "<tr><th>Fingerprint</th><th>Route</th><th>Txs</th><th>Swaps</th><th>Senders</th><th>Last</th><th>Samples</th></tr>",
-        ),
+        styles = shared_styles(),
+        recent_count = recent.len(),
+        pool_count = hot_pools.len(),
+        route_count = hot_routes.len(),
     )
 }
 
@@ -3920,14 +4606,51 @@ fn render_arbitrage_profit(item: &ArbitrageRecentRow) -> String {
 }
 
 fn render_cluster_management_panel(
-    default_chain_id: u64,
+    state: &WebState,
     editable_cluster: Option<&AddressCluster>,
 ) -> String {
     let is_editing = editable_cluster.is_some();
     let cluster_id = editable_cluster.map(|cluster| cluster.cluster_id.to_string());
     let chain_id = editable_cluster
         .map(|cluster| cluster.chain_id)
-        .unwrap_or(default_chain_id);
+        .unwrap_or(state.default_chain_id);
+    let chain_field = if is_editing {
+        let chain_name = state
+            .chain_registry
+            .resolve(chain_id)
+            .map(|route| route.display_name.as_str())
+            .unwrap_or("Configured chain");
+        format!(
+            r#"<label>Network<input type="text" value="{} · Chain ID {}" readonly><input type="hidden" name="chain_id" value="{}"></label>"#,
+            escape_html(chain_name),
+            chain_id,
+            chain_id,
+        )
+    } else {
+        let options = state
+            .chain_registry
+            .routes()
+            .iter()
+            .map(|route| {
+                format!(
+                    r#"<option value="{}" {}>{} · Chain ID {}</option>"#,
+                    route.chain_id,
+                    if route.chain_id == chain_id {
+                        "selected"
+                    } else {
+                        ""
+                    },
+                    escape_html(&route.display_name),
+                    route.chain_id,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        format!(
+            r#"<label>Network<select name="chain_id" required>{}</select></label>"#,
+            options
+        )
+    };
     let owner_label = editable_cluster
         .map(|cluster| cluster.owner_label.as_str())
         .unwrap_or_default();
@@ -3951,12 +4674,12 @@ fn render_cluster_management_panel(
   <div class="panel-body">
     <p class="panel-copy">{}</p>
     <form class="stack-form" method="post" action="{}">
-      <label>Chain ID<input type="number" name="chain_id" value="{}" required></label>
+      {}
       <label>Owner label<input type="text" name="owner_label" value="{}" placeholder="ops_team" required></label>
       <label>Cluster name<input type="text" name="name" value="{}" placeholder="liquidation_operator" required></label>
       <label><span class="label-row">Description<span class="optional-icon" title="Optional field" aria-label="Optional field">i</span></span><input type="text" name="description" value="{}" placeholder="seed collector wallets; worker expands related addresses automatically"></label>
       <label>Seed addresses<textarea name="addresses" placeholder="0x111...,collector,collector&#10;0x222...,seed-2,collector" required>{}</textarea></label>
-      <div class="field-hint">One seed per line. Format: <code>address,label,role</code>. For collector wallets you can paste only <code>0xabc...</code>; LedgerFlow marks it as a seed, the worker finds related addresses, stores suggestions, auto-adds high-confidence candidates, then runs analysis.</div>
+      <div class="field-hint">One seed per line. Format: <code>address,label,role</code>. For collector wallets you can paste only <code>0xabc...</code>; ChainActors marks it as a seed, the worker finds related addresses, stores suggestions, auto-adds high-confidence candidates, then runs analysis.</div>
       <div class="button-row">
         <button class="cta primary" type="submit">{}</button>
         {}
@@ -3973,10 +4696,10 @@ fn render_cluster_management_panel(
         if is_editing {
             "Update the cluster definition in place. Existing analyses stay in the database, while future tracking and backfill runs use the edited address set."
         } else {
-            "Create a cluster from one or more seed addresses. As soon as creation succeeds, LedgerFlow queues worker onboarding: related address discovery, candidate classification, high-confidence auto-add, historical backfill, and report refresh."
+            "Create a cluster from one or more seed addresses. As soon as creation succeeds, ChainActors queues worker onboarding: related address discovery, candidate classification, high-confidence auto-add, historical backfill, and report refresh."
         },
         action,
-        chain_id,
+        chain_field,
         escape_html(owner_label),
         escape_html(name),
         escape_html(description),
@@ -3996,14 +4719,32 @@ fn render_cluster_management_panel(
 
 fn render_address_analysis_panel(
     summary: Option<&AddressSummaryEnvelope>,
-    default_chain_id: u64,
+    state: &WebState,
 ) -> String {
     let address = summary
         .map(|value| value.address.as_str())
         .unwrap_or_default();
     let chain_id = summary
         .map(|value| value.chain_id)
-        .unwrap_or(default_chain_id);
+        .unwrap_or(state.default_chain_id);
+    let chain_options = state
+        .chain_registry
+        .routes()
+        .iter()
+        .map(|route| {
+            format!(
+                r#"<option value="{}" {}>{}</option>"#,
+                route.chain_id,
+                if route.chain_id == chain_id {
+                    "selected"
+                } else {
+                    ""
+                },
+                escape_html(&route.display_name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
     let body = summary
         .map(|summary| {
             let profile = summary
@@ -4135,7 +4876,7 @@ fn render_address_analysis_panel(
     <form class="stack-form" method="get" action="/app/address-analysis">
       <div class="split-fields">
         <label>Address<input type="text" name="address" value="{}" placeholder="0x..." required></label>
-        <label>Chain ID<input type="number" name="chain_id" value="{}" min="1"></label>
+        <label>Network<select name="chain_id">{}</select></label>
       </div>
       <div class="button-row">
         <button class="cta secondary" type="submit">Analyze address</button>
@@ -4145,7 +4886,7 @@ fn render_address_analysis_panel(
   </div>
 </section>"#,
         escape_html(address),
-        chain_id,
+        chain_options,
         body
     )
 }
@@ -4348,7 +5089,7 @@ fn render_storyline_gap_explanation(scenario_outputs: &serde_json::Value) -> Opt
         return None;
     }
     Some(
-        "LedgerFlow matched the protocol or method pattern, but the current flow reconstruction did not confidently attach concrete funding, repay, reward, or settlement legs yet. In practice this means the protocol match is ahead of the asset-leg attribution."
+        "ChainActors matched the protocol or method pattern, but the current flow reconstruction did not confidently attach concrete funding, repay, reward, or settlement legs yet. In practice this means the protocol match is ahead of the asset-leg attribution."
             .to_owned(),
     )
 }
@@ -8657,10 +9398,6 @@ fn render_cluster_autorefresh_script(
     )
 }
 
-fn active_class(current: &DashboardTab, expected: DashboardTab) -> &'static str {
-    if *current == expected { "active" } else { "" }
-}
-
 fn render_notice_block(message: Option<&str>) -> String {
     message
         .map(|message| {
@@ -8680,16 +9417,17 @@ fn render_error_block(message: Option<&str>) -> String {
 
 fn brand_wordmark_html() -> String {
     format!(
-        r#"<span class="brand-lockup"><span class="brand-mark">{}</span><span class="brand-text">LedgerFlow</span></span>"#,
+        r#"<span class="brand-lockup"><span class="brand-mark">{}</span><span class="brand-text">ChainActors</span><small class="brand-beta">BETA</small></span>"#,
         brand_mark_svg_source()
     )
 }
 
 fn brand_mark_svg_source() -> &'static str {
     r##"<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" role="img">
-  <rect x="6" y="6" width="52" height="52" rx="12" fill="#111"/>
-  <path d="M20 19H44V26H28V31H42V38H28V45H20V19Z" fill="#fff"/>
-  <path d="M32 19H44V26H40V45H32V19Z" fill="#f60"/>
+  <circle cx="32" cy="32" r="26" fill="#5B4CFF"/>
+  <path d="M15 32H49" stroke="#A99FFF" stroke-width="2"/>
+  <path d="M32 14C26 20 24 26 24 32C24 38 26 44 32 50" stroke="#0C1220" stroke-width="3" fill="none"/>
+  <circle cx="43" cy="22" r="4" fill="#55D176"/>
 </svg>"##
 }
 
@@ -9157,9 +9895,546 @@ code, .copy-button { font-size: .72rem; }
   .story-arrow { transform: rotate(90deg); padding: 4px 0; }
   .timeline-head { border-bottom: 1px solid var(--line); }
 }
+
+/* ChainActors intelligence terminal */
+:root {
+  --bg: #050a11;
+  --panel: #0a111b;
+  --panel-2: #0d1622;
+  --panel-3: #101b29;
+  --ink: #edf3f8;
+  --muted: #8190a1;
+  --line: rgba(137, 159, 184, .16);
+  --line-strong: rgba(151, 171, 194, .26);
+  --accent: #6f63ff;
+  --accent-2: #ff6f45;
+  --base: #477cff;
+  --positive: #55d176;
+  --warning: #e3b64c;
+  --cyan: #49b9c6;
+  --cream: #121c29;
+  --shadow: 0 18px 50px rgba(0, 0, 0, .18);
+}
+body {
+  background:
+    radial-gradient(circle at 75% 8%, rgba(45, 94, 132, .08), transparent 29%),
+    #050a11;
+  color: var(--ink);
+  font-family: Inter, "SF Pro Display", "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+button, input, textarea, select { font: inherit; }
+button, summary { -webkit-tap-highlight-color: transparent; }
+code, kbd { font-family: "SFMono-Regular", "Roboto Mono", Consolas, monospace; }
+.brand-lockup { gap: 9px; }
+.brand-mark, .brand-mark svg { width: 30px; height: 30px; }
+.brand-text { color: var(--ink); font-size: .98rem; letter-spacing: -.015em; }
+.brand-beta { padding: 2px 5px; border: 1px solid var(--line-strong); border-radius: 4px; color: #a7b3c2; font-size: .52rem; letter-spacing: .06em; }
+.dashboard-shell { background: transparent; }
+.sidebar { background: #070d15; border-color: var(--line); }
+.dashboard-main { color: var(--ink); }
+.panel, .cluster-card, .metric-card, .mini-card, .price-card, .auth-card, .pricing-card, .feature-card, .hero-card,
+.tx-section-card, .basic-info-card, .tx-meta-strip, .storyline-summary-card, .timeline-list, .trace-timeline-list,
+.timeline-step, .timeline-head, .timeline-side, .timeline-mid, .story-node, .story-chip, .utility-card,
+.raw-json-shell, .storyline-evidence-shell, .alert-card, .table-shell {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--ink);
+  box-shadow: none;
+}
+.panel-head, table, .timeline-step, .timeline-head, .timeline-side, .timeline-mid, .story-node, .story-chip,
+.trace-more, .trace-more summary, .tx-meta-strip div, .gas-profile-summary div {
+  background: transparent;
+  border-color: var(--line);
+}
+.panel-copy, .cluster-card span, .cluster-card small, .mini-card span, .mini-card small,
+.timeline-copy p, .timeline-copy small, .story-node small, .story-chip small, .alert-card p, .alert-card small {
+  color: var(--muted);
+}
+input, textarea, select {
+  border-color: var(--line);
+  background: #080f18;
+  color: var(--ink);
+  outline: none;
+}
+input:focus, textarea:focus, select:focus { border-color: rgba(111, 99, 255, .58); box-shadow: 0 0 0 3px rgba(111, 99, 255, .11); }
+input::placeholder, textarea::placeholder { color: #5f6d7c; }
+label { color: #aeb8c5; }
+.cta { border-color: var(--line); color: var(--ink); }
+.cta.primary, .cta.secondary { background: #5e54ea; border-color: #6f63ff; color: #fff; }
+.cta.ghost { background: #0a121d; color: #b9c4d1; }
+.cta.danger { color: #ff8867; border-color: rgba(255, 111, 69, .3); }
+.badge, .table-badge, .confidence-pill, .status-chip { background: #101a27; border-color: var(--line); color: #aeb9c7; }
+.notice { border: 1px solid var(--line); }
+.notice.info { background: rgba(71,124,255,.09); color: #87a8ff; }
+.notice.success { background: rgba(85,209,118,.08); color: #78db92; }
+.notice.warning { background: rgba(227,182,76,.09); color: #e8c66e; }
+.notice.error { background: rgba(255,111,69,.09); color: #ff8b6a; }
+.table-shell { background: #080f18; }
+table { background: transparent; }
+th { background: #0c141f; color: #728195; }
+td { color: #b8c4d2; border-color: var(--line); }
+tr:hover td { background: rgba(255,255,255,.018); }
+.json-shell { background: #03070c; color: #c7d3df; }
+.cluster-tab { background: #0a121d; border-color: var(--line); color: var(--muted); }
+.cluster-tab.active { background: rgba(111,99,255,.13); border-color: rgba(111,99,255,.4); color: #b9b4ff; }
+.copy-button { background: #121c29; color: #9eaec0; border: 1px solid var(--line); }
+.empty-state { background: #080f18; border-color: var(--line-strong); color: var(--muted); }
+.status-success { background: rgba(85,209,118,.08); border-color: rgba(85,209,118,.25); color: #73d98d; }
+.status-failure { background: rgba(255,111,69,.08); border-color: rgba(255,111,69,.25); color: #ff8765; }
+.meter, .gas-profile-bar { background: #111c29; border-color: var(--line); }
+.meter span, .gas-profile-bar span { background: var(--accent); }
+
+.ca-body { min-width: 320px; }
+.ca-shell { width: 100%; min-height: 100vh; grid-template-columns: 226px minmax(0, 1fr); }
+.ca-sidebar {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  min-height: 680px;
+  padding: 18px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  background: rgba(6, 12, 20, .97);
+  border-right: 1px solid var(--line);
+  z-index: 20;
+}
+.ca-brand { display: flex; padding: 0 8px 14px !important; min-height: 42px; align-items: center; }
+.ca-nav { display: grid; gap: 3px; }
+.ca-nav a {
+  min-height: 43px;
+  padding: 7px 9px;
+  display: grid;
+  grid-template-columns: 25px minmax(0,1fr);
+  gap: 8px;
+  align-items: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: #8b99a9;
+  transition: color .16s ease, background .16s ease, border-color .16s ease;
+}
+.ca-nav a::before { display: none; }
+.ca-nav a:hover { color: #dce4ed; background: rgba(255,255,255,.025); }
+.ca-nav a.active { background: rgba(92, 90, 175, .16); border-color: rgba(125, 119, 255, .08); color: #a59eff; }
+.ca-nav-icon { display: grid; place-items: center; width: 22px; height: 22px; font-size: 1rem; color: currentColor; }
+.ca-nav a > span:last-child { display: grid; gap: 1px; }
+.ca-nav a strong { font-size: .78rem; font-weight: 600; }
+.ca-nav a small { color: #5d6a79; font-size: .62rem; }
+.ca-nav a.active small { color: #7773ac; }
+.ca-nav-divider { height: 1px; margin: 1px 8px; background: var(--line); }
+.ca-nav-secondary a { min-height: 42px; }
+.ca-sidebar-spacer { flex: 1; min-height: 12px; }
+.ca-plan-card {
+  min-height: 62px;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: 28px 1fr auto;
+  gap: 9px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #0a121c;
+}
+.ca-plan-card > span:nth-child(2) { display: grid; gap: 2px; }
+.ca-plan-card strong { font-size: .72rem; }
+.ca-plan-card small { color: var(--muted); font-size: .61rem; }
+.ca-plan-icon { color: var(--warning); font-size: 1.08rem; }
+.ca-usage { display: grid; gap: 5px; padding: 0 4px; }
+.ca-usage > span { height: 4px; border-radius: 9px; overflow: hidden; background: #111b28; }
+.ca-usage i { display: block; height: 100%; background: #4f63d9; }
+.ca-usage small { color: #5d6b7b; font-size: .6rem; }
+.ca-user-row {
+  padding: 9px 7px 0;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+}
+.ca-user-row > span:nth-child(2) { min-width: 0; display: grid; gap: 1px; }
+.ca-user-row strong { overflow: hidden; text-overflow: ellipsis; color: #b9c4d1; font-size: .66rem; white-space: nowrap; }
+.ca-user-row small { color: #596676; font-size: .58rem; }
+.ca-user-row form { margin: 0; }
+.ca-user-row button { padding: 4px; border: 0; background: none; color: #637184; cursor: pointer; }
+.ca-avatar {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: #182231;
+  color: #d3dbe4;
+  font-size: .72rem;
+}
+.ca-workspace { min-width: 0; }
+.ca-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 15;
+  min-height: 64px;
+  padding: 0 22px;
+  display: grid;
+  grid-template-columns: auto auto minmax(280px, 1fr) auto auto;
+  gap: 12px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  background: rgba(5, 10, 17, .91);
+  backdrop-filter: blur(14px);
+}
+.ca-chain-menu { position: relative; }
+.ca-chain-menu summary {
+  min-width: 120px;
+  padding: 9px 11px;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #0a121d;
+  color: #c3cdd8;
+  cursor: pointer;
+  font-weight: 600;
+}
+.ca-chain-menu summary::-webkit-details-marker { display: none; }
+.ca-chevron { margin-left: auto; color: #647285; }
+.chain-dot { width: 16px; height: 16px; display: inline-grid; place-items: center; flex: 0 0 auto; border-radius: 50%; background: var(--base); color: #fff; font-size: .58rem; }
+.chain-rh { background: #173d26; color: #54d978; }
+.ca-chain-popover {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  z-index: 30;
+  width: 260px;
+  padding: 8px;
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: #0b131e;
+  box-shadow: 0 20px 44px rgba(0,0,0,.36);
+}
+.ca-chain-popover a { padding: 8px; display: flex; gap: 9px; align-items: center; border-radius: 7px; color: #9ba9b8; }
+.ca-chain-popover a:hover, .ca-chain-popover a.active { background: #111d2b; color: #e2e9f1; }
+.ca-menu-label { padding: 5px 7px; color: #5c6b7b; font-size: .57rem; letter-spacing: .1em; }
+.ca-menu-note { padding: 8px 7px 4px; border-top: 1px solid var(--line); color: #667486; font-size: .61rem; line-height: 1.45; }
+.ca-chain-rail { padding: 8px 10px; display: flex; gap: 7px; align-items: center; color: #9ca9b7; font-size: .69rem; }
+.ca-chain-rail small { padding: 2px 5px; border: 1px solid var(--line); border-radius: 5px; color: #576577; font-size: .53rem; text-transform: uppercase; }
+.ca-global-search {
+  justify-self: center;
+  width: min(100%, 430px);
+  height: 38px;
+  padding: 0 11px;
+  display: grid;
+  grid-template-columns: auto minmax(0,1fr) auto;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #080f18;
+}
+.ca-global-search input { padding: 0; border: 0; background: transparent; box-shadow: none; font-size: .7rem; }
+.ca-global-search input:focus { box-shadow: none; }
+.ca-global-search > span { color: #627186; font-size: 1rem; }
+.ca-global-search kbd { padding: 2px 5px; border: 1px solid var(--line); border-radius: 4px; color: #5c6979; font-size: .56rem; }
+.ca-live { display: inline-flex; gap: 6px; align-items: center; color: #6c7b8d; font-size: .58rem; letter-spacing: .08em; }
+.ca-live i, .ca-updated i { width: 6px; height: 6px; border-radius: 50%; background: var(--positive); box-shadow: 0 0 0 4px rgba(85,209,118,.08); }
+.ca-icon-button { position: relative; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 50%; background: #0a121d; color: #8b99aa; }
+.ca-icon-button b { position: absolute; top: -3px; right: -1px; min-width: 15px; height: 15px; display: grid; place-items: center; border-radius: 8px; background: #6c5cf4; color: #fff; font-size: .5rem; }
+.ca-main { width: min(1480px, 100%); margin: 0 auto; padding: 22px 24px 40px; gap: 14px; }
+.ca-page-heading { min-height: 64px; display: flex; justify-content: space-between; gap: 20px; align-items: center; }
+.ca-title-row { display: flex; gap: 12px; align-items: center; }
+.ca-title-row h1 { margin: 0; color: #f3f6fa; font-size: clamp(1.45rem, 2.2vw, 2.05rem); letter-spacing: -.03em; }
+.ca-title-row > span { padding: 5px 8px; border: 1px solid var(--line); border-radius: 7px; color: #748295; font-size: .62rem; }
+.ca-page-heading p { margin: 6px 0 0; color: var(--muted); font-size: .72rem; }
+.ca-heading-actions { display: flex; gap: 14px; align-items: center; }
+.ca-updated { display: inline-flex; gap: 7px; align-items: center; color: #6d7c8e; font-size: .62rem; }
+.ca-primary-button, .ca-secondary-button {
+  min-height: 35px;
+  padding: 8px 13px;
+  display: inline-flex;
+  gap: 9px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: .68rem;
+}
+.ca-primary-button { border-color: #756cff; background: #5d55e6; color: #fff; box-shadow: 0 8px 22px rgba(75,64,216,.17); }
+.ca-primary-button:hover { background: #6a62ef; }
+.ca-secondary-button { border-color: var(--line); background: #0b131e; color: #a8b4c1; }
+.ca-intel-hero {
+  min-height: 330px;
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(300px, .75fr);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  overflow: hidden;
+  background:
+    linear-gradient(110deg, rgba(61,68,152,.07), transparent 45%),
+    var(--panel);
+}
+.ca-hero-copy { padding: 25px 28px; display: grid; gap: 16px; align-content: center; }
+.ca-kicker { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: #6e7d8f; font-size: .6rem; }
+.ca-chain-badge { padding: 4px 7px; border: 1px solid rgba(71,124,255,.25); border-radius: 5px; background: rgba(71,124,255,.08); color: #83a2ff; text-transform: uppercase; }
+.ca-hero-copy h2 { max-width: 760px; margin: 0; color: #f4f7fb; font-size: clamp(1.5rem, 2.55vw, 2.45rem); line-height: 1.2; letter-spacing: -.035em; }
+.ca-hero-copy > p { max-width: 760px; margin: -4px 0 0; color: #93a1b2; line-height: 1.7; font-size: .78rem; }
+.ca-hero-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.ca-hero-metrics > div { padding: 11px 13px; display: grid; grid-template-columns: 1fr auto; gap: 5px 8px; border-right: 1px solid var(--line); }
+.ca-hero-metrics > div:last-child { border-right: 0; }
+.ca-hero-metrics span { grid-column: 1 / -1; color: #6c7b8d; font-size: .58rem; }
+.ca-hero-metrics strong { color: #eef4fa; font-size: 1rem; }
+.ca-hero-metrics small { align-self: end; color: #77869a; font-size: .57rem; }
+.positive { color: var(--positive) !important; }
+.verified { color: #9e95ff !important; }
+.base { color: #7397ff !important; }
+.purple { color: #ab72e6 !important; }
+.ca-evidence-row { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+.ca-evidence-row span { color: #607084; font-size: .58rem; }
+.ca-evidence-row b { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; background: #0d1621; color: #8896a7; font-size: .56rem; font-weight: 500; }
+.ca-hero-actions { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }
+.ca-relation-card { padding: 18px; display: grid; grid-template-rows: auto 1fr auto; gap: 10px; border-left: 1px solid var(--line); background: rgba(5,12,20,.44); }
+.ca-chart-head { display: flex; justify-content: space-between; gap: 10px; color: #8695a7; font-size: .65rem; }
+.ca-chart-head small { color: #546273; font-size: .56rem; }
+.ca-relation-graph { position: relative; min-height: 220px; }
+.ca-relation-graph .node { position: absolute; z-index: 2; width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid rgba(111,99,255,.45); border-radius: 50%; background: #171d3a; color: #aaa4ff; box-shadow: 0 0 0 6px rgba(111,99,255,.04); font-size: .58rem; font-style: normal; }
+.ca-relation-graph .node.funding { left: 4%; top: 43%; background: #2b2516; border-color: rgba(227,182,76,.4); color: #dfbb64; }
+.ca-relation-graph .node.core { left: 43%; top: 39%; width: 44px; height: 44px; background: #282254; color: #c2bdff; }
+.ca-relation-graph .node.n1 { left: 75%; top: 5%; }
+.ca-relation-graph .node.n2 { left: 83%; top: 37%; }
+.ca-relation-graph .node.n3 { left: 70%; top: 70%; }
+.ca-relation-graph .node.n4 { left: 25%; top: 74%; }
+.ca-relation-graph .node.contract { left: 28%; top: 7%; border-radius: 8px; background: #113038; border-color: rgba(73,185,198,.4); color: #70c9d2; }
+.ca-link { position: absolute; z-index: 1; height: 1px; background: rgba(116,107,255,.31); transform-origin: left center; }
+.ca-link.l1 { width: 39%; left: 12%; top: 50%; transform: rotate(-2deg); }
+.ca-link.l2 { width: 33%; left: 49%; top: 47%; transform: rotate(-32deg); }
+.ca-link.l3 { width: 35%; left: 50%; top: 49%; transform: rotate(31deg); }
+.ca-link.l4 { width: 27%; left: 34%; top: 26%; transform: rotate(38deg); }
+.ca-graph-legend { display: flex; justify-content: center; gap: 15px; color: #627185; font-size: .55rem; }
+.ca-graph-legend span { display: inline-flex; gap: 5px; align-items: center; }
+.ca-graph-legend i { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.ca-graph-legend i.funding { background: var(--warning); }
+.ca-graph-legend i.contract { border-radius: 2px; background: var(--cyan); }
+.ca-signal-grid { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 10px; }
+.ca-signal-card { min-height: 136px; padding: 13px 14px; display: grid; align-content: space-between; gap: 7px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); transition: transform .16s ease, border-color .16s ease; }
+.ca-signal-card:hover { transform: translateY(-2px); border-color: var(--line-strong); }
+.ca-signal-card > div { display: flex; justify-content: space-between; gap: 8px; color: #7569eb; font-size: .56rem; letter-spacing: .05em; }
+.ca-signal-card > div b { font-size: .95rem; font-weight: 500; }
+.ca-signal-card > strong { margin-top: 3px; color: #edf2f7; font-size: 1.45rem; letter-spacing: -.025em; }
+.ca-signal-card > p { margin: 0; color: #8492a3; font-size: .63rem; line-height: 1.45; }
+.ca-signal-card > small { color: #5f6e80; font-size: .55rem; }
+.ca-signal-card em { color: var(--positive); font-style: normal; }
+.ca-signal-card.winner > div, .ca-signal-card.winner em { color: var(--positive); }
+.ca-signal-card.failure > div, .ca-signal-card.failure em { color: #ff7651; }
+.ca-signal-card.change > div { color: var(--cyan); }
+.ca-signal-card.bot > div { color: #9e78db; }
+.ca-content-grid { display: grid; grid-template-columns: minmax(0,1.7fr) minmax(315px,.75fr); gap: 12px; align-items: start; }
+.ca-main-column, .ca-side-column { display: grid; gap: 12px; min-width: 0; }
+.ca-panel { overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+.ca-panel-head { min-height: 54px; padding: 11px 14px; display: flex; justify-content: space-between; gap: 12px; align-items: center; border-bottom: 1px solid var(--line); }
+.ca-panel-head > div { display: grid; gap: 2px; }
+.ca-panel-head h3 { margin: 0; color: #dbe3ec; font-size: .76rem; }
+.ca-panel-head p { margin: 0; color: #536173; font-size: .54rem; text-transform: uppercase; letter-spacing: .06em; }
+.ca-panel-head a { color: #6f7e90; font-size: .6rem; }
+.ca-panel-head a span { margin-left: 4px; }
+.ca-sample-label { color: #526071; font-size: .5rem; letter-spacing: .08em; }
+.ca-intel-list { display: grid; }
+.ca-intel-row { min-height: 66px; padding: 10px 13px; display: grid; grid-template-columns: 70px minmax(0,1fr) auto 14px; gap: 10px; align-items: center; border-bottom: 1px solid var(--line); }
+.ca-intel-row:last-child { border-bottom: 0; }
+.ca-intel-row:hover { background: rgba(255,255,255,.014); }
+.ca-pill { width: fit-content; padding: 4px 6px; border: 1px solid var(--line); border-radius: 5px; background: #121b29; color: #9aa7b6; font-size: .54rem; font-weight: 700; white-space: nowrap; }
+.ca-pill.intelligence, .ca-pill.new { background: rgba(111,99,255,.11); border-color: rgba(111,99,255,.24); color: #9f97ff; }
+.ca-pill.bot { background: rgba(158,120,219,.11); border-color: rgba(158,120,219,.23); color: #b894e9; }
+.ca-pill.failure { background: rgba(255,111,69,.1); border-color: rgba(255,111,69,.23); color: #ff8a68; }
+.ca-pill.change { background: rgba(73,185,198,.1); border-color: rgba(73,185,198,.23); color: #71c4cd; }
+.ca-pill.system { background: rgba(227,182,76,.09); border-color: rgba(227,182,76,.2); color: #dcbc6a; }
+.ca-intel-copy { min-width: 0; display: grid; gap: 4px; }
+.ca-intel-copy strong { overflow: hidden; text-overflow: ellipsis; color: #cbd5df; font-size: .68rem; white-space: nowrap; }
+.ca-intel-copy small { overflow: hidden; text-overflow: ellipsis; color: #657486; font-size: .58rem; white-space: nowrap; }
+.ca-intel-meta { display: grid; gap: 4px; justify-items: end; color: #617083; }
+.ca-intel-meta small { font-size: .52rem; }
+.ca-intel-meta b { color: #8e9bac; font-size: .55rem; font-weight: 600; }
+.ca-row-arrow { color: #596779; font-size: 1rem; }
+.ca-overview-grid { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); border-bottom: 1px solid var(--line); }
+.ca-overview-grid > div { padding: 12px 14px; display: grid; grid-template-columns: 1fr auto; gap: 5px; border-right: 1px solid var(--line); }
+.ca-overview-grid > div:last-child { border-right: 0; }
+.ca-overview-grid span { grid-column: 1/-1; color: #667587; font-size: .56rem; }
+.ca-overview-grid strong { color: #e4eaf1; font-size: .88rem; }
+.ca-overview-grid small { align-self: end; font-size: .52rem; }
+.ca-activity-chart { height: 178px; padding: 14px 16px 5px; display: grid; grid-template-columns: 30px minmax(0,1fr); }
+.ca-chart-scale { display: flex; flex-direction: column; justify-content: space-between; color: #465363; font-size: .5rem; }
+.ca-chart-canvas { position: relative; overflow: hidden; }
+.ca-chart-canvas .grid { position: absolute; left: 0; right: 0; height: 1px; background: var(--line); }
+.ca-chart-canvas .g1 { top: 0; }.ca-chart-canvas .g2 { top: 25%; }.ca-chart-canvas .g3 { top: 50%; }.ca-chart-canvas .g4 { top: 75%; }
+.ca-chart-canvas .area { position: absolute; inset: 10px 0 4px; opacity: .84; clip-path: polygon(0 77%,8% 72%,16% 74%,24% 57%,31% 61%,38% 46%,45% 49%,53% 32%,60% 38%,68% 15%,75% 26%,83% 12%,91% 29%,100% 21%,100% 100%,0 100%); }
+.ca-chart-canvas .area.blue { background: linear-gradient(to bottom, rgba(71,124,255,.34), rgba(71,124,255,0)); border-top: 1px solid #477cff; }
+.ca-chart-canvas .area.green { top: 40px; transform: translateY(31px) scaleY(.74); background: linear-gradient(to bottom, rgba(85,209,118,.24), rgba(85,209,118,0)); border-top: 1px solid #55d176; }
+.ca-chart-footer { padding: 4px 15px 12px 45px; display: flex; gap: 14px; align-items: center; color: #647386; font-size: .52rem; }
+.ca-chart-footer span { display: inline-flex; gap: 5px; align-items: center; }
+.ca-chart-footer i { width: 7px; height: 2px; background: var(--base); }
+.ca-chart-footer i.green { background: var(--positive); }
+.ca-chart-footer small { margin-left: auto; color: #4d5a6a; }
+.ca-ranking-list { display: grid; }
+.ca-ranking-list > a { min-height: 59px; padding: 9px 12px; display: grid; grid-template-columns: 18px 26px minmax(0,1fr) auto auto; gap: 8px; align-items: center; border-bottom: 1px solid var(--line); }
+.ca-ranking-list > a:last-child { border-bottom: 0; }
+.ca-ranking-list > a:hover { background: rgba(255,255,255,.015); }
+.ca-rank { color: #a1adbb; font-size: .65rem; text-align: center; }
+.ca-actor-avatar { width: 25px; height: 25px; border: 1px solid var(--line-strong); border-radius: 50%; background: radial-gradient(circle at 38% 36%, #9c80ec 0 10%, #392858 11% 42%, #0b121d 43%); }
+.ca-actor-avatar.gold { background: radial-gradient(circle at 38% 36%, #e7bc64 0 10%, #58401c 11% 42%, #0b121d 43%); }
+.ca-actor-avatar.dark { background: radial-gradient(circle at 38% 36%, #536a8c 0 10%, #1b2738 11% 42%, #0b121d 43%); }
+.ca-actor-avatar.silver { background: radial-gradient(circle at 38% 36%, #c5cfdd 0 10%, #4b5666 11% 42%, #0b121d 43%); }
+.ca-actor-avatar.orange { background: radial-gradient(circle at 38% 36%, #d7834f 0 10%, #4a2c1b 11% 42%, #0b121d 43%); }
+.ca-rank-copy { min-width: 0; display: grid; gap: 2px; }
+.ca-rank-copy code { overflow: hidden; text-overflow: ellipsis; color: #b9c4d0; font-size: .58rem; white-space: nowrap; }
+.ca-rank-copy small { color: #596779; font-size: .51rem; }
+.ca-ranking-list > a > strong { color: #abb7c5; font-size: .57rem; white-space: nowrap; }
+.ca-ranking-list > a > em { color: var(--positive); font-size: .52rem; font-style: normal; }
+.ca-hot-list { display: grid; }
+.ca-hot-list a { min-height: 61px; padding: 10px 13px; display: grid; grid-template-columns: 20px minmax(0,1fr) auto; gap: 8px; align-items: center; border-bottom: 1px solid var(--line); }
+.ca-hot-list a:last-child { border-bottom: 0; }
+.ca-hot-list a:hover { background: rgba(255,255,255,.014); }
+.ca-hot-list .hot { color: #ff6f45; text-shadow: 0 0 10px rgba(255,111,69,.35); }
+.ca-hot-list a > span:nth-child(2) { display: grid; gap: 2px; }
+.ca-hot-list b { color: #9aa7b6; font-size: .56rem; }
+.ca-hot-list small { color: #596778; font-size: .52rem; }
+.ca-hot-list strong { color: #a7b2bf; font-size: .56rem; font-weight: 500; white-space: nowrap; }
+.ca-plane-row { min-height: 66px; padding: 12px 14px; display: grid; grid-template-columns: 20px minmax(0,1fr) auto; gap: 9px; align-items: center; }
+.ca-plane-row > span:nth-child(2) { display: grid; gap: 3px; }
+.ca-plane-row strong { color: #abb7c4; font-size: .62rem; }
+.ca-plane-row small { color: #566475; font-size: .52rem; }
+.ca-plane-row > b { color: var(--positive); font-size: .54rem; }
+.ca-supported { padding: 18px 20px; display: grid; grid-template-columns: minmax(250px,.55fr) minmax(0,1.45fr); gap: 26px; align-items: center; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+.ca-eyebrow { color: #8f86ff; font-size: .54rem; letter-spacing: .11em; }
+.ca-supported h3 { margin: 6px 0; color: #dce4ed; font-size: .9rem; }
+.ca-supported p { margin: 0; color: #667587; font-size: .6rem; line-height: 1.55; }
+.ca-supported-cards { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 9px; }
+.ca-supported-cards article { min-height: 68px; padding: 10px; display: grid; grid-template-columns: 32px minmax(0,1fr) auto; gap: 9px; align-items: center; border: 1px solid var(--line); border-radius: 8px; background: #0b131e; }
+.chain-logo { width: 31px; height: 31px; display: grid; place-items: center; border-radius: 50%; background: var(--base); color: #fff; font-size: .72rem; font-weight: 800; }
+.chain-logo.rh { background: #123320; color: #56d77a; }
+.chain-logo.more { background: #171425; color: #9d94ee; }
+.ca-supported-cards article > div { display: grid; gap: 2px; }
+.ca-supported-cards strong { color: #b4bfcc; font-size: .62rem; }
+.ca-supported-cards small { color: #576577; font-size: .51rem; }
+.ca-supported-cards article > span:last-child { display: grid; gap: 1px; justify-items: end; }
+.ca-supported-cards article > span:last-child b { color: #8896a7; font-size: .58rem; }
+.ca-supported-cards article.muted { opacity: .73; }
+
+/* Existing research surfaces inherit the new shell and terminal language. */
+.dashboard-body > .dashboard-shell:not(.ca-shell) { grid-template-columns: 226px minmax(0,1fr); }
+.dashboard-body > .dashboard-shell:not(.ca-shell) .sidebar { background: #070d15; }
+.dashboard-body > .dashboard-shell:not(.ca-shell) .dashboard-main { padding: 20px 22px 34px; }
+.dashboard-body > .dashboard-shell:not(.ca-shell) .dashboard-hero { padding: 0 0 14px; border-color: var(--line); }
+.dashboard-body > .dashboard-shell:not(.ca-shell) .dashboard-hero h1 { color: #eef3f8; }
+.dashboard-body > .dashboard-shell:not(.ca-shell) .dashboard-hero p { color: var(--muted); max-width: 780px; }
+
+@media (max-width: 1180px) {
+  .ca-shell { grid-template-columns: 204px minmax(0,1fr); }
+  .ca-topbar { grid-template-columns: auto minmax(240px,1fr) auto auto; }
+  .ca-chain-rail { display: none; }
+  .ca-content-grid { grid-template-columns: minmax(0,1.45fr) minmax(285px,.8fr); }
+  .ca-signal-grid { grid-template-columns: repeat(3,minmax(0,1fr)); }
+  .ca-intel-hero { grid-template-columns: minmax(0,1.4fr) minmax(270px,.7fr); }
+  .ca-supported { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 820px) {
+  .ca-shell, .dashboard-body > .dashboard-shell:not(.ca-shell) { grid-template-columns: 1fr; }
+  .ca-sidebar {
+    position: sticky;
+    top: 0;
+    width: 100%;
+    height: auto;
+    min-height: 0;
+    padding: 8px 12px;
+    display: grid;
+    grid-template-columns: auto minmax(0,1fr);
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .ca-brand { padding: 0 8px !important; }
+  .ca-nav { display: flex; overflow-x: auto; }
+  .ca-nav a { min-width: 48px; min-height: 42px; grid-template-columns: 1fr; justify-items: center; }
+  .ca-nav a > span:last-child { display: none; }
+  .ca-nav-divider, .ca-nav-secondary, .ca-plan-card, .ca-usage, .ca-user-row, .ca-sidebar-spacer { display: none; }
+  .ca-topbar { position: static; min-height: 56px; padding: 8px 14px; grid-template-columns: auto minmax(0,1fr) auto; }
+  .ca-live, .ca-icon-button { display: none; }
+  .ca-global-search { width: 100%; }
+  .ca-main { padding: 16px 14px 30px; }
+  .ca-page-heading { align-items: flex-start; }
+  .ca-heading-actions { display: none; }
+  .ca-intel-hero { grid-template-columns: 1fr; }
+  .ca-relation-card { min-height: 300px; border-left: 0; border-top: 1px solid var(--line); }
+  .ca-content-grid { grid-template-columns: 1fr; }
+  .ca-signal-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .ca-supported-cards { grid-template-columns: 1fr; }
+  .dashboard-body > .dashboard-shell:not(.ca-shell) .sidebar { position: static; min-height: 0; }
+}
+
+@media (max-width: 520px) {
+  .ca-sidebar { grid-template-columns: 1fr; gap: 5px; }
+  .ca-brand { display: none; }
+  .ca-nav a { min-width: 44px; }
+  .ca-topbar { grid-template-columns: auto minmax(0,1fr); }
+  .ca-chain-menu summary { min-width: 42px; width: 42px; padding: 9px; }
+  .ca-chain-menu summary > span:not(.chain-dot) { display: none; }
+  .ca-chain-menu summary { font-size: 0; }
+  .ca-global-search kbd { display: none; }
+  .ca-page-heading { min-height: 54px; }
+  .ca-title-row { align-items: flex-start; flex-direction: column; gap: 5px; }
+  .ca-page-heading p { max-width: 330px; }
+  .ca-hero-copy { padding: 20px 18px; }
+  .ca-hero-copy h2 { font-size: 1.5rem; }
+  .ca-hero-metrics { grid-template-columns: 1fr; }
+  .ca-hero-metrics > div { border-right: 0; border-bottom: 1px solid var(--line); }
+  .ca-hero-metrics > div:last-child { border-bottom: 0; }
+  .ca-signal-grid { grid-template-columns: 1fr 1fr; }
+  .ca-signal-card { min-height: 125px; }
+  .ca-signal-card:nth-child(5) { grid-column: 1/-1; }
+  .ca-intel-row { grid-template-columns: 62px minmax(0,1fr) 12px; }
+  .ca-intel-meta { display: none; }
+  .ca-overview-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .ca-overview-grid > div { border-bottom: 1px solid var(--line); }
+  .ca-overview-grid > div:nth-child(even) { border-right: 0; }
+  .ca-overview-grid > div:last-child { grid-column: 1/-1; }
+  .ca-chart-footer { padding-left: 15px; flex-wrap: wrap; }
+  .ca-chart-footer small { width: 100%; margin-left: 0; }
+  .ca-supported { padding: 15px; }
+}
 "#
 }
 
+#[cfg(test)]
+mod web_tests {
+    use super::*;
+
+    #[test]
+    fn chain_scoped_payload_rejects_mismatched_upstream() {
+        let result = parse_chain_scoped_json::<serde_json::Value>(
+            r#"{"chain_id":42161,"status":"ok"}"#,
+            8453,
+            "test api",
+        );
+        let error = result.expect_err("mismatched chain should fail closed");
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert!(error.message.contains("chain mismatch"));
+    }
+
+    #[test]
+    fn chain_scoped_payload_accepts_matching_upstream() {
+        let value = parse_chain_scoped_json::<serde_json::Value>(
+            r#"{"chain_id":8453,"status":"ok"}"#,
+            8453,
+            "test api",
+        )
+        .expect("matching chain should decode");
+        assert_eq!(value["status"], "ok");
+    }
+}
+
+#[derive(Debug)]
 pub struct WebError {
     status: StatusCode,
     message: String,

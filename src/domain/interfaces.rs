@@ -5,11 +5,11 @@ use chrono::{DateTime, Utc};
 
 use crate::core::errors::LedgerResult;
 use crate::domain::entities::{
-    AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
-    ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
-    ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterStrategyReportSnapshot,
-    ClusterTrackingState, EvidencePack, ProtocolAddressMetadata, RecognizerResult,
-    TransactionAnalysis,
+    AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel,
+    AddressLabelAssertion, AddressProfile, ClassifiedTransaction, ClusterAddress, ClusterAlert,
+    ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot,
+    ClusterStrategyReportSnapshot, ClusterTrackingState, EvidencePack, ProtocolAddressMetadata,
+    RecognizerResult, TransactionAnalysis,
 };
 use crate::domain::enums::BehaviorTag;
 use crate::domain::value_objects::{AddressTxRef, AssetFlow, ValidationMessage};
@@ -139,7 +139,10 @@ pub trait AnalysisRepository: Send + Sync {
     ) -> LedgerResult<u64>;
     async fn claim_next_address_analysis_job(&self) -> LedgerResult<Option<AddressAnalysisJob>>;
     async fn upsert_address_profile(&self, profile: &AddressProfile) -> LedgerResult<()>;
-    async fn upsert_address_labels(&self, labels: &[AddressLabel]) -> LedgerResult<()>;
+    async fn upsert_address_label_assertions(
+        &self,
+        assertions: &[AddressLabelAssertion],
+    ) -> LedgerResult<()>;
     async fn upsert_protocol_address_metadata(
         &self,
         metadata: &[ProtocolAddressMetadata],

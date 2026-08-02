@@ -6,11 +6,17 @@ This document defines the target architecture for running LedgerFlow across
 multiple EVM chains when each chain's data and RPC workload live on a separate
 server.
 
-The current application is not ready to deploy in this topology without code
-changes. In particular, the web process currently has one analysis API URL, one
-indexer API URL, and a PostgreSQL connection that contains both user data and
-chain analysis data. The rollout plan below removes those assumptions before
-traffic is moved.
+The web BFF now resolves analysis and indexer upstreams through the
+control-plane `chain_registry` table. Requests carry an explicit chain ID,
+request ID, bounded connect/read timeouts, and an optional per-chain service
+credential sourced from the deployment secret store. Legacy single-upstream
+environment variables remain only as a zero-row development fallback.
+
+The remaining migration boundary is the control database itself: existing
+arbitrage SQL, cluster ownership joins, and the CryptoHouse diagnostics endpoint
+still read legacy chain tables directly. Production must not move to the final
+split topology until those reads are served by the versioned Chain API or a
+central summary cache.
 
 ## Decision
 
@@ -101,6 +107,11 @@ Suggested fields:
 Secrets and bearer tokens must live in the deployment secret store, keyed by
 `chain_id`; they must not be stored in the registry table or returned to the
 browser.
+
+The current BFF reads service credentials from
+`LEDGERFLOW_CHAIN_API_BEARER_TOKEN_<chain_id>` and
+`LEDGERFLOW_CHAIN_INDEXER_BEARER_TOKEN_<chain_id>`. These values are applied
+server-side after registry resolution and are never rendered into HTML.
 
 Example capabilities:
 
@@ -375,4 +386,3 @@ The multi-chain architecture is complete when:
 - the main page performs no synchronous expensive cross-chain fan-out
 - adding a chain requires configuration and deployment, not a code fork
 - RPC concurrency is enforced independently on every chain server
-

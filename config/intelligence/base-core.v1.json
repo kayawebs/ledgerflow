@@ -1,0 +1,374 @@
+{
+  "dataset_key": "base-core-contracts",
+  "dataset_version": "1.0.0",
+  "chain_id": 8453,
+  "source": {
+    "source_key": "ledgerflow_curated_base",
+    "display_name": "LedgerFlow curated Base registry",
+    "source_kind": "curated",
+    "trust_score": 0.99,
+    "owner": "LedgerFlow",
+    "homepage": null,
+    "metadata": {
+      "replaces": ["ledgerflow_seed", "builtin"]
+    }
+  },
+  "addresses": [
+    {
+      "address": "0x4200000000000000000000000000000000000006",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "token",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "ERC-20 token contract",
+          "evidence": {"verification": "curated_registry"}
+        },
+        {
+          "label_key": "token:weth",
+          "dimension": "asset_identity",
+          "exclusive_group": "canonical_asset_identity",
+          "confidence": 1.0,
+          "description": "Wrapped Ether",
+          "evidence": {"symbol": "WETH"}
+        },
+        {
+          "label_key": "canonical:weth",
+          "dimension": "asset_status",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "Canonical wrapped native asset",
+          "evidence": {}
+        }
+      ],
+      "token_metadata": {
+        "symbol": "WETH",
+        "name": "Wrapped Ether",
+        "decimals": 18
+      },
+      "protocol_deployments": [],
+      "metadata": {"legacy_source": "BASE_TOKEN_SEEDS"}
+    },
+    {
+      "address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "token",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "ERC-20 token contract",
+          "evidence": {}
+        },
+        {
+          "label_key": "token:usdc",
+          "dimension": "asset_identity",
+          "exclusive_group": "canonical_asset_identity",
+          "confidence": 1.0,
+          "description": "USD Coin",
+          "evidence": {"symbol": "USDC"}
+        },
+        {
+          "label_key": "stablecoin",
+          "dimension": "asset_class",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "Stablecoin",
+          "evidence": {}
+        }
+      ],
+      "token_metadata": {
+        "symbol": "USDC",
+        "name": "USD Coin",
+        "decimals": 6
+      },
+      "protocol_deployments": [],
+      "metadata": {"legacy_source": "BASE_TOKEN_SEEDS"}
+    },
+    {
+      "address": "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "token",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "ERC-20 token contract",
+          "evidence": {}
+        },
+        {
+          "label_key": "token:usdbc",
+          "dimension": "asset_identity",
+          "exclusive_group": "canonical_asset_identity",
+          "confidence": 1.0,
+          "description": "USD Base Coin",
+          "evidence": {"symbol": "USDbC"}
+        },
+        {
+          "label_key": "stablecoin",
+          "dimension": "asset_class",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "Stablecoin",
+          "evidence": {}
+        }
+      ],
+      "token_metadata": {
+        "symbol": "USDbC",
+        "name": "USD Base Coin",
+        "decimals": 6
+      },
+      "protocol_deployments": [],
+      "metadata": {"legacy_source": "BASE_TOKEN_SEEDS"}
+    },
+    {
+      "address": "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "token",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "ERC-20 token contract",
+          "evidence": {}
+        },
+        {
+          "label_key": "token:usdt",
+          "dimension": "asset_identity",
+          "exclusive_group": "canonical_asset_identity",
+          "confidence": 1.0,
+          "description": "Tether USD",
+          "evidence": {"symbol": "USDT"}
+        },
+        {
+          "label_key": "stablecoin",
+          "dimension": "asset_class",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "Stablecoin",
+          "evidence": {}
+        }
+      ],
+      "token_metadata": {
+        "symbol": "USDT",
+        "name": "Tether USD",
+        "decimals": 6
+      },
+      "protocol_deployments": [],
+      "metadata": {"legacy_source": "BASE_TOKEN_SEEDS"}
+    },
+    {
+      "address": "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "router",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 0.99,
+          "description": "DEX router contract",
+          "evidence": {}
+        },
+        {
+          "label_key": "protocol:uniswap",
+          "dimension": "protocol",
+          "exclusive_group": null,
+          "confidence": 0.99,
+          "description": "Uniswap deployment",
+          "evidence": {"deployment": "v2_router"}
+        }
+      ],
+      "token_metadata": null,
+      "protocol_deployments": [
+        {
+          "protocol_key": "uniswap",
+          "display_name": "Uniswap",
+          "protocol_family": "dex",
+          "contract_role": "router",
+          "confidence": 0.99,
+          "metadata": {"deployment": "v2_router"}
+        }
+      ],
+      "metadata": {"legacy_label": "uniswap_v2_router"}
+    },
+    {
+      "address": "0x2626664c2603336e57b271c5c0b26f421741e481",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "router",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 0.99,
+          "description": "DEX router contract",
+          "evidence": {}
+        },
+        {
+          "label_key": "protocol:uniswap",
+          "dimension": "protocol",
+          "exclusive_group": null,
+          "confidence": 0.99,
+          "description": "Uniswap deployment",
+          "evidence": {"deployment": "swaprouter02"}
+        }
+      ],
+      "token_metadata": null,
+      "protocol_deployments": [
+        {
+          "protocol_key": "uniswap",
+          "display_name": "Uniswap",
+          "protocol_family": "dex",
+          "contract_role": "router",
+          "confidence": 0.99,
+          "metadata": {"deployment": "swaprouter02"}
+        }
+      ],
+      "metadata": {"legacy_label": "uniswap_v3_swaprouter02"}
+    },
+    {
+      "address": "0x6ff5693b99212da76ad316178a184ab56d299b43",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "router",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 0.95,
+          "description": "DEX router contract",
+          "evidence": {}
+        },
+        {
+          "label_key": "protocol:uniswap",
+          "dimension": "protocol",
+          "exclusive_group": null,
+          "confidence": 0.95,
+          "description": "Uniswap deployment",
+          "evidence": {"deployment": "universal_router"}
+        }
+      ],
+      "token_metadata": null,
+      "protocol_deployments": [
+        {
+          "protocol_key": "uniswap",
+          "display_name": "Uniswap",
+          "protocol_family": "dex",
+          "contract_role": "router",
+          "confidence": 0.95,
+          "metadata": {"deployment": "universal_router"}
+        }
+      ],
+      "metadata": {"legacy_label": "uniswap_universal_router"}
+    },
+    {
+      "address": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "router",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 0.95,
+          "description": "DEX router contract",
+          "evidence": {}
+        },
+        {
+          "label_key": "protocol:aerodrome",
+          "dimension": "protocol",
+          "exclusive_group": null,
+          "confidence": 0.95,
+          "description": "Aerodrome deployment",
+          "evidence": {}
+        }
+      ],
+      "token_metadata": null,
+      "protocol_deployments": [
+        {
+          "protocol_key": "aerodrome",
+          "display_name": "Aerodrome",
+          "protocol_family": "dex",
+          "contract_role": "router",
+          "confidence": 0.95,
+          "metadata": {}
+        }
+      ],
+      "metadata": {"legacy_label": "aerodrome_router"}
+    },
+    {
+      "address": "0x7747f8d2a76bd6345cc29622a946a929647f2359",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "router",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 0.99,
+          "description": "Settlement/router contract",
+          "evidence": {}
+        },
+        {
+          "label_key": "protocol:zeroex",
+          "dimension": "protocol",
+          "exclusive_group": null,
+          "confidence": 0.99,
+          "description": "0x deployment",
+          "evidence": {"deployment": "base_settler"}
+        }
+      ],
+      "token_metadata": null,
+      "protocol_deployments": [
+        {
+          "protocol_key": "zeroex",
+          "display_name": "0x",
+          "protocol_family": "dex",
+          "contract_role": "settler",
+          "confidence": 0.99,
+          "metadata": {"deployment": "base_settler"}
+        }
+      ],
+      "metadata": {"legacy_label": "zeroex_base_settler"}
+    },
+    {
+      "address": "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb",
+      "address_kind": "contract",
+      "labels": [
+        {
+          "label_key": "protocol",
+          "dimension": "contract_role",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "Protocol core contract",
+          "evidence": {}
+        },
+        {
+          "label_key": "protocol:morpho_blue",
+          "dimension": "protocol",
+          "exclusive_group": null,
+          "confidence": 1.0,
+          "description": "Morpho Blue deployment",
+          "evidence": {}
+        }
+      ],
+      "token_metadata": null,
+      "protocol_deployments": [
+        {
+          "protocol_key": "morpho_blue",
+          "display_name": "Morpho Blue",
+          "protocol_family": "lending",
+          "contract_role": "protocol",
+          "confidence": 1.0,
+          "metadata": {}
+        }
+      ],
+      "metadata": {"legacy_label": "morpho_blue"}
+    }
+  ],
+  "metadata": {
+    "description": "Versioned replacement for the former Base Rust constants",
+    "schema_version": "1"
+  }
+}

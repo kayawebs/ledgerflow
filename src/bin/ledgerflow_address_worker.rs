@@ -9,7 +9,7 @@ use ledgerflow::{
     repositories::sqlx::SqlxAnalysisRepository,
     services::{
         address_intelligence::AddressIntelligenceService, analysis::AnalysisService,
-        indexer_client::IndexerHttpClient, pricing::PriceService, seeds::seed_known_metadata,
+        indexer_client::IndexerHttpClient, pricing::PriceService,
         token_metadata::TokenMetadataService,
     },
 };
@@ -34,10 +34,6 @@ async fn main() {
         .run(repository.pool())
         .await
         .expect("migrations should succeed");
-    seed_known_metadata(repository.pool(), config.default_chain_id)
-        .await
-        .expect("seed metadata should succeed");
-
     let rpc_client = Arc::new(HttpRpcClient::new(config.rpc_url.clone()));
     let token_metadata_service = Arc::new(TokenMetadataService::new(
         repository.pool().clone(),
@@ -68,6 +64,10 @@ async fn main() {
                 price_service.clone(),
                 config.address_whale_threshold_usd,
             )
+            .with_native_asset(
+                config.wrapped_native_token_address.clone(),
+                config.native_token_symbol.clone(),
+            )
             .with_history_backfill(
                 analysis_service,
                 tx_source,
@@ -76,6 +76,10 @@ async fn main() {
     } else {
         AddressIntelligenceService::new(repository, rpc_client)
             .with_portfolio_classification(price_service, config.address_whale_threshold_usd)
+            .with_native_asset(
+                config.wrapped_native_token_address.clone(),
+                config.native_token_symbol.clone(),
+            )
     };
 
     info!(

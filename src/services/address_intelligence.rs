@@ -3,13 +3,14 @@ use std::{collections::BTreeMap, sync::Arc};
 use chrono::Utc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::{
     core::errors::LedgerResult,
     domain::{
         entities::{
-            AddressAnalysisJob, AddressLabel, AddressProfile, ProtocolAddressMetadata,
-            TransactionAnalysis,
+            AddressAnalysisJob, AddressLabel, AddressLabelAssertion, AddressProfile,
+            ProtocolAddressMetadata, TransactionAnalysis,
         },
         enums::AssetType,
         interfaces::{ClusterTxSource, DynRepository},
@@ -19,7 +20,6 @@ use crate::{
     services::{analysis::AnalysisService, pricing::PriceService},
 };
 
-const WETH_ADDRESS: &str = "0x4200000000000000000000000000000000000006";
 const BALANCE_OF_SELECTOR: &str = "0x70a08231";
 const PORTFOLIO_TOKEN_LIMIT: usize = 64;
 const TOKEN0_SELECTOR: &str = "0x0dfe1681";
@@ -39,6 +39,8 @@ pub struct AddressIntelligenceService {
     history_query_limit: u32,
     price_service: Option<Arc<PriceService>>,
     whale_threshold_usd: f64,
+    wrapped_native_token_address: Option<String>,
+    native_token_symbol: String,
 }
 
 impl AddressIntelligenceService {
@@ -51,6 +53,8 @@ impl AddressIntelligenceService {
             history_query_limit: 1000,
             price_service: None,
             whale_threshold_usd: 100_000.0,
+            wrapped_native_token_address: None,
+            native_token_symbol: "ETH".to_owned(),
         }
     }
 
@@ -61,6 +65,18 @@ impl AddressIntelligenceService {
     ) -> Self {
         self.price_service = Some(price_service);
         self.whale_threshold_usd = whale_threshold_usd.max(0.0);
+        self
+    }
+
+    pub fn with_native_asset(
+        mut self,
+        wrapped_token_address: Option<String>,
+        symbol: impl Into<String>,
+    ) -> Self {
+        self.wrapped_native_token_address = wrapped_token_address
+            .map(|address| address.trim().to_ascii_lowercase())
+            .filter(|address| !address.is_empty());
+        self.native_token_symbol = symbol.into();
         self
     }
 
@@ -82,7 +98,7 @@ impl AddressIntelligenceService {
         };
 
         match self.analyze_job(&job).await {
-            Ok((mut profile, mut labels, protocol_metadata)) => {
+            Ok((mut profile, mut assertions, protocol_metadata)) => {
                 if self.backfill_address_history(&job).await? {
                     profile.metadata = merge_metadata(
                         profile.metadata,
@@ -98,7 +114,7 @@ impl AddressIntelligenceService {
                         json!({ "portfolio_estimate": valuation.to_json() }),
                     );
                     if valuation.is_whale() {
-                        labels.push(label_for(
+                        assertions.push(assertion_for(
                             &job,
                             "actor:whale",
                             "balance_classifier",
@@ -109,7 +125,9 @@ impl AddressIntelligenceService {
                     }
                 }
                 self.repository.upsert_address_profile(&profile).await?;
-                self.repository.upsert_address_labels(&labels).await?;
+                self.repository
+                    .upsert_address_label_assertions(&assertions)
+                    .await?;
                 if !protocol_metadata.is_empty() {
                     self.repository
                         .upsert_protocol_address_metadata(&protocol_metadata)
@@ -134,7 +152,7 @@ impl AddressIntelligenceService {
         job: &AddressAnalysisJob,
     ) -> LedgerResult<(
         AddressProfile,
-        Vec<AddressLabel>,
+        Vec<AddressLabelAssertion>,
         Vec<ProtocolAddressMetadata>,
     )> {
         let code = self
@@ -150,20 +168,20 @@ impl AddressIntelligenceService {
             format!("0x{}", hex::encode(hasher.finalize()))
         });
         let has_code = bytecode_length.unwrap_or_default() > 0;
-        let known = known_address_label(job.chain_id, &job.address);
-        let protocol_probe = if known.is_none() && has_code {
+        let existing_labels = self
+            .repository
+            .list_address_labels(job.chain_id, &[job.address.to_ascii_lowercase()])
+            .await?;
+        let known_address_type = effective_address_type(&existing_labels);
+        let protocol_probe = if has_code {
             self.probe_protocol_address(job.chain_id, &job.address)
                 .await
         } else {
             None
         };
         let role_labels = role_labels_from_metadata(&job.metadata);
-        let address_type = if known
-            .as_ref()
-            .map(|label| matches!(label.address_type.as_str(), "token" | "router" | "protocol"))
-            .unwrap_or(false)
-        {
-            known.as_ref().unwrap().address_type.clone()
+        let address_type = if let Some(known_address_type) = known_address_type {
+            known_address_type
         } else if let Some(probe) = protocol_probe.as_ref() {
             probe.contract_role.clone()
         } else if role_labels.iter().any(|label| label == "erc20_token") {
@@ -214,7 +232,7 @@ impl AddressIntelligenceService {
             updated_at: now,
         };
 
-        let mut labels = vec![label_for(
+        let mut assertions = vec![assertion_for(
             job,
             &address_type,
             "address_worker",
@@ -223,7 +241,7 @@ impl AddressIntelligenceService {
             now,
         )];
         for role_label in role_labels {
-            labels.push(label_for(
+            assertions.push(assertion_for(
                 job,
                 &role_label,
                 "tx_analysis",
@@ -232,29 +250,13 @@ impl AddressIntelligenceService {
                 now,
             ));
         }
-        if let Some(known) = known.as_ref() {
-            labels.push(label_for(
-                job,
-                &known.label,
-                "builtin",
-                known.confidence,
-                json!({ "reason": "known_address" }),
-                now,
-            ));
-        }
-        let mut protocol_metadata = protocol_probe
+        let protocol_metadata = protocol_probe
             .as_ref()
             .map(|probe| probe.to_metadata(job, now))
             .into_iter()
             .collect::<Vec<_>>();
-        if let Some(known_metadata) = known
-            .as_ref()
-            .and_then(|known| known.to_protocol_metadata(job, now))
-        {
-            protocol_metadata.push(known_metadata);
-        }
         if let Some(probe) = protocol_probe {
-            labels.push(label_for(
+            assertions.push(assertion_for(
                 job,
                 &probe.protocol_family,
                 "protocol_probe",
@@ -262,7 +264,7 @@ impl AddressIntelligenceService {
                 probe.to_json(),
                 now,
             ));
-            labels.push(label_for(
+            assertions.push(assertion_for(
                 job,
                 &probe.protocol_name,
                 "protocol_probe",
@@ -270,7 +272,7 @@ impl AddressIntelligenceService {
                 probe.to_json(),
                 now,
             ));
-            labels.push(label_for(
+            assertions.push(assertion_for(
                 job,
                 &probe.contract_role,
                 "protocol_probe",
@@ -279,7 +281,7 @@ impl AddressIntelligenceService {
                 now,
             ));
         }
-        Ok((profile, labels, protocol_metadata))
+        Ok((profile, assertions, protocol_metadata))
     }
 
     async fn probe_protocol_address(&self, chain_id: u64, address: &str) -> Option<ProtocolProbe> {
@@ -464,21 +466,31 @@ impl AddressIntelligenceService {
             && let Some(raw_balance) = hex_quantity_to_decimal_approx(&raw_balance)
             && raw_balance != "0"
         {
-            match price_service
-                .quote_current_amount(job.chain_id, WETH_ADDRESS, &raw_balance, 18)
-                .await?
-            {
-                Some(quote) => assets.push(json!({
-                    "asset_type": "native",
-                    "token_address": Value::Null,
-                    "symbol": "ETH",
-                    "balance_raw_approx": raw_balance,
-                    "amount_decimal": quote.amount_decimal,
-                    "price_decimal": quote.price_decimal,
-                    "estimated_usd": quote.value_decimal,
-                    "price_source": quote.source,
-                })),
-                None => missing_prices.push("native".to_owned()),
+            if let Some(wrapped_native_token_address) = &self.wrapped_native_token_address {
+                match price_service
+                    .quote_current_amount(
+                        job.chain_id,
+                        wrapped_native_token_address,
+                        &raw_balance,
+                        18,
+                    )
+                    .await?
+                {
+                    Some(quote) => assets.push(json!({
+                        "asset_type": "native",
+                        "token_address": Value::Null,
+                        "wrapped_token_address": wrapped_native_token_address,
+                        "symbol": self.native_token_symbol,
+                        "balance_raw_approx": raw_balance,
+                        "amount_decimal": quote.amount_decimal,
+                        "price_decimal": quote.price_decimal,
+                        "estimated_usd": quote.value_decimal,
+                        "price_source": quote.source,
+                    })),
+                    None => missing_prices.push("native".to_owned()),
+                }
+            } else {
+                missing_prices.push("native".to_owned());
             }
         }
 
@@ -748,92 +760,30 @@ fn merge_metadata(mut left: Value, right: Value) -> Value {
     }
 }
 
-struct KnownAddressLabel {
-    label: String,
-    address_type: String,
-    confidence: f32,
-}
-
-impl KnownAddressLabel {
-    fn to_protocol_metadata(
-        &self,
-        job: &AddressAnalysisJob,
-        now: chrono::DateTime<Utc>,
-    ) -> Option<ProtocolAddressMetadata> {
-        let (protocol_family, protocol_name, contract_role) = if self.label.starts_with("uniswap_")
-        {
-            ("dex", "uniswap", self.address_type.as_str())
-        } else if self.label.starts_with("aerodrome_") {
-            ("dex", "aerodrome", self.address_type.as_str())
-        } else if self.label.starts_with("zeroex_") {
-            ("dex", "zeroex", self.address_type.as_str())
-        } else if self.label == "morpho_blue" {
-            ("lending", "morpho_blue", self.address_type.as_str())
-        } else {
-            return None;
-        };
-        Some(ProtocolAddressMetadata {
-            chain_id: job.chain_id,
-            address: job.address.to_ascii_lowercase(),
-            protocol_family: protocol_family.to_owned(),
-            protocol_name: protocol_name.to_owned(),
-            contract_role: contract_role.to_owned(),
-            source: "builtin".to_owned(),
-            adapter_version: "known_address_v1".to_owned(),
-            confidence: self.confidence,
-            metadata: json!({
-                "label": self.label,
-                "address_type": self.address_type,
-            }),
-            first_seen_at: job.first_seen_at,
-            last_seen_at: now,
-            updated_at: now,
-        })
-    }
-}
-
-fn known_address_label(chain_id: u64, address: &str) -> Option<KnownAddressLabel> {
-    if chain_id != 8453 {
-        return None;
-    }
-    match address.to_ascii_lowercase().as_str() {
-        "0x4200000000000000000000000000000000000006" => Some(KnownAddressLabel {
-            label: "weth_token".to_owned(),
-            address_type: "token".to_owned(),
-            confidence: 0.99,
-        }),
-        "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24" => Some(KnownAddressLabel {
-            label: "uniswap_v2_router".to_owned(),
-            address_type: "router".to_owned(),
-            confidence: 0.95,
-        }),
-        "0x2626664c2603336e57b271c5c0b26f421741e481" => Some(KnownAddressLabel {
-            label: "uniswap_v3_swaprouter02".to_owned(),
-            address_type: "router".to_owned(),
-            confidence: 0.95,
-        }),
-        "0x6ff5693b99212da76ad316178a184ab56d299b43" => Some(KnownAddressLabel {
-            label: "uniswap_universal_router".to_owned(),
-            address_type: "router".to_owned(),
-            confidence: 0.9,
-        }),
-        "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf" => Some(KnownAddressLabel {
-            label: "aerodrome_router".to_owned(),
-            address_type: "router".to_owned(),
-            confidence: 0.9,
-        }),
-        "0x7747f8d2a76bd6345cc29622a946a929647f2359" => Some(KnownAddressLabel {
-            label: "zeroex_base_settler".to_owned(),
-            address_type: "router".to_owned(),
-            confidence: 0.95,
-        }),
-        "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb" => Some(KnownAddressLabel {
-            label: "morpho_blue".to_owned(),
-            address_type: "protocol".to_owned(),
-            confidence: 0.95,
-        }),
-        _ => None,
-    }
+fn effective_address_type(labels: &[AddressLabel]) -> Option<String> {
+    const PRECEDENCE: &[&str] = &[
+        "token",
+        "router",
+        "protocol",
+        "dex_pool",
+        "router_candidate",
+        "protocol_candidate",
+        "eoa",
+        "contract",
+    ];
+    PRECEDENCE.iter().find_map(|candidate| {
+        labels
+            .iter()
+            .filter(|label| label.confidence >= 0.70)
+            .any(|label| {
+                label
+                    .label
+                    .strip_prefix("address_type:")
+                    .unwrap_or(&label.label)
+                    == *candidate
+            })
+            .then(|| (*candidate).to_owned())
+    })
 }
 
 fn role_labels_from_metadata(metadata: &Value) -> Vec<String> {
@@ -848,23 +798,87 @@ fn role_labels_from_metadata(metadata: &Value) -> Vec<String> {
         .collect()
 }
 
-fn label_for(
+fn assertion_for(
     job: &AddressAnalysisJob,
     label: &str,
     source: &str,
     confidence: f32,
     evidence_json: Value,
     now: chrono::DateTime<Utc>,
-) -> AddressLabel {
-    AddressLabel {
+) -> AddressLabelAssertion {
+    let (dimension, exclusive_group) = label_taxonomy(label);
+    let (source_kind, source_trust, origin_kind, method_version) = source_provenance(source);
+    let address = job.address.to_ascii_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(format!(
+        "{}|{}|{}|{}|{}",
+        job.chain_id, address, label, source, method_version
+    ));
+    AddressLabelAssertion {
+        assertion_id: Uuid::new_v4(),
+        claim_fingerprint: hex::encode(hasher.finalize()),
         chain_id: job.chain_id,
-        address: job.address.to_ascii_lowercase(),
+        address,
         label: label.to_owned(),
+        dimension: dimension.to_owned(),
+        exclusive_group: exclusive_group.map(str::to_owned),
         source: source.to_owned(),
+        source_kind: source_kind.to_owned(),
+        source_trust,
+        origin_kind: origin_kind.to_owned(),
+        method_version: method_version.to_owned(),
+        dataset_key: None,
+        dataset_version: None,
+        assertion_value: true,
         confidence,
+        status: "active".to_owned(),
+        valid_from_block: None,
+        valid_to_block: None,
+        observed_at: now,
+        expires_at: None,
         evidence_json,
         created_at: now,
         updated_at: now,
+    }
+}
+
+fn label_taxonomy(label: &str) -> (&'static str, Option<&'static str>) {
+    if label.starts_with("actor:") {
+        ("actor_type", None)
+    } else if label.starts_with("token:")
+        || label.starts_with("canonical:")
+        || label == "stablecoin"
+    {
+        ("asset_identity", None)
+    } else if label.starts_with("protocol:") {
+        ("protocol", None)
+    } else if matches!(label, "eoa" | "contract") {
+        ("address_kind", Some("address_kind"))
+    } else if label.contains("router")
+        || label.contains("pool")
+        || matches!(
+            label,
+            "token"
+                | "protocol"
+                | "router_candidate"
+                | "protocol_candidate"
+                | "approval_spender"
+                | "touched_contract"
+        )
+    {
+        ("contract_role", None)
+    } else {
+        ("behavior_or_role", None)
+    }
+}
+
+fn source_provenance(source: &str) -> (&'static str, f32, &'static str, &'static str) {
+    match source {
+        "address_worker" => ("onchain", 0.90, "onchain", "address_worker_v2"),
+        "protocol_probe" => ("onchain", 0.92, "onchain", "dex_probe_v1"),
+        "tx_analysis" => ("model", 0.78, "model", "transaction_roles_v1"),
+        "balance_classifier" => ("model", 0.82, "model", "portfolio_classifier_v1"),
+        _ => ("model", 0.50, "model", "unknown_v1"),
     }
 }
 

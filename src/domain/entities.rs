@@ -101,6 +101,37 @@ pub struct AddressLabel {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A provenance-preserving claim about an address. Unlike `AddressLabel`, which
+/// is a read projection, assertions keep the producer, method version,
+/// confidence, validity, and evidence needed to recompute effective labels.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AddressLabelAssertion {
+    pub assertion_id: Uuid,
+    pub claim_fingerprint: String,
+    pub chain_id: u64,
+    pub address: String,
+    pub label: String,
+    pub dimension: String,
+    pub exclusive_group: Option<String>,
+    pub source: String,
+    pub source_kind: String,
+    pub source_trust: f32,
+    pub origin_kind: String,
+    pub method_version: String,
+    pub dataset_key: Option<String>,
+    pub dataset_version: Option<String>,
+    pub assertion_value: bool,
+    pub confidence: f32,
+    pub status: String,
+    pub valid_from_block: Option<u64>,
+    pub valid_to_block: Option<u64>,
+    pub observed_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub evidence_json: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ProtocolAddressMetadata {
     pub chain_id: u64,

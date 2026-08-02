@@ -1,14 +1,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use ledgerflow::{
     core::errors::{LedgerError, LedgerResult},
-    domain::{entities::AddressAnalysisCandidate, interfaces::DynRepository},
+    domain::{
+        entities::{AddressAnalysisCandidate, AddressLabelAssertion},
+        interfaces::DynRepository,
+    },
     ingestion::rpc::RpcClient,
     repositories::memory::InMemoryAnalysisRepository,
     services::address_intelligence::AddressIntelligenceService,
 };
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 struct MockRpcClient;
 
@@ -68,9 +73,15 @@ impl RpcClient for MockRpcClient {
 }
 
 #[tokio::test]
-async fn address_worker_profiles_and_labels_known_token_candidates() {
+async fn address_worker_uses_curated_assertions_for_known_token_candidates() {
     let repo: DynRepository = Arc::new(InMemoryAnalysisRepository::default());
     let weth = "0x4200000000000000000000000000000000000006".to_owned();
+    repo.upsert_address_label_assertions(&[
+        curated_assertion(8453, &weth, "token", "contract_role"),
+        curated_assertion(8453, &weth, "token:weth", "asset_identity"),
+    ])
+    .await
+    .unwrap();
     repo.enqueue_address_analysis_candidates(
         8453,
         &[AddressAnalysisCandidate {
@@ -95,7 +106,7 @@ async fn address_worker_profiles_and_labels_known_token_candidates() {
         .list_address_labels(8453, &[weth.clone()])
         .await
         .unwrap();
-    assert!(labels.iter().any(|label| label.label == "weth_token"));
+    assert!(labels.iter().any(|label| label.label == "token:weth"));
     assert!(labels.iter().any(|label| label.label == "erc20_token"));
     assert!(
         repo.claim_next_address_analysis_job()
@@ -103,6 +114,41 @@ async fn address_worker_profiles_and_labels_known_token_candidates() {
             .unwrap()
             .is_none()
     );
+}
+
+fn curated_assertion(
+    chain_id: u64,
+    address: &str,
+    label: &str,
+    dimension: &str,
+) -> AddressLabelAssertion {
+    let now = Utc::now();
+    AddressLabelAssertion {
+        assertion_id: Uuid::new_v4(),
+        claim_fingerprint: format!("test:{chain_id}:{address}:{label}"),
+        chain_id,
+        address: address.to_owned(),
+        label: label.to_owned(),
+        dimension: dimension.to_owned(),
+        exclusive_group: None,
+        source: "test_curated_registry".to_owned(),
+        source_kind: "curated".to_owned(),
+        source_trust: 1.0,
+        origin_kind: "curated_seed".to_owned(),
+        method_version: "test_v1".to_owned(),
+        dataset_key: Some("test-core".to_owned()),
+        dataset_version: Some("1".to_owned()),
+        assertion_value: true,
+        confidence: 1.0,
+        status: "active".to_owned(),
+        valid_from_block: None,
+        valid_to_block: None,
+        observed_at: now,
+        expires_at: None,
+        evidence_json: json!({ "verification": "test" }),
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 #[tokio::test]

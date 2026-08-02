@@ -9,10 +9,11 @@ use uuid::Uuid;
 use crate::core::errors::LedgerResult;
 use crate::domain::{
     entities::{
-        AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel, AddressProfile,
-        ClassifiedTransaction, ClusterAddress, ClusterAlert, ClusterBackfillRun, ClusterCoverage,
-        ClusterDiscoveredTx, ClusterMetricsSnapshot, ClusterStrategyReportSnapshot,
-        ClusterTrackingState, EvidencePack, ProtocolAddressMetadata, TransactionAnalysis,
+        AddressAnalysisCandidate, AddressAnalysisJob, AddressCluster, AddressLabel,
+        AddressLabelAssertion, AddressProfile, ClassifiedTransaction, ClusterAddress, ClusterAlert,
+        ClusterBackfillRun, ClusterCoverage, ClusterDiscoveredTx, ClusterMetricsSnapshot,
+        ClusterStrategyReportSnapshot, ClusterTrackingState, EvidencePack, ProtocolAddressMetadata,
+        TransactionAnalysis,
     },
     enums::{ClusterBackfillStatus, ClusterTrackingStatus, ClusterTxStatus},
     interfaces::AnalysisRepository,
@@ -34,7 +35,7 @@ pub struct InMemoryAnalysisRepository {
         RwLock<HashMap<(Uuid, String), ClusterStrategyReportSnapshot>>,
     cluster_alerts: RwLock<HashMap<Uuid, Vec<ClusterAlert>>>,
     address_profiles: RwLock<HashMap<(u64, String), AddressProfile>>,
-    address_labels: RwLock<HashMap<(u64, String, String, String), AddressLabel>>,
+    address_assertions: RwLock<HashMap<String, AddressLabelAssertion>>,
     protocol_metadata:
         RwLock<HashMap<(u64, String, String, String, String), ProtocolAddressMetadata>>,
     address_jobs: RwLock<HashMap<(u64, String), AddressAnalysisJob>>,
@@ -685,18 +686,13 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
         Ok(())
     }
 
-    async fn upsert_address_labels(&self, labels: &[AddressLabel]) -> LedgerResult<()> {
-        let mut store = self.address_labels.write().await;
-        for label in labels {
-            store.insert(
-                (
-                    label.chain_id,
-                    label.address.to_ascii_lowercase(),
-                    label.label.clone(),
-                    label.source.clone(),
-                ),
-                label.clone(),
-            );
+    async fn upsert_address_label_assertions(
+        &self,
+        assertions: &[AddressLabelAssertion],
+    ) -> LedgerResult<()> {
+        let mut store = self.address_assertions.write().await;
+        for assertion in assertions {
+            store.insert(assertion.claim_fingerprint.clone(), assertion.clone());
         }
         Ok(())
     }
@@ -779,14 +775,50 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
             .iter()
             .map(|address| address.to_ascii_lowercase())
             .collect::<Vec<_>>();
-        Ok(self
-            .address_labels
-            .read()
-            .await
-            .values()
-            .filter(|label| label.chain_id == chain_id)
-            .filter(|label| address_set.contains(&label.address.to_ascii_lowercase()))
-            .cloned()
+        let now = Utc::now();
+        let mut effective = HashMap::<(String, String), AddressLabelAssertion>::new();
+        for assertion in self.address_assertions.read().await.values() {
+            if assertion.chain_id != chain_id
+                || !address_set.contains(&assertion.address.to_ascii_lowercase())
+                || assertion.status != "active"
+                || !assertion.assertion_value
+                || assertion
+                    .expires_at
+                    .is_some_and(|expires_at| expires_at <= now)
+            {
+                continue;
+            }
+            let group = assertion
+                .exclusive_group
+                .as_ref()
+                .map(|value| format!("exclusive:{value}"))
+                .unwrap_or_else(|| format!("label:{}", assertion.label));
+            let key = (assertion.address.to_ascii_lowercase(), group);
+            let score = assertion.confidence * assertion.source_trust;
+            let should_replace = effective
+                .get(&key)
+                .map(|current| {
+                    score > current.confidence * current.source_trust
+                        || (score == current.confidence * current.source_trust
+                            && assertion.observed_at > current.observed_at)
+                })
+                .unwrap_or(true);
+            if should_replace {
+                effective.insert(key, assertion.clone());
+            }
+        }
+        Ok(effective
+            .into_values()
+            .map(|assertion| AddressLabel {
+                chain_id: assertion.chain_id,
+                address: assertion.address,
+                label: assertion.label,
+                source: assertion.source,
+                confidence: assertion.confidence * assertion.source_trust,
+                evidence_json: assertion.evidence_json,
+                created_at: assertion.created_at,
+                updated_at: assertion.updated_at,
+            })
             .collect())
     }
 }

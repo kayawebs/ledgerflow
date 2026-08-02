@@ -1,0 +1,23 @@
+{
+  "dataset_key": "robinhood-mainnet-core-contracts",
+  "dataset_version": "0.1.0",
+  "chain_id": 4663,
+  "source": {
+    "source_key": "robinhood_official_contracts",
+    "display_name": "Robinhood Chain official contracts",
+    "source_kind": "official",
+    "trust_score": 1.0,
+    "owner": "Robinhood Chain",
+    "homepage": null,
+    "metadata": {
+      "template": true,
+      "review_required": true
+    }
+  },
+  "addresses": [],
+  "metadata": {
+    "description": "Populate only with verified Robinhood Chain mainnet addresses before import",
+    "schema_version": "1",
+    "template": true
+  }
+}
