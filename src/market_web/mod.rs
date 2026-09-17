@@ -19,6 +19,13 @@ use sqlx::{Row, postgres::PgPoolOptions};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+mod intel;
+mod pages;
+mod ui;
+
+use crate::services::market_data::run_market_migrations;
+use crate::services::market_pnl::EarningsWindow;
+use crate::services::market_read::{MarketReadService, TokenBoard};
 use crate::services::protocol_market::{
     MarketAddressLookup, MarketLaunch, MarketOverviewStats, ProtocolClusterCard,
     ProtocolClusterDetail, ProtocolMarketService, VerifiedEarningsRankingRow, VerifiedExecutionRow,
@@ -30,6 +37,7 @@ const ROBINHOOD_CHAIN_ID: u64 = 4663;
 #[derive(Clone)]
 pub struct MarketWebState {
     service: Arc<ProtocolMarketService>,
+    market: Arc<MarketReadService>,
     client: Client,
     base_evidence_url: String,
     public_base_url: String,
@@ -82,6 +90,13 @@ struct PageQuery {
     window: Option<String>,
     address: Option<String>,
     category: Option<String>,
+    tab: Option<String>,
+    sort: Option<String>,
+    dir: Option<String>,
+    q: Option<String>,
+    page: Option<i64>,
+    interval: Option<i32>,
+    period: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -181,7 +196,9 @@ pub async fn router_from_env() -> Result<(Router, SocketAddr), Box<dyn std::erro
         .connect(&database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
+    run_market_migrations(&database_url).await?;
     let state = MarketWebState {
+        market: Arc::new(MarketReadService::new(pool.clone())),
         service: Arc::new(ProtocolMarketService::new(pool)),
         client: Client::builder().timeout(Duration::from_secs(8)).build()?,
         base_evidence_url,
@@ -207,6 +224,7 @@ pub fn router(state: MarketWebState) -> Router {
         .route("/launches/{launch_id}", get(launch_detail_page))
         .route("/clusters", get(clusters_page))
         .route("/clusters/{cluster_id}", get(cluster_detail_page))
+        .route("/address/{address}", get(address_page))
         .route("/arbitrage", get(arbitrage_page))
         .route("/liquidations", get(liquidations_page))
         .route("/seed-library", get(seed_library_page))
@@ -215,6 +233,14 @@ pub fn router(state: MarketWebState) -> Router {
         .route("/auth/wallet/verify", post(wallet_verify))
         .route("/auth/wallet/logout", post(wallet_logout))
         .route("/api/session", get(wallet_session))
+        .route("/fragments/ticker", get(ticker_fragment))
+        .route("/fragments/overview/boards", get(overview_boards_fragment))
+        .route("/fragments/overview/feed", get(overview_feed_fragment))
+        .route("/fragments/launches", get(launch_table_fragment))
+        .route(
+            "/fragments/launches/{launch_id}/trades",
+            get(token_trades_fragment),
+        )
         .route("/api/market/overview", get(market_overview_api))
         .route("/api/market/launches", get(market_launches_api))
         .route("/api/market/clusters", get(market_clusters_api))
@@ -237,33 +263,144 @@ async fn overview_page(
     State(state): State<MarketWebState>,
     Query(query): Query<PageQuery>,
     headers: HeaderMap,
-) -> Result<Html<String>, MarketWebError> {
+) -> Result<Response, MarketWebError> {
+    let context = PageContext::new(&query);
+    if context.chain_id != ROBINHOOD_CHAIN_ID {
+        return legacy_overview_page(state, query, headers).await;
+    }
+    let (ticker, boards, feed, wallet) = tokio::try_join!(
+        async {
+            state
+                .market
+                .ticker(context.chain_id)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        render_overview_boards(&state, &context),
+        render_overview_feed(&state, &context),
+        session_address(&state, &headers),
+    )?;
+    Ok(Html(layout(
+        &context,
+        context.locale.text("Pons market", "Pons 行情"),
+        "overview",
+        wallet.as_deref(),
+        &pages::overview(&context, &ticker, &boards, &feed),
+    ))
+    .into_response())
+}
+
+async fn legacy_overview_page(
+    state: MarketWebState,
+    query: PageQuery,
+    headers: HeaderMap,
+) -> Result<Response, MarketWebError> {
     let context = PageContext::new(&query);
     let stats = load_overview(&state, context.chain_id, context.window).await?;
-    let launches = if context.chain_id == ROBINHOOD_CHAIN_ID {
-        state
-            .service
-            .launches(context.chain_id, context.window, 8)
-            .await?
-    } else {
-        Vec::new()
-    };
-    let executions = if context.chain_id == ROBINHOOD_CHAIN_ID {
-        state
-            .service
-            .verified_arbitrage(context.chain_id, 6)
-            .await?
-    } else {
-        Vec::new()
-    };
     let wallet = session_address(&state, &headers).await?;
     Ok(Html(layout(
         &context,
         context.locale.text("Market Overview", "市场总览"),
         "overview",
         wallet.as_deref(),
-        &render_overview(&context, &stats, &launches, &executions),
-    )))
+        &render_overview(&context, &stats, &[], &[]),
+    ))
+    .into_response())
+}
+
+async fn render_overview_boards(
+    state: &MarketWebState,
+    context: &PageContext<'_>,
+) -> Result<String, MarketWebError> {
+    let chain_id = context.chain_id;
+    let (hot, gainers, newest, graduating) = tokio::try_join!(
+        state.market.board(chain_id, TokenBoard::Hot, 8),
+        state.market.board(chain_id, TokenBoard::Gainers, 8),
+        state.market.newest_launches(chain_id, 8),
+        state.market.board(chain_id, TokenBoard::Graduating, 8),
+    )?;
+    Ok(pages::fragment_overview_boards(
+        context,
+        &pages::OverviewBoards {
+            hot: &hot,
+            gainers: &gainers,
+            newest: &newest,
+            graduating: &graduating,
+        },
+    ))
+}
+
+async fn render_overview_feed(
+    state: &MarketWebState,
+    context: &PageContext<'_>,
+) -> Result<String, MarketWebError> {
+    let trades = state
+        .market
+        .big_trades(context.chain_id, pages::WHALE_TRADE_MIN_USD, 3_000, 12)
+        .await?;
+    Ok(pages::fragment_trade_feed(context, &trades))
+}
+
+async fn ticker_fragment(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    let ticker = state.market.ticker(ROBINHOOD_CHAIN_ID).await?;
+    Ok(Html(pages::fragment_ticker(&context, &ticker)))
+}
+
+async fn overview_boards_fragment(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    Ok(Html(render_overview_boards(&state, &context).await?))
+}
+
+async fn overview_feed_fragment(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    Ok(Html(render_overview_feed(&state, &context).await?))
+}
+
+fn launch_table_query(query: &PageQuery) -> pages::LaunchTableQuery<'_> {
+    pages::LaunchTableQuery {
+        board: TokenBoard::parse(query.tab.as_deref()),
+        sort: query
+            .sort
+            .as_deref()
+            .filter(|sort| crate::services::market_read::TOKEN_SORTS.contains(sort)),
+        descending: query.dir.as_deref() != Some("asc"),
+        search: query
+            .q
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    }
+}
+
+async fn render_token_table(
+    state: &MarketWebState,
+    context: &PageContext<'_>,
+    query: &PageQuery,
+) -> Result<String, MarketWebError> {
+    let table_query = launch_table_query(query);
+    let page = state
+        .market
+        .token_page(
+            context.chain_id,
+            table_query.board,
+            table_query.sort,
+            table_query.search,
+            table_query.descending,
+            query.page.unwrap_or(1),
+            50,
+        )
+        .await?;
+    Ok(pages::fragment_launch_table(context, &table_query, &page))
 }
 
 async fn launches_page(
@@ -272,33 +409,35 @@ async fn launches_page(
     headers: HeaderMap,
 ) -> Result<Html<String>, MarketWebError> {
     let context = PageContext::new(&query);
-    let launches = if context.chain_id == ROBINHOOD_CHAIN_ID {
-        state
-            .service
-            .launches(context.chain_id, context.window, 100)
-            .await?
-    } else {
-        Vec::new()
-    };
-    let wallet = session_address(&state, &headers).await?;
-    let content = format!(
-        "{}<section class=\"panel\">{}</section>",
-        page_intro(
-            &context,
-            "Launch Radar",
-            "发币雷达",
-            "Rank launches by capital velocity, price movement, participant outcomes and capital origin — all inside the launch protocol domain.",
-            "按资金流速、价格变化、参与者盈亏和资金来源排序，所有结论仅在对应发币协议域内成立。",
-        ),
-        render_launch_table(&context, &launches, 100)
-    );
+    let (table, wallet) = tokio::try_join!(
+        render_token_table(&state, &context, &query),
+        session_address(&state, &headers),
+    )?;
     Ok(Html(layout(
         &context,
-        context.locale.text("Launch Radar", "发币雷达"),
+        context.locale.text("Launches", "发币"),
         "launches",
         wallet.as_deref(),
-        &content,
+        &pages::launches(&context, &launch_table_query(&query), &table),
     )))
+}
+
+async fn launch_table_fragment(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    Ok(Html(render_token_table(&state, &context, &query).await?))
+}
+
+async fn token_trades_fragment(
+    State(state): State<MarketWebState>,
+    Path(launch_id): Path<Uuid>,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    let trades = state.market.recent_trades(launch_id, 30).await?;
+    Ok(Html(pages::fragment_token_trades(&context, &trades)))
 }
 
 async fn launch_detail_page(
@@ -309,6 +448,33 @@ async fn launch_detail_page(
 ) -> Result<Response, MarketWebError> {
     let context = PageContext::new(&query);
     let wallet = session_address(&state, &headers).await?;
+    let interval = match query.interval {
+        Some(minutes @ (1 | 5 | 15 | 60)) => minutes,
+        _ => 5,
+    };
+    if let Some(token) = state.market.token(context.chain_id, launch_id).await? {
+        let (candles, trades) = tokio::try_join!(
+            state.market.candles(launch_id, interval, 120),
+            state.market.recent_trades(launch_id, 30),
+        )?;
+        let title = token.symbol.clone().unwrap_or_else(|| "Token".to_owned());
+        return Ok(Html(layout(
+            &context,
+            &title,
+            "launches",
+            wallet.as_deref(),
+            &pages::token_detail(
+                &context,
+                &pages::TokenDetail {
+                    token: &token,
+                    candles: &candles,
+                    interval,
+                    trades: &trades,
+                },
+            ),
+        ))
+        .into_response());
+    }
     let launch = state
         .service
         .launches(context.chain_id, context.window, 500)
@@ -325,8 +491,8 @@ async fn launch_detail_page(
                 wallet.as_deref(),
                 &empty_state(
                     &context,
-                    "Launch evidence is not available.",
-                    "该发币记录尚无可用证据。",
+                    "This launch has no indexed trades yet.",
+                    "该代币暂无已索引的成交。",
                 ),
             )),
         )
@@ -350,11 +516,8 @@ async fn clusters_page(
     State(state): State<MarketWebState>,
     Query(query): Query<PageQuery>,
     headers: HeaderMap,
-) -> Result<Html<String>, MarketWebError> {
+) -> Result<Response, MarketWebError> {
     let context = PageContext::new(&query);
-    let category = normalize_cluster_category(query.category.as_deref());
-    let clusters = state.service.clusters(context.chain_id, 500).await?;
-    let mut lookup = None;
     let mut lookup_error = None;
     if let Some(input) = query
         .address
@@ -363,29 +526,131 @@ async fn clusters_page(
     {
         match normalize_address(input) {
             Ok(address) => {
-                lookup = Some(
-                    state
-                        .service
-                        .address_lookup(context.chain_id, &address)
-                        .await?,
+                return Ok(
+                    axum::response::Redirect::to(&intel::address_url(&context, &address))
+                        .into_response(),
                 );
             }
             Err(error) => lookup_error = Some(error.message),
         }
     }
-    let wallet = session_address(&state, &headers).await?;
+    let window = EarningsWindow::parse(query.period.as_deref());
+    let (wallets, clusters, newest, wallet) = tokio::try_join!(
+        async {
+            state
+                .market
+                .wallet_leaderboard(context.chain_id, window.key(), 50, 0)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .cluster_leaderboard(context.chain_id, window.key(), 50)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .newest_clusters(context.chain_id, window.key(), 12)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        session_address(&state, &headers),
+    )?;
     Ok(Html(layout(
         &context,
         context.locale.text("Address Intelligence", "地址情报"),
         "clusters",
         wallet.as_deref(),
-        &render_clusters(
+        &intel::intel(
             &context,
-            query.address.as_deref(),
-            lookup.as_ref(),
-            lookup_error.as_deref(),
-            category,
-            &clusters,
+            &intel::IntelPage {
+                window,
+                wallets: &wallets,
+                clusters: &clusters,
+                newest_clusters: &newest,
+                lookup_error: lookup_error.as_deref(),
+            },
+        ),
+    ))
+    .into_response())
+}
+
+async fn address_page(
+    State(state): State<MarketWebState>,
+    Path(address): Path<String>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    let address = normalize_address(&address)?;
+    let chain_id = context.chain_id;
+    let (earnings, positions, lookup, day, week, month, wallet) = tokio::try_join!(
+        async {
+            state
+                .market
+                .address_earnings(chain_id, &address)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .address_positions(chain_id, &address, 100)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .service
+                .address_lookup(chain_id, &address)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .wallet_rank(chain_id, "24h", &address)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .wallet_rank(chain_id, "7d", &address)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .wallet_rank(chain_id, "30d", &address)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        session_address(&state, &headers),
+    )?;
+    let ranks = [
+        (EarningsWindow::Day, day),
+        (EarningsWindow::Week, week),
+        (EarningsWindow::Month, month),
+    ];
+    Ok(Html(layout(
+        &context,
+        &ui::short_address(&address),
+        "clusters",
+        wallet.as_deref(),
+        &intel::address(
+            &context,
+            &intel::AddressPage {
+                address: &address,
+                earnings: &earnings,
+                ranks: &ranks,
+                positions: &positions,
+                lookup: &lookup,
+            },
         ),
     )))
 }
@@ -433,16 +698,30 @@ async fn cluster_detail_page(
         } else {
             Vec::new()
         };
+    let earnings_section = if cluster.cluster.cluster_kind == "issuer_cohort" {
+        let (rank, members) = tokio::try_join!(
+            state
+                .market
+                .cluster_rank(context.chain_id, "30d", cluster_id),
+            state.market.cluster_member_earnings(cluster_id, 50),
+        )?;
+        intel::cluster_earnings(&context, rank.as_ref(), &members)
+    } else {
+        String::new()
+    };
     Ok(Html(layout(
         &context,
         context.locale.text("Cluster Evidence", "聚类证据"),
         "clusters",
         wallet.as_deref(),
-        &render_cluster_detail(
-            &context,
-            &cluster,
-            &earnings,
-            normalize_cluster_category(query.category.as_deref()),
+        &format!(
+            "{earnings_section}{}",
+            render_cluster_detail(
+                &context,
+                &cluster,
+                &earnings,
+                normalize_cluster_category(query.category.as_deref()),
+            )
         ),
     ))
     .into_response())
@@ -2056,35 +2335,21 @@ fn layout(
     content: &str,
 ) -> String {
     let l = context.locale;
-    let nav = [
-        ("overview", "/", l.text("Overview", "总览")),
-        ("launches", "/launches", l.text("Launch Radar", "发币雷达")),
-        (
-            "clusters",
-            "/clusters",
-            l.text("Address Intelligence", "地址情报"),
-        ),
-        ("arbitrage", "/arbitrage", l.text("Arbitrage", "套利")),
-        (
-            "liquidations",
-            "/liquidations",
-            l.text("Liquidations", "清算"),
-        ),
-    ]
-    .into_iter()
-    .map(|(key, path, label)| {
-        format!(
-            "<a class=\"{}\" href=\"{}\">{}</a>",
-            if active == key { "active" } else { "" },
-            context.url(path),
-            label,
-        )
-    })
-    .collect::<String>();
+    let nav = pages::NAV
+        .into_iter()
+        .map(|(key, path, en, zh)| {
+            format!(
+                "<a class=\"{}\" href=\"{}\">{}</a>",
+                if active == key { "active" } else { "" },
+                context.url(path),
+                l.text(en, zh),
+            )
+        })
+        .collect::<String>();
     let wallet_button = wallet
         .map(|address| {
             format!(
-                "<button class=\"wallet connected\" type=\"button\" data-wallet-logout><i></i>{}</button>",
+                "<button class=\"wallet connected\" type=\"button\" data-wallet-logout>● {}</button>",
                 truncate(address, 6)
             )
         })
@@ -2097,54 +2362,37 @@ fn layout(
     let other_lang = if l == Locale::En { "zh" } else { "en" };
     let language_label = if l == Locale::En { "中文" } else { "EN" };
     format!(
-        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head><body>
-<header><a class="brand" href="{home}"><span>{mark}</span><div><strong>LedgerFlow</strong><small>MARKET INTELLIGENCE</small></div></a><nav>{nav}</nav><div class="tools"><form><input type="hidden" name="lang" value="{lang}"><input type="hidden" name="window" value="{window}"><select name="chain_id" onchange="this.form.submit()"><option value="4663" {rh}>Robinhood</option><option value="8453" {base}>Base</option></select></form><a class="language" href="?lang={other_lang}&chain_id={chain_id}&window={window}">{language_label}</a>{wallet_button}</div></header>
-<div class="subbar"><span>{range_label}</span>{range_links}</div><main>{content}</main><footer><span>{footer_copy}</span><a href="{seed_url}">{seed_label} →</a></footer>{wallet_script}</body></html>"#,
+        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>{title} · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{legacy}{styles}</style></head><body>
+<header class="top"><div class="bar"><a class="brand" href="{home}"><span>{mark}</span><div><strong>LedgerFlow</strong><small>MARKET INTELLIGENCE</small></div></a><nav class="main">{nav}</nav><div class="tools"><form><input type="hidden" name="lang" value="{lang}"><select name="chain_id" onchange="this.form.submit()" aria-label="Network"><option value="4663" {rh}>Robinhood</option><option value="8453" {base}>Base</option></select></form><a class="lang" href="?lang={other_lang}&chain_id={chain_id}">{language_label}</a>{wallet_button}</div></div>
+<div class="ticker"><div data-refresh="{ticker_url}" data-every="15" data-eager></div></div></header>
+<main>{content}</main><footer class="site"><span>{footer_copy}</span><a href="{seed_url}">{seed_label} →</a></footer>{wallet_script}{script}</body></html>"#,
         lang = l.code(),
         title = escape_html(title),
-        styles = STYLES,
+        legacy = LEGACY_STYLES,
+        styles = ui::STYLES,
         home = context.url("/"),
         mark = brand_mark_svg_source(),
         nav = nav,
-        window = context.window,
         rh = if context.chain_id == ROBINHOOD_CHAIN_ID {
             "selected"
         } else {
             ""
         },
-        base = if context.chain_id == 8453 {
-            "selected"
-        } else {
-            ""
-        },
+        base = if context.chain_id == 8453 { "selected" } else { "" },
         other_lang = other_lang,
         chain_id = context.chain_id,
         language_label = language_label,
         wallet_button = wallet_button,
-        range_label = l.text("Window", "时间范围"),
-        range_links = ["1h", "6h", "24h", "7d", "30d"]
-            .into_iter()
-            .map(|window| format!(
-                "<a class=\"{}\" href=\"?lang={}&chain_id={}&window={}\">{}</a>",
-                if context.window == window {
-                    "active"
-                } else {
-                    ""
-                },
-                l.code(),
-                context.chain_id,
-                window,
-                window
-            ))
-            .collect::<String>(),
+        ticker_url = pages::fragment_url(context, "/fragments/ticker", ""),
         content = content,
         footer_copy = l.text(
-            "Evidence-backed market intelligence. Not financial advice.",
-            "基于证据的市场情报，不构成投资建议。"
+            "Computed from on-chain data via LedgerFlow's own node. Estimates are labelled. Not financial advice.",
+            "数据由 LedgerFlow 自有节点读取链上数据计算，估算值均有标注，不构成投资建议。"
         ),
         seed_url = context.url("/seed-library"),
         seed_label = l.text("Protocol seeds", "协议种子"),
         wallet_script = WALLET_SCRIPT,
+        script = ui::SCRIPT,
     )
 }
 
@@ -2474,20 +2722,17 @@ if(connect) connect.addEventListener('click',async()=>{try{if(!window.ethereum)t
 const logout=document.querySelector('[data-wallet-logout]');if(logout) logout.addEventListener('click',async()=>{await fetch('/auth/wallet/logout',{method:'POST'});location.reload()});
 </script>"#;
 
-const STYLES: &str = r#"
-:root{color-scheme:dark;--bg:#080808;--panel:#111;--line:#292929;--text:#f7f5f2;--muted:#aaa49c;--orange:#ff6600;--green:#71e3a3;--red:#ff8177;--violet:#b299ff}
-*{box-sizing:border-box}html{font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}body{margin:0;min-width:1040px;background:radial-gradient(circle at 86% -10%,rgba(255,102,0,.09),transparent 29%),var(--bg)}a{color:inherit;text-decoration:none}button,select{font:inherit}header{height:72px;display:grid;grid-template-columns:245px 1fr auto;align-items:center;gap:22px;padding:0 32px;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;background:rgba(8,8,8,.94);backdrop-filter:blur(16px)}
-.brand{display:flex;align-items:center;gap:10px}.brand>span{width:38px;height:38px}.brand svg{width:100%;height:100%}.brand div{display:flex;flex-direction:column}.brand strong{font-size:17px;letter-spacing:-.02em}.brand small{font-size:12px;color:var(--muted);letter-spacing:.08em}nav{display:flex;justify-content:center;gap:3px}nav a{padding:8px 10px;border-radius:7px;color:var(--muted);font-size:13px}nav a:hover,nav a.active{color:var(--text);background:#181818}.tools{display:flex;align-items:center;gap:8px}.tools select,.language,.wallet{height:38px;border:1px solid var(--line);border-radius:8px;background:#121212;color:var(--text);padding:0 12px;font-size:13px}.wallet{background:var(--text);color:#111;font-weight:700;cursor:pointer}.wallet.connected{background:#12261a;color:var(--green);border-color:#245f3d}.wallet i{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:7px}
-.subbar{height:42px;border-bottom:1px solid #1b1b1b;display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:0 34px;color:var(--muted);font-size:12px}.subbar>a{padding:4px 9px;border-radius:12px}.subbar>a.active{background:#272019;color:#ffb27f}.subbar>span{margin-right:4px}main{max-width:1540px;margin:0 auto;padding:28px 34px 70px}.hero{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:46px;align-items:end;padding:20px 0 30px}.eyebrow{display:block;color:#c1bbb3;font-size:12px;letter-spacing:.12em;font-weight:700}.hero h1{font-size:clamp(34px,3.2vw,44px);line-height:1.04;max-width:850px;margin:10px 0 12px;letter-spacing:-.045em}.hero-copy>p{color:var(--muted);font-size:14px;max-width:790px}.hero-actions{display:flex;gap:10px;margin-top:18px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid #393939;border-radius:8px;padding:0 16px;font-size:13px;font-weight:700;background:#151515}.button.primary{background:var(--orange);border-color:var(--orange);color:white}.button.small{min-height:35px;margin-top:12px}.fresh-card{border-left:1px solid var(--line);padding:5px 0 4px 24px}.fresh-card>span{font-size:12px;color:#c0b9b0;letter-spacing:.1em}.fresh-card>strong{display:block;font-size:18px;margin:8px 0}.fresh-card div{font-size:12px;color:var(--muted);margin-top:10px}.fresh-card b{color:var(--text)}
+const LEGACY_STYLES: &str = r#"
+.hero{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:46px;align-items:end;padding:20px 0 30px}.eyebrow{display:block;color:#c1bbb3;font-size:12px;letter-spacing:.12em;font-weight:700}.hero h1{font-size:clamp(34px,3.2vw,44px);line-height:1.04;max-width:850px;margin:10px 0 12px;letter-spacing:-.045em}.hero-copy>p{color:var(--muted);font-size:14px;max-width:790px}.hero-actions{display:flex;gap:10px;margin-top:18px}.button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid #393939;border-radius:8px;padding:0 16px;font-size:13px;font-weight:700;background:#151515}.button.primary{background:var(--orange);border-color:var(--orange);color:white}.button.small{min-height:35px;margin-top:12px}.fresh-card{border-left:1px solid var(--line);padding:5px 0 4px 24px}.fresh-card>span{font-size:12px;color:#c0b9b0;letter-spacing:.1em}.fresh-card>strong{display:block;font-size:18px;margin:8px 0}.fresh-card div{font-size:12px;color:var(--muted);margin-top:10px}.fresh-card b{color:var(--text)}
 .metrics{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-bottom:22px}.metric{padding:18px 22px;min-height:120px;background:var(--panel);border-right:1px solid var(--line)}.metric:last-child{border:0}.metric>div{display:flex;gap:10px;color:var(--muted);font-size:12px}.metric>strong{display:flex;align-items:baseline;gap:7px;min-height:40px;margin:13px 0 0;font-size:27px;line-height:1.15}.metric>strong small{font-size:12px;color:var(--muted);font-weight:500}.metric p{font-size:12px;color:var(--muted);font-style:normal;margin:3px 0}.accent{color:var(--orange)}.positive{color:var(--green)}.negative{color:var(--red)}.slash{color:#555}.unavailable{font-size:17px;color:#777}
 .split{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(350px,.65fr);gap:22px;margin-bottom:22px}.panel{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:22px;margin-bottom:22px}.section-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}.section-head h2,.panel h2{font-size:19px;margin:3px 0}.section-head>a,.section-head>span{color:var(--muted);font-size:12px}.table-wrap{overflow:auto}table{border-collapse:collapse;width:100%;font-size:12px}th{text-align:left;color:#888;font-weight:600;white-space:nowrap;padding:9px 12px;border-bottom:1px solid var(--line)}td{padding:13px 12px;border-bottom:1px solid #222;vertical-align:middle}tbody tr:last-child td{border-bottom:0}td small,td strong{display:block}td small{color:#777;margin-top:2px}td code{font-size:12px;color:#bbb}.token-cell{display:flex;align-items:center;gap:10px;min-width:170px}.token-cell>span{display:grid;place-items:center;width:34px;height:34px;border-radius:9px;background:#251a12;color:#ff9e5d;font-weight:800}.state,.severity,.execution-row em{display:inline-flex;padding:3px 7px;border-radius:5px;background:#1f1c18;color:#e6aa7e;font-size:12px;font-style:normal;white-space:nowrap}.severity.high,.severity.critical{background:#2c1717;color:#ffaaa3}
 .honest-empty{min-height:180px;display:flex;align-items:center;justify-content:center;gap:16px;border:1px dashed #343434;border-radius:9px;padding:24px;text-align:left}.honest-empty i{width:10px;height:10px;background:var(--orange);border-radius:50%;box-shadow:0 0 0 7px rgba(255,102,0,.1)}.honest-empty strong{font-size:15px}.honest-empty p{max-width:650px;color:var(--muted);font-size:13px;margin:7px 0}.honest-empty small{font-size:12px;color:#777}.honest-empty.compact{min-height:120px}.execution-row{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid #222}.execution-row:last-child{border:0}.execution-row div strong,.execution-row div small{display:block}.execution-row div small{font-size:12px;color:#777}.execution-row>b{font-size:13px;color:var(--green)}.method{display:grid;grid-template-columns:300px 1fr;gap:50px;align-items:center}.method ol{display:grid;grid-template-columns:repeat(3,1fr);list-style:none;padding:0;margin:0;gap:20px}.method li{font-size:13px;color:#ccc}.method li b{display:block;color:var(--orange);font-size:12px;margin-bottom:8px}
 .signal-contract{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:9px;margin-bottom:14px;overflow:hidden}.signal-contract>div{display:flex;flex-direction:column;gap:4px;padding:15px;border-right:1px solid var(--line)}.signal-contract>div:last-child{border:0}.signal-contract span{font-size:12px;color:var(--orange)}.signal-contract strong{font-size:13px}.signal-contract small{font-size:12px;color:var(--muted)}
-.page-intro{padding:28px 0 38px}.page-intro h1{font-size:48px;margin-bottom:15px}.cluster-section-head{margin-top:30px}.cluster-filters{display:flex;flex-wrap:wrap;gap:8px;margin:-3px 0 18px}.cluster-filters a{display:inline-flex;align-items:center;gap:8px;min-height:36px;padding:0 13px;border:1px solid var(--line);border-radius:18px;color:var(--muted);font-size:12px;background:#101010}.cluster-filters a:hover,.cluster-filters a.active{border-color:#80502f;color:#fff;background:#241910}.cluster-filters b{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:#282828;color:#d6d0c8;font-size:12px}.cluster-filters a.active b{background:#663317;color:#ffd2b3}.cluster-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.cluster{display:block;border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:20px;transition:border-color .15s ease}.cluster:hover{border-color:#555}.cluster>div{display:flex;justify-content:space-between;align-items:center}.cluster>div small{font-size:12px;color:var(--muted)}.cluster h3{margin:18px 0 5px}.cluster code{font-size:12px;color:#aaa}.cluster dl,.detail-grid dl,.lookup-match dl{margin:18px 0}.cluster dl div,.detail-grid dl div,.lookup-match dl div{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #222}.cluster dt,.detail-grid dt,.lookup-match dt{color:var(--muted);font-size:12px}.cluster dd,.detail-grid dd,.lookup-match dd{margin:0;font-size:13px}.cluster p,.scope-note p,.limitations p,.cluster-explanation p{color:var(--muted);font-size:13px}.open-link{display:block;color:#ddd;font-size:12px;margin-top:14px}.address-lookup{display:grid;grid-template-columns:minmax(260px,.7fr) minmax(480px,1.3fr);gap:28px;align-items:start}.address-lookup>div>p{color:var(--muted);font-size:13px;max-width:530px}.address-lookup form>div{display:grid;grid-template-columns:1fr auto;gap:8px}.address-lookup input{min-width:0;height:48px;border:1px solid #3b3b3b;border-radius:8px;background:#090909;color:var(--text);padding:0 14px;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}.address-lookup button{height:48px;border:0;border-radius:8px;padding:0 20px;background:var(--orange);color:white;font-weight:750;cursor:pointer}.lookup-prompt,.lookup-error{grid-column:1/-1;border-top:1px solid var(--line);padding-top:18px}.lookup-prompt p,.lookup-error span{display:block;color:var(--muted);font-size:13px;margin:5px 0}.lookup-error strong{color:var(--red)}.lookup-results{grid-column:1/-1;border-top:1px solid var(--line);padding-top:20px}.lookup-address{display:flex;align-items:center;gap:12px;min-width:0}.lookup-address span,.lookup-address small{color:var(--muted);font-size:12px}.lookup-address code{font-size:13px;overflow-wrap:anywhere}.lookup-address small{margin-left:auto}.lookup-metrics{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:9px;overflow:hidden;margin:18px 0}.lookup-metrics>div{padding:13px;border-right:1px solid var(--line)}.lookup-metrics>div:last-child{border:0}.lookup-metrics span,.lookup-metrics strong{display:block}.lookup-metrics span{color:var(--muted);font-size:12px}.lookup-metrics strong{font-size:19px;margin-top:4px}.lookup-columns{display:grid;grid-template-columns:1fr 1fr;gap:16px}.lookup-columns>section{border:1px solid var(--line);border-radius:9px;padding:14px}.mini-head{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:12px;margin-bottom:8px}.lookup-match{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,.7fr) auto;gap:14px;align-items:center;border-top:1px solid #242424;padding:13px 0}.lookup-match>div strong,.lookup-match>div small{display:block}.lookup-match>div strong{font-size:13px;margin-top:5px}.lookup-match>div small{font-size:12px;color:var(--muted)}.lookup-match dl{margin:0}.lookup-match>span{color:var(--orange)}.lookup-none{display:flex;flex-direction:column;gap:4px;border-top:1px solid #242424;padding:14px 0}.lookup-none strong{font-size:13px}.lookup-none span,.lookup-limitation{color:var(--muted);font-size:12px}.protocol-hit{display:flex;justify-content:space-between;gap:14px;border-top:1px solid #242424;padding:13px 0}.protocol-hit strong,.protocol-hit small{display:block}.protocol-hit small{color:var(--muted);font-size:12px}.protocol-hit>div:last-child{text-align:right}.protocol-hit span,.protocol-hit b{display:block;font-size:12px}.protocol-hit span{color:var(--orange)}.cluster-detail-hero h1{font-size:42px}.cluster-explanation{border-left:3px solid var(--orange)}.back{display:inline-block;color:var(--muted);font-size:13px;margin-bottom:22px}.detail-hero{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:1px solid var(--line);padding:5px 0 32px;margin-bottom:22px}.detail-hero h1{font-size:50px;margin:10px 0 4px}.detail-hero code{color:var(--muted)}.detail-hero aside{display:flex;flex-direction:column;align-items:flex-end}.detail-hero aside>strong{font-size:38px}.detail-hero aside span,.detail-hero aside small{color:var(--muted);font-size:12px}.tags{display:flex;align-items:center;gap:10px;margin-top:15px;color:var(--muted);font-size:12px}.detail-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:22px}.answer{padding:18px;background:#151515;border-radius:8px;margin-top:18px}.answer strong{font-size:18px}.answer p{font-size:13px;color:var(--muted)}footer{max-width:1540px;margin:0 auto;border-top:1px solid var(--line);padding:24px 34px 35px;display:flex;justify-content:space-between;color:#777;font-size:12px}
+.page-intro{padding:28px 0 38px}.page-intro h1{font-size:48px;margin-bottom:15px}.cluster-section-head{margin-top:30px}.cluster-filters{display:flex;flex-wrap:wrap;gap:8px;margin:-3px 0 18px}.cluster-filters a{display:inline-flex;align-items:center;gap:8px;min-height:36px;padding:0 13px;border:1px solid var(--line);border-radius:18px;color:var(--muted);font-size:12px;background:#101010}.cluster-filters a:hover,.cluster-filters a.active{border-color:#80502f;color:#fff;background:#241910}.cluster-filters b{display:inline-grid;place-items:center;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:#282828;color:#d6d0c8;font-size:12px}.cluster-filters a.active b{background:#663317;color:#ffd2b3}.cluster-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.cluster{display:block;border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:20px;transition:border-color .15s ease}.cluster:hover{border-color:#555}.cluster>div{display:flex;justify-content:space-between;align-items:center}.cluster>div small{font-size:12px;color:var(--muted)}.cluster h3{margin:18px 0 5px}.cluster code{font-size:12px;color:#aaa}.cluster dl,.detail-grid dl,.lookup-match dl{margin:18px 0}.cluster dl div,.detail-grid dl div,.lookup-match dl div{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #222}.cluster dt,.detail-grid dt,.lookup-match dt{color:var(--muted);font-size:12px}.cluster dd,.detail-grid dd,.lookup-match dd{margin:0;font-size:13px}.cluster p,.scope-note p,.limitations p,.cluster-explanation p{color:var(--muted);font-size:13px}.open-link{display:block;color:#ddd;font-size:12px;margin-top:14px}.address-lookup{display:grid;grid-template-columns:minmax(260px,.7fr) minmax(480px,1.3fr);gap:28px;align-items:start}.address-lookup>div>p{color:var(--muted);font-size:13px;max-width:530px}.address-lookup form>div{display:grid;grid-template-columns:1fr auto;gap:8px}.address-lookup input{min-width:0;height:48px;border:1px solid #3b3b3b;border-radius:8px;background:#090909;color:var(--text);padding:0 14px;font:13px ui-monospace,SFMono-Regular,Menlo,monospace}.address-lookup button{height:48px;border:0;border-radius:8px;padding:0 20px;background:var(--orange);color:white;font-weight:750;cursor:pointer}.lookup-prompt,.lookup-error{grid-column:1/-1;border-top:1px solid var(--line);padding-top:18px}.lookup-prompt p,.lookup-error span{display:block;color:var(--muted);font-size:13px;margin:5px 0}.lookup-error strong{color:var(--red)}.lookup-results{grid-column:1/-1;border-top:1px solid var(--line);padding-top:20px}.lookup-address{display:flex;align-items:center;gap:12px;min-width:0}.lookup-address span,.lookup-address small{color:var(--muted);font-size:12px}.lookup-address code{font-size:13px;overflow-wrap:anywhere}.lookup-address small{margin-left:auto}.lookup-metrics{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:9px;overflow:hidden;margin:18px 0}.lookup-metrics>div{padding:13px;border-right:1px solid var(--line)}.lookup-metrics>div:last-child{border:0}.lookup-metrics span,.lookup-metrics strong{display:block}.lookup-metrics span{color:var(--muted);font-size:12px}.lookup-metrics strong{font-size:19px;margin-top:4px}.lookup-columns{display:grid;grid-template-columns:1fr 1fr;gap:16px}.lookup-columns>section{border:1px solid var(--line);border-radius:9px;padding:14px}.mini-head{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:12px;margin-bottom:8px}.lookup-match{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,.7fr) auto;gap:14px;align-items:center;border-top:1px solid #242424;padding:13px 0}.lookup-match>div strong,.lookup-match>div small{display:block}.lookup-match>div strong{font-size:13px;margin-top:5px}.lookup-match>div small{font-size:12px;color:var(--muted)}.lookup-match dl{margin:0}.lookup-match>span{color:var(--orange)}.lookup-none{display:flex;flex-direction:column;gap:4px;border-top:1px solid #242424;padding:14px 0}.lookup-none strong{font-size:13px}.lookup-none span,.lookup-limitation{color:var(--muted);font-size:12px}.protocol-hit{display:flex;justify-content:space-between;gap:14px;border-top:1px solid #242424;padding:13px 0}.protocol-hit strong,.protocol-hit small{display:block}.protocol-hit small{color:var(--muted);font-size:12px}.protocol-hit>div:last-child{text-align:right}.protocol-hit span,.protocol-hit b{display:block;font-size:12px}.protocol-hit span{color:var(--orange)}.cluster-detail-hero h1{font-size:42px}.cluster-explanation{border-left:3px solid var(--orange)}.back{display:inline-block;color:var(--muted);font-size:13px;margin-bottom:22px}.detail-hero{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:1px solid var(--line);padding:5px 0 32px;margin-bottom:22px}.detail-hero h1{font-size:50px;margin:10px 0 4px}.detail-hero code{color:var(--muted)}.detail-hero aside{display:flex;flex-direction:column;align-items:flex-end}.detail-hero aside>strong{font-size:38px}.detail-hero aside span,.detail-hero aside small{color:var(--muted);font-size:12px}.tags{display:flex;align-items:center;gap:10px;margin-top:15px;color:var(--muted);font-size:12px}.detail-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:22px}.answer{padding:18px;background:#151515;border-radius:8px;margin-top:18px}.answer strong{font-size:18px}.answer p{font-size:13px;color:var(--muted)}
 .page-intro{display:flex;align-items:baseline;justify-content:space-between;gap:20px;padding:12px 0 22px}.page-intro h1{font-size:29px;line-height:1.15;margin:0;letter-spacing:-.03em}.page-intro>span{font-size:12px;color:var(--muted)}
 .address-lookup{grid-template-columns:minmax(220px,.5fr) minmax(480px,1.5fr);gap:24px}.address-lookup input,.address-lookup button{height:44px}.lookup-prompt,.lookup-error{padding-top:15px}.cluster-detail-hero h1{font-size:38px}.back{margin-bottom:18px}.detail-hero{padding-bottom:25px}.detail-hero h1{font-size:42px}.detail-hero aside>strong{font-size:34px}.detail-grid{gap:16px}.answer{padding:14px;margin-top:12px}
 .ranking-panel>.section-head{margin-bottom:10px}.asset-ranking{margin-top:18px;border-top:1px solid var(--line);padding-top:14px}.asset-ranking:first-of-type{margin-top:0;border-top:0;padding-top:0}.asset-heading{display:flex;align-items:center;gap:10px;margin-bottom:7px}.asset-heading strong{font-size:16px}.asset-heading code{font-size:12px;color:var(--muted)}.rank-empty{display:flex;align-items:center;min-height:74px;color:var(--muted);font-size:13px}.earnings-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.earning-card{border:1px solid var(--line);border-radius:9px;padding:15px;background:#0d0d0d}.earning-card>span{display:block;color:var(--muted);font-size:12px}.earning-card>strong{display:block;color:var(--green);font-size:21px;margin:6px 0 10px}.earning-card dl{margin:0}.earning-card dl div{display:flex;justify-content:space-between;border-top:1px solid #222;padding:6px 0}.earning-card dt{color:var(--muted);font-size:12px}.earning-card dd{margin:0;font-size:12px}
-@media(max-width:1200px){header{grid-template-columns:210px 1fr auto;padding:0 22px}.site-header nav a,nav a{padding:7px 6px}.split{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.metric:nth-child(2){border-right:0}.metric:nth-child(-n+2){border-bottom:1px solid var(--line)}.cluster-grid{grid-template-columns:repeat(2,1fr)}.address-lookup{grid-template-columns:1fr}.lookup-columns{grid-template-columns:1fr}.earnings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:1200px){.split{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}.metric:nth-child(2){border-right:0}.metric:nth-child(-n+2){border-bottom:1px solid var(--line)}.cluster-grid{grid-template-columns:repeat(2,1fr)}.address-lookup{grid-template-columns:1fr}.lookup-columns{grid-template-columns:1fr}.earnings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 "#;
 
 #[cfg(test)]
@@ -2543,7 +2788,10 @@ mod tests {
             "font-size:9px",
             "font-size:8px",
         ] {
-            assert!(!STYLES.contains(value), "found forbidden size {value}");
+            assert!(
+                !LEGACY_STYLES.contains(value) && !ui::STYLES.contains(value),
+                "found forbidden size {value}"
+            );
         }
     }
 
@@ -2563,8 +2811,7 @@ mod tests {
             lang: Some("zh".to_owned()),
             chain_id: Some(8453),
             window: Some("7d".to_owned()),
-            address: None,
-            category: None,
+            ..PageQuery::default()
         };
         let context = PageContext::new(&base);
         assert_eq!(context.chain_id, 8453);
