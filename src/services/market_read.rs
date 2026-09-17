@@ -405,11 +405,11 @@ impl MarketReadService {
     pub async fn recent_trades(&self, launch_id: Uuid, limit: i64) -> LedgerResult<Vec<TradeRow>> {
         sqlx::query_as::<_, TradeRow>(
             r#"select f.launch_id, s.symbol, f.token_address, f.trader_address, f.trade_side,
-                      (f.quote_amount_raw::numeric / power(10::numeric, q.decimals))::float8
+                      (f.quote_amount_raw::numeric * power(10::numeric, -(q.decimals)))::float8
                         as quote_amount,
-                      (f.token_amount_raw::numeric / power(10::numeric, t.decimals))::float8
+                      (f.token_amount_raw::numeric * power(10::numeric, -(t.decimals)))::float8
                         as token_amount,
-                      (f.quote_amount_raw::numeric / power(10::numeric, q.decimals)
+                      (f.quote_amount_raw::numeric * power(10::numeric, -(q.decimals))
                         * s.quote_usd_price)::float8 as usd_value,
                       s.quote_symbol, f.tx_hash, f.occurred_at
                from public.protocol_launch_trade_facts f
@@ -461,11 +461,11 @@ impl MarketReadService {
                  where f.chain_id = $1 and f.block_number > $3 and f.is_canonical
                ), valued as (
                  select f.launch_id, s.symbol, f.token_address, f.trader_address, f.trade_side,
-                        (f.quote_amount_raw::numeric / power(10::numeric, q.decimals))::float8
+                        (f.quote_amount_raw::numeric * power(10::numeric, -(q.decimals)))::float8
                           as quote_amount,
-                        (f.token_amount_raw::numeric / power(10::numeric, 18))::float8
+                        (f.token_amount_raw::numeric * power(10::numeric, -(18)))::float8
                           as token_amount,
-                        (f.quote_amount_raw::numeric / power(10::numeric, q.decimals)
+                        (f.quote_amount_raw::numeric * power(10::numeric, -(q.decimals))
                           * s.quote_usd_price)::float8 as usd_value,
                         s.quote_symbol, f.tx_hash, f.occurred_at, f.block_number, f.log_index
                  from recent f
@@ -765,7 +765,7 @@ impl MarketReadService {
                  coalesce(sum(cost_usd) filter (where eligible), 0)::float8 as cost,
                  count(*) filter (where eligible) as tokens,
                  count(*) filter (where eligible
-                   and proceeds_usd + remaining * price_usd - cost_usd > 0) as wins,
+                   and proceeds_usd - cost_usd * sold_ratio > 0) as wins,
                  count(*) filter (where not eligible) as excluded,
                  (select count(*) from public.protocol_token_launches
                   where chain_id = $1 and creator_address = $2) as created,

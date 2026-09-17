@@ -208,6 +208,33 @@ impl MarketArbitrageEstimator {
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;
+        let mut rows = rows;
+        if (rows.len() as i64) < self.config.batch_size {
+            // Once caught up, also estimate older deterministically verified
+            // executions so estimates can be checked against them.
+            let verified = sqlx::query(
+                r#"select candidate.tx_hash, candidate.block_number, candidate.block_timestamp,
+                          candidate.sender_address, candidate.entry_contract,
+                          candidate.swap_log_count, candidate.distinct_pool_count
+                   from public.economic_verification_results verification
+                   join public.arbitrage_candidates candidate
+                     on candidate.chain_id = verification.chain_id
+                    and candidate.tx_hash = verification.tx_hash
+                   where verification.chain_id = $1 and verification.result_status = 'verified'
+                     and not exists (
+                       select 1 from market.arbitrage_estimates estimate
+                       where estimate.chain_id = candidate.chain_id
+                         and estimate.tx_hash = candidate.tx_hash
+                     )
+                   limit $2"#,
+            )
+            .bind(chain_id)
+            .bind(self.config.batch_size - rows.len() as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)?;
+            rows.extend(verified);
+        }
         let candidates = rows
             .iter()
             .map(|row| Candidate {
@@ -351,7 +378,7 @@ impl MarketArbitrageEstimator {
                where chain_id = $1 and status = 'unknown'
                  and block_time > now() - interval '30 days'
                order by block_time desc
-               limit 5000"#,
+               limit 50000"#,
         )
         .bind(self.config.chain_id as i64)
         .fetch_all(&self.pool)
@@ -443,8 +470,8 @@ impl MarketArbitrageEstimator {
 const VALUATION_SQL: &str = r#"
 with priced as (
   select delta.tx_hash, delta.token_address,
-         delta.amount_raw / power(10::numeric, meta.decimals) as amount,
-         delta.amount_raw / power(10::numeric, meta.decimals) * price.price_usd as usd
+         delta.amount_raw * power(10::numeric, -(meta.decimals)) as amount,
+         delta.amount_raw * power(10::numeric, -(meta.decimals)) * price.price_usd as usd
   from market.arbitrage_estimate_deltas delta
   join market.arbitrage_estimates estimate
     on estimate.chain_id = delta.chain_id and estimate.tx_hash = delta.tx_hash
@@ -470,6 +497,28 @@ with priced as (
   select tx_hash, sum(usd) as gross, bool_and(usd is not null) as all_priced,
          (array_agg(token_address order by usd is null desc))[1] as unpriced_token
   from priced group by tx_hash
+), verified as (
+  -- Deterministic verification (archive balances + traces) supersedes the
+  -- receipt estimate for the profit it covers.
+  select verification.tx_hash,
+         verification.profit_amount_raw::numeric
+           * power(10::numeric, -(meta.decimals)) * price.price_usd as usd
+  from public.economic_verification_results verification
+  join market.arbitrage_estimates estimate
+    on estimate.chain_id = verification.chain_id and estimate.tx_hash = verification.tx_hash
+  left join public.erc20_token_metadata meta
+    on meta.chain_id = verification.chain_id
+   and meta.token_address = verification.profit_token_address
+  left join lateral (
+    select p.price_usd from market.asset_usd_prices p
+    where p.chain_id = verification.chain_id
+      and p.asset_address = verification.profit_token_address
+      and p.bucket_start <= estimate.block_time
+      and p.bucket_start > estimate.block_time - interval '48 hours'
+    order by p.bucket_start desc limit 1
+  ) price on true
+  where verification.chain_id = $1 and verification.tx_hash = any($2)
+    and verification.result_status = 'verified'
 ), native as (
   select estimate.tx_hash,
          (select p.price_usd from market.asset_usd_prices p
@@ -482,13 +531,21 @@ with priced as (
 )
 update market.arbitrage_estimates estimate
 set gas_usd = estimate.gas_native * native.native_usd,
-    gross_usd = case when coalesce(totals.all_priced, true) then coalesce(totals.gross, 0) end,
-    net_usd = case when coalesce(totals.all_priced, true) and native.native_usd is not null
-      then coalesce(totals.gross, 0) - estimate.gas_native * native.native_usd end,
-    status = case when coalesce(totals.all_priced, true) and native.native_usd is not null
-      then 'estimated' else 'unknown' end,
+    gross_usd = case
+      when verified.usd is not null then verified.usd
+      when coalesce(totals.all_priced, true) then coalesce(totals.gross, 0) end,
+    net_usd = case
+      when native.native_usd is null then null
+      when verified.usd is not null then verified.usd - estimate.gas_native * native.native_usd
+      when coalesce(totals.all_priced, true)
+        then coalesce(totals.gross, 0) - estimate.gas_native * native.native_usd end,
+    status = case
+      when native.native_usd is not null
+       and (verified.usd is not null or coalesce(totals.all_priced, true))
+        then 'estimated' else 'unknown' end,
     reason = case
       when native.native_usd is null then 'native USD price unavailable'
+      when verified.usd is not null then 'profit from deterministic verification'
       when not coalesce(totals.all_priced, true) then 'unpriced token ' || totals.unpriced_token
       when estimate.tx_status = 'reverted' then 'reverted transaction; gas only'
       when estimate.token_count = 0 then 'no ERC-20 delta in sender/executor scope'
@@ -500,6 +557,7 @@ set gas_usd = estimate.gas_native * native.native_usd,
     )
 from native
 left join totals on totals.tx_hash = native.tx_hash
+left join verified on verified.tx_hash = native.tx_hash
 where estimate.chain_id = $1 and estimate.tx_hash = native.tx_hash
 "#;
 

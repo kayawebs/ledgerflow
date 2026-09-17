@@ -28,7 +28,6 @@ pub const MARKET_METHODOLOGY_VERSION: &str = "market_curve_v1";
 pub const NATIVE_ASSET_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const TOTAL_SUPPLY_SELECTOR: &str = "0x18160ddd";
 const QUOTE_ASSET_CACHE_TTL: Duration = Duration::from_secs(600);
-const SUPPLY_FETCH_CONCURRENCY: usize = 8;
 /// Observations further than this factor from the asset's anchor are dropped.
 const PRICE_OUTLIER_FACTOR: f64 = 1.6;
 /// No quote asset on the market is worth more than this; larger values are
@@ -94,10 +93,10 @@ impl Default for MarketProjectorConfig {
             candle_block_batch: 100_000,
             candle_reprocess_blocks: 1_500,
             candle_minute_lookback_blocks: 6_000,
-            stats_candle_scan_limit: 20_000,
-            stats_batch_size: 1_000,
+            stats_candle_scan_limit: 60_000,
+            stats_batch_size: 2_000,
             stats_decay_seconds: 60,
-            supply_fetch_limit: 128,
+            supply_fetch_limit: 200,
             supply_fetch_timeout_ms: 5_000,
         }
     }
@@ -118,12 +117,15 @@ pub struct MarketProjectionSummary {
     pub supplies_fetched: u64,
     pub candle_ms: u64,
     pub stats_ms: u64,
+    pub stats_backlog: bool,
 }
 
 impl MarketProjectionSummary {
     /// True when any stage still has a backlog and the loop should not sleep.
     pub fn has_backlog(&self) -> bool {
-        self.candle_to_block < self.candle_head_block || self.price_buckets_scanned > 0
+        self.candle_to_block < self.candle_head_block
+            || self.price_buckets_scanned > 0
+            || self.stats_backlog
     }
 }
 
@@ -358,6 +360,7 @@ impl MarketProjector {
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;
+        summary.stats_backlog = changed.len() as i64 >= self.config.stats_candle_scan_limit;
         let mut next_since = since;
         let mut launches = BTreeSet::new();
         for row in &changed {
@@ -426,34 +429,36 @@ impl MarketProjector {
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;
-        let mut tasks = tokio::task::JoinSet::new();
-        let permits = Arc::new(tokio::sync::Semaphore::new(SUPPLY_FETCH_CONCURRENCY));
-        for row in rows {
-            let permits = permits.clone();
-            let launch_id: Uuid = row.get("launch_id");
-            let token: String = row.get("token_address");
-            let decimals: Option<i32> = row.get("decimals");
-            let rpc = rpc.clone();
-            let timeout = Duration::from_millis(self.config.supply_fetch_timeout_ms.max(100));
-            tasks.spawn(async move {
-                let _permit = permits.acquire_owned().await;
-                let outcome =
-                    tokio::time::timeout(timeout, rpc.eth_call(&token, TOTAL_SUPPLY_SELECTOR))
-                        .await;
-                let supply = match (outcome, decimals) {
-                    (Ok(Ok(hex)), Some(decimals)) => {
-                        scaled_uint_from_hex(&hex, decimals.max(0) as u32)
-                    }
-                    _ => None,
-                };
-                (launch_id, supply)
-            });
-        }
+        let targets = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<Uuid, _>("launch_id"),
+                    row.get::<String, _>("token_address"),
+                    row.get::<Option<i32>, _>("decimals"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let calls = targets
+            .iter()
+            .map(|(_, token, _)| (token.clone(), TOTAL_SUPPLY_SELECTOR.to_owned()))
+            .collect::<Vec<_>>();
+        let results = match tokio::time::timeout(
+            Duration::from_millis(self.config.supply_fetch_timeout_ms.max(100) * 4),
+            rpc.eth_call_batch(&calls),
+        )
+        .await
+        {
+            Ok(Ok(results)) => results,
+            // Transient RPC trouble: leave supplies pending for the next pass.
+            Ok(Err(_)) | Err(_) => return Ok(0),
+        };
         let mut fetched = 0;
-        while let Some(joined) = tasks.join_next().await {
-            let (launch_id, supply) = joined.map_err(|error| {
-                LedgerError::TransientIngestion(format!("total supply task failed: {error}"))
-            })?;
+        for ((launch_id, _, decimals), result) in targets.into_iter().zip(results) {
+            let supply = match (result, decimals) {
+                (Ok(hex), Some(decimals)) => scaled_uint_from_hex(&hex, decimals.max(0) as u32),
+                _ => None,
+            };
             let status = if supply.is_some() { "ready" } else { "error" };
             fetched += u64::from(supply.is_some());
             sqlx::query(
@@ -679,25 +684,31 @@ const PRICE_ROLLUP_SQL: &str = r#"with observations as materialized (
                    and block_bucket between $3 and $4
                    and block_timestamp is not null and price_decimal > 0 and confidence >= $5
                ), references_ as materialized (
-                 -- Robust anchor per asset: the batch median when the batch has enough
-                 -- observations, otherwise the last stored hourly price. Swap-derived
-                 -- observations are noisy (odd routes, dust), so anything beyond the
-                 -- outlier factor of the anchor is dropped.
+                 -- Robust anchor per asset, in order of preference: the median of the
+                 -- asset's stored hourly prices over the previous 7 days, the batch
+                 -- median when the batch is well observed, otherwise the batch median
+                 -- of pool snapshots only. Swap-derived observations are noisy (odd
+                 -- routes, dust), so anything beyond the outlier factor is dropped.
                  select batch.asset_address,
-                        case when batch.observation_count >= 5 or previous.price_usd is null
-                          then batch.median_price else previous.price_usd end as anchor
+                        coalesce(history.median_price,
+                          case when batch.observation_count >= 5 then batch.median_price end,
+                          batch.snapshot_median) as anchor
                  from (
-                   select asset_address, min(bucket_start) as first_bucket, count(*) as observation_count,
-                          percentile_disc(0.5) within group (order by price_decimal) as median_price
+                   select asset_address, min(bucket_start) as first_bucket,
+                          count(*) as observation_count,
+                          percentile_disc(0.5) within group (order by price_decimal) as median_price,
+                          percentile_disc(0.5) within group (order by price_decimal)
+                            filter (where source = 'dex_pool_snapshot') as snapshot_median
                    from observations group by asset_address
                  ) batch
                  left join lateral (
-                   select price.price_usd from market.asset_usd_prices price
+                   select percentile_disc(0.5) within group (order by price.price_usd) as median_price
+                   from market.asset_usd_prices price
                    where price.chain_id = $1 and price.asset_address = batch.asset_address
                      and price.bucket_start < batch.first_bucket
-                     and price.bucket_start > batch.first_bucket - interval '48 hours'
-                   order by price.bucket_start desc limit 1
-                 ) previous on true
+                     and price.bucket_start > batch.first_bucket - interval '7 days'
+                   having count(*) >= 6
+                 ) history on true
                ), accepted as (
                  select observations.*
                  from observations
@@ -721,6 +732,8 @@ const PRICE_ROLLUP_SQL: &str = r#"with observations as materialized (
                           then 'pool_snapshot_median' else 'swap_median_banded' end as source
                  from scoped
                  group by asset_address, bucket_start
+                 -- A single swap-derived observation is not an hourly price.
+                 having bool_or(source = 'dex_pool_snapshot') or count(*) >= 2
                )
                insert into market.asset_usd_prices (
                  chain_id, asset_address, bucket_start, price_usd, observation_count,
@@ -754,10 +767,10 @@ with touched as materialized (
   select fact.launch_id, fact.domain_id, launch.quote_token_address,
          date_trunc('minute', fact.occurred_at) as bucket_start,
          fact.trade_side, fact.trader_address, fact.block_number, fact.tx_index, fact.log_index,
-         fact.quote_amount_raw::numeric / power(10::numeric, quote_decimals.value) as quote_amount,
-         fact.token_amount_raw::numeric / power(10::numeric, token_meta.decimals) as token_amount,
-         fact.fee_amount_raw::numeric / power(10::numeric, quote_decimals.value) as fee_amount,
-         fact.tax_amount_raw::numeric / power(10::numeric, quote_decimals.value) as tax_amount
+         fact.quote_amount_raw::numeric * power(10::numeric, -(quote_decimals.value)) as quote_amount,
+         fact.token_amount_raw::numeric * power(10::numeric, -(token_meta.decimals)) as token_amount,
+         fact.fee_amount_raw::numeric * power(10::numeric, -(quote_decimals.value)) as fee_amount,
+         fact.tax_amount_raw::numeric * power(10::numeric, -(quote_decimals.value)) as tax_amount
   from touched
   join public.protocol_launch_trade_facts fact
     on fact.launch_id = touched.launch_id and fact.is_canonical

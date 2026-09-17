@@ -21,7 +21,7 @@ use crate::{
     services::market_data::NATIVE_ASSET_ADDRESS,
 };
 
-pub const PNL_METHODOLOGY_VERSION: &str = "market_wallet_pnl_v1";
+pub const PNL_METHODOLOGY_VERSION: &str = "market_wallet_pnl_v2_realized_rank";
 /// Blocks kept between the candle cursor and applied positions so canonical
 /// flips near the chain head never reach an already-applied increment.
 const POSITION_SAFETY_LAG_BLOCKS: i64 = 600;
@@ -310,8 +310,8 @@ with launches as materialized (
          case when fact.trade_side = 'buy' then fact.recipient_address else fact.trader_address end
            as owner,
          fact.trade_side, fact.block_number, fact.occurred_at,
-         fact.quote_amount_raw::numeric / power(10::numeric, launch.quote_decimals) as quote_amount,
-         fact.token_amount_raw::numeric / power(10::numeric, launch.token_decimals) as token_amount
+         fact.quote_amount_raw::numeric * power(10::numeric, -(launch.quote_decimals)) as quote_amount,
+         fact.token_amount_raw::numeric * power(10::numeric, -(launch.token_decimals)) as token_amount
   from public.protocol_launch_trade_facts fact
   join launches launch on launch.launch_id = fact.launch_id
   where fact.chain_id = $1 and fact.block_number between $2 and $3 and fact.is_canonical
@@ -404,25 +404,27 @@ const WALLET_LEADERBOARD_SQL_BODY: &str = r#"
   select address,
          sum(pnl) as pnl, sum(realized) as realized, sum(unrealized) as unrealized,
          sum(cost_usd) as cost, count(*)::int as tokens,
-         (count(*) filter (where pnl > 0))::int as wins,
+         (count(*) filter (where realized > 0))::int as wins,
          sum(trades)::int as trades, max(last_trade_at) as last_trade_at,
-         (array_agg(launch_id order by pnl desc))[1] as best_launch_id,
-         (array_agg(symbol order by pnl desc))[1] as best_symbol,
-         (array_agg(pnl order by pnl desc))[1] as best_pnl,
-         (array_agg(cost_usd order by pnl desc))[1] as best_cost,
-         (array_agg(multiple order by pnl desc))[1] as best_multiple
+         (array_agg(launch_id order by realized desc))[1] as best_launch_id,
+         (array_agg(symbol order by realized desc))[1] as best_symbol,
+         (array_agg(realized order by realized desc))[1] as best_pnl,
+         (array_agg(cost_usd * sold_ratio order by realized desc))[1] as best_cost,
+         (array_agg(case when cost_usd * sold_ratio > 0
+            then proceeds_usd / (cost_usd * sold_ratio) end order by realized desc))[1]
+           as best_multiple
   from valued
   group by address
   having sum(cost_usd) >= $4
 ), ranked as (
-  select wallets.*, row_number() over (order by pnl desc, address) as rank
+  select wallets.*, row_number() over (order by realized desc, address) as rank
   from wallets
   where not exists (
     select 1 from public.protocol_deployments deployment
     where deployment.chain_id = $1 and deployment.address = wallets.address
       and deployment.status = 'active'
   )
-  order by pnl desc
+  order by realized desc
   limit $5
 )
 insert into market.wallet_leaderboard (
@@ -455,7 +457,7 @@ const CLUSTER_LEADERBOARD_SQL_BODY: &str = r#"
     on member.cluster_id = cluster.cluster_id and member.address = valued.address
   join public.protocol_intelligence_domains domain on domain.domain_id = cluster.domain_id
 ), member_totals as (
-  select cluster_id, address, sum(pnl) as pnl from scoped group by cluster_id, address
+  select cluster_id, address, sum(realized) as pnl from scoped group by cluster_id, address
 ), clusters as (
   select scoped.cluster_id, min(domain_key) as domain_key, min(cluster_kind) as cluster_kind,
          min(subject_address) as subject_address, min(first_seen_at) as first_seen_at,
@@ -463,14 +465,14 @@ const CLUSTER_LEADERBOARD_SQL_BODY: &str = r#"
          sum(cost_usd) as cost, count(distinct launch_id)::int as tokens,
          count(distinct address)::int as active_members,
          max(last_trade_at) as last_trade_at,
-         (array_agg(launch_id order by pnl desc))[1] as best_launch_id,
-         (array_agg(symbol order by pnl desc))[1] as best_symbol,
-         (array_agg(pnl order by pnl desc))[1] as best_pnl
+         (array_agg(launch_id order by realized desc))[1] as best_launch_id,
+         (array_agg(symbol order by realized desc))[1] as best_symbol,
+         (array_agg(realized order by realized desc))[1] as best_pnl
   from scoped
   group by scoped.cluster_id
 ), ranked as (
   select clusters.*,
-         row_number() over (order by pnl desc, cluster_id) as rank,
+         row_number() over (order by realized desc, cluster_id) as rank,
          row_number() over (order by first_seen_at desc nulls last, cluster_id) as newest
   from clusters
 )

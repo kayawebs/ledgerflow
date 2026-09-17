@@ -254,6 +254,52 @@ impl IndexerRpcClient {
         )
     }
 
+    /// Executes many read-only `eth_call`s in one JSON-RPC batch. Each entry is
+    /// `Ok(hex)` or the per-call error message, in input order.
+    pub async fn eth_call_batch(
+        &self,
+        calls: &[(String, String)],
+    ) -> LedgerResult<Vec<Result<String, String>>> {
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (to, data))| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "eth_call",
+                    "params": [{ "to": to, "data": data }, "latest"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let responses = self.call_batch(requests).await?;
+        let mut by_id = BTreeMap::new();
+        for response in responses {
+            let Some(id) = response.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
+            let outcome = match (
+                response.get("result").and_then(Value::as_str),
+                response.get("error"),
+            ) {
+                (Some(result), None) => Ok(result.to_owned()),
+                (_, Some(error)) => Err(error.to_string()),
+                _ => Err("missing eth_call result".to_owned()),
+            };
+            by_id.insert(id, outcome);
+        }
+        Ok((0..calls.len() as u64)
+            .map(|id| {
+                by_id
+                    .remove(&id)
+                    .unwrap_or_else(|| Err("missing batch response".to_owned()))
+            })
+            .collect())
+    }
+
     /// Executes a read-only `eth_call` at `latest` and returns the raw hex result.
     pub async fn eth_call(&self, to: &str, data: &str) -> LedgerResult<String> {
         let result = self

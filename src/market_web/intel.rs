@@ -83,8 +83,8 @@ pub fn intel(context: &PageContext<'_>, page: &IntelPage<'_>) -> String {
         ),
         clusters = cluster_table(context, page.clusters),
         method = l.text(
-            "Earnings = sell proceeds + remaining tokens at the latest curve price − purchase cost (average cost, USD at trade time). Gas, transfers and other venues are excluded; wallets that sold more than they bought on the curve are not ranked. Clusters are valid only inside the Pons domain and never imply common ownership.",
-            "收益 = 卖出所得 + 剩余代币按最新曲线价格估值 − 买入成本（平均成本法，美元按成交时价格换算）。不含 gas、转账及其他交易场所；曲线卖出多于买入的地址不参与排名。集群仅在 Pons 协议域内成立，不代表同一实体。"
+            "Rankings use realized profit: sell proceeds minus the average cost of the tokens sold, in USD at trade time. Unrealized values remaining tokens at the latest curve price and is shown for context only. Gas, transfers and other venues are excluded; wallets that sold more than they bought on the curve and tokens without a reliable USD price are not ranked. Clusters are valid only inside the Pons domain and never imply common ownership.",
+            "排行按已实现收益：卖出所得减去所卖代币的平均成本（美元按成交时价格换算）。未实现收益按最新曲线价格估值剩余代币，仅供参考。不含 gas、转账及其他交易场所；曲线卖出多于买入的地址及无可靠美元价格的代币不参与排名。集群仅在 Pons 协议域内成立，不代表同一实体。"
         ),
     )
 }
@@ -110,7 +110,7 @@ fn podium(context: &PageContext<'_>, wallets: &[WalletRankRow]) -> String {
                 rank = ui::rank(wallet.rank as usize),
                 address = ui::short_address(&wallet.address),
                 kind = kind_badge(context, wallet.address_kind.as_deref()),
-                pnl = ui::signed_usd(Some(wallet.pnl_usd)),
+                pnl = ui::signed_usd(Some(wallet.realized_usd)),
                 win_label = l.text("Win rate", "胜率"),
                 win_rate = win_rate(wallet.winning_tokens, wallet.tokens_traded),
                 tokens = wallet.tokens_traded,
@@ -135,7 +135,7 @@ fn wallet_table(context: &PageContext<'_>, wallets: &[WalletRankRow]) -> String 
         .iter()
         .map(|wallet| {
             format!(
-                "<tr data-href=\"{href}\"><td class=\"l\">{rank}</td><td class=\"l\"><span class=\"mono\">{address}</span> {kind}{clusters}</td><td class=\"{pnl_class}\"><strong>{pnl}</strong></td><td>{realized}</td><td>{unrealized}</td><td>{win}</td><td>{tokens}</td><td class=\"l\">{best}</td><td class=\"muted\">{age}</td></tr>",
+                "<tr data-href=\"{href}\"><td class=\"l\">{rank}</td><td class=\"l\"><span class=\"mono\">{address}</span> {kind}{clusters}</td><td class=\"{pnl_class}\"><strong>{realized}</strong></td><td class=\"muted\">{unrealized}</td><td>{win}</td><td>{tokens}</td><td>{volume}</td><td class=\"l\">{best}</td><td class=\"muted\">{age}</td></tr>",
                 href = address_url(context, &wallet.address),
                 rank = ui::rank(wallet.rank as usize),
                 address = ui::short_address(&wallet.address),
@@ -145,9 +145,9 @@ fn wallet_table(context: &PageContext<'_>, wallets: &[WalletRankRow]) -> String 
                 } else {
                     String::new()
                 },
-                pnl_class = if wallet.pnl_usd >= 0.0 { "up" } else { "down" },
-                pnl = ui::signed_usd(Some(wallet.pnl_usd)),
+                pnl_class = if wallet.realized_usd >= 0.0 { "up" } else { "down" },
                 realized = ui::signed_usd(Some(wallet.realized_usd)),
+                volume = ui::usd(Some(wallet.cost_usd)),
                 unrealized = ui::signed_usd(Some(wallet.unrealized_usd)),
                 win = win_rate(wallet.winning_tokens, wallet.tokens_traded),
                 tokens = wallet.tokens_traded,
@@ -159,11 +159,11 @@ fn wallet_table(context: &PageContext<'_>, wallets: &[WalletRankRow]) -> String 
     format!(
         "<div class=\"table-wrap\"><table class=\"market\"><thead><tr><th class=\"l\">#</th><th class=\"l\">{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th class=\"l\">{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div>",
         l.text("Wallet", "地址"),
-        l.text("Earnings", "收益"),
-        l.text("Realized", "已实现"),
+        l.text("Realized profit", "已实现收益"),
         l.text("Unrealized", "未实现"),
         l.text("Win rate", "胜率"),
         l.text("Tokens", "币种数"),
+        l.text("Invested", "投入"),
         l.text("Best trade", "最佳一笔"),
         l.text("Active", "最近活跃"),
     )
@@ -173,7 +173,7 @@ fn cluster_table(context: &PageContext<'_>, clusters: &[ClusterRankRow]) -> Stri
     let l = context.locale;
     let ranked = clusters
         .iter()
-        .filter(|cluster| cluster.pnl_usd > 0.0)
+        .filter(|cluster| cluster.realized_usd > 0.0)
         .take(50)
         .collect::<Vec<_>>();
     if ranked.is_empty() {
@@ -199,7 +199,7 @@ fn cluster_table(context: &PageContext<'_>, clusters: &[ClusterRankRow]) -> Stri
                     .map(ui::short_address)
                     .unwrap_or_default(),
                 members = format!("{} / {}", cluster.active_members, cluster.member_count),
-                pnl = ui::signed_usd(Some(cluster.pnl_usd)),
+                pnl = ui::signed_usd(Some(cluster.realized_usd)),
                 winners = cluster.winning_members,
                 tokens = cluster.tokens_traded,
                 best = cluster_best(cluster),
@@ -211,7 +211,7 @@ fn cluster_table(context: &PageContext<'_>, clusters: &[ClusterRankRow]) -> Stri
         "<div class=\"table-wrap\"><table class=\"market\"><thead><tr><th class=\"l\">#</th><th class=\"l\">{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th class=\"l\">{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div>",
         l.text("Cluster", "集群"),
         l.text("Active / members", "活跃 / 成员"),
-        l.text("Earnings", "收益"),
+        l.text("Realized profit", "已实现收益"),
         l.text("Profitable members", "盈利成员"),
         l.text("Tokens", "币种数"),
         l.text("Best token", "最赚的币"),
@@ -243,8 +243,8 @@ fn newest_clusters(context: &PageContext<'_>, clusters: &[ClusterRankRow]) -> St
                 members_label = l.text("members", "成员"),
                 found = ui::age(cluster.first_seen_at, l),
                 ago = l.text("ago", "前"),
-                class = if cluster.pnl_usd >= 0.0 { "up" } else { "down" },
-                pnl = ui::signed_usd(Some(cluster.pnl_usd)),
+                class = if cluster.realized_usd >= 0.0 { "up" } else { "down" },
+                pnl = ui::signed_usd(Some(cluster.realized_usd)),
                 best = cluster_best(cluster),
             )
         })
@@ -282,20 +282,20 @@ pub fn address(context: &PageContext<'_>, page: &AddressPage<'_>) -> String {
     };
     let stats = [
         kv(
-            l.text("Total earnings", "总收益"),
+            l.text("Realized profit", "已实现收益"),
             format!(
                 "<span class=\"{}\">{}</span>",
-                if earnings.pnl_usd >= 0.0 {
+                if earnings.realized_usd >= 0.0 {
                     "up"
                 } else {
                     "down"
                 },
-                ui::signed_usd(Some(earnings.pnl_usd))
+                ui::signed_usd(Some(earnings.realized_usd))
             ),
         ),
         kv(
-            l.text("Realized", "已实现"),
-            ui::signed_usd(Some(earnings.realized_usd)),
+            l.text("Total incl. unrealized", "含未实现总计"),
+            ui::signed_usd(Some(earnings.pnl_usd)),
         ),
         kv(
             l.text("Unrealized", "未实现"),
@@ -406,13 +406,13 @@ pub fn address(context: &PageContext<'_>, page: &AddressPage<'_>) -> String {
         hue = page.address.bytes().last().unwrap_or(0) as u32 * 360 / 256,
         address = escape_html(page.address),
         rank_badges = rank_badges,
-        class = if earnings.pnl_usd >= 0.0 {
+        class = if earnings.realized_usd >= 0.0 {
             "up"
         } else {
             "down"
         },
-        pnl = ui::signed_usd(Some(earnings.pnl_usd)),
-        pnl_label = l.text("Pons curve earnings", "Pons 曲线收益"),
+        pnl = ui::signed_usd(Some(earnings.realized_usd)),
+        pnl_label = l.text("Pons realized profit", "Pons 已实现收益"),
         trust = ui::trust(l, ui::Trust::Estimated),
         stats = stats,
         positions_title = l.text("Positions", "持仓与交易"),
@@ -456,8 +456,8 @@ pub fn cluster_earnings(
             format!(
                 "<div class=\"stats\"><div class=\"stat glow\"><span>{} · 30d</span><strong class=\"{}\">{}</strong><small>🏆 #{}</small></div><div class=\"stat\"><span>{}</span><strong>{} / {}</strong></div><div class=\"stat\"><span>{}</span><strong>{}</strong></div><div class=\"stat\"><span>{}</span><strong>{}</strong><small>{}</small></div></div>",
                 l.text("Cluster earnings", "集群收益"),
-                if rank.pnl_usd >= 0.0 { "up" } else { "down" },
-                ui::signed_usd(Some(rank.pnl_usd)),
+                if rank.realized_usd >= 0.0 { "up" } else { "down" },
+                ui::signed_usd(Some(rank.realized_usd)),
                 rank.rank,
                 l.text("Active / members", "活跃 / 成员"),
                 rank.active_members,

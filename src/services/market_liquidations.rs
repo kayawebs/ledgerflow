@@ -330,8 +330,8 @@ impl LiquidationIndexer {
         let result = sqlx::query(
             r#"with priced as (
                  select liquidation.chain_id, liquidation.tx_hash, liquidation.log_index,
-                        liquidation.repaid_raw / power(10::numeric, loan_meta.decimals) as repaid,
-                        liquidation.seized_raw / power(10::numeric, collateral_meta.decimals) as seized,
+                        liquidation.repaid_raw * power(10::numeric, -(loan_meta.decimals)) as repaid,
+                        liquidation.seized_raw * power(10::numeric, -(collateral_meta.decimals)) as seized,
                         loan_price.price_usd as loan_usd,
                         collateral_price.price_usd as collateral_usd
                  from market.lending_liquidations liquidation
