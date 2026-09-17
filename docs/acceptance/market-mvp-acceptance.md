@@ -22,7 +22,7 @@
 | M5 套利估算 + 前端 | PARTIAL | 覆盖率 99.9%；与确定性验证 94.9% 一致；约 47% 结果为“未知”（收益流出可见范围） |
 | M6 清算索引 + 前端 | PARTIAL | 全历史 176 条 / 3 个合约；8 月前无价格，仅 33 条通过合理性校验给出奖励 |
 | M7 毕业后行情 | PASS | 8,409/8,409 毕业币映射 V4 池；3,590 万笔池内成交进入 K 线 |
-| M8 加固与验收 | PARTIAL | 测试、性能、截图完成；24h 浸泡、生产切换、数据库调优待确认 |
+| M8 加固与验收 | PARTIAL | 已部署生产（2026-09-17 13:10 UTC）；24h 浸泡进行中 |
 
 ---
 
@@ -51,7 +51,7 @@
 | 1.7 | 窗口衰减 | PASS | 最后成交 > 25h 仍报告 24h 成交额的币：0 |
 | 1.8 | 回补 | PASS | 全部 V2 历史（2,400 万曲线成交 + 3,590 万池内成交）完成；回补期间生产 3001 正常 |
 | 1.9 | 幂等与重启 | PASS | 所有阶段持久游标；多次重启与重建后对账仍一致；持仓增量与游标同事务 |
-| 1.10 | 旧快照停止追加 | PENDING | 需停止生产 `protocol-market-projector` 容器，等待确认后执行 |
+| 1.10 | 旧快照停止追加 | PASS | `protocol-market-projector` 已停止，并移入 Compose profile `legacy-market-projector` |
 
 ## M2 发币 FOMO 前端
 
@@ -120,9 +120,9 @@
 | # | 验收项 | 状态 | 证据 |
 |---|---|---|---|
 | 8.1 | 测试 | PASS | `cargo test --lib` 190/190；`cargo fmt --check` 通过；市场模块 clippy 仅剩格式风格类提示 |
-| 8.2 | 24h 浸泡 | PENDING | 投影器已连续运行数小时；正式 24h 浸泡需部署为容器后进行 |
+| 8.2 | 24h 浸泡 | PENDING | 容器化投影器自 13:10 UTC 运行，0 错误，各游标落后 < 25 s；24h 后复核 |
 | 8.3 | 页面性能 | PASS | release 构建、20 次热请求 p95：总览 144 ms、发币 8 ms、涨幅 40 ms、市值排序 11 ms、地址情报 13 ms、套利 142 ms、清算 17 ms、大单流 160 ms，全部 < 300 ms |
-| 8.4 | 生产切换 | PENDING | 需确认后执行：构建镜像，启动 `market-projector`，替换 `market-web`；回滚到 `market-mvp-baseline` 镜像 |
+| 8.4 | 生产切换 | PASS | 独立镜像 `ledgerflow-market:market-mvp-rc2`（仅市场两个服务使用，其他服务镜像不变）；3001 热请求 p95：总览 89 ms、其余 ≤ 55 ms；回滚镜像 `ledgerflow:market-web-pre-mvp` |
 | 8.5 | 截图 | PASS | `docs/product/screenshots/mvp-before-*` 与 `mvp-after-*` |
 
 ---
@@ -135,8 +135,17 @@
 - 2026-08-02 之前没有 USD 价格序列，早期清算不给出美元奖励。
 - `market` schema 已占 26 GB（池内成交 3,590 万行为主）；PostgreSQL 仍是默认 `shared_buffers = 128MB`，建议在维护窗口调优。
 
-## 待确认事项
+## 部署与主机资源（2026-09-17）
 
-1. 部署到生产（3001 替换 + 新增 `market-projector` 容器）。
-2. 停止旧 `protocol-market-projector`（每分钟追加快照，已被新表取代）。
-3. PostgreSQL 内存参数调优（需重启数据库容器）。
+主机：32 核 / 188 GB / NVMe RAID，负载约 21–25，可用内存约 78 GB，1 GB swap 已占满。同机运行 robinhood-nitro、robinhood-arb、base-pilot 等服务。
+
+| 项 | 结果 |
+|---|---|
+| 新容器占用 | `market-projector` 约 25 MB / < 3% CPU；`market-web` 约 220–440 MB |
+| 镜像构建 | `Dockerfile.market` 只编译两个二进制，`CARGO_BUILD_JOBS=8`，约 2 分钟 |
+| ClickHouse | 发现池内成交的链头查询全表扫描 22.5 亿行（190 CPU 秒/5 分钟），按游标限定后 241 ms → 8 ms，ClickHouse CPU 432% → 46% |
+| PostgreSQL 排行榜重建 | 约占 1 个核；改为 24h 每 2 分钟、7d 每 15 分钟、30d 每小时（约 0.35 核） |
+| PostgreSQL 参数（reload 生效，未重启） | `effective_cache_size` 4GB → 48GB、`random_page_cost` 4 → 1.1（NVMe）、`work_mem` 4MB → 16MB、`maintenance_work_mem` 64MB → 512MB；`market.token_stats` 等高频更新表 autovacuum 阈值调低 |
+| 未做 | `shared_buffers` 仍为 128MB：需要重启数据库，会中断 chainactors-v2 全部服务；当前页面与投影器性能已达标，操作系统页缓存承担了读缓存 |
+
+需要关注：生产容器 `ledgerflow-chainactors-v2-address-worker-1`（非本次改动）常驻内存约 50 GB，疑似内存泄漏。
