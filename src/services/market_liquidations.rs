@@ -28,7 +28,7 @@ const PROTOCOL: &str = "morpho_blue_compatible";
 /// Seized collateral value divided by repaid debt value. Liquidation
 /// incentives keep this slightly above 1; values outside the band mean one of
 /// the USD prices is unreliable, so no bonus is published.
-const MIN_PLAUSIBLE_SEIZED_RATIO: f64 = 0.9;
+const MIN_PLAUSIBLE_SEIZED_RATIO: f64 = 1.0;
 const MAX_PLAUSIBLE_SEIZED_RATIO: f64 = 1.5;
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 

@@ -53,7 +53,14 @@ pub async fn run_market_migrations(database_url: &str) -> LedgerResult<()> {
         .execute(&mut connection)
         .await
         .map_err(db_error)?;
-    MARKET_MIGRATOR
+    // Market migrations are additive, so a binary may start against a schema
+    // that a newer projector already migrated (rolling deploys).
+    let mut migrator = Migrator {
+        migrations: MARKET_MIGRATOR.migrations.clone(),
+        ..Migrator::DEFAULT
+    };
+    migrator.set_ignore_missing(true);
+    migrator
         .run(&mut connection)
         .await
         .map_err(|error| LedgerError::Persistence(format!("market migration failed: {error}")))?;
