@@ -1056,6 +1056,12 @@ with base as materialized (
    and fact.block_number >= $3
    and fact.occurred_at >= now() - interval '24 hours'
   group by fact.launch_id
+), pool_activity as materialized (
+  select swap.launch_id, count(*) as swaps
+  from market.pool_swap_facts swap
+  join base on base.launch_id = swap.launch_id
+  where swap.block_number >= $3 and swap.occurred_at >= now() - interval '24 hours'
+  group by swap.launch_id
 ), sparkline as materialized (
   select base.launch_id,
          array_agg(point.close_price_quote order by hours.offset_hours desc) as points
@@ -1093,7 +1099,10 @@ with base as materialized (
          coalesce(windows.trades_24h, 0)::int as trades_24h,
          coalesce(windows.buys_24h, 0)::int as buys_24h,
          coalesce(windows.sells_24h, 0)::int as sells_24h,
-         traders.buyers, traders.sellers,
+         -- Pool swaps are sent by routers, so a curve-only trader count would
+         -- understate a graduated token: report unknown instead.
+         case when coalesce(pool_activity.swaps, 0) = 0 then traders.buyers end as buyers,
+         case when coalesce(pool_activity.swaps, 0) = 0 then traders.sellers end as sellers,
          case when coalesce(refs.ref_5m, lifetime.first_open) > 0
            then (latest.close_price_quote / coalesce(refs.ref_5m, lifetime.first_open) - 1) * 100 end
            as change_5m,
@@ -1114,6 +1123,7 @@ with base as materialized (
   left join windows on windows.launch_id = base.launch_id
   left join references_ refs on refs.launch_id = base.launch_id
   left join traders on traders.launch_id = base.launch_id
+  left join pool_activity on pool_activity.launch_id = base.launch_id
   left join sparkline on sparkline.launch_id = base.launch_id
 )
 insert into market.token_stats (
