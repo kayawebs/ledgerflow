@@ -258,7 +258,7 @@ impl MarketReadService {
         board: TokenBoard,
         limit: i64,
     ) -> LedgerResult<Vec<TokenRow>> {
-        self.token_page(chain_id, board, None, None, true, 1, limit)
+        self.token_page(chain_id, board, None, None, true, 1, limit, false)
             .await
             .map(|page| page.rows)
     }
@@ -273,6 +273,7 @@ impl MarketReadService {
         descending: bool,
         page: i64,
         page_size: i64,
+        with_total: bool,
     ) -> LedgerResult<TokenPage> {
         let page = page.max(1);
         let page_size = page_size.clamp(1, 100);
@@ -298,13 +299,13 @@ impl MarketReadService {
             None => " and $3::text is null",
         };
         let sql = format!(
-            "select {TOKEN_COLUMNS}, count(*) over() as total
+            "select {TOKEN_COLUMNS}
              from market.token_stats s
              where s.chain_id = $1 and {filter}{search_clause}
              order by {order}
              limit $2 offset $4"
         );
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query_as::<_, TokenRow>(&sql)
             .bind(chain_id as i64)
             .bind(page_size)
             .bind(search.as_deref())
@@ -313,15 +314,25 @@ impl MarketReadService {
             .fetch_all(&self.pool)
             .await
             .map_err(db_error)?;
-        let total = rows
-            .first()
-            .map(|row| row.get::<i64, _>("total"))
-            .unwrap_or(0);
-        let rows = rows
-            .iter()
-            .map(TokenRow::from_row)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(db_error)?;
+        // A separate count keeps the page query an index-ordered LIMIT scan.
+        let total = if with_total {
+            let count_sql = format!(
+                "select count(*) from market.token_stats s
+                 where s.chain_id = $1 and {filter}{search_clause}
+                   and $2::bigint is not null and $4::bigint is not null"
+            );
+            sqlx::query_scalar::<_, i64>(&count_sql)
+                .bind(chain_id as i64)
+                .bind(page_size)
+                .bind(search.as_deref())
+                .bind((page - 1) * page_size)
+                .bind(MIN_RANKED_VOLUME_USD)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_error)?
+        } else {
+            rows.len() as i64
+        };
         Ok(TokenPage {
             rows,
             total,
@@ -402,28 +413,47 @@ impl MarketReadService {
         Ok(rows)
     }
 
+    /// Latest curve trades and post-graduation pool swaps for one launch.
     pub async fn recent_trades(&self, launch_id: Uuid, limit: i64) -> LedgerResult<Vec<TradeRow>> {
         sqlx::query_as::<_, TradeRow>(
-            r#"select f.launch_id, s.symbol, f.token_address, f.trader_address, f.trade_side,
-                      (f.quote_amount_raw::numeric * power(10::numeric, -(q.decimals)))::float8
+            r#"with scale as (
+                 select s.launch_id, s.symbol, s.token_address, s.quote_symbol, s.quote_usd_price,
+                        t.decimals as token_decimals,
+                        coalesce(
+                          (select decimals from public.erc20_token_metadata m
+                           where m.chain_id = s.chain_id and m.token_address = s.quote_token_address),
+                          case when s.quote_token_address = $3 then 18 end) as quote_decimals
+                 from market.token_stats s
+                 join public.erc20_token_metadata t
+                   on t.chain_id = s.chain_id and t.token_address = s.token_address
+                 where s.launch_id = $1
+               ), trades as (
+                 (select f.trader_address, f.trade_side, f.quote_amount_raw::numeric as quote_raw,
+                         f.token_amount_raw::numeric as token_raw, f.tx_hash, f.occurred_at,
+                         f.block_number, f.log_index
+                  from public.protocol_launch_trade_facts f
+                  where f.launch_id = $1 and f.is_canonical
+                  order by f.block_number desc, f.tx_index desc, f.log_index desc
+                  limit $2)
+                 union all
+                 (select p.sender_address, p.trade_side, p.quote_amount_raw, p.token_amount_raw,
+                         p.tx_hash, p.occurred_at, p.block_number, p.log_index
+                  from market.pool_swap_facts p
+                  where p.launch_id = $1
+                  order by p.block_number desc, p.log_index desc
+                  limit $2)
+               )
+               select scale.launch_id, scale.symbol, scale.token_address, trades.trader_address,
+                      trades.trade_side,
+                      (trades.quote_raw * power(10::numeric, -(scale.quote_decimals)))::float8
                         as quote_amount,
-                      (f.token_amount_raw::numeric * power(10::numeric, -(t.decimals)))::float8
+                      (trades.token_raw * power(10::numeric, -(scale.token_decimals)))::float8
                         as token_amount,
-                      (f.quote_amount_raw::numeric * power(10::numeric, -(q.decimals))
-                        * s.quote_usd_price)::float8 as usd_value,
-                      s.quote_symbol, f.tx_hash, f.occurred_at
-               from public.protocol_launch_trade_facts f
-               join market.token_stats s on s.launch_id = f.launch_id
-               join public.erc20_token_metadata t
-                 on t.chain_id = f.chain_id and t.token_address = f.token_address
-               cross join lateral (
-                 select coalesce(
-                   (select decimals from public.erc20_token_metadata m
-                    where m.chain_id = s.chain_id and m.token_address = s.quote_token_address),
-                   case when s.quote_token_address = $3 then 18 end) as decimals
-               ) q
-               where f.launch_id = $1 and f.is_canonical
-               order by f.block_number desc, f.tx_index desc, f.log_index desc
+                      (trades.quote_raw * power(10::numeric, -(scale.quote_decimals))
+                        * scale.quote_usd_price)::float8 as usd_value,
+                      scale.quote_symbol, trades.tx_hash, trades.occurred_at
+               from trades cross join scale
+               order by trades.block_number desc, trades.log_index desc
                limit $2"#,
         )
         .bind(launch_id)
@@ -456,16 +486,26 @@ impl MarketReadService {
         // the (chain_id, block_number) index instead of a parallel scan.
         sqlx::query_as::<_, TradeRow>(
             r#"with recent as materialized (
-                 select f.*
+                 select f.launch_id, f.token_address, f.trader_address, f.trade_side,
+                        f.quote_amount_raw::numeric as quote_amount_raw,
+                        f.token_amount_raw::numeric as token_amount_raw,
+                        f.tx_hash, f.occurred_at, f.block_number, f.log_index
                  from public.protocol_launch_trade_facts f
                  where f.chain_id = $1 and f.block_number > $3 and f.is_canonical
+                 union all
+                 select p.launch_id, s.token_address, p.sender_address, p.trade_side,
+                        p.quote_amount_raw, p.token_amount_raw, p.tx_hash, p.occurred_at,
+                        p.block_number, p.log_index
+                 from market.pool_swap_facts p
+                 join market.token_stats s on s.launch_id = p.launch_id
+                 where p.chain_id = $1 and p.block_number > $3
                ), valued as (
                  select f.launch_id, s.symbol, f.token_address, f.trader_address, f.trade_side,
-                        (f.quote_amount_raw::numeric * power(10::numeric, -(q.decimals)))::float8
+                        (f.quote_amount_raw * power(10::numeric, -(q.decimals)))::float8
                           as quote_amount,
-                        (f.token_amount_raw::numeric * power(10::numeric, -(18)))::float8
+                        (f.token_amount_raw * power(10::numeric, -(18)))::float8
                           as token_amount,
-                        (f.quote_amount_raw::numeric * power(10::numeric, -(q.decimals))
+                        (f.quote_amount_raw * power(10::numeric, -(q.decimals))
                           * s.quote_usd_price)::float8 as usd_value,
                         s.quote_symbol, f.tx_hash, f.occurred_at, f.block_number, f.log_index
                  from recent f

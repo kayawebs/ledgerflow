@@ -117,7 +117,7 @@ fn podium(context: &PageContext<'_>, wallets: &[WalletRankRow]) -> String {
                 tokens_label = l.text("tokens", "个币"),
                 trades = ui::count(wallet.trades.into()),
                 trades_label = l.text("trades", "笔"),
-                best = best_trade(context, wallet),
+                best = best_trade(context, wallet, false),
             )
         })
         .collect()
@@ -151,7 +151,7 @@ fn wallet_table(context: &PageContext<'_>, wallets: &[WalletRankRow]) -> String 
                 unrealized = ui::signed_usd(Some(wallet.unrealized_usd)),
                 win = win_rate(wallet.winning_tokens, wallet.tokens_traded),
                 tokens = wallet.tokens_traded,
-                best = best_trade(context, wallet),
+                best = best_trade(context, wallet, true),
                 age = ui::age(wallet.last_trade_at, l),
             )
         })
@@ -530,7 +530,7 @@ fn win_rate(wins: i32, total: i32) -> String {
     format!("{:.0}%", f64::from(wins) / f64::from(total) * 100.0)
 }
 
-fn best_trade(context: &PageContext<'_>, wallet: &WalletRankRow) -> String {
+fn best_trade(context: &PageContext<'_>, wallet: &WalletRankRow, linked: bool) -> String {
     let (Some(symbol), Some(pnl)) = (wallet.best_symbol.as_deref(), wallet.best_pnl_usd) else {
         return "—".to_owned();
     };
@@ -539,13 +539,17 @@ fn best_trade(context: &PageContext<'_>, wallet: &WalletRankRow) -> String {
         .filter(|value| value.is_finite() && *value > 0.0)
         .map(|value| format!(" <span class=\"pill up\">{value:.1}x</span>"))
         .unwrap_or_default();
+    // Rows inside another link (podium cards) must not nest anchors.
+    let name = match wallet.best_launch_id.filter(|_| linked) {
+        Some(launch_id) => format!(
+            "<a href=\"{}\"><strong>{}</strong></a>",
+            context.url(&format!("/launches/{launch_id}")),
+            escape_html(symbol)
+        ),
+        None => format!("<strong>{}</strong>", escape_html(symbol)),
+    };
     format!(
-        "<a href=\"{}\"><strong>{}</strong></a> {} → <span class=\"up\">{}</span>{multiple}",
-        wallet
-            .best_launch_id
-            .map(|launch_id| context.url(&format!("/launches/{launch_id}")))
-            .unwrap_or_default(),
-        escape_html(symbol),
+        "{name} {} → <span class=\"up\">{}</span>{multiple}",
         ui::usd(wallet.best_cost_usd),
         ui::signed_usd(Some(pnl)),
     )

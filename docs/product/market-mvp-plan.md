@@ -105,8 +105,8 @@
 ### M0 基线与工程化（0.5 天）
 - [x] 快照提交现有未提交工作，tag `market-mvp-baseline`，建分支 `feat/market-mvp`
 - [x] 生成开发计划与验收报告
-- [ ] `CLAUDE.md`（仓库导航、运行/部署命令、数据约束）
-- [ ] 改版前截图存档；开发实例 `market-web-dev`（端口 3401）与生产 3001 并行，读取同一数据库
+- [x] `CLAUDE.md`（仓库导航、运行/部署命令、数据约束）
+- [x] 改版前截图存档；开发实例 `market-web-dev`（端口 3401）与生产 3001 并行，读取同一数据库
 
 ### M1 行情数据底座（2 天）
 - 迁移：`market_asset_usd_prices_1m`、`market_token_candles_1m`、`market_token_stats`、`totalSupply` 字段
@@ -150,6 +150,20 @@
 **总计约 15 个工作日。** 顺序按“尽早出可见价值”排列：M1→M2 先让发币页焕然一新，再做 M3→M4 赚钱榜，再补套利、清算和毕业后行情。
 
 ---
+
+## 4.1 实施中的设计变更（2026-09-17）
+
+| 变更 | 原因 |
+|---|---|
+| 新表放在独立 `market` schema，迁移在 `migrations_market/`，独立 `_sqlx_migrations` | 生产容器由旧代码构建且启动时执行 public 迁移；若在 public 追加迁移，旧容器重启会因“未知迁移”崩溃 |
+| USD 价格改为**小时级**稳健中位数：优先池子快照价，swap 推导价须在 7 日中位数 1.6 倍内，单条观测的小时丢弃 | `price_observations` 中 swap 推导价噪声极大（WETH 出现 $0.01–$1.2e13），分钟级中位数会把单笔噪声放大成天量成交额 |
+| 引入 `price_grade`：原生 ETH/WETH 与注册表稳定币为 reliable，股票代币等为 derived（页面价格前加 ≈） | 股票代币仅有 swap 推导价，仍偏差较大；收益排行只使用 reliable 价格的持仓 |
+| 收益排行按**已实现收益**排序，未实现仅作参考 | 狙击机器人持有大量无法按最后成交价卖出的尾货，按“含未实现”排名会虚高到数百万美元 |
+| 导航沿用“地址情报 / Address Intelligence”，页面内做“谁在赚钱”排行 | 既有测试固化了“不使用 Smart Money / 赚钱地址”命名的产品决定 |
+| 持仓改为增量累加（落后 K 线游标 600 块，与游标同事务提交） | 全量重算每批需随机读取 46 GB 表的完整历史，50 s/批；增量后 1–2 s/批 |
+| 套利估算范围 = 发送者 + 入口合约；存在确定性验证结果时以验证利润为准 | 原验证器只算发送者，97% 结果为证据不足；对 468 条已验证套利复算，94.9% 完全一致 |
+| 毕业后 V4 池：PoolId 取自毕业交易回执中的 PoolManager `Initialize` 事件；池内 swap 从 LedgerFlow ClickHouse 规范日志读取 | 无需推导 PoolId；节点 `eth_getLogs` 在 PoolManager 上 20 万块范围即超时，ClickHouse（同一本地节点写入）0.7 s |
+| 清算：Morpho Blue 兼容 `Liquidate` 事件 + `idToMarketParams` 校验 | 本地节点实测存在 3 个 Morpho 兼容合约 |
 
 ## 5. 风险与对策
 

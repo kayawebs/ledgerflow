@@ -18,13 +18,15 @@ use uuid::Uuid;
 
 use crate::{
     core::errors::{LedgerError, LedgerResult},
-    indexer::rpc::IndexerRpcClient,
+    indexer::{clickhouse::ClickHouseClient, rpc::IndexerRpcClient},
 };
 
 pub const V4_INITIALIZE_TOPIC: &str =
     "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438";
 pub const V4_SWAP_TOPIC: &str =
     "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f";
+const CLICKHOUSE_POOL_IDS_PER_QUERY: usize = 2_000;
+const SWAP_INSERT_CHUNK: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PoolInitialization {
@@ -172,9 +174,9 @@ impl Default for PoolIndexerConfig {
         Self {
             chain_id: 4663,
             head_lag_blocks: 4,
-            map_batch: 100,
+            map_batch: 200,
             initial_range: 20_000,
-            max_range: 400_000,
+            max_range: 500_000,
             min_range: 1_000,
             pool_ids_per_request: 200,
         }
@@ -201,8 +203,27 @@ impl PoolIteration {
 pub struct PoolIndexer {
     pool: PgPool,
     rpc: IndexerRpcClient,
+    /// LedgerFlow's canonical log store, ingested from the same local node.
+    /// Preferred for swap history: node `eth_getLogs` over the busy PoolManager
+    /// times out on large ranges.
+    logs: Option<ClickHouseClient>,
     config: PoolIndexerConfig,
     range: u64,
+}
+
+#[derive(Default)]
+struct SwapColumns {
+    tx_hashes: Vec<String>,
+    log_indexes: Vec<i64>,
+    launch_ids: Vec<Uuid>,
+    pool_ids: Vec<String>,
+    blocks: Vec<i64>,
+    times: Vec<Option<DateTime<Utc>>>,
+    sides: Vec<String>,
+    senders: Vec<String>,
+    token_amounts: Vec<String>,
+    quote_amounts: Vec<String>,
+    sqrt_prices: Vec<String>,
 }
 
 struct MappedPool {
@@ -211,11 +232,21 @@ struct MappedPool {
 }
 
 impl PoolIndexer {
-    pub fn new(pool: PgPool, rpc: IndexerRpcClient, config: PoolIndexerConfig) -> Self {
+    pub fn new(
+        pool: PgPool,
+        rpc: IndexerRpcClient,
+        logs: Option<ClickHouseClient>,
+        config: PoolIndexerConfig,
+    ) -> Self {
         Self {
-            range: config.initial_range,
+            range: if logs.is_some() {
+                config.max_range
+            } else {
+                config.initial_range
+            },
             pool,
             rpc,
+            logs,
             config,
         }
     }
@@ -227,6 +258,11 @@ impl PoolIndexer {
     pub async fn process_once(&mut self) -> LedgerResult<PoolIteration> {
         let mut iteration = PoolIteration::default();
         self.map_graduated_launches(&mut iteration).await?;
+        if iteration.mapped + iteration.unmapped >= self.config.map_batch as u64 {
+            // Map every graduated launch before scanning swaps; otherwise each
+            // pool mapped behind the cursor needs its own historical catch-up.
+            return Ok(iteration);
+        }
         self.index_swaps(&mut iteration).await?;
         Ok(iteration)
     }
@@ -326,11 +362,20 @@ impl PoolIndexer {
 
     async fn index_swaps(&mut self, iteration: &mut PoolIteration) -> LedgerResult<()> {
         let chain_id = self.config.chain_id as i64;
-        let head = self
+        let mut head = self
             .rpc
             .get_latest_block_number()
             .await?
             .saturating_sub(self.config.head_lag_blocks);
+        if let Some(logs) = &self.logs {
+            // Only scan what the log store has ingested.
+            match logs.max_log_block(self.config.chain_id as u32).await? {
+                Some(ingested) => {
+                    head = head.min(ingested.saturating_sub(self.config.head_lag_blocks))
+                }
+                None => head = 0,
+            }
+        }
         iteration.head_block = head;
         let first_init: Option<i64> = sqlx::query_scalar(
             "select min(init_block) from market.token_pools where chain_id = $1 and status = 'mapped'",
@@ -421,6 +466,23 @@ impl PoolIndexer {
     ) -> LedgerResult<u64> {
         let ids = pools.keys().cloned().collect::<Vec<_>>();
         let mut logs = Vec::new();
+        if let Some(store) = &self.logs {
+            for chunk in ids.chunks(CLICKHOUSE_POOL_IDS_PER_QUERY) {
+                logs.extend(
+                    store
+                        .canonical_logs_by_topic1(
+                            self.config.chain_id as u32,
+                            from,
+                            to,
+                            manager,
+                            V4_SWAP_TOPIC,
+                            chunk,
+                        )
+                        .await?,
+                );
+            }
+            return self.store_swaps(pools, &logs).await;
+        }
         for chunk in ids.chunks(self.config.pool_ids_per_request.max(1)) {
             let mut start = from;
             while start <= to {
@@ -438,10 +500,17 @@ impl PoolIndexer {
                 start = end + 1;
             }
         }
+        self.store_swaps(pools, &logs).await
+    }
+
+    async fn store_swaps(
+        &self,
+        pools: &BTreeMap<String, MappedPool>,
+        logs: &[Value],
+    ) -> LedgerResult<u64> {
         let mut seen = BTreeSet::new();
-        let mut tx = self.pool.begin().await.map_err(db_error)?;
-        let mut stored = 0;
-        for log in &logs {
+        let mut rows = SwapColumns::default();
+        for log in logs {
             let Some(swap) = decode_swap(log) else {
                 continue;
             };
@@ -456,25 +525,49 @@ impl PoolIndexer {
             if !seen.insert((swap.tx_hash.clone(), swap.log_index)) {
                 continue;
             }
+            rows.tx_hashes.push(swap.tx_hash);
+            rows.log_indexes.push(swap.log_index as i64);
+            rows.launch_ids.push(mapped.launch_id);
+            rows.pool_ids.push(swap.pool_id);
+            rows.blocks.push(swap.block_number as i64);
+            rows.times.push(swap.block_time);
+            rows.sides.push(side.to_owned());
+            rows.senders.push(swap.sender);
+            rows.token_amounts.push(token_amount.to_string());
+            rows.quote_amounts.push(quote_amount.to_string());
+            rows.sqrt_prices.push(swap.sqrt_price_x96.to_string());
+        }
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let mut stored = 0;
+        for start in (0..rows.tx_hashes.len()).step_by(SWAP_INSERT_CHUNK) {
+            let end = (start + SWAP_INSERT_CHUNK).min(rows.tx_hashes.len());
             let result = sqlx::query(
                 r#"insert into market.pool_swap_facts (
                      chain_id, tx_hash, log_index, launch_id, pool_id, block_number, occurred_at,
                      trade_side, sender_address, token_amount_raw, quote_amount_raw, sqrt_price_x96
-                   ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::numeric, $11::numeric, $12::numeric)
+                   )
+                   select $1, tx_hash, log_index, launch_id, pool_id, block_number, occurred_at,
+                          trade_side, sender_address, token_amount::numeric, quote_amount::numeric,
+                          sqrt_price::numeric
+                   from unnest($2::text[], $3::bigint[], $4::uuid[], $5::text[], $6::bigint[],
+                               $7::timestamptz[], $8::text[], $9::text[], $10::text[], $11::text[],
+                               $12::text[])
+                     as swap(tx_hash, log_index, launch_id, pool_id, block_number, occurred_at,
+                             trade_side, sender_address, token_amount, quote_amount, sqrt_price)
                    on conflict (chain_id, tx_hash, log_index) do nothing"#,
             )
             .bind(self.config.chain_id as i64)
-            .bind(&swap.tx_hash)
-            .bind(swap.log_index as i64)
-            .bind(mapped.launch_id)
-            .bind(&swap.pool_id)
-            .bind(swap.block_number as i64)
-            .bind(swap.block_time)
-            .bind(side)
-            .bind(&swap.sender)
-            .bind(token_amount.to_string())
-            .bind(quote_amount.to_string())
-            .bind(swap.sqrt_price_x96.to_string())
+            .bind(&rows.tx_hashes[start..end])
+            .bind(&rows.log_indexes[start..end])
+            .bind(&rows.launch_ids[start..end])
+            .bind(&rows.pool_ids[start..end])
+            .bind(&rows.blocks[start..end])
+            .bind(&rows.times[start..end])
+            .bind(&rows.sides[start..end])
+            .bind(&rows.senders[start..end])
+            .bind(&rows.token_amounts[start..end])
+            .bind(&rows.quote_amounts[start..end])
+            .bind(&rows.sqrt_prices[start..end])
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;

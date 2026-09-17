@@ -25,6 +25,11 @@ pub const LIQUIDATION_METHODOLOGY_VERSION: &str = "market_lending_liquidation_v1
 pub const MORPHO_LIQUIDATE_TOPIC: &str =
     "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41";
 const PROTOCOL: &str = "morpho_blue_compatible";
+/// Seized collateral value divided by repaid debt value. Liquidation
+/// incentives keep this slightly above 1; values outside the band mean one of
+/// the USD prices is unreliable, so no bonus is published.
+const MIN_PLAUSIBLE_SEIZED_RATIO: f64 = 0.9;
+const MAX_PLAUSIBLE_SEIZED_RATIO: f64 = 1.5;
 const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,30 +362,38 @@ impl LiquidationIndexer {
                      and price.bucket_start > liquidation.block_time - interval '48 hours'
                    order by price.bucket_start desc limit 1
                  ) collateral_price on true
-                 where liquidation.chain_id = $1 and liquidation.status = 'unknown'
-                   and $2::text is not null
+                 where liquidation.chain_id = $1 and $2::text is not null
                )
                update market.lending_liquidations liquidation
                set repaid_amount = priced.repaid,
                    seized_amount = priced.seized,
                    repaid_usd = priced.repaid * priced.loan_usd,
                    seized_usd = priced.seized * priced.collateral_usd,
-                   bonus_usd = priced.seized * priced.collateral_usd - priced.repaid * priced.loan_usd,
-                   status = case when priced.loan_usd is not null and priced.collateral_usd is not null
-                     and priced.repaid is not null and priced.seized is not null
+                   bonus_usd = case when priced.ratio between $3 and $4
+                     then priced.seized * priced.collateral_usd - priced.repaid * priced.loan_usd end,
+                   status = case when priced.ratio between $3 and $4
                      then 'estimated' else 'unknown' end,
                    reason = case
                      when priced.repaid is null or priced.seized is null then 'token decimals unavailable'
                      when priced.loan_usd is null then 'loan token USD price unavailable'
                      when priced.collateral_usd is null then 'collateral USD price unavailable'
+                     when not (priced.ratio between $3 and $4)
+                       then 'seized/repaid value ratio outside plausible liquidation incentive'
                    end,
                    computed_at = now()
-               from priced
+               from (
+                 select priced.*,
+                        (priced.seized * priced.collateral_usd)
+                          / nullif(priced.repaid * priced.loan_usd, 0) as ratio
+                 from priced
+               ) priced
                where liquidation.chain_id = priced.chain_id and liquidation.tx_hash = priced.tx_hash
                  and liquidation.log_index = priced.log_index"#,
         )
         .bind(self.config.chain_id as i64)
         .bind(NATIVE_ASSET_ADDRESS)
+        .bind(MIN_PLAUSIBLE_SEIZED_RATIO)
+        .bind(MAX_PLAUSIBLE_SEIZED_RATIO)
         .execute(&self.pool)
         .await
         .map_err(db_error)?;

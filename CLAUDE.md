@@ -48,7 +48,6 @@ Query quickly: `sudo -n docker exec -i ledgerflow-chainactors-v2-db-1 psql -U po
 ```bash
 cargo check --bin ledgerflow_market_web          # fast compile check
 cargo test --lib market                          # market unit tests
-cargo test --lib market                          # focused unit tests
 cargo fmt && cargo clippy --all-targets
 cargo test --all-targets                         # full suite before tagging
 ```
@@ -68,7 +67,6 @@ Git commits need `-c user.name=peter -c user.email=wcy19960411@gmail.com`
 - `src/services/market_read.rs` – read queries for the web (never scan trade facts).
 - `src/market_web/{ui,pages,intel,execution}.rs` – components and pages.
 - `scripts/market_mvp_acceptance.sql` – reproducible acceptance checks.
-
 - `src/market_web/` – server-rendered pages, inline CSS/JS, wallet auth, JSON APIs.
 - `src/services/protocol_market.rs` – read models used by the web + seed import.
 - `src/services/protocol_launch_indexer.rs` – Pons factory/curve log ingestion via RPC.

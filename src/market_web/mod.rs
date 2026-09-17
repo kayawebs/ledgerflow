@@ -39,6 +39,7 @@ const ROBINHOOD_CHAIN_ID: u64 = 4663;
 pub struct MarketWebState {
     service: Arc<ProtocolMarketService>,
     market: Arc<MarketReadService>,
+    overview_cache: Arc<RwLock<Option<OverviewCache>>>,
     client: Client,
     base_evidence_url: String,
     public_base_url: String,
@@ -47,6 +48,20 @@ pub struct MarketWebState {
     wallet_session_ttl: chrono::Duration,
     remote_evidence: Arc<RwLock<Option<RemoteEvidenceCache>>>,
 }
+
+/// Overview aggregates change at most every few seconds; caching them keeps
+/// the landing page and its refresh fragments off the database.
+#[derive(Clone)]
+struct OverviewCache {
+    loaded_at: std::time::Instant,
+    ticker: crate::services::market_read::MarketTicker,
+    hot: Vec<crate::services::market_read::TokenRow>,
+    gainers: Vec<crate::services::market_read::TokenRow>,
+    newest: Vec<crate::services::market_read::TokenRow>,
+    graduating: Vec<crate::services::market_read::TokenRow>,
+}
+
+const OVERVIEW_CACHE_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct RemoteEvidenceCache {
@@ -200,6 +215,7 @@ pub async fn router_from_env() -> Result<(Router, SocketAddr), Box<dyn std::erro
     run_market_migrations(&database_url).await?;
     let state = MarketWebState {
         market: Arc::new(MarketReadService::new(pool.clone())),
+        overview_cache: Arc::new(RwLock::new(None)),
         service: Arc::new(ProtocolMarketService::new(pool)),
         client: Client::builder().timeout(Duration::from_secs(8)).build()?,
         base_evidence_url,
@@ -271,13 +287,7 @@ async fn overview_page(
         return legacy_overview_page(state, query, headers).await;
     }
     let (ticker, boards, feed, wallet) = tokio::try_join!(
-        async {
-            state
-                .market
-                .ticker(context.chain_id)
-                .await
-                .map_err(MarketWebError::from)
-        },
+        async { overview_data(&state).await.map(|data| data.ticker) },
         render_overview_boards(&state, &context),
         render_overview_feed(&state, &context),
         session_address(&state, &headers),
@@ -310,24 +320,44 @@ async fn legacy_overview_page(
     .into_response())
 }
 
-async fn render_overview_boards(
-    state: &MarketWebState,
-    context: &PageContext<'_>,
-) -> Result<String, MarketWebError> {
-    let chain_id = context.chain_id;
-    let (hot, gainers, newest, graduating) = tokio::try_join!(
+async fn overview_data(state: &MarketWebState) -> Result<OverviewCache, MarketWebError> {
+    if let Some(cache) = state.overview_cache.read().await.as_ref()
+        && cache.loaded_at.elapsed() < OVERVIEW_CACHE_TTL
+    {
+        return Ok(cache.clone());
+    }
+    let chain_id = ROBINHOOD_CHAIN_ID;
+    let (ticker, hot, gainers, newest, graduating) = tokio::try_join!(
+        state.market.ticker(chain_id),
         state.market.board(chain_id, TokenBoard::Hot, 8),
         state.market.board(chain_id, TokenBoard::Gainers, 8),
         state.market.newest_launches(chain_id, 8),
         state.market.board(chain_id, TokenBoard::Graduating, 8),
     )?;
+    let cache = OverviewCache {
+        loaded_at: std::time::Instant::now(),
+        ticker,
+        hot,
+        gainers,
+        newest,
+        graduating,
+    };
+    *state.overview_cache.write().await = Some(cache.clone());
+    Ok(cache)
+}
+
+async fn render_overview_boards(
+    state: &MarketWebState,
+    context: &PageContext<'_>,
+) -> Result<String, MarketWebError> {
+    let data = overview_data(state).await?;
     Ok(pages::fragment_overview_boards(
         context,
         &pages::OverviewBoards {
-            hot: &hot,
-            gainers: &gainers,
-            newest: &newest,
-            graduating: &graduating,
+            hot: &data.hot,
+            gainers: &data.gainers,
+            newest: &data.newest,
+            graduating: &data.graduating,
         },
     ))
 }
@@ -348,7 +378,7 @@ async fn ticker_fragment(
     Query(query): Query<PageQuery>,
 ) -> Result<Html<String>, MarketWebError> {
     let context = PageContext::new(&query);
-    let ticker = state.market.ticker(ROBINHOOD_CHAIN_ID).await?;
+    let ticker = overview_data(&state).await?.ticker;
     Ok(Html(pages::fragment_ticker(&context, &ticker)))
 }
 
@@ -390,7 +420,12 @@ async fn render_token_table(
     query: &PageQuery,
 ) -> Result<String, MarketWebError> {
     let table_query = launch_table_query(query);
-    let page = state
+    // Hot and volume boards list exactly the tokens active in 24h, which the
+    // cached overview already counts.
+    let cached_total = matches!(table_query.board, TokenBoard::Hot | TokenBoard::Volume)
+        && table_query.search.is_none()
+        && context.chain_id == ROBINHOOD_CHAIN_ID;
+    let mut page = state
         .market
         .token_page(
             context.chain_id,
@@ -400,8 +435,12 @@ async fn render_token_table(
             table_query.descending,
             query.page.unwrap_or(1),
             50,
+            !cached_total,
         )
         .await?;
+    if cached_total {
+        page.total = overview_data(state).await?.ticker.active_tokens_24h;
+    }
     Ok(pages::fragment_launch_table(context, &table_query, &page))
 }
 

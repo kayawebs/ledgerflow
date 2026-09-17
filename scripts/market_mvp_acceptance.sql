@@ -20,9 +20,9 @@ with sample as (
 ), fact_totals as (
   select f.launch_id, count(*) as trades,
          coalesce(sum(f.quote_amount_raw::numeric) filter (where f.trade_side = 'buy'), 0)
-           / power(10::numeric, max(coalesce(q.decimals, 18))) as buy_quote,
+           * power(10::numeric, -max(coalesce(q.decimals, 18))) as buy_quote,
          coalesce(sum(f.quote_amount_raw::numeric) filter (where f.trade_side = 'sell'), 0)
-           / power(10::numeric, max(coalesce(q.decimals, 18))) as sell_quote
+           * power(10::numeric, -max(coalesce(q.decimals, 18))) as sell_quote
   from public.protocol_launch_trade_facts f
   join sample using (launch_id)
   join public.protocol_token_launches l on l.launch_id = f.launch_id
@@ -74,9 +74,9 @@ with cursor_block as (
 ), recomputed as (
   select s.launch_id, s.address,
          coalesce(sum(f.token_amount_raw::numeric) filter (where f.trade_side = 'buy'), 0)
-           / 1e18 as bought_token,
+           * power(10::numeric, -18) as bought_token,
          coalesce(sum(f.token_amount_raw::numeric) filter (where f.trade_side = 'sell'), 0)
-           / 1e18 as sold_token,
+           * power(10::numeric, -18) as sold_token,
          count(*) filter (where f.trade_side = 'buy') as buys,
          count(*) filter (where f.trade_side = 'sell') as sells
   from sample s, cursor_block

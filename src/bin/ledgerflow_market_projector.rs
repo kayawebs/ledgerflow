@@ -5,7 +5,7 @@ use std::{
 
 use ledgerflow::{
     core::{config::AppConfig, env::load_dotenv, logging::init_logging},
-    indexer::rpc::IndexerRpcClient,
+    indexer::{clickhouse::ClickHouseClient, rpc::IndexerRpcClient},
     services::{
         market_arbitrage::{MarketArbitrageConfig, MarketArbitrageEstimator},
         market_data::{MarketProjector, MarketProjectorConfig, run_market_migrations},
@@ -127,9 +127,27 @@ async fn main() {
         },
     );
     if let Some(rpc) = rpc.clone() {
+        let log_store = env::var("LEDGERFLOW_MARKET_CLICKHOUSE_URL")
+            .or_else(|_| env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_URL"))
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .map(|url| {
+                ClickHouseClient::new(
+                    url,
+                    env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE")
+                        .unwrap_or_else(|_| "ledgerflow_indexer".to_owned()),
+                    env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_USER")
+                        .unwrap_or_else(|_| "ledgerflow".to_owned()),
+                    env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD").ok(),
+                )
+            });
+        if log_store.is_none() {
+            warn!("no ClickHouse log store configured; pool swaps use node eth_getLogs");
+        }
         let mut pools = PoolIndexer::new(
             pool.clone(),
             rpc,
+            log_store,
             PoolIndexerConfig {
                 chain_id: config.chain_id,
                 ..PoolIndexerConfig::default()

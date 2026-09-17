@@ -342,8 +342,8 @@ pub fn launches(context: &PageContext<'_>, query: &LaunchTableQuery<'_>, table: 
         search = l.text("Search", "搜索"),
         refresh = escape_html(&launch_table_url(context, query, None, "/fragments/launches")),
         note = l.text(
-            "Gainers and losers require at least $250 of 24h volume. Market cap = price × total supply. Holders and wallet PnL arrive with the address intelligence release.",
-            "涨跌榜要求 24h 成交额至少 $250。市值 = 价格 × 总供应量。持有人与钱包盈亏将随聪明钱版本上线。"
+            "Gainers and losers require at least $250 of 24h volume. Market cap = price × total supply. Graduated tokens include Uniswap V4 pool trades. ≈ marks USD derived from swap medians (stock-token quotes).",
+            "涨跌榜要求 24h 成交额至少 $250。市值 = 价格 × 总供应量。已毕业代币包含 Uniswap V4 池内成交。≈ 表示美元价由成交中位数推导（股票代币报价）。"
         ),
     )
 }
@@ -603,7 +603,10 @@ pub fn token_detail(context: &PageContext<'_>, detail: &TokenDetail<'_>) -> Stri
         trust = ui::trust(l, ui::Trust::Estimated),
         stats = stats,
         trades_title = l.text("Recent trades", "最新成交"),
-        trades_note = l.text("Bonding-curve trades", "联合曲线成交"),
+        trades_note = l.text(
+            "Curve trades and post-graduation pool swaps",
+            "联合曲线成交与毕业后池内成交"
+        ),
         trades_url = fragment_url(
             context,
             &format!("/fragments/launches/{}/trades", token.launch_id),

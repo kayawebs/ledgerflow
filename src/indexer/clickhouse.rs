@@ -473,6 +473,95 @@ impl ClickHouseClient {
         deserialize_rows(&payload)
     }
 
+    /// Newest block with ingested logs for `chain_id`.
+    pub async fn max_log_block(&self, chain_id: u32) -> LedgerResult<Option<u64>> {
+        let payload = self
+            .query_json(&format!(
+                "SELECT max(block_number) AS max_block, count() > 0 AS present \
+                 FROM {}.logs_raw WHERE chain_id = {} FORMAT JSON",
+                self.database, chain_id
+            ))
+            .await?;
+        let Some(row) = payload["data"].as_array().and_then(|rows| rows.first()) else {
+            return Ok(None);
+        };
+        if row.get("present").and_then(value_as_u64) != Some(1) {
+            return Ok(None);
+        }
+        Ok(row.get("max_block").and_then(value_as_u64))
+    }
+
+    /// Canonical logs emitted by `address` with `topic0` whose first indexed
+    /// topic is one of `topic1s`, shaped like `eth_getLogs` results (hex block
+    /// number, log index and block timestamp).
+    pub async fn canonical_logs_by_topic1(
+        &self,
+        chain_id: u32,
+        from_block: u64,
+        to_block: u64,
+        address: &str,
+        topic0: &str,
+        topic1s: &[String],
+    ) -> LedgerResult<Vec<Value>> {
+        if from_block > to_block || topic1s.is_empty() {
+            return Ok(Vec::new());
+        }
+        let valid_word = |value: &str, length: usize| {
+            value.strip_prefix("0x").is_some_and(|body| {
+                body.len() == length && body.chars().all(|character| character.is_ascii_hexdigit())
+            })
+        };
+        if !valid_word(address, 40) || !valid_word(topic0, 64) {
+            return Err(LedgerError::MalformedEvidence(
+                "invalid address or topic filter".to_owned(),
+            ));
+        }
+        if let Some(invalid) = topic1s.iter().find(|topic| !valid_word(topic, 64)) {
+            return Err(LedgerError::MalformedEvidence(format!(
+                "invalid topic filter: {invalid}"
+            )));
+        }
+        let topic1s = topic1s
+            .iter()
+            .map(|topic| format!("'{}'", topic.to_ascii_lowercase()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT logs.topics AS topics, logs.data AS data, logs.tx_hash AS transactionHash,
+                       concat('0x', lower(hex(logs.log_index))) AS logIndex,
+                       concat('0x', lower(hex(logs.block_number))) AS blockNumber,
+                       if(blocks.timestamp = 0, NULL, concat('0x', lower(hex(blocks.timestamp))))
+                         AS blockTimestamp
+                FROM {db}.logs_canonical AS logs
+                LEFT JOIN (
+                  SELECT block_number, any(timestamp) AS timestamp
+                  FROM {db}.canonical_blocks
+                  WHERE chain_id = {chain} AND block_number BETWEEN {from} AND {to} AND is_canonical = 1
+                  GROUP BY block_number
+                ) AS blocks ON blocks.block_number = logs.block_number
+                WHERE logs.chain_id = {chain}
+                  AND logs.block_number BETWEEN {from} AND {to}
+                  AND lower(logs.address) = '{address}'
+                  AND length(logs.topics) = 3
+                  AND lower(logs.topics[1]) = '{topic0}'
+                  AND lower(logs.topics[2]) IN ({topic1s})
+                ORDER BY logs.block_number, logs.tx_index, logs.log_index
+                FORMAT JSON
+                "#,
+                db = self.database,
+                chain = chain_id,
+                from = from_block,
+                to = to_block,
+                address = address.to_ascii_lowercase(),
+                topic0 = topic0.to_ascii_lowercase(),
+                topic1s = topic1s,
+            ))
+            .await?;
+        Ok(payload["data"].as_array().cloned().unwrap_or_default())
+    }
+
     pub async fn canonical_address_observations(
         &self,
         chain_id: u32,

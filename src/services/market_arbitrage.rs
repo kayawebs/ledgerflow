@@ -26,13 +26,17 @@ use crate::{
     services::market_data::NATIVE_ASSET_ADDRESS,
 };
 
-pub const ARBITRAGE_METHODOLOGY_VERSION: &str = "market_arbitrage_receipt_scope_v1";
+pub const ARBITRAGE_METHODOLOGY_VERSION: &str = "market_arbitrage_receipt_scope_v3";
+/// Largest |net| / gross outflow value accepted as an arbitrage margin.
+const MAX_MARGIN_ON_OUTFLOW: f64 = 0.2;
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReceiptAccounting {
     pub tx_status: &'static str,
     pub deltas: BTreeMap<String, BigInt>,
+    /// Gross amount of each token sent from the scope to outside addresses.
+    pub outflows: BTreeMap<String, BigUint>,
     pub gas_wei: BigUint,
 }
 
@@ -48,6 +52,7 @@ pub fn account_receipt(receipt: &Value, scope: &[String]) -> ReceiptAccounting {
     let gas_used = hex_uint(receipt.get("gasUsed").and_then(Value::as_str));
     let gas_price = hex_uint(receipt.get("effectiveGasPrice").and_then(Value::as_str));
     let mut deltas = BTreeMap::<String, BigInt>::new();
+    let mut outflows = BTreeMap::<String, BigUint>::new();
     if tx_status == "success" {
         for log in receipt
             .get("logs")
@@ -82,7 +87,11 @@ pub fn account_receipt(receipt: &Value, scope: &[String]) -> ReceiptAccounting {
             if from_scope == to_scope {
                 continue;
             }
-            let entry = deltas.entry(token.to_ascii_lowercase()).or_default();
+            let token = token.to_ascii_lowercase();
+            if from_scope {
+                *outflows.entry(token.clone()).or_default() += amount.clone();
+            }
+            let entry = deltas.entry(token).or_default();
             let signed = BigInt::from_biguint(Sign::Plus, amount);
             if to_scope {
                 *entry += signed;
@@ -91,10 +100,11 @@ pub fn account_receipt(receipt: &Value, scope: &[String]) -> ReceiptAccounting {
             }
         }
     }
-    deltas.retain(|_, amount| amount.sign() != Sign::NoSign);
+    deltas.retain(|token, amount| amount.sign() != Sign::NoSign || outflows.contains_key(token));
     ReceiptAccounting {
         tx_status,
         deltas,
+        outflows,
         gas_wei: gas_used * gas_price,
     }
 }
@@ -294,7 +304,13 @@ impl MarketArbitrageEstimator {
             .bind(candidate.swap_count)
             .bind(candidate.pool_count)
             .bind(accounting.tx_status)
-            .bind(accounting.deltas.len() as i32)
+            .bind(
+                accounting
+                    .deltas
+                    .values()
+                    .filter(|amount| amount.sign() != Sign::NoSign)
+                    .count() as i32,
+            )
             .bind(accounting.gas_wei.to_string())
             .bind(ARBITRAGE_METHODOLOGY_VERSION)
             .execute(&mut *tx)
@@ -302,15 +318,23 @@ impl MarketArbitrageEstimator {
             .map_err(db_error)?;
             for (token, amount) in &accounting.deltas {
                 sqlx::query(
-                    r#"insert into market.arbitrage_estimate_deltas (chain_id, tx_hash, token_address, amount_raw)
-                       values ($1, $2, $3, $4::numeric)
+                    r#"insert into market.arbitrage_estimate_deltas (
+                         chain_id, tx_hash, token_address, amount_raw, outflow_raw
+                       ) values ($1, $2, $3, $4::numeric, $5::numeric)
                        on conflict (chain_id, tx_hash, token_address) do update set
-                         amount_raw = excluded.amount_raw"#,
+                         amount_raw = excluded.amount_raw, outflow_raw = excluded.outflow_raw"#,
                 )
                 .bind(chain_id)
                 .bind(&candidate.tx_hash)
                 .bind(token)
                 .bind(amount.to_string())
+                .bind(
+                    accounting
+                        .outflows
+                        .get(token)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "0".to_owned()),
+                )
                 .execute(&mut *tx)
                 .await
                 .map_err(db_error)?;
@@ -337,6 +361,7 @@ impl MarketArbitrageEstimator {
             .bind(chain_id)
             .bind(&hashes)
             .bind(NATIVE_ASSET_ADDRESS)
+            .bind(MAX_MARGIN_ON_OUTFLOW)
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;
@@ -376,7 +401,6 @@ impl MarketArbitrageEstimator {
         let hashes: Vec<String> = sqlx::query_scalar(
             r#"select tx_hash from market.arbitrage_estimates
                where chain_id = $1 and status = 'unknown'
-                 and block_time > now() - interval '30 days'
                order by block_time desc
                limit 50000"#,
         )
@@ -391,6 +415,7 @@ impl MarketArbitrageEstimator {
             .bind(self.config.chain_id as i64)
             .bind(&hashes)
             .bind(NATIVE_ASSET_ADDRESS)
+            .bind(MAX_MARGIN_ON_OUTFLOW)
             .execute(&self.pool)
             .await
             .map_err(db_error)?;
@@ -471,7 +496,8 @@ const VALUATION_SQL: &str = r#"
 with priced as (
   select delta.tx_hash, delta.token_address,
          delta.amount_raw * power(10::numeric, -(meta.decimals)) as amount,
-         delta.amount_raw * power(10::numeric, -(meta.decimals)) * price.price_usd as usd
+         delta.amount_raw * power(10::numeric, -(meta.decimals)) * price.price_usd as usd,
+         delta.outflow_raw * power(10::numeric, -(meta.decimals)) * price.price_usd as outflow_usd
   from market.arbitrage_estimate_deltas delta
   join market.arbitrage_estimates estimate
     on estimate.chain_id = delta.chain_id and estimate.tx_hash = delta.tx_hash
@@ -495,6 +521,8 @@ with priced as (
   returning 1
 ), totals as (
   select tx_hash, sum(usd) as gross, bool_and(usd is not null) as all_priced,
+         bool_or(amount > 0) as has_inflow,
+         sum(outflow_usd) as outflow_usd,
          (array_agg(token_address order by usd is null desc))[1] as unpriced_token
   from priced group by tx_hash
 ), verified as (
@@ -531,21 +559,42 @@ with priced as (
 )
 update market.arbitrage_estimates estimate
 set gas_usd = estimate.gas_native * native.native_usd,
+    outflow_usd = totals.outflow_usd,
     gross_usd = case
       when verified.usd is not null then verified.usd
       when coalesce(totals.all_priced, true) then coalesce(totals.gross, 0) end,
     net_usd = case
       when native.native_usd is null then null
       when verified.usd is not null then verified.usd - estimate.gas_native * native.native_usd
+      when totals.tx_hash is not null and not coalesce(totals.has_inflow, false) then null
+      when totals.tx_hash is not null and coalesce(totals.all_priced, true)
+       and not (coalesce(totals.outflow_usd, 0) > 0
+                and abs(coalesce(totals.gross, 0)) <= $4 * totals.outflow_usd) then null
       when coalesce(totals.all_priced, true)
         then coalesce(totals.gross, 0) - estimate.gas_native * native.native_usd end,
     status = case
-      when native.native_usd is not null
-       and (verified.usd is not null or coalesce(totals.all_priced, true))
-        then 'estimated' else 'unknown' end,
+      when native.native_usd is null then 'unknown'
+      when verified.usd is not null then 'estimated'
+      -- Only outflows are visible: the proceeds settled outside the
+      -- sender/executor scope or in native ETH, so the loss would be fictitious.
+      when totals.tx_hash is not null and not coalesce(totals.has_inflow, false) then 'unknown'
+      when totals.tx_hash is not null and coalesce(totals.all_priced, true)
+       and not (coalesce(totals.outflow_usd, 0) > 0
+                and abs(coalesce(totals.gross, 0)) <= $4 * totals.outflow_usd) then 'unknown'
+      when coalesce(totals.all_priced, true) then 'estimated'
+      else 'unknown' end,
     reason = case
       when native.native_usd is null then 'native USD price unavailable'
       when verified.usd is not null then 'profit from deterministic verification'
+      when totals.tx_hash is not null and not coalesce(totals.has_inflow, false)
+        then 'no inflow in sender/executor scope; proceeds settled elsewhere'
+      when totals.tx_hash is not null and coalesce(totals.all_priced, true)
+       and coalesce(totals.outflow_usd, 0) <= 0
+        then 'no outflow in sender/executor scope; funded in native ETH or elsewhere'
+      when totals.tx_hash is not null and coalesce(totals.all_priced, true)
+       and not (coalesce(totals.outflow_usd, 0) > 0
+                and abs(coalesce(totals.gross, 0)) <= $4 * totals.outflow_usd)
+        then 'net result implausible for the capital cycled'
       when not coalesce(totals.all_priced, true) then 'unpriced token ' || totals.unpriced_token
       when estimate.tx_status = 'reverted' then 'reverted transaction; gas only'
       when estimate.token_count = 0 then 'no ERC-20 delta in sender/executor scope'
@@ -653,8 +702,11 @@ mod tests {
         });
         let accounting = account_receipt(&receipt, &scope());
         assert_eq!(accounting.tx_status, "success");
-        assert_eq!(accounting.deltas.len(), 1);
         assert_eq!(accounting.deltas[WETH], BigInt::from(12));
+        // USDG cycled through the executor: zero net, but its outflow is kept.
+        assert_eq!(accounting.deltas[USDG], BigInt::from(0));
+        assert_eq!(accounting.outflows[WETH], BigUint::from(1_000_u32));
+        assert_eq!(accounting.outflows[USDG], BigUint::from(2_500_u32));
         assert_eq!(
             accounting.gas_wei,
             BigUint::from(21_000_u64 * 1_000_000_000)
