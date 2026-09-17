@@ -63,9 +63,11 @@ impl EarningsWindow {
     /// How stale a leaderboard may become before it is rebuilt.
     fn refresh_every(self) -> Duration {
         match self {
-            Self::Day => Duration::from_secs(60),
-            Self::Week => Duration::from_secs(300),
-            Self::Month => Duration::from_secs(900),
+            // Rebuilds scan every position traded in the window (30d: ~5M rows,
+            // ~2 min), so longer windows refresh less often on the shared host.
+            Self::Day => Duration::from_secs(120),
+            Self::Week => Duration::from_secs(900),
+            Self::Month => Duration::from_secs(3_600),
         }
     }
 }

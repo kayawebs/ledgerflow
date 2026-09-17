@@ -31,7 +31,7 @@ kept; they carry RPC-sourced data that is expensive to refetch.)
 | Stats | `stats:<chain>` (candle `updated_at`, µs) | `token_stats`; windowed metrics also refresh every 60 s while a token has 24h trades |
 | Total supply | — | `token_stats.total_supply` via `totalSupply()` |
 | Positions | `positions:<chain>` (block, 600 blocks behind candles) | `wallet_positions`, incremental and transactional with its cursor |
-| Leaderboards | — | `wallet_leaderboard`, `cluster_leaderboard` (24h every 60 s, 7d every 5 min, 30d every 15 min) |
+| Leaderboards | — | `wallet_leaderboard`, `cluster_leaderboard` (24h every 2 min, 7d every 15 min, 30d every 60 min) |
 | Arbitrage | `arbitrage_estimates:<chain>` (block time, µs) | `arbitrage_estimates`, `arbitrage_estimate_deltas`, `arbitrage_bot_leaderboard` |
 | Price assets | — | new tokens in `price_assets` receive 30 days of price history |
 | Liquidations | `liquidations:<chain>` (block) | `lending_markets`, `lending_liquidations` |
