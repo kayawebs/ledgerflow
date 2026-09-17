@@ -4,3 +4,5 @@ target
 ledgerflow-backups
 *.log
 .env
+*.local.json
+*.local.env
