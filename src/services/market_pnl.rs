@@ -13,7 +13,7 @@ use std::{
 };
 
 use serde::Serialize;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -22,6 +22,9 @@ use crate::{
 };
 
 pub const PNL_METHODOLOGY_VERSION: &str = "market_wallet_pnl_v1";
+/// Blocks kept between the candle cursor and applied positions so canonical
+/// flips near the chain head never reach an already-applied increment.
+const POSITION_SAFETY_LAG_BLOCKS: i64 = 600;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum EarningsWindow {
@@ -71,7 +74,6 @@ impl EarningsWindow {
 pub struct MarketPnlConfig {
     pub chain_id: u64,
     pub position_block_batch: i64,
-    pub position_reprocess_blocks: i64,
     pub leaderboard_size: i64,
     pub new_cluster_rows: i64,
     pub min_wallet_cost_usd: f64,
@@ -82,7 +84,6 @@ impl Default for MarketPnlConfig {
         Self {
             chain_id: 4663,
             position_block_batch: 100_000,
-            position_reprocess_blocks: 1_500,
             leaderboard_size: 500,
             new_cluster_rows: 100,
             min_wallet_cost_usd: 50.0,
@@ -147,20 +148,24 @@ impl MarketPnlProjector {
         Ok(summary)
     }
 
+    /// Accumulates positions over blocks that are at least
+    /// `POSITION_SAFETY_LAG_BLOCKS` behind the candle cursor. Canonical flips
+    /// in the launch indexer happen well inside that lag, so each block range is
+    /// applied exactly once; the increment and checkpoint commit together.
     async fn project_positions(&self, summary: &mut MarketPnlSummary) -> LedgerResult<()> {
         let chain_id = self.config.chain_id as i64;
         let key = format!("positions:{}", self.config.chain_id);
-        // Positions price trades from candles, so they never pass the candle cursor.
-        let limit: Option<i64> = sqlx::query_scalar(
+        let candle_cursor: Option<i64> = sqlx::query_scalar(
             "select last_position from market.projector_checkpoints where checkpoint_key = $1",
         )
         .bind(format!("candles:{}", self.config.chain_id))
         .fetch_optional(&self.pool)
         .await
         .map_err(db_error)?;
-        let Some(limit) = limit else {
+        let Some(candle_cursor) = candle_cursor else {
             return Ok(());
         };
+        let limit = candle_cursor - POSITION_SAFETY_LAG_BLOCKS;
         summary.position_limit_block = limit;
         let cursor: i64 = match sqlx::query_scalar::<_, i64>(
             "select last_position from market.projector_checkpoints where checkpoint_key = $1",
@@ -182,27 +187,37 @@ impl MarketPnlProjector {
                 first.unwrap_or(limit) - 1
             }
         };
+        let start = cursor + 1;
         let end = (cursor + self.config.position_block_batch).min(limit);
-        let start = if end >= limit {
-            (cursor + 1 - self.config.position_reprocess_blocks).max(0)
-        } else {
-            cursor + 1
-        };
         summary.position_from_block = start;
-        summary.position_to_block = end;
+        summary.position_to_block = end.max(cursor);
         if end < start {
+            summary.position_to_block = limit;
             return Ok(());
         }
-        let row = sqlx::query(POSITION_PROJECTION_SQL)
-            .bind(chain_id)
-            .bind(start)
-            .bind(end)
-            .bind(NATIVE_ASSET_ADDRESS)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_error)?;
-        summary.positions_upserted = row.get("upserted");
-        summary.positions_deleted = row.get("deleted");
+        let launch_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+            r#"select distinct launch_id from public.protocol_launch_trade_facts
+               where chain_id = $1 and block_number between $2 and $3"#,
+        )
+        .bind(chain_id)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        if !launch_ids.is_empty() {
+            let result = sqlx::query(POSITION_INCREMENT_SQL)
+                .bind(chain_id)
+                .bind(start)
+                .bind(end)
+                .bind(NATIVE_ASSET_ADDRESS)
+                .bind(&launch_ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_error)?;
+            summary.positions_upserted = result.rows_affected() as i64;
+        }
         sqlx::query(
             r#"insert into market.projector_checkpoints (
                  checkpoint_key, last_position, last_run_at, last_success_at, updated_at
@@ -212,10 +227,11 @@ impl MarketPnlProjector {
                  last_success_at = now(), last_error = null, updated_at = now()"#,
         )
         .bind(&key)
-        .bind(end.max(cursor))
-        .execute(&self.pool)
+        .bind(end)
+        .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         Ok(())
     }
 
@@ -268,46 +284,44 @@ impl MarketPnlProjector {
     }
 }
 
-/// Rebuilds positions for every (launch, owner) pair with a trade in blocks
-/// `$2..=$3`, using each pair's complete canonical history up to `$3`.
-const POSITION_PROJECTION_SQL: &str = r#"
-with touched as materialized (
-  select distinct launch_id,
-         case when trade_side = 'buy' then recipient_address else trader_address end as owner
-  from public.protocol_launch_trade_facts
-  where chain_id = $1 and block_number between $2 and $3
-), touched_launches as materialized (
-  select distinct touched.launch_id, launch.domain_id, launch.creator_address,
+/// Adds the canonical curve trades in blocks `$2..=$3` (launches `$5`) to
+/// each (launch, owner) position. USD cost uses the candle quote price of the
+/// trade's minute; a single unpriced trade makes the position's USD unknown.
+const POSITION_INCREMENT_SQL: &str = r#"
+with launches as materialized (
+  select launch.launch_id, launch.domain_id, launch.creator_address,
          token_meta.decimals as token_decimals,
          coalesce(quote_meta.decimals,
            case when launch.quote_token_address = $4 then 18 end) as quote_decimals
-  from touched
-  join public.protocol_token_launches launch on launch.launch_id = touched.launch_id
-  left join public.erc20_token_metadata token_meta
-    on token_meta.chain_id = launch.chain_id and token_meta.token_address = launch.token_address
-   and token_meta.fetch_status = 'ok'
-  left join public.erc20_token_metadata quote_meta
-    on quote_meta.chain_id = launch.chain_id
-   and quote_meta.token_address = launch.quote_token_address
-   and quote_meta.fetch_status = 'ok'
+  from public.protocol_token_launches launch
+  left join lateral (
+    select decimals from public.erc20_token_metadata meta
+    where meta.chain_id = launch.chain_id and meta.token_address = launch.token_address
+      and meta.fetch_status = 'ok'
+  ) token_meta on true
+  left join lateral (
+    select decimals from public.erc20_token_metadata meta
+    where meta.chain_id = launch.chain_id and meta.token_address = launch.quote_token_address
+      and meta.fetch_status = 'ok'
+  ) quote_meta on true
+  where launch.launch_id = any($5::uuid[])
 ), facts as materialized (
   select fact.launch_id, launch.domain_id, launch.creator_address,
          case when fact.trade_side = 'buy' then fact.recipient_address else fact.trader_address end
            as owner,
          fact.trade_side, fact.block_number, fact.occurred_at,
          fact.quote_amount_raw::numeric / power(10::numeric, launch.quote_decimals) as quote_amount,
-         fact.token_amount_raw::numeric / power(10::numeric, launch.token_decimals) as token_amount,
-         candle.quote_usd_price
-  from touched_launches launch
-  join public.protocol_launch_trade_facts fact
-    on fact.launch_id = launch.launch_id and fact.is_canonical and fact.block_number <= $3
+         fact.token_amount_raw::numeric / power(10::numeric, launch.token_decimals) as token_amount
+  from public.protocol_launch_trade_facts fact
+  join launches launch on launch.launch_id = fact.launch_id
+  where fact.chain_id = $1 and fact.block_number between $2 and $3 and fact.is_canonical
+    and launch.token_decimals is not null and launch.quote_decimals is not null
+), priced as (
+  select facts.*, candle.quote_usd_price
+  from facts
   left join market.token_candles_1m candle
-    on candle.launch_id = fact.launch_id
-   and candle.bucket_start = date_trunc('minute', fact.occurred_at)
-  where launch.token_decimals is not null and launch.quote_decimals is not null
-), scoped as materialized (
-  select facts.* from facts
-  join touched on touched.launch_id = facts.launch_id and touched.owner = facts.owner
+    on candle.launch_id = facts.launch_id
+   and candle.bucket_start = date_trunc('minute', facts.occurred_at)
 ), aggregated as (
   select launch_id, owner, domain_id, creator_address,
          coalesce(sum(token_amount) filter (where trade_side = 'buy'), 0) as bought_token,
@@ -327,43 +341,31 @@ with touched as materialized (
          min(occurred_at) as first_trade_at,
          max(occurred_at) as last_trade_at,
          max(block_number) as last_block
-  from scoped
+  from priced
   group by launch_id, owner, domain_id, creator_address
-), upserted as (
-  insert into market.wallet_positions (
-    launch_id, address, chain_id, domain_id, creator_address, bought_token, sold_token,
-    cost_quote, proceeds_quote, cost_usd, proceeds_usd, buy_count, sell_count,
-    first_trade_at, last_trade_at, last_block, updated_at
-  )
-  select launch_id, owner, $1, domain_id, creator_address, bought_token, sold_token,
-         cost_quote, proceeds_quote, cost_usd, proceeds_usd, buy_count, sell_count,
-         first_trade_at, last_trade_at, last_block, now()
-  from aggregated
-  on conflict (launch_id, address) do update set
-    bought_token = excluded.bought_token, sold_token = excluded.sold_token,
-    cost_quote = excluded.cost_quote, proceeds_quote = excluded.proceeds_quote,
-    cost_usd = excluded.cost_usd, proceeds_usd = excluded.proceeds_usd,
-    buy_count = excluded.buy_count, sell_count = excluded.sell_count,
-    first_trade_at = excluded.first_trade_at, last_trade_at = excluded.last_trade_at,
-    last_block = excluded.last_block, updated_at = excluded.updated_at
-  where (market.wallet_positions.buy_count, market.wallet_positions.sell_count,
-         market.wallet_positions.last_block, market.wallet_positions.cost_usd,
-         market.wallet_positions.proceeds_usd)
-        is distinct from
-        (excluded.buy_count, excluded.sell_count, excluded.last_block, excluded.cost_usd,
-         excluded.proceeds_usd)
-  returning 1
-), deleted as (
-  delete from market.wallet_positions position
-  using touched
-  where position.launch_id = touched.launch_id and position.address = touched.owner
-    and not exists (
-      select 1 from aggregated
-      where aggregated.launch_id = touched.launch_id and aggregated.owner = touched.owner
-    )
-  returning 1
 )
-select (select count(*) from upserted) as upserted, (select count(*) from deleted) as deleted
+insert into market.wallet_positions as position (
+  launch_id, address, chain_id, domain_id, creator_address, bought_token, sold_token,
+  cost_quote, proceeds_quote, cost_usd, proceeds_usd, buy_count, sell_count,
+  first_trade_at, last_trade_at, last_block, updated_at
+)
+select launch_id, owner, $1, domain_id, creator_address, bought_token, sold_token,
+       cost_quote, proceeds_quote, cost_usd, proceeds_usd, buy_count, sell_count,
+       first_trade_at, last_trade_at, last_block, now()
+from aggregated
+on conflict (launch_id, address) do update set
+  bought_token = position.bought_token + excluded.bought_token,
+  sold_token = position.sold_token + excluded.sold_token,
+  cost_quote = position.cost_quote + excluded.cost_quote,
+  proceeds_quote = position.proceeds_quote + excluded.proceeds_quote,
+  cost_usd = position.cost_usd + excluded.cost_usd,
+  proceeds_usd = position.proceeds_usd + excluded.proceeds_usd,
+  buy_count = position.buy_count + excluded.buy_count,
+  sell_count = position.sell_count + excluded.sell_count,
+  first_trade_at = least(position.first_trade_at, excluded.first_trade_at),
+  last_trade_at = greatest(position.last_trade_at, excluded.last_trade_at),
+  last_block = greatest(position.last_block, excluded.last_block),
+  updated_at = now()
 "#;
 
 /// Average-cost PnL for positions traded inside the window, valued at the

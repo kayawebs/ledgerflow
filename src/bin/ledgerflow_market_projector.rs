@@ -9,6 +9,7 @@ use ledgerflow::{
     services::{
         market_arbitrage::{MarketArbitrageConfig, MarketArbitrageEstimator},
         market_data::{MarketProjector, MarketProjectorConfig, run_market_migrations},
+        market_liquidations::{LiquidationIndexer, LiquidationIndexerConfig},
         market_pnl::{MarketPnlConfig, MarketPnlProjector},
     },
 };
@@ -26,7 +27,7 @@ async fn main() {
         .await
         .expect("market migrations should succeed");
     let pool = PgPoolOptions::new()
-        .max_connections(4)
+        .max_connections(8)
         .acquire_timeout(Duration::from_secs(30))
         .connect(&database_url)
         .await
@@ -110,10 +111,6 @@ async fn main() {
                 "LEDGERFLOW_MARKET_POSITION_BLOCK_BATCH",
                 pnl_defaults.position_block_batch,
             ),
-            position_reprocess_blocks: env_parse(
-                "LEDGERFLOW_MARKET_POSITION_REPROCESS_BLOCKS",
-                pnl_defaults.position_reprocess_blocks,
-            ),
             leaderboard_size: env_parse(
                 "LEDGERFLOW_MARKET_LEADERBOARD_SIZE",
                 pnl_defaults.leaderboard_size,
@@ -128,6 +125,61 @@ async fn main() {
             ),
         },
     );
+    if let Some(rpc) = rpc.clone() {
+        let defaults = LiquidationIndexerConfig::default();
+        let mut indexer = LiquidationIndexer::new(
+            pool.clone(),
+            rpc,
+            LiquidationIndexerConfig {
+                chain_id: config.chain_id,
+                start_block: env_parse(
+                    "LEDGERFLOW_MARKET_LIQUIDATION_START_BLOCK",
+                    defaults.start_block,
+                ),
+                ..defaults
+            },
+        );
+        tokio::spawn(async move {
+            let mut last_valuation = Instant::now() - Duration::from_secs(3_600);
+            loop {
+                let delay = match indexer.process_once().await {
+                    Ok(iteration) => {
+                        if iteration.logs > 0 || iteration.has_backlog() {
+                            info!(
+                                from = iteration.from_block,
+                                to = iteration.to_block,
+                                head = iteration.head_block,
+                                logs = iteration.logs,
+                                accepted = iteration.accepted,
+                                rejected = iteration.rejected,
+                                range = iteration.range,
+                                "market liquidation indexing completed"
+                            );
+                        }
+                        if iteration.has_backlog() {
+                            Duration::from_millis(100)
+                        } else {
+                            Duration::from_secs(10)
+                        }
+                    }
+                    Err(index_error) => {
+                        error!(error = %index_error, "market liquidation indexing failed");
+                        Duration::from_secs(30)
+                    }
+                };
+                if last_valuation.elapsed() >= Duration::from_secs(120) {
+                    match indexer.value_pending().await {
+                        Ok(rows) => info!(rows, "market liquidation valuation completed"),
+                        Err(value_error) => {
+                            warn!(error = %value_error, "market liquidation valuation failed")
+                        }
+                    }
+                    last_valuation = Instant::now();
+                }
+                tokio::time::sleep(delay).await;
+            }
+        });
+    }
     if let Some(rpc) = rpc.clone() {
         let defaults = MarketArbitrageConfig::default();
         let estimator = MarketArbitrageEstimator::new(
@@ -199,6 +251,36 @@ async fn main() {
             }
         });
     }
+    tokio::spawn(async move {
+        loop {
+            let delay = match pnl.project_once().await {
+                Ok(pnl_summary) => {
+                    info!(
+                        position_from = pnl_summary.position_from_block,
+                        position_to = pnl_summary.position_to_block,
+                        position_limit = pnl_summary.position_limit_block,
+                        positions = pnl_summary.positions_upserted,
+                        positions_deleted = pnl_summary.positions_deleted,
+                        wallet_rows = pnl_summary.wallet_rows,
+                        cluster_rows = pnl_summary.cluster_rows,
+                        position_ms = pnl_summary.position_ms,
+                        leaderboard_ms = pnl_summary.leaderboard_ms,
+                        "market pnl projection completed"
+                    );
+                    if pnl_summary.has_backlog() {
+                        Duration::from_millis(50)
+                    } else {
+                        Duration::from_secs(5)
+                    }
+                }
+                Err(pnl_error) => {
+                    error!(error = %pnl_error, "market pnl projection failed");
+                    Duration::from_secs(15)
+                }
+            };
+            tokio::time::sleep(delay).await;
+        }
+    });
     let projector = MarketProjector::new(pool, rpc, config.clone());
     info!(chain_id = config.chain_id, "market projector started");
 
@@ -223,28 +305,7 @@ async fn main() {
                     stats_ms = summary.stats_ms,
                     "market projection completed"
                 );
-                let pnl_backlog = match pnl.project_once().await {
-                    Ok(pnl_summary) => {
-                        info!(
-                            position_from = pnl_summary.position_from_block,
-                            position_to = pnl_summary.position_to_block,
-                            position_limit = pnl_summary.position_limit_block,
-                            positions = pnl_summary.positions_upserted,
-                            positions_deleted = pnl_summary.positions_deleted,
-                            wallet_rows = pnl_summary.wallet_rows,
-                            cluster_rows = pnl_summary.cluster_rows,
-                            position_ms = pnl_summary.position_ms,
-                            leaderboard_ms = pnl_summary.leaderboard_ms,
-                            "market pnl projection completed"
-                        );
-                        pnl_summary.has_backlog()
-                    }
-                    Err(pnl_error) => {
-                        error!(error = %pnl_error, "market pnl projection failed");
-                        false
-                    }
-                };
-                if summary.has_backlog() || pnl_backlog {
+                if summary.has_backlog() {
                     Duration::from_millis(50)
                 } else {
                     poll

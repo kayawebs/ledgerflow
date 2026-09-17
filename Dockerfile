@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations
+COPY migrations_market ./migrations_market
 COPY assets ./assets
 COPY config ./config
 COPY schemas ./schemas
@@ -53,6 +54,7 @@ COPY --from=builder /app/target/release/ledgerflow_market_web /usr/local/bin/led
 COPY --from=builder /app/target/release/ledgerflow_protocol_launch_indexer /usr/local/bin/ledgerflow_protocol_launch_indexer
 COPY --from=builder /app/target/release/ledgerflow_protocol_cluster_projector /usr/local/bin/ledgerflow_protocol_cluster_projector
 COPY --from=builder /app/target/release/ledgerflow_protocol_market_projector /usr/local/bin/ledgerflow_protocol_market_projector
+COPY --from=builder /app/target/release/ledgerflow_market_projector /usr/local/bin/ledgerflow_market_projector
 
 ENV RUST_LOG=info
 

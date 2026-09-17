@@ -838,6 +838,336 @@ impl MarketReadService {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ArbitrageOverview {
+    pub executions: i64,
+    pub estimated: i64,
+    pub profitable: i64,
+    pub net_usd: f64,
+    pub gross_usd: f64,
+    pub gas_usd: f64,
+    pub bots: i64,
+    pub verified: i64,
+    pub latest_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct BotRankRow {
+    pub rank: i32,
+    pub bot_address: String,
+    pub address_kind: Option<String>,
+    pub net_usd: f64,
+    pub gross_usd: f64,
+    pub gas_usd: f64,
+    pub executions: i32,
+    pub profitable_executions: i32,
+    pub unknown_executions: i32,
+    pub senders: i32,
+    pub verified_executions: i32,
+    pub best_tx_hash: Option<String>,
+    pub best_net_usd: Option<f64>,
+    pub last_execution_at: Option<DateTime<Utc>>,
+    pub cluster_id: Option<Uuid>,
+    pub computed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct ArbitrageRow {
+    pub tx_hash: String,
+    pub bot_address: String,
+    pub sender_address: Option<String>,
+    pub block_time: Option<DateTime<Utc>>,
+    pub swap_count: i32,
+    pub pool_count: i32,
+    pub net_usd: Option<f64>,
+    pub gross_usd: Option<f64>,
+    pub gas_usd: Option<f64>,
+    pub status: String,
+    pub is_verified: bool,
+    pub tokens: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct LiquidationOverview {
+    pub liquidations: i64,
+    pub estimated: i64,
+    pub repaid_usd: f64,
+    pub seized_usd: f64,
+    pub bonus_usd: f64,
+    pub liquidators: i64,
+    pub borrowers: i64,
+    pub bad_debt_events: i64,
+    pub latest_at: Option<DateTime<Utc>>,
+    pub scanned_to_block: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct LiquidatorRankRow {
+    pub liquidator: String,
+    pub liquidations: i64,
+    pub repaid_usd: Option<f64>,
+    pub bonus_usd: Option<f64>,
+    pub best_bonus_usd: Option<f64>,
+    pub markets: i64,
+    pub last_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct LiquidationRow {
+    pub tx_hash: String,
+    pub block_time: Option<DateTime<Utc>>,
+    pub liquidator: String,
+    pub borrower: String,
+    pub loan_symbol: Option<String>,
+    pub collateral_symbol: Option<String>,
+    pub repaid_amount: Option<f64>,
+    pub seized_amount: Option<f64>,
+    pub repaid_usd: Option<f64>,
+    pub bonus_usd: Option<f64>,
+    pub bad_debt: bool,
+    pub status: String,
+}
+
+const ARBITRAGE_ROW_COLUMNS: &str = r#"
+  e.tx_hash, e.bot_address, e.sender_address, e.block_time, e.swap_count, e.pool_count,
+  e.net_usd::float8 as net_usd, e.gross_usd::float8 as gross_usd, e.gas_usd::float8 as gas_usd,
+  e.status, e.is_verified,
+  (select string_agg(coalesce(m.symbol, left(d.token_address, 8)), ' · ')
+   from market.arbitrage_estimate_deltas d
+   left join public.erc20_token_metadata m
+     on m.chain_id = d.chain_id and m.token_address = d.token_address
+   where d.chain_id = e.chain_id and d.tx_hash = e.tx_hash) as tokens
+"#;
+
+const LIQUIDATION_ROW_COLUMNS: &str = r#"
+  l.tx_hash, l.block_time, l.liquidator, l.borrower,
+  loan.symbol as loan_symbol, collateral.symbol as collateral_symbol,
+  l.repaid_amount::float8 as repaid_amount, l.seized_amount::float8 as seized_amount,
+  l.repaid_usd::float8 as repaid_usd, l.bonus_usd::float8 as bonus_usd,
+  l.bad_debt_raw > 0 as bad_debt, l.status
+"#;
+
+impl MarketReadService {
+    pub async fn arbitrage_overview(
+        &self,
+        chain_id: u64,
+        hours: i32,
+    ) -> LedgerResult<ArbitrageOverview> {
+        let row = sqlx::query(
+            r#"select count(*) as executions,
+                      count(*) filter (where status = 'estimated') as estimated,
+                      count(*) filter (where status = 'estimated' and net_usd > 0) as profitable,
+                      coalesce(sum(net_usd) filter (where status = 'estimated'), 0)::float8 as net,
+                      coalesce(sum(gross_usd) filter (where status = 'estimated'), 0)::float8 as gross,
+                      coalesce(sum(gas_usd) filter (where status = 'estimated'), 0)::float8 as gas,
+                      count(distinct bot_address) as bots,
+                      count(*) filter (where is_verified) as verified,
+                      max(block_time) as latest_at
+               from market.arbitrage_estimates
+               where chain_id = $1 and block_time >= now() - make_interval(hours => $2)"#,
+        )
+        .bind(chain_id as i64)
+        .bind(hours)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)?;
+        Ok(ArbitrageOverview {
+            executions: row.get("executions"),
+            estimated: row.get("estimated"),
+            profitable: row.get("profitable"),
+            net_usd: row.get("net"),
+            gross_usd: row.get("gross"),
+            gas_usd: row.get("gas"),
+            bots: row.get("bots"),
+            verified: row.get("verified"),
+            latest_at: row.get("latest_at"),
+        })
+    }
+
+    pub async fn bot_leaderboard(
+        &self,
+        chain_id: u64,
+        window: &str,
+        limit: i64,
+    ) -> LedgerResult<Vec<BotRankRow>> {
+        sqlx::query_as::<_, BotRankRow>(
+            r#"select rank, bot_address, address_kind, net_usd::float8 as net_usd,
+                      gross_usd::float8 as gross_usd, gas_usd::float8 as gas_usd, executions,
+                      profitable_executions, unknown_executions, senders, verified_executions,
+                      best_tx_hash, best_net_usd::float8 as best_net_usd, last_execution_at,
+                      cluster_id, computed_at
+               from market.arbitrage_bot_leaderboard
+               where chain_id = $1 and window_key = $2
+               order by rank limit $3"#,
+        )
+        .bind(chain_id as i64)
+        .bind(window)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)
+    }
+
+    pub async fn biggest_arbitrages(
+        &self,
+        chain_id: u64,
+        hours: i32,
+        limit: i64,
+    ) -> LedgerResult<Vec<ArbitrageRow>> {
+        let sql = format!(
+            "select {ARBITRAGE_ROW_COLUMNS} from market.arbitrage_estimates e
+             where e.chain_id = $1 and e.status = 'estimated'
+               and e.block_time >= now() - make_interval(hours => $2)
+             order by e.net_usd desc nulls last limit $3"
+        );
+        sqlx::query_as::<_, ArbitrageRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(hours)
+            .bind(limit.clamp(1, 100))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+
+    pub async fn recent_profitable_arbitrages(
+        &self,
+        chain_id: u64,
+        min_net_usd: f64,
+        limit: i64,
+    ) -> LedgerResult<Vec<ArbitrageRow>> {
+        let sql = format!(
+            "select {ARBITRAGE_ROW_COLUMNS} from market.arbitrage_estimates e
+             where e.chain_id = $1 and e.block_time >= now() - interval '6 hours'
+               and e.status = 'estimated' and e.net_usd >= $2
+             order by e.block_time desc limit $3"
+        );
+        sqlx::query_as::<_, ArbitrageRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(min_net_usd)
+            .bind(limit.clamp(1, 100))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+
+    pub async fn bot_executions(
+        &self,
+        chain_id: u64,
+        bot_address: &str,
+        limit: i64,
+    ) -> LedgerResult<Vec<ArbitrageRow>> {
+        let sql = format!(
+            "select {ARBITRAGE_ROW_COLUMNS} from market.arbitrage_estimates e
+             where e.chain_id = $1 and e.bot_address = $2
+             order by e.block_time desc limit $3"
+        );
+        sqlx::query_as::<_, ArbitrageRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(bot_address)
+            .bind(limit.clamp(1, 200))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+
+    pub async fn liquidation_overview(
+        &self,
+        chain_id: u64,
+        days: i32,
+    ) -> LedgerResult<LiquidationOverview> {
+        let row = sqlx::query(
+            r#"select count(*) as liquidations,
+                      count(*) filter (where status = 'estimated') as estimated,
+                      coalesce(sum(repaid_usd), 0)::float8 as repaid,
+                      coalesce(sum(seized_usd), 0)::float8 as seized,
+                      coalesce(sum(bonus_usd), 0)::float8 as bonus,
+                      count(distinct liquidator) as liquidators,
+                      count(distinct borrower) as borrowers,
+                      count(*) filter (where bad_debt_raw > 0) as bad_debt,
+                      max(block_time) as latest_at,
+                      (select last_position from market.projector_checkpoints
+                       where checkpoint_key = 'liquidations:' || $1::text) as scanned_to
+               from market.lending_liquidations
+               where chain_id = $1 and block_time >= now() - make_interval(days => $2)"#,
+        )
+        .bind(chain_id as i64)
+        .bind(days)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)?;
+        Ok(LiquidationOverview {
+            liquidations: row.get("liquidations"),
+            estimated: row.get("estimated"),
+            repaid_usd: row.get("repaid"),
+            seized_usd: row.get("seized"),
+            bonus_usd: row.get("bonus"),
+            liquidators: row.get("liquidators"),
+            borrowers: row.get("borrowers"),
+            bad_debt_events: row.get("bad_debt"),
+            latest_at: row.get("latest_at"),
+            scanned_to_block: row.get("scanned_to"),
+        })
+    }
+
+    pub async fn liquidator_leaderboard(
+        &self,
+        chain_id: u64,
+        days: i32,
+        limit: i64,
+    ) -> LedgerResult<Vec<LiquidatorRankRow>> {
+        sqlx::query_as::<_, LiquidatorRankRow>(
+            r#"select liquidator, count(*) as liquidations,
+                      sum(repaid_usd)::float8 as repaid_usd,
+                      sum(bonus_usd)::float8 as bonus_usd,
+                      max(bonus_usd)::float8 as best_bonus_usd,
+                      count(distinct market_id) as markets,
+                      max(block_time) as last_at
+               from market.lending_liquidations
+               where chain_id = $1 and block_time >= now() - make_interval(days => $2)
+               group by liquidator
+               order by sum(bonus_usd) desc nulls last, count(*) desc
+               limit $3"#,
+        )
+        .bind(chain_id as i64)
+        .bind(days)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)
+    }
+
+    pub async fn liquidations(
+        &self,
+        chain_id: u64,
+        days: i32,
+        order_by_bonus: bool,
+        limit: i64,
+    ) -> LedgerResult<Vec<LiquidationRow>> {
+        let order = if order_by_bonus {
+            "l.bonus_usd desc nulls last"
+        } else {
+            "l.block_time desc"
+        };
+        let sql = format!(
+            "select {LIQUIDATION_ROW_COLUMNS}
+             from market.lending_liquidations l
+             left join public.erc20_token_metadata loan
+               on loan.chain_id = l.chain_id and loan.token_address = l.loan_token
+             left join public.erc20_token_metadata collateral
+               on collateral.chain_id = l.chain_id and collateral.token_address = l.collateral_token
+             where l.chain_id = $1 and l.block_time >= now() - make_interval(days => $2)
+             order by {order} limit $3"
+        );
+        sqlx::query_as::<_, LiquidationRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(days)
+            .bind(limit.clamp(1, 200))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+}
+
 /// Board filter and default ordering. `$5` is the minimum ranked volume.
 fn board_clause(board: TokenBoard) -> (&'static str, &'static str) {
     match board {

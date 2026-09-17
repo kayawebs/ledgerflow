@@ -4,7 +4,7 @@
 use super::{PageContext, escape_html, ui};
 use crate::services::{
     market_pnl::EarningsWindow,
-    market_read::{AddressEarnings, ClusterRankRow, PositionRow, WalletRankRow},
+    market_read::{AddressEarnings, ArbitrageRow, ClusterRankRow, PositionRow, WalletRankRow},
     protocol_market::MarketAddressLookup,
 };
 
@@ -257,6 +257,7 @@ pub struct AddressPage<'a> {
     pub ranks: &'a [(EarningsWindow, Option<WalletRankRow>)],
     pub positions: &'a [PositionRow],
     pub lookup: &'a MarketAddressLookup,
+    pub arbitrage: &'a [ArbitrageRow],
 }
 
 pub fn address(context: &PageContext<'_>, page: &AddressPage<'_>) -> String {
@@ -399,7 +400,7 @@ pub fn address(context: &PageContext<'_>, page: &AddressPage<'_>) -> String {
            <div class=\"price\"><strong class=\"{class}\">{pnl}</strong><div class=\"muted\">{pnl_label} {trust}</div></div></section>\
          <article class=\"card\" style=\"margin-bottom:12px\"><div class=\"kv\">{stats}</div></article>\
          <section class=\"grid2\"><article class=\"card\"><div class=\"card-head\"><h2>{positions_title}</h2><span class=\"muted\">{positions_note}</span></div>{positions}</article>\
-           <article class=\"card\"><div class=\"card-head\"><h2>{clusters_title}</h2></div><div class=\"card-body\">{clusters}</div></article></section>",
+           <article class=\"card\"><div class=\"card-head\"><h2>{clusters_title}</h2></div><div class=\"card-body\">{clusters}</div></article></section>{arbitrage}",
         back = context.url("/clusters"),
         back_label = l.text("Rankings", "收益排行"),
         hue = page.address.bytes().last().unwrap_or(0) as u32 * 360 / 256,
@@ -430,6 +431,16 @@ pub fn address(context: &PageContext<'_>, page: &AddressPage<'_>) -> String {
         positions = positions,
         clusters_title = l.text("Clusters", "所属集群"),
         clusters = clusters,
+        arbitrage = if page.arbitrage.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<article class=\"card\"><div class=\"card-head\"><h2>⚡ {}</h2>{}</div><div class=\"card-body\">{}</div></article>",
+                l.text("Arbitrage executions", "套利执行"),
+                ui::trust(l, ui::Trust::Estimated),
+                super::execution::arbitrage_list(context, page.arbitrage)
+            )
+        },
     )
 }
 
@@ -507,7 +518,7 @@ fn kind_badge(context: &PageContext<'_>, kind: Option<&str>) -> String {
             "<span class=\"badge\">🤖 {}</span>",
             context.locale.text("Contract", "合约")
         ),
-        Some("eoa") => format!("<span class=\"badge\">👤 EOA</span>"),
+        Some("eoa") => "<span class=\"badge\">👤 EOA</span>".to_owned(),
         _ => String::new(),
     }
 }

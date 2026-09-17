@@ -77,8 +77,8 @@ pub fn account_receipt(receipt: &Value, scope: &[String]) -> ReceiptAccounting {
             };
             let from = topic_address(topics[1]);
             let to = topic_address(topics[2]);
-            let from_scope = scope.iter().any(|address| *address == from);
-            let to_scope = scope.iter().any(|address| *address == to);
+            let from_scope = scope.contains(&from);
+            let to_scope = scope.contains(&to);
             if from_scope == to_scope {
                 continue;
             }

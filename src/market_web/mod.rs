@@ -19,6 +19,7 @@ use sqlx::{Row, postgres::PgPoolOptions};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+mod execution;
 mod intel;
 mod pages;
 mod ui;
@@ -237,6 +238,7 @@ pub fn router(state: MarketWebState) -> Router {
         .route("/fragments/overview/boards", get(overview_boards_fragment))
         .route("/fragments/overview/feed", get(overview_feed_fragment))
         .route("/fragments/launches", get(launch_table_fragment))
+        .route("/fragments/arbitrage/feed", get(arbitrage_feed_fragment))
         .route(
             "/fragments/launches/{launch_id}/trades",
             get(token_trades_fragment),
@@ -587,7 +589,7 @@ async fn address_page(
     let context = PageContext::new(&query);
     let address = normalize_address(&address)?;
     let chain_id = context.chain_id;
-    let (earnings, positions, lookup, day, week, month, wallet) = tokio::try_join!(
+    let (earnings, positions, lookup, day, week, month, arbitrage, wallet) = tokio::try_join!(
         async {
             state
                 .market
@@ -630,6 +632,13 @@ async fn address_page(
                 .await
                 .map_err(MarketWebError::from)
         },
+        async {
+            state
+                .market
+                .bot_executions(chain_id, &address, 20)
+                .await
+                .map_err(MarketWebError::from)
+        },
         session_address(&state, &headers),
     )?;
     let ranks = [
@@ -650,6 +659,7 @@ async fn address_page(
                 ranks: &ranks,
                 positions: &positions,
                 lookup: &lookup,
+                arbitrage: &arbitrage,
             },
         ),
     )))
@@ -733,35 +743,99 @@ async fn arbitrage_page(
     headers: HeaderMap,
 ) -> Result<Html<String>, MarketWebError> {
     let context = PageContext::new(&query);
-    let rows = if context.chain_id == ROBINHOOD_CHAIN_ID {
-        state
-            .service
-            .verified_arbitrage(context.chain_id, 100)
-            .await?
-    } else {
-        Vec::new()
-    };
-    let rankings = if context.chain_id == ROBINHOOD_CHAIN_ID {
-        state
-            .service
-            .verified_arbitrage_rankings(context.chain_id, context.window, 100)
-            .await?
-    } else {
-        Vec::new()
-    };
-    let remote = if context.chain_id == 8453 {
-        remote_events(&state, "dex_arbitrage", 100).await?
-    } else {
-        Vec::new()
-    };
     let wallet = session_address(&state, &headers).await?;
+    if context.chain_id != ROBINHOOD_CHAIN_ID {
+        let remote = remote_events(&state, "dex_arbitrage", 100).await?;
+        return Ok(Html(layout(
+            &context,
+            context.locale.text("Arbitrage Intelligence", "套利情报"),
+            "arbitrage",
+            wallet.as_deref(),
+            &render_arbitrage(&context, &[], &[], &remote),
+        )));
+    }
+    let window = EarningsWindow::parse(query.period.as_deref());
+    let hours = match window {
+        EarningsWindow::Day => 24,
+        EarningsWindow::Week => 168,
+        EarningsWindow::Month => 720,
+    };
+    let chain_id = context.chain_id;
+    let (overview, bots, biggest, feed, verified, rankings) = tokio::try_join!(
+        async {
+            state
+                .market
+                .arbitrage_overview(chain_id, hours)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .bot_leaderboard(chain_id, window.key(), 50)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .biggest_arbitrages(chain_id, hours, 10)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        render_arbitrage_feed(&state, &context),
+        async {
+            state
+                .service
+                .verified_arbitrage(chain_id, 50)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .service
+                .verified_arbitrage_rankings(chain_id, window.key(), 100)
+                .await
+                .map_err(MarketWebError::from)
+        },
+    )?;
+    let verified_section = render_arbitrage(&context, &rankings, &verified, &[]);
     Ok(Html(layout(
         &context,
-        context.locale.text("Arbitrage Intelligence", "套利情报"),
+        context.locale.text("Arbitrage bots", "套利机器人"),
         "arbitrage",
         wallet.as_deref(),
-        &render_arbitrage(&context, &rankings, &rows, &remote),
+        &execution::arbitrage(
+            &context,
+            &execution::ArbitragePage {
+                window,
+                overview: &overview,
+                bots: &bots,
+                biggest: &biggest,
+                feed: &feed,
+                verified_section: &verified_section,
+            },
+        ),
     )))
+}
+
+async fn render_arbitrage_feed(
+    state: &MarketWebState,
+    context: &PageContext<'_>,
+) -> Result<String, MarketWebError> {
+    let rows = state
+        .market
+        .recent_profitable_arbitrages(context.chain_id, 1.0, 12)
+        .await?;
+    Ok(execution::arbitrage_list(context, &rows))
+}
+
+async fn arbitrage_feed_fragment(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    Ok(Html(render_arbitrage_feed(&state, &context).await?))
 }
 
 async fn liquidations_page(
@@ -770,18 +844,72 @@ async fn liquidations_page(
     headers: HeaderMap,
 ) -> Result<Html<String>, MarketWebError> {
     let context = PageContext::new(&query);
-    let records = if context.chain_id == 8453 {
-        remote_events(&state, "liquidation", 100).await?
-    } else {
-        Vec::new()
-    };
     let wallet = session_address(&state, &headers).await?;
+    if context.chain_id != ROBINHOOD_CHAIN_ID {
+        let records = remote_events(&state, "liquidation", 100).await?;
+        return Ok(Html(layout(
+            &context,
+            context.locale.text("Liquidation Intelligence", "清算情报"),
+            "liquidations",
+            wallet.as_deref(),
+            &render_liquidations(&context, &records),
+        )));
+    }
+    let chain_id = context.chain_id;
+    let (overview, liquidators, biggest, recent, head) = tokio::try_join!(
+        async {
+            state
+                .market
+                .liquidation_overview(chain_id, 30)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .liquidator_leaderboard(chain_id, 30, 30)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .liquidations(chain_id, 30, true, 8)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .liquidations(chain_id, 30, false, 50)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            sqlx::query_scalar::<_, i64>(
+                "select last_position from market.projector_checkpoints where checkpoint_key = $1",
+            )
+            .bind(format!("candles:{chain_id}"))
+            .fetch_optional(state.service.pool())
+            .await
+            .map_err(internal_error)
+        },
+    )?;
     Ok(Html(layout(
         &context,
-        context.locale.text("Liquidation Intelligence", "清算情报"),
+        context.locale.text("Liquidations", "清算"),
         "liquidations",
         wallet.as_deref(),
-        &render_liquidations(&context, &records),
+        &execution::liquidations(
+            &context,
+            &execution::LiquidationPage {
+                overview: &overview,
+                head_block: head.map(|block| block as u64),
+                liquidators: &liquidators,
+                biggest: &biggest,
+                recent: &recent,
+            },
+        ),
     )))
 }
 
@@ -1626,15 +1754,6 @@ fn cluster_category(domain_kind: &str, cluster_kind: &str) -> &'static str {
     }
 }
 
-fn cluster_category_label(locale: Locale, category: &str) -> &'static str {
-    match category {
-        "tokens" => locale.text("Token related", "Token 相关"),
-        "arbitrage" => locale.text("Arbitrage", "套利相关"),
-        "liquidations" => locale.text("Liquidations", "清算相关"),
-        _ => locale.text("Other", "其他"),
-    }
-}
-
 fn cluster_filter_url(context: &PageContext<'_>, category: &str, address: Option<&str>) -> String {
     let mut url = format!(
         "{}&category={}",
@@ -1653,224 +1772,6 @@ fn cluster_detail_url(context: &PageContext<'_>, cluster_id: Uuid, category: &st
         "{}&category={}",
         context.url(&format!("/clusters/{cluster_id}")),
         urlencoding::encode(category)
-    )
-}
-
-fn render_clusters(
-    context: &PageContext<'_>,
-    address_input: Option<&str>,
-    lookup: Option<&MarketAddressLookup>,
-    lookup_error: Option<&str>,
-    category: &str,
-    clusters: &[ProtocolClusterCard],
-) -> String {
-    let l = context.locale;
-    let lookup_result = if let Some(error) = lookup_error {
-        format!(
-            "<div class=\"lookup-error\"><strong>{}</strong><span>{}</span></div>",
-            l.text("Invalid address", "地址格式错误"),
-            escape_html(error),
-        )
-    } else if let Some(lookup) = lookup {
-        render_address_lookup(context, lookup)
-    } else {
-        format!(
-            "<div class=\"lookup-prompt\"><strong>{}</strong></div>",
-            l.text("Enter an address.", "输入地址。"),
-        )
-    };
-    let category_count = |value: &str| {
-        clusters
-            .iter()
-            .filter(|cluster| {
-                value == "all"
-                    || cluster_category(&cluster.domain_kind, &cluster.cluster_kind) == value
-            })
-            .count()
-    };
-    let filters = [
-        ("all", l.text("All", "全部")),
-        ("tokens", l.text("Token related", "Token 相关")),
-        ("arbitrage", l.text("Arbitrage", "套利相关")),
-        ("liquidations", l.text("Liquidations", "清算相关")),
-        ("other", l.text("Other", "其他")),
-    ]
-    .into_iter()
-    .map(|(value, label)| {
-        format!(
-            "<a class=\"{}\" href=\"{}\">{} <b>{}</b></a>",
-            if category == value { "active" } else { "" },
-            cluster_filter_url(context, value, address_input),
-            label,
-            category_count(value),
-        )
-    })
-    .collect::<String>();
-    let matching_clusters = clusters
-        .iter()
-        .filter(|cluster| {
-            category == "all"
-                || cluster_category(&cluster.domain_kind, &cluster.cluster_kind) == category
-        })
-        .collect::<Vec<_>>();
-    let matching_count = matching_clusters.len();
-    let shown_count = matching_count.min(100);
-    let cards = if matching_clusters.is_empty() {
-        empty_state(
-            context,
-            "No protocol-scoped clusters match this category yet.",
-            "该分类下尚无协议域聚类。",
-        )
-    } else {
-        matching_clusters
-            .iter()
-            .take(100)
-            .map(|cluster| {
-                let domain = match l { Locale::En => &cluster.domain_name_en, Locale::Zh => &cluster.domain_name_zh };
-                let cluster_category = cluster_category(&cluster.domain_kind, &cluster.cluster_kind);
-                format!(
-                    "<a class=\"cluster\" href=\"{}\"><div><em class=\"state\">{}</em><small>{}</small></div><h3>{}</h3><code>{}</code><dl><div><dt>{}</dt><dd>{}</dd></div><div><dt>{}</dt><dd>{}</dd></div><div><dt>{}</dt><dd>{:.0}%</dd></div></dl><span class=\"open-link\">{} →</span></a>",
-                    cluster_detail_url(context, cluster.cluster_id, category),
-                    escape_html(&cluster.evidence_state.to_uppercase()),
-                    format!("{} · {}", cluster_category_label(l, cluster_category), escape_html(domain)),
-                    humanize(&cluster.cluster_kind),
-                    cluster.subject_address.as_deref().map(|value| truncate(value, 8)).unwrap_or_else(|| "—".to_owned()),
-                    l.text("Members", "成员"), cluster.member_count,
-                    l.text("Economic scope", "经济范围"), cluster.economic_member_count,
-                    l.text("Confidence", "置信度"), cluster.confidence * 100.0,
-                    l.text("Open", "查看"),
-                )
-            })
-            .collect::<String>()
-    };
-    format!(
-        "{}<section class=\"address-lookup panel\"><div><h2>{}</h2></div><form action=\"/clusters\" method=\"get\"><input type=\"hidden\" name=\"lang\" value=\"{}\"><input type=\"hidden\" name=\"chain_id\" value=\"{}\"><input type=\"hidden\" name=\"window\" value=\"{}\"><input type=\"hidden\" name=\"category\" value=\"{}\"><div><input name=\"address\" value=\"{}\" placeholder=\"0x…\" aria-label=\"{}\" autocomplete=\"off\" spellcheck=\"false\"><button type=\"submit\">{}</button></div></form>{}</section><div class=\"section-head cluster-section-head\"><h2>{}</h2><span>{} / {}</span></div><div class=\"cluster-filters\" aria-label=\"{}\">{}</div><section class=\"cluster-grid\">{}</section>",
-        page_intro(context, "Address Intelligence", "地址情报", "", ""),
-        l.text("Address lookup", "地址查询"),
-        l.code(),
-        context.chain_id,
-        context.window,
-        category,
-        escape_html(address_input.unwrap_or_default()),
-        l.text("EVM address", "EVM 地址"),
-        l.text("Search", "查询"),
-        lookup_result,
-        l.text("Clusters", "聚类"),
-        shown_count,
-        matching_count,
-        l.text("Filter evidence groups by category", "按分类筛选证据群组"),
-        filters,
-        cards,
-    )
-}
-
-fn render_address_lookup(context: &PageContext<'_>, lookup: &MarketAddressLookup) -> String {
-    let l = context.locale;
-    let activity = &lookup.activity;
-    let has_activity = activity.launches_created > 0
-        || activity.launch_tokens > 0
-        || activity.launches_traded > 0
-        || activity.curve_trades > 0
-        || activity.verified_arbitrage_executions > 0
-        || activity.verified_settlements_received > 0;
-    let cluster_matches = if lookup.cluster_matches.is_empty() {
-        format!(
-            "<div class=\"lookup-none\"><strong>{}</strong><span>{}</span></div>",
-            l.text("No cluster match", "未命中聚类"),
-            l.text("No scoped evidence.", "暂无协议域证据。"),
-        )
-    } else {
-        lookup
-            .cluster_matches
-            .iter()
-            .map(|matched| {
-                let cluster = &matched.cluster;
-                let domain = match l {
-                    Locale::En => &cluster.domain_name_en,
-                    Locale::Zh => &cluster.domain_name_zh,
-                };
-                format!(
-                    "<a class=\"lookup-match\" href=\"{}\"><div><em class=\"state\">{}</em><strong>{}</strong><small>{}</small></div><dl><div><dt>{}</dt><dd>{}</dd></div><div><dt>{}</dt><dd>{}</dd></div><div><dt>{}</dt><dd>{:.0}%</dd></div></dl><span>→</span></a>",
-                    cluster_detail_url(
-                        context,
-                        cluster.cluster_id,
-                        cluster_category(&cluster.domain_kind, &cluster.cluster_kind),
-                    ),
-                    escape_html(&matched.member_evidence_state.to_uppercase()),
-                    escape_html(domain),
-                    format!(
-                        "{} · {}",
-                        cluster_category_label(
-                            l,
-                            cluster_category(&cluster.domain_kind, &cluster.cluster_kind),
-                        ),
-                        humanize(&cluster.cluster_kind),
-                    ),
-                    l.text("Role in this cluster", "在该聚类中的角色"),
-                    humanize(&matched.member_role),
-                    l.text("Observed interactions", "观察交互数"),
-                    format_number(matched.interaction_count),
-                    l.text("Membership confidence", "成员置信度"),
-                    matched.member_confidence * 100.0,
-                )
-            })
-            .collect::<String>()
-    };
-    let protocol_matches = if lookup.protocol_matches.is_empty() {
-        format!(
-            "<div class=\"lookup-none compact\"><strong>{}</strong><span>{}</span></div>",
-            l.text("No indexed protocol role", "未命中协议角色"),
-            l.text("Not in the current address library.", "不在当前地址库中。"),
-        )
-    } else {
-        lookup
-            .protocol_matches
-            .iter()
-            .map(|matched| {
-                let domain = match l {
-                    Locale::En => matched.domain_name_en.as_deref(),
-                    Locale::Zh => matched.domain_name_zh.as_deref(),
-                }
-                .unwrap_or(&matched.protocol_name);
-                format!(
-                    "<div class=\"protocol-hit\"><div><strong>{}</strong><small>{}</small></div><div><span>{}</span><b>{:.0}%</b></div></div>",
-                    escape_html(domain),
-                    humanize(&matched.address_role),
-                    escape_html(&matched.evidence_state.to_uppercase()),
-                    matched.confidence * 100.0,
-                )
-            })
-            .collect::<String>()
-    };
-    format!(
-        r#"<section class="lookup-results"><div class="lookup-address"><span>{address_label}</span><code>{address}</code><small>{last_seen}</small></div><div class="lookup-metrics"><div><span>{created}</span><strong>{created_value}</strong></div><div><span>{traded}</span><strong>{traded_value}</strong></div><div><span>{curve}</span><strong>{curve_value}</strong></div><div><span>{verified}</span><strong>{verified_value}</strong></div></div>{activity_note}<div class="lookup-columns"><section><div class="mini-head"><span>{cluster_label}</span><b>{cluster_count}</b></div>{cluster_matches}</section><section><div class="mini-head"><span>{protocol_label}</span><b>{protocol_count}</b></div>{protocol_matches}</section></div></section>"#,
-        address_label = l.text("Normalized address", "标准化地址"),
-        address = escape_html(&lookup.address),
-        last_seen = activity.last_seen_at.map(format_time).unwrap_or_else(|| l
-            .text("No indexed activity time", "暂无已索引活动时间")
-            .to_owned()),
-        created = l.text("Launches created", "发币数量"),
-        created_value = format_number(activity.launches_created),
-        traded = l.text("Launches traded", "参与发币"),
-        traded_value = format_number(activity.launches_traded),
-        curve = l.text("Curve trades", "曲线交易"),
-        curve_value = format_number(activity.curve_trades),
-        verified = l.text("Verified arbitrage", "已验证套利"),
-        verified_value = format_number(activity.verified_arbitrage_executions),
-        activity_note = if has_activity {
-            String::new()
-        } else {
-            format!(
-                "<p class=\"lookup-limitation\">{}</p>",
-                l.text("No indexed scoped activity.", "暂无已索引协议活动。")
-            )
-        },
-        cluster_label = l.text("Cluster matches", "命中聚类"),
-        cluster_count = lookup.cluster_matches.len(),
-        cluster_matches = cluster_matches,
-        protocol_label = l.text("Protocol roles", "协议角色"),
-        protocol_count = lookup.protocol_matches.len(),
-        protocol_matches = protocol_matches,
     )
 }
 

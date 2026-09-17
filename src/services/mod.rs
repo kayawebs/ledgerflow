@@ -16,6 +16,7 @@ pub mod indexer_client;
 pub mod intelligence_import;
 pub mod market_arbitrage;
 pub mod market_data;
+pub mod market_liquidations;
 pub mod market_pnl;
 pub mod market_read;
 pub mod metrics;

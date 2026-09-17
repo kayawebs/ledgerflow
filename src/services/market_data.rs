@@ -28,6 +28,7 @@ pub const MARKET_METHODOLOGY_VERSION: &str = "market_curve_v1";
 pub const NATIVE_ASSET_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 const TOTAL_SUPPLY_SELECTOR: &str = "0x18160ddd";
 const QUOTE_ASSET_CACHE_TTL: Duration = Duration::from_secs(600);
+const SUPPLY_FETCH_CONCURRENCY: usize = 8;
 /// Observations further than this factor from the asset's anchor are dropped.
 const PRICE_OUTLIER_FACTOR: f64 = 1.6;
 /// No quote asset on the market is worth more than this; larger values are
@@ -96,7 +97,7 @@ impl Default for MarketProjectorConfig {
             stats_candle_scan_limit: 20_000,
             stats_batch_size: 1_000,
             stats_decay_seconds: 60,
-            supply_fetch_limit: 32,
+            supply_fetch_limit: 128,
             supply_fetch_timeout_ms: 5_000,
         }
     }
@@ -426,13 +427,16 @@ impl MarketProjector {
         .await
         .map_err(db_error)?;
         let mut tasks = tokio::task::JoinSet::new();
+        let permits = Arc::new(tokio::sync::Semaphore::new(SUPPLY_FETCH_CONCURRENCY));
         for row in rows {
+            let permits = permits.clone();
             let launch_id: Uuid = row.get("launch_id");
             let token: String = row.get("token_address");
             let decimals: Option<i32> = row.get("decimals");
             let rpc = rpc.clone();
             let timeout = Duration::from_millis(self.config.supply_fetch_timeout_ms.max(100));
             tasks.spawn(async move {
+                let _permit = permits.acquire_owned().await;
                 let outcome =
                     tokio::time::timeout(timeout, rpc.eth_call(&token, TOTAL_SUPPLY_SELECTOR))
                         .await;

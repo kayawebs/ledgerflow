@@ -180,6 +180,25 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  market-projector:
+    <<: [*ledgerflow-env, *ledgerflow-image]
+    command: ["ledgerflow_market_projector"]
+    environment:
+      LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
+      # Local RPC only: total supply, arbitrage receipts and liquidation logs.
+      LEDGERFLOW_MARKET_RPC_URL: ${LEDGERFLOW_MARKET_COMPOSE_RPC_URL:-http://rpc-gateway:8545}
+      LEDGERFLOW_MARKET_CHAIN_ID: ${LEDGERFLOW_MARKET_CHAIN_ID:-4663}
+      LEDGERFLOW_MARKET_POLL_INTERVAL_MS: ${LEDGERFLOW_MARKET_POLL_INTERVAL_MS:-3000}
+      LEDGERFLOW_MARKET_ARBITRAGE_BACKFILL_DAYS: ${LEDGERFLOW_MARKET_ARBITRAGE_BACKFILL_DAYS:-2}
+      LEDGERFLOW_MARKET_ARBITRAGE_RECEIPT_CONCURRENCY: ${LEDGERFLOW_MARKET_ARBITRAGE_RECEIPT_CONCURRENCY:-4}
+      LEDGERFLOW_MARKET_LIQUIDATION_START_BLOCK: ${LEDGERFLOW_MARKET_LIQUIDATION_START_BLOCK:-0}
+    depends_on:
+      rpc-gateway:
+        condition: service_started
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
   protocol-market-projector:
     <<: [*ledgerflow-env, *ledgerflow-image]
     command: ["ledgerflow_protocol_market_projector"]
