@@ -12,7 +12,9 @@ use crate::domain::entities::{
     RecognizerResult, TransactionAnalysis,
 };
 use crate::domain::enums::BehaviorTag;
-use crate::domain::value_objects::{AddressTxRef, AssetFlow, ValidationMessage};
+use crate::domain::value_objects::{
+    AddressTxDiscovery, AddressTxRef, AssetFlow, ChainDataSourceStatus, ValidationMessage,
+};
 use crate::ingestion::models::RawTransactionBundle;
 
 #[async_trait]
@@ -41,6 +43,16 @@ pub trait AnalysisRepository: Send + Sync {
     async fn get_cluster(&self, cluster_id: uuid::Uuid) -> LedgerResult<Option<AddressCluster>>;
     async fn list_clusters(&self) -> LedgerResult<Vec<AddressCluster>>;
     async fn list_analyses_for_cluster(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> LedgerResult<Vec<TransactionAnalysis>>;
+    /// Address intelligence must include a wallet that appears only inside a
+    /// deterministic token/native flow, not only the outer transaction sender
+    /// or recipient.
+    async fn list_analyses_for_observed_addresses(
         &self,
         chain_id: u64,
         addresses: &[String],
@@ -138,6 +150,15 @@ pub trait AnalysisRepository: Send + Sync {
         candidates: &[AddressAnalysisCandidate],
     ) -> LedgerResult<u64>;
     async fn claim_next_address_analysis_job(&self) -> LedgerResult<Option<AddressAnalysisJob>>;
+    async fn claim_next_address_analysis_job_up_to(
+        &self,
+        maximum_priority: i32,
+    ) -> LedgerResult<Option<AddressAnalysisJob>>;
+    async fn claim_next_address_analysis_job_for_chain_up_to(
+        &self,
+        chain_id: u64,
+        maximum_priority: i32,
+    ) -> LedgerResult<Option<AddressAnalysisJob>>;
     async fn upsert_address_profile(&self, profile: &AddressProfile) -> LedgerResult<()>;
     async fn upsert_address_label_assertions(
         &self,
@@ -147,6 +168,12 @@ pub trait AnalysisRepository: Send + Sync {
         &self,
         metadata: &[ProtocolAddressMetadata],
     ) -> LedgerResult<()>;
+    async fn list_protocol_address_metadata(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+        block_number: Option<u64>,
+    ) -> LedgerResult<Vec<ProtocolAddressMetadata>>;
     async fn complete_address_analysis_job(&self, chain_id: u64, address: &str)
     -> LedgerResult<()>;
     async fn fail_address_analysis_job(
@@ -197,6 +224,27 @@ pub trait Recognizer: Send + Sync {
 #[async_trait]
 pub trait ClusterTxSource: Send + Sync {
     async fn get_last_indexed_block(&self, chain_id: u64) -> LedgerResult<u64>;
+
+    async fn get_data_source_status(&self, chain_id: u64) -> LedgerResult<ChainDataSourceStatus> {
+        let indexed_to_block = self.get_last_indexed_block(chain_id).await?;
+        Ok(ChainDataSourceStatus {
+            chain_id,
+            data_source: "canonical_index".to_owned(),
+            indexed_from_block: None,
+            indexed_to_block: Some(indexed_to_block),
+            chain_head: None,
+            ingestion_lag: None,
+            last_updated_at: None,
+            history_mode: "source_not_attested".to_owned(),
+            full_history_available: false,
+            available: true,
+            limitation: Some(
+                "The transaction source does not attest its indexed start, chain head, or freshness."
+                    .to_owned(),
+            ),
+        })
+    }
+
     async fn query_address_refs(
         &self,
         chain_id: u64,
@@ -205,4 +253,22 @@ pub trait ClusterTxSource: Send + Sync {
         from_block: Option<u64>,
         to_block: Option<u64>,
     ) -> LedgerResult<Vec<AddressTxRef>>;
+
+    async fn query_address_refs_with_coverage(
+        &self,
+        chain_id: u64,
+        address: &str,
+        limit: u32,
+        from_block: Option<u64>,
+        to_block: Option<u64>,
+    ) -> LedgerResult<AddressTxDiscovery> {
+        Ok(AddressTxDiscovery {
+            refs: self
+                .query_address_refs(chain_id, address, limit, from_block, to_block)
+                .await?,
+            coverage_complete: None,
+            indexed_block_count: None,
+            requested_block_count: None,
+        })
+    }
 }

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use ledgerflow::{
     core::{config::AppConfig, env::load_dotenv, logging::init_logging},
@@ -23,6 +23,26 @@ async fn main() {
     load_dotenv();
     init_logging();
     let config = AppConfig::from_env();
+    let concurrency = env::var("LEDGERFLOW_ADDRESS_WORKER_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 32);
+    let maximum_job_priority = env::var("LEDGERFLOW_ADDRESS_WORKER_MAX_PRIORITY")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(100)
+        .clamp(0, 100);
+    let history_lookback_blocks = env::var("LEDGERFLOW_ADDRESS_HISTORY_LOOKBACK_BLOCKS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(50_000)
+        .max(1);
+    let history_analysis_limit = env::var("LEDGERFLOW_ADDRESS_HISTORY_ANALYSIS_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(32)
+        .clamp(1, 256);
 
     let mut registry = RecognizerRegistry::new();
     let plugin_context = load_plugins(&config.plugins, &mut registry);
@@ -51,7 +71,7 @@ async fn main() {
             repository.clone(),
             config.enabled_recognizers.clone(),
         )
-        .with_token_metadata_service(token_metadata_service)
+        .with_token_metadata_service(token_metadata_service.clone())
         .with_price_service(price_service.clone()),
     );
     let service = if let Some(indexer_url) = config.indexer_api_base_url.clone() {
@@ -60,14 +80,14 @@ async fn main() {
             config.indexer_api_bearer_token.clone(),
         )) as Arc<dyn ClusterTxSource>;
         AddressIntelligenceService::new(repository, rpc_client)
+            .with_worker_chain_id(config.default_chain_id)
+            .with_maximum_job_priority(maximum_job_priority)
+            .with_token_metadata_service(token_metadata_service.clone())
             .with_portfolio_classification(
                 price_service.clone(),
                 config.address_whale_threshold_usd,
             )
-            .with_native_asset(
-                config.wrapped_native_token_address.clone(),
-                config.native_token_symbol.clone(),
-            )
+            .with_native_asset(config.native_token_symbol.clone())
             .with_history_backfill(
                 analysis_service,
                 tx_source,
@@ -75,21 +95,42 @@ async fn main() {
             )
     } else {
         AddressIntelligenceService::new(repository, rpc_client)
+            .with_worker_chain_id(config.default_chain_id)
+            .with_maximum_job_priority(maximum_job_priority)
+            .with_token_metadata_service(token_metadata_service)
             .with_portfolio_classification(price_service, config.address_whale_threshold_usd)
-            .with_native_asset(
-                config.wrapped_native_token_address.clone(),
-                config.native_token_symbol.clone(),
-            )
-    };
+            .with_native_asset(config.native_token_symbol.clone())
+            .with_transaction_analysis(analysis_service)
+    }
+    .with_history_limits(history_lookback_blocks, history_analysis_limit);
 
     info!(
         whale_threshold_usd = config.address_whale_threshold_usd,
+        concurrency,
+        maximum_job_priority,
+        history_lookback_blocks,
+        history_analysis_limit,
         "address intelligence worker started"
     );
+    let mut workers = tokio::task::JoinSet::new();
+    loop {
+        while workers.len() < concurrency {
+            let worker_slot = workers.len();
+            workers.spawn(run_worker(service.clone(), worker_slot));
+        }
+        if let Some(result) = workers.join_next().await {
+            error!(result = ?result, "address worker task exited; restarting slot");
+            tokio::time::sleep(ERROR_POLL_INTERVAL).await;
+        }
+    }
+}
+
+async fn run_worker(service: AddressIntelligenceService, worker_slot: usize) {
     loop {
         match service.process_next_job().await {
             Ok(Some(profile)) => {
                 info!(
+                    worker_slot,
                     chain_id = profile.chain_id,
                     address = %profile.address,
                     address_type = %profile.address_type,
@@ -99,7 +140,7 @@ async fn main() {
             }
             Ok(None) => tokio::time::sleep(IDLE_POLL_INTERVAL).await,
             Err(err) => {
-                error!(error = %err, "address analysis worker iteration failed");
+                error!(worker_slot, error = %err, "address analysis worker iteration failed");
                 tokio::time::sleep(ERROR_POLL_INTERVAL).await;
             }
         }

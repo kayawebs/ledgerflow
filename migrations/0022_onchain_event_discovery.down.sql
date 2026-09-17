@@ -1,0 +1,10 @@
+drop table if exists stock_token_ui_transfer_events;
+drop index if exists idx_stock_token_multiplier_events_block;
+alter table stock_token_multiplier_events drop column if exists is_canonical;
+alter table stock_token_multiplier_events drop column if exists event_signature;
+alter table stock_token_multiplier_events drop column if exists tx_index;
+alter table stock_token_multiplier_events drop column if exists block_hash;
+drop table if exists dex_pool_metadata;
+drop table if exists dex_factory_metadata;
+drop table if exists contract_discovery_candidates;
+drop table if exists onchain_event_cursors;

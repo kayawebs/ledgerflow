@@ -6,18 +6,20 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    core::errors::LedgerResult,
+    core::errors::{LedgerError, LedgerResult},
     domain::{
         entities::{
             AddressAnalysisJob, AddressLabel, AddressLabelAssertion, AddressProfile,
             ProtocolAddressMetadata, TransactionAnalysis,
         },
-        enums::AssetType,
+        enums::{AddressHitDirection, AssetType},
         interfaces::{ClusterTxSource, DynRepository},
         value_objects::AddressTxRef,
     },
     ingestion::rpc::RpcClient,
-    services::{analysis::AnalysisService, pricing::PriceService},
+    services::{
+        analysis::AnalysisService, pricing::PriceService, token_metadata::TokenMetadataService,
+    },
 };
 
 const BALANCE_OF_SELECTOR: &str = "0x70a08231";
@@ -29,18 +31,50 @@ const FACTORY_SELECTOR: &str = "0xc45a0155";
 const STABLE_SELECTOR: &str = "0x5f6e283f";
 const GET_RESERVES_SELECTOR: &str = "0x0902f1ac";
 const SLOT0_SELECTOR: &str = "0x3850c7bd";
+const ERC20_TRANSFER_TOPIC: &str =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const ADDRESS_ACTIVITY_LOG_CHUNK_BLOCKS: u64 = 5_000;
+
+#[derive(Debug, Default)]
+struct AddressHistoryResult {
+    start_block: Option<u64>,
+    end_block: Option<u64>,
+    direct_transaction_count: usize,
+    transfer_log_count: usize,
+    unique_transaction_count: usize,
+    analyzed_transaction_count: usize,
+    limitations: Vec<String>,
+}
+
+impl AddressHistoryResult {
+    fn to_json(&self) -> Value {
+        json!({
+            "start_block": self.start_block,
+            "end_block": self.end_block,
+            "direct_transaction_count": self.direct_transaction_count,
+            "transfer_log_count": self.transfer_log_count,
+            "unique_transaction_count": self.unique_transaction_count,
+            "analyzed_transaction_count": self.analyzed_transaction_count,
+            "limitations": self.limitations,
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct AddressIntelligenceService {
     repository: DynRepository,
     rpc_client: Arc<dyn RpcClient>,
     analysis_service: Option<Arc<AnalysisService>>,
+    token_metadata_service: Option<Arc<TokenMetadataService>>,
     tx_source: Option<Arc<dyn ClusterTxSource>>,
     history_query_limit: u32,
     price_service: Option<Arc<PriceService>>,
     whale_threshold_usd: f64,
-    wrapped_native_token_address: Option<String>,
     native_token_symbol: String,
+    maximum_job_priority: i32,
+    worker_chain_id: Option<u64>,
+    history_lookback_blocks: u64,
+    history_analysis_limit: usize,
 }
 
 impl AddressIntelligenceService {
@@ -49,12 +83,16 @@ impl AddressIntelligenceService {
             repository,
             rpc_client,
             analysis_service: None,
+            token_metadata_service: None,
             tx_source: None,
             history_query_limit: 1000,
             price_service: None,
             whale_threshold_usd: 100_000.0,
-            wrapped_native_token_address: None,
             native_token_symbol: "ETH".to_owned(),
+            maximum_job_priority: 100,
+            worker_chain_id: None,
+            history_lookback_blocks: 50_000,
+            history_analysis_limit: 32,
         }
     }
 
@@ -68,15 +106,36 @@ impl AddressIntelligenceService {
         self
     }
 
-    pub fn with_native_asset(
+    pub fn with_token_metadata_service(
         mut self,
-        wrapped_token_address: Option<String>,
-        symbol: impl Into<String>,
+        token_metadata_service: Arc<TokenMetadataService>,
     ) -> Self {
-        self.wrapped_native_token_address = wrapped_token_address
-            .map(|address| address.trim().to_ascii_lowercase())
-            .filter(|address| !address.is_empty());
+        self.token_metadata_service = Some(token_metadata_service);
+        self
+    }
+
+    pub fn with_native_asset(mut self, symbol: impl Into<String>) -> Self {
         self.native_token_symbol = symbol.into();
+        self
+    }
+
+    pub fn with_maximum_job_priority(mut self, maximum_job_priority: i32) -> Self {
+        self.maximum_job_priority = maximum_job_priority.clamp(0, 100);
+        self
+    }
+
+    pub fn with_worker_chain_id(mut self, chain_id: u64) -> Self {
+        self.worker_chain_id = Some(chain_id);
+        self
+    }
+
+    pub fn with_history_limits(
+        mut self,
+        history_lookback_blocks: u64,
+        history_analysis_limit: usize,
+    ) -> Self {
+        self.history_lookback_blocks = history_lookback_blocks.max(1);
+        self.history_analysis_limit = history_analysis_limit.clamp(1, 256);
         self
     }
 
@@ -92,23 +151,60 @@ impl AddressIntelligenceService {
         self
     }
 
+    pub fn with_transaction_analysis(mut self, analysis_service: Arc<AnalysisService>) -> Self {
+        self.analysis_service = Some(analysis_service);
+        self
+    }
+
     pub async fn process_next_job(&self) -> LedgerResult<Option<AddressProfile>> {
-        let Some(job) = self.repository.claim_next_address_analysis_job().await? else {
+        let job = match self.worker_chain_id {
+            Some(chain_id) => {
+                self.repository
+                    .claim_next_address_analysis_job_for_chain_up_to(
+                        chain_id,
+                        self.maximum_job_priority,
+                    )
+                    .await?
+            }
+            None => {
+                self.repository
+                    .claim_next_address_analysis_job_up_to(self.maximum_job_priority)
+                    .await?
+            }
+        };
+        let Some(job) = job else {
             return Ok(None);
         };
 
         match self.analyze_job(&job).await {
             Ok((mut profile, mut assertions, protocol_metadata)) => {
-                if self.backfill_address_history(&job).await? {
+                if should_backfill_address_history(&profile.address_type) {
+                    if let Some(history) = self.backfill_address_history(&job).await? {
+                        profile.metadata = merge_metadata(
+                            profile.metadata,
+                            json!({
+                                "address_history_backfilled_at": Utc::now(),
+                                "address_history_backfill_source": "indexer_and_rpc_activity_locator",
+                                "address_history_backfill_mode": "bounded_recent_activity",
+                                "address_history_lookback_blocks": self.history_lookback_blocks,
+                                "address_history_analysis_limit": self.history_analysis_limit,
+                                "address_history": history.to_json(),
+                            }),
+                        );
+                    }
+                } else {
                     profile.metadata = merge_metadata(
                         profile.metadata,
                         json!({
-                            "address_history_backfilled_at": Utc::now(),
-                            "address_history_backfill_source": "indexer",
+                            "address_history_backfill_skipped": true,
+                            "address_history_backfill_skip_reason":
+                                "high-volume protocol address uses its scoped protocol projector",
                         }),
                     );
                 }
-                if let Some(valuation) = self.evaluate_portfolio(&job, &profile).await? {
+                if should_evaluate_portfolio(&job.metadata)
+                    && let Some(valuation) = self.evaluate_portfolio(&job, &profile).await?
+                {
                     profile.metadata = merge_metadata(
                         profile.metadata,
                         json!({ "portfolio_estimate": valuation.to_json() }),
@@ -168,6 +264,26 @@ impl AddressIntelligenceService {
             format!("0x{}", hex::encode(hasher.finalize()))
         });
         let has_code = bytecode_length.unwrap_or_default() > 0;
+        let role_labels = role_labels_from_metadata(&job.metadata);
+        let token_metadata = if has_code
+            && role_labels
+                .iter()
+                .any(|label| matches!(label.as_str(), "suspected_token" | "erc20_token"))
+        {
+            match self.token_metadata_service.as_ref() {
+                Some(service) => Some(
+                    service
+                        .get_or_fetch(job.chain_id, &job.address, None)
+                        .await?,
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let token_metadata_verified = token_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.fetch_status == "ok");
         let existing_labels = self
             .repository
             .list_address_labels(job.chain_id, &[job.address.to_ascii_lowercase()])
@@ -179,8 +295,9 @@ impl AddressIntelligenceService {
         } else {
             None
         };
-        let role_labels = role_labels_from_metadata(&job.metadata);
-        let address_type = if let Some(known_address_type) = known_address_type {
+        let address_type = if token_metadata_verified {
+            "token".to_owned()
+        } else if let Some(known_address_type) = known_address_type {
             known_address_type
         } else if let Some(probe) = protocol_probe.as_ref() {
             probe.contract_role.clone()
@@ -227,6 +344,7 @@ impl AddressIntelligenceService {
                 "analyzed_by": "ledgerflow_address_worker",
                 "job_metadata": job.metadata,
                 "protocol_intelligence": protocol_probe.as_ref().map(ProtocolProbe::to_json),
+                "token_metadata": token_metadata.as_ref().map(|metadata| metadata.to_json()),
             }),
             created_at: now,
             updated_at: now,
@@ -240,11 +358,25 @@ impl AddressIntelligenceService {
             json!({ "reason": "address_type" }),
             now,
         )];
+        if let Some(metadata) = token_metadata
+            .as_ref()
+            .filter(|metadata| metadata.fetch_status == "ok")
+        {
+            assertions.push(assertion_for(
+                job,
+                "erc20_token",
+                "token_metadata_probe",
+                0.95,
+                metadata.to_json(),
+                now,
+            ));
+        }
+        let role_source = role_assertion_source(&job.metadata);
         for role_label in role_labels {
             assertions.push(assertion_for(
                 job,
                 &role_label,
-                "tx_analysis",
+                role_source,
                 0.75,
                 json!({ "reason": "observed_role", "metadata": job.metadata }),
                 now,
@@ -361,36 +493,90 @@ impl AddressIntelligenceService {
             .map(|value| value != 0)
     }
 
-    async fn backfill_address_history(&self, job: &AddressAnalysisJob) -> LedgerResult<bool> {
+    async fn backfill_address_history(
+        &self,
+        job: &AddressAnalysisJob,
+    ) -> LedgerResult<Option<AddressHistoryResult>> {
+        let evidence_hashes =
+            evidence_transaction_hashes(&job.metadata, self.history_query_limit.min(16) as usize);
+        if !evidence_hashes.is_empty() {
+            let Some(analysis_service) = self.analysis_service.as_ref() else {
+                return Err(LedgerError::AnalysisInvariant(
+                    "bounded evidence history was requested but transaction analysis is not configured"
+                        .to_owned(),
+                ));
+            };
+            let mut failures = Vec::new();
+            let mut analyzed_transaction_count = 0;
+            for tx_hash in evidence_hashes {
+                if self
+                    .repository
+                    .get_analysis(job.chain_id, &tx_hash)
+                    .await?
+                    .is_some()
+                {
+                    analyzed_transaction_count += 1;
+                    continue;
+                }
+                if let Err(error) = analysis_service
+                    .analyze_transaction(job.chain_id, &tx_hash)
+                    .await
+                {
+                    failures.push(format!("{tx_hash}: {error}"));
+                } else {
+                    analyzed_transaction_count += 1;
+                }
+            }
+            if !failures.is_empty() {
+                return Err(LedgerError::TransientIngestion(format!(
+                    "{} bounded seed evidence transaction(s) could not be analyzed: {}",
+                    failures.len(),
+                    failures.join("; ").chars().take(4_000).collect::<String>()
+                )));
+            }
+            return Ok(Some(AddressHistoryResult {
+                unique_transaction_count: analyzed_transaction_count,
+                analyzed_transaction_count,
+                ..AddressHistoryResult::default()
+            }));
+        }
         if !should_backfill_history(&job.metadata) {
-            return Ok(false);
+            return Ok(None);
         }
         let (Some(analysis_service), Some(tx_source)) =
             (self.analysis_service.as_ref(), self.tx_source.as_ref())
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let end_block = tx_source.get_last_indexed_block(job.chain_id).await?;
+        let start_block = end_block.saturating_sub(self.history_lookback_blocks.saturating_sub(1));
         let mut tx_map = BTreeMap::<String, AddressTxRef>::new();
         collect_refs_for_range(
             tx_source.as_ref(),
             job.chain_id,
             &job.address,
-            0,
+            start_block,
             end_block,
             self.history_query_limit,
             &mut tx_map,
         )
         .await?;
+        let direct_transaction_count = tx_map.len();
+        let (transfer_log_count, activity_scan_start, transfer_limitation) = self
+            .collect_transfer_activity_refs(job, start_block, end_block, &mut tx_map)
+            .await;
 
         let mut txs = tx_map.into_values().collect::<Vec<_>>();
         txs.sort_by(|left, right| {
-            (left.block_number, left.tx_index, left.tx_hash.as_str()).cmp(&(
-                right.block_number,
-                right.tx_index,
-                right.tx_hash.as_str(),
+            (right.block_number, right.tx_index, right.tx_hash.as_str()).cmp(&(
+                left.block_number,
+                left.tx_index,
+                left.tx_hash.as_str(),
             ))
         });
+        let unique_transaction_count = txs.len();
+        txs.truncate(self.history_analysis_limit);
+        let mut analyzed_transaction_count = 0;
         for tx_ref in txs {
             if self
                 .repository
@@ -398,6 +584,7 @@ impl AddressIntelligenceService {
                 .await?
                 .is_some()
             {
+                analyzed_transaction_count += 1;
                 continue;
             }
             if analysis_service
@@ -407,8 +594,91 @@ impl AddressIntelligenceService {
             {
                 continue;
             }
+            analyzed_transaction_count += 1;
         }
-        Ok(true)
+        let mut limitations = Vec::new();
+        if let Some(limitation) = transfer_limitation {
+            limitations.push(limitation);
+        }
+        if unique_transaction_count > self.history_analysis_limit {
+            limitations.push(format!(
+                "Only the newest {} of {} discovered transactions were analyzed.",
+                self.history_analysis_limit, unique_transaction_count
+            ));
+        }
+        Ok(Some(AddressHistoryResult {
+            start_block: Some(activity_scan_start.unwrap_or(start_block)),
+            end_block: Some(end_block),
+            direct_transaction_count,
+            transfer_log_count,
+            unique_transaction_count,
+            analyzed_transaction_count,
+            limitations,
+        }))
+    }
+
+    async fn collect_transfer_activity_refs(
+        &self,
+        job: &AddressAnalysisJob,
+        start_block: u64,
+        end_block: u64,
+        tx_map: &mut BTreeMap<String, AddressTxRef>,
+    ) -> (usize, Option<u64>, Option<String>) {
+        let address_topic = padded_address_topic(&job.address);
+        let discovery_limit = self.history_analysis_limit.saturating_mul(8).clamp(64, 512);
+        let mut cursor_end = end_block;
+        let mut transfer_log_count = 0usize;
+        let mut earliest_scanned;
+        loop {
+            let chunk_start = cursor_end
+                .saturating_sub(ADDRESS_ACTIVITY_LOG_CHUNK_BLOCKS.saturating_sub(1))
+                .max(start_block);
+            earliest_scanned = chunk_start;
+            for (direction, topics) in [
+                (
+                    AddressHitDirection::To,
+                    json!([ERC20_TRANSFER_TOPIC, null, address_topic]),
+                ),
+                (
+                    AddressHitDirection::From,
+                    json!([ERC20_TRANSFER_TOPIC, address_topic]),
+                ),
+            ] {
+                let filter = json!({
+                    "fromBlock": format!("0x{chunk_start:x}"),
+                    "toBlock": format!("0x{cursor_end:x}"),
+                    "topics": topics,
+                });
+                let logs = match self.rpc_client.get_logs(job.chain_id, filter).await {
+                    Ok(logs) => logs,
+                    Err(error) => {
+                        return (
+                            transfer_log_count,
+                            Some(earliest_scanned),
+                            Some(format!(
+                                "Token-transfer activity lookup stopped at block {cursor_end}: {error}"
+                            )),
+                        );
+                    }
+                };
+                transfer_log_count = transfer_log_count.saturating_add(logs.len());
+                for log in logs {
+                    if let Some(reference) = transfer_log_address_ref(
+                        job.chain_id,
+                        &job.address,
+                        direction.clone(),
+                        &log,
+                    ) {
+                        tx_map.entry(reference.tx_hash.clone()).or_insert(reference);
+                    }
+                }
+            }
+            if tx_map.len() >= discovery_limit || chunk_start == start_block {
+                break;
+            }
+            cursor_end = chunk_start.saturating_sub(1);
+        }
+        (transfer_log_count, Some(earliest_scanned), None)
     }
 
     async fn evaluate_portfolio(
@@ -424,7 +694,12 @@ impl AddressIntelligenceService {
         }
         let analyses = self
             .repository
-            .list_analyses_for_cluster(job.chain_id, std::slice::from_ref(&job.address), None, None)
+            .list_analyses_for_observed_addresses(
+                job.chain_id,
+                std::slice::from_ref(&job.address),
+                None,
+                None,
+            )
             .await?;
         let tokens = collect_portfolio_tokens(&job.address, &analyses, PORTFOLIO_TOKEN_LIMIT);
         let observed_token_count = tokens.len();
@@ -466,11 +741,14 @@ impl AddressIntelligenceService {
             && let Some(raw_balance) = hex_quantity_to_decimal_approx(&raw_balance)
             && raw_balance != "0"
         {
-            if let Some(wrapped_native_token_address) = &self.wrapped_native_token_address {
+            if let Some(wrapped_native_token_address) = price_service
+                .wrapped_native_token_address(job.chain_id)
+                .await?
+            {
                 match price_service
                     .quote_current_amount(
                         job.chain_id,
-                        wrapped_native_token_address,
+                        &wrapped_native_token_address,
                         &raw_balance,
                         18,
                     )
@@ -690,6 +968,57 @@ fn decode_address_word(value: &str) -> Option<String> {
     Some(format!("0x{}", address.to_ascii_lowercase()))
 }
 
+fn padded_address_topic(address: &str) -> String {
+    format!(
+        "0x{:0>64}",
+        address.trim_start_matches("0x").to_ascii_lowercase()
+    )
+}
+
+fn address_from_topic(topic: &str) -> Option<String> {
+    let body = topic.trim().trim_start_matches("0x");
+    if body.len() != 64 || !body.chars().all(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("0x{}", &body[24..]).to_ascii_lowercase())
+}
+
+fn transfer_log_address_ref(
+    _chain_id: u64,
+    address: &str,
+    direction: AddressHitDirection,
+    log: &Value,
+) -> Option<AddressTxRef> {
+    if log.get("removed").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let topics = log.get("topics")?.as_array()?;
+    if topics.len() < 3
+        || !topics[0]
+            .as_str()?
+            .eq_ignore_ascii_case(ERC20_TRANSFER_TOPIC)
+    {
+        return None;
+    }
+    let from_address = address_from_topic(topics[1].as_str()?)?;
+    let to_address = address_from_topic(topics[2].as_str()?)?;
+    let tx_hash = log.get("transactionHash")?.as_str()?.to_ascii_lowercase();
+    if tx_hash.len() != 66 {
+        return None;
+    }
+    let block_number = parse_uint_hex(log.get("blockNumber")?.as_str()?)? as u64;
+    let tx_index = parse_uint_hex(log.get("transactionIndex")?.as_str()?)? as u32;
+    Some(AddressTxRef {
+        address: address.to_ascii_lowercase(),
+        tx_hash,
+        block_number,
+        tx_index,
+        direction,
+        from_address: Some(from_address),
+        to_address: Some(to_address),
+    })
+}
+
 fn parse_uint_hex(value: &str) -> Option<u128> {
     u128::from_str_radix(value.trim().strip_prefix("0x").unwrap_or(value.trim()), 16).ok()
 }
@@ -749,6 +1078,44 @@ fn should_backfill_history(metadata: &Value) -> bool {
             .any(|role| role == "manual_lookup")
 }
 
+fn evidence_transaction_hashes(metadata: &Value, limit: usize) -> Vec<String> {
+    if metadata.get("history_mode").and_then(Value::as_str) != Some("evidence_transactions") {
+        return Vec::new();
+    }
+    metadata
+        .get("evidence_transaction_hashes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .filter(|hash| {
+            hash.len() == 66
+                && hash.starts_with("0x")
+                && hash[2..]
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+        })
+        .take(limit.max(1))
+        .collect()
+}
+
+fn should_evaluate_portfolio(metadata: &Value) -> bool {
+    if metadata.get("source").and_then(Value::as_str) != Some("canonical_address_facts") {
+        return true;
+    }
+    role_labels_from_metadata(metadata)
+        .iter()
+        .any(|role| matches!(role.as_str(), "portfolio_refresh" | "manual_lookup"))
+}
+
+fn should_backfill_address_history(address_type: &str) -> bool {
+    !matches!(
+        address_type,
+        "token" | "router" | "protocol" | "dex_pool" | "router_candidate" | "protocol_candidate"
+    )
+}
+
 fn merge_metadata(mut left: Value, right: Value) -> Value {
     if let (Some(left_obj), Some(right_obj)) = (left.as_object_mut(), right.as_object()) {
         for (key, value) in right_obj {
@@ -796,6 +1163,16 @@ fn role_labels_from_metadata(metadata: &Value) -> Vec<String> {
         .filter(|value| !value.trim().is_empty())
         .map(|value| value.trim().to_ascii_lowercase())
         .collect()
+}
+
+fn role_assertion_source(metadata: &Value) -> &'static str {
+    match metadata.get("source").and_then(Value::as_str) {
+        Some("canonical_address_facts") => "canonical_address_facts",
+        Some("onchain_factory_event" | "validated_dex_pool_inventory") => {
+            "onchain_contract_discovery"
+        }
+        _ => "tx_analysis",
+    }
 }
 
 fn assertion_for(
@@ -864,6 +1241,8 @@ fn label_taxonomy(label: &str) -> (&'static str, Option<&'static str>) {
                 | "protocol_candidate"
                 | "approval_spender"
                 | "touched_contract"
+                | "suspected_token"
+                | "erc20_token"
         )
     {
         ("contract_role", None)
@@ -876,6 +1255,9 @@ fn source_provenance(source: &str) -> (&'static str, f32, &'static str, &'static
     match source {
         "address_worker" => ("onchain", 0.90, "onchain", "address_worker_v2"),
         "protocol_probe" => ("onchain", 0.92, "onchain", "dex_probe_v1"),
+        "token_metadata_probe" => ("onchain", 0.95, "onchain", "erc20_metadata_probe_v1"),
+        "canonical_address_facts" => ("onchain", 0.95, "onchain", "address_fact_producer_v1"),
+        "onchain_contract_discovery" => ("onchain", 0.90, "onchain", "canonical_factory_events_v1"),
         "tx_analysis" => ("model", 0.78, "model", "transaction_roles_v1"),
         "balance_classifier" => ("model", 0.82, "model", "portfolio_classifier_v1"),
         _ => ("model", 0.50, "model", "unknown_v1"),
@@ -905,6 +1287,56 @@ mod tests {
     }
 
     #[test]
+    fn canonical_fact_jobs_skip_portfolio_work_without_an_explicit_refresh() {
+        assert!(!should_evaluate_portfolio(&json!({
+            "source": "canonical_address_facts",
+            "roles": ["transaction_sender"]
+        })));
+        assert!(should_evaluate_portfolio(&json!({
+            "source": "canonical_address_facts",
+            "roles": ["transaction_sender", "portfolio_refresh"]
+        })));
+        assert!(should_evaluate_portfolio(&json!({
+            "source": "manual_lookup",
+            "roles": []
+        })));
+    }
+
+    #[test]
+    fn high_volume_protocol_addresses_use_scoped_projectors() {
+        assert!(!should_backfill_address_history("token"));
+        assert!(!should_backfill_address_history("router"));
+        assert!(!should_backfill_address_history("protocol"));
+        assert!(!should_backfill_address_history("dex_pool"));
+        assert!(!should_backfill_address_history("router_candidate"));
+        assert!(!should_backfill_address_history("protocol_candidate"));
+        assert!(should_backfill_address_history("eoa"));
+        assert!(should_backfill_address_history("contract"));
+    }
+
+    #[test]
+    fn seed_history_is_bounded_to_explicit_valid_evidence_hashes() {
+        let first = format!("0x{}", "1".repeat(64));
+        let second = format!("0x{}", "a".repeat(64));
+        let metadata = json!({
+            "history_mode": "evidence_transactions",
+            "evidence_transaction_hashes": [first, "0xnot-a-hash", second]
+        });
+        let hashes = evidence_transaction_hashes(&metadata, 1);
+        assert_eq!(hashes, vec![format!("0x{}", "1".repeat(64))]);
+        assert!(
+            evidence_transaction_hashes(
+                &json!({
+                    "history_mode": "full",
+                    "evidence_transaction_hashes": [format!("0x{}", "2".repeat(64))]
+                }),
+                8
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn partial_portfolio_can_promote_whale_without_full_coverage() {
         let valuation = PortfolioValuation {
             estimated_usd: 125_000.0,
@@ -925,5 +1357,29 @@ mod tests {
             hex_quantity_to_decimal_approx("0xde0b6b3a7640000").as_deref(),
             Some("1000000000000000000")
         );
+    }
+
+    #[test]
+    fn transfer_log_activity_recovers_a_recipient_that_is_not_a_tx_endpoint() {
+        let observed = "0x0629da86af5a4ae1ba5e1589b13702558d0fb056";
+        let sender = "0x8407699e359ae158bd7ec0668600cc19a79f17c3";
+        let tx_hash = format!("0x{}", "a".repeat(64));
+        let log = json!({
+            "transactionHash": tx_hash,
+            "blockNumber": "0x2fd8f6f",
+            "transactionIndex": "0x57",
+            "removed": false,
+            "topics": [
+                ERC20_TRANSFER_TOPIC,
+                padded_address_topic(sender),
+                padded_address_topic(observed),
+            ]
+        });
+        let reference = transfer_log_address_ref(8453, observed, AddressHitDirection::To, &log)
+            .expect("valid Transfer log should produce an activity reference");
+        assert_eq!(reference.address, observed);
+        assert_eq!(reference.from_address.as_deref(), Some(sender));
+        assert_eq!(reference.to_address.as_deref(), Some(observed));
+        assert_eq!(reference.block_number, 0x2fd8f6f);
     }
 }

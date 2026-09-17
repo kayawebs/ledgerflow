@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ledgerflow.dev/schemas/observed-address-intelligence-v1.schema.json",
+  "title": "LedgerFlow Observed Address Intelligence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "chain_id",
+    "address",
+    "object",
+    "activity_windows",
+    "behaviors",
+    "relationships",
+    "economics",
+    "changes",
+    "timeline",
+    "briefs",
+    "limitations"
+  ],
+  "properties": {
+    "contract_version": { "const": "observed-address-intelligence.v1" },
+    "chain_id": { "type": "integer", "minimum": 1 },
+    "address": { "type": "string", "pattern": "^0x[0-9a-f]{40}$" },
+    "object": {
+      "type": "object",
+      "required": ["current_status", "progress", "monitoring_enabled", "coverage_is_partial"],
+      "properties": {
+        "current_status": {
+          "enum": ["queued", "discovering", "backfilling", "classifying", "verifying_economics", "building_baseline", "ready", "stale", "failed"]
+        },
+        "progress": { "type": "object" },
+        "monitoring_enabled": { "type": "boolean" },
+        "coverage_is_partial": { "type": "boolean" },
+        "coverage_start": { "type": ["string", "null"], "format": "date-time" },
+        "coverage_end": { "type": ["string", "null"], "format": "date-time" },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "activity_windows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["window", "transaction_count", "success_count", "reverted_count", "coverage"],
+        "properties": {
+          "window": { "enum": ["24h", "7d", "30d", "previous_7d", "previous_30d"] },
+          "transaction_count": { "type": "integer", "minimum": 0 },
+          "success_count": { "type": "integer", "minimum": 0 },
+          "reverted_count": { "type": "integer", "minimum": 0 },
+          "gas_cost_raw": { "type": ["string", "null"], "pattern": "^[0-9]+$" },
+          "native_inflow_raw": { "type": ["string", "null"], "pattern": "^[0-9]+$" },
+          "native_outflow_raw": { "type": ["string", "null"], "pattern": "^[0-9]+$" },
+          "token_inflows": { "type": "array" },
+          "token_outflows": { "type": "array" },
+          "touched_contracts": { "type": "array" },
+          "touched_pools": { "type": "array" },
+          "coverage": { "type": "object" }
+        }
+      }
+    },
+    "behaviors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["label", "confidence", "supporting_transaction_count", "supporting_transactions", "evidence_coverage"],
+        "properties": {
+          "label": {
+            "enum": ["dex_swap", "multi_swap", "dex_arbitrage_candidate", "verified_dex_arbitrage", "liquidation", "liquidation_attempt", "contract_deployment", "approval", "funding", "settlement", "asset_transfer", "failed_execution", "unknown_contract_interaction"]
+          },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "supporting_transaction_count": { "type": "integer", "minimum": 0 },
+          "supporting_transactions": { "type": "array", "items": { "type": "string" } },
+          "evidence_coverage": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["related_address", "relationship_type", "evidence_state", "interaction_count", "supporting_transactions", "confidence"],
+        "properties": {
+          "related_address": { "type": "string", "pattern": "^0x[0-9a-f]{40}$" },
+          "relationship_type": { "enum": ["frequent_call_target", "funding_source", "executor_candidate", "settlement_recipient", "profit_recipient_candidate", "router", "pool", "protocol", "co_occurring_address"] },
+          "evidence_state": { "enum": ["observed", "possible", "candidate"] },
+          "interaction_count": { "type": "integer", "minimum": 1 },
+          "supporting_transactions": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "economics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["result_status", "economically_verified_transaction_count", "excluded_transaction_count", "coverage_ratio", "limitations"],
+        "properties": {
+          "result_status": { "enum": ["verified", "estimated", "unknown"] },
+          "verified_gross_surplus": { "type": "array" },
+          "verified_net_result": { "type": "array" },
+          "observed_net_token_flow": { "type": "array" },
+          "economically_verified_transaction_count": { "type": "integer", "minimum": 0 },
+          "excluded_transaction_count": { "type": "integer", "minimum": 0 },
+          "coverage_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+          "limitations": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "changes": { "type": "array" },
+    "timeline": { "type": "array" },
+    "briefs": { "type": "array" },
+    "limitations": { "type": "array", "items": { "type": "string" } }
+  }
+}

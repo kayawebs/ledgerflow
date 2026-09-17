@@ -156,7 +156,11 @@ struct SwapSubject<'a> {
 
 fn find_swap_subject(analysis: &TransactionAnalysis) -> Option<SwapSubject<'_>> {
     let mut candidates = vec![("initiator", analysis.from_address.to_lowercase())];
-    if let Some(executor) = analysis.to_address.as_ref().map(|value| value.to_lowercase()) {
+    if let Some(executor) = analysis
+        .to_address
+        .as_ref()
+        .map(|value| value.to_lowercase())
+    {
         if !candidates
             .iter()
             .any(|(_, address)| address.eq_ignore_ascii_case(&executor))

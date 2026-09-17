@@ -2,6 +2,7 @@ use std::env;
 
 const DEFAULT_ENABLED_RECOGNIZERS: &[&str] = &[
     "selector_presence",
+    "protocol_deployment_evidence",
     "failed_execution_classifier",
     "erc20_transfer_flow",
     "erc20_approval",
@@ -55,7 +56,6 @@ pub struct AppConfig {
     pub telegram_chat_id: Option<String>,
     pub price_worker_poll_interval_ms: u64,
     pub address_whale_threshold_usd: f64,
-    pub wrapped_native_token_address: Option<String>,
     pub native_token_symbol: String,
     pub email_from: Option<String>,
     pub email_delivery_mode: String,
@@ -208,16 +208,6 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(100_000.0),
-            wrapped_native_token_address: env::var("LEDGERFLOW_WRAPPED_NATIVE_TOKEN_ADDRESS")
-                .ok()
-                .or_else(|| {
-                    let chain_id = env::var("LEDGERFLOW_DEFAULT_CHAIN_ID")
-                        .ok()
-                        .and_then(|value| value.parse::<u64>().ok())
-                        .unwrap_or(8453);
-                    (chain_id == 8453)
-                        .then(|| "0x4200000000000000000000000000000000000006".to_owned())
-                }),
             native_token_symbol: env::var("LEDGERFLOW_NATIVE_TOKEN_SYMBOL")
                 .unwrap_or_else(|_| "ETH".to_owned()),
             email_from: env::var("LEDGERFLOW_EMAIL_FROM").ok(),

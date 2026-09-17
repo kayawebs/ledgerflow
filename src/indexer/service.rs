@@ -12,12 +12,13 @@ use uuid::Uuid;
 
 use crate::core::errors::{LedgerError, LedgerResult};
 use crate::indexer::clickhouse::ClickHouseClient;
-use crate::indexer::config::IndexerConfig;
+use crate::indexer::config::{IndexerConfig, IndexerHistoryReceiptMode, IndexerWorkerMode};
 use crate::indexer::models::{
-    AddressTxDirection, AddressTxHashesResponse, AddressTxQueryResponse, AddressTxRef,
-    CreateIndexerApiKeyRequest, CreateIndexerApiKeyResponse, IndexedBlock, IndexerApiKeyRecord,
-    IndexerApiKeyStatus, LazyIndexCoverage, LazyIndexingRequest, RevokeIndexerApiKeyRequest,
-    extract_block_refs, normalize_address,
+    AddressTxDirection, AddressTxHashesResponse, AddressTxQueryResponse, ChainReorganization,
+    CreateIndexerApiKeyRequest, CreateIndexerApiKeyResponse, IndexedBlock, IndexedBlockFacts,
+    IndexerApiKeyRecord, IndexerApiKeyStatus, IndexerStorageStats, IndexerWorkerProgress,
+    LazyIndexCoverage, LazyIndexingRequest, RevokeIndexerApiKeyRequest, extract_block_facts,
+    normalize_address,
 };
 use crate::indexer::rpc::IndexerRpcClient;
 
@@ -30,7 +31,10 @@ pub struct IndexerService {
 
 impl IndexerService {
     pub fn new(config: IndexerConfig) -> Self {
-        let rpc = Arc::new(IndexerRpcClient::new(config.rpc_url.clone()));
+        let rpc = Arc::new(IndexerRpcClient::with_timeout(
+            config.rpc_url.clone(),
+            Duration::from_millis(config.rpc_request_timeout_ms),
+        ));
         let clickhouse = Arc::new(ClickHouseClient::new(
             config.clickhouse_url.clone(),
             config.clickhouse_database.clone(),
@@ -49,9 +53,28 @@ impl IndexerService {
     }
 
     pub async fn run_worker_forever(&self) {
+        let mut consecutive_failures = 0_u32;
         loop {
             if let Err(err) = self.run_worker_once().await {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if let Err(progress_error) = self
+                    .record_worker_failure(consecutive_failures, &err.to_string())
+                    .await
+                {
+                    warn!(error = %progress_error, "failed to persist indexer worker error");
+                }
                 error!(error = %err, "indexer worker loop failed");
+                sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
+            } else {
+                return;
+            }
+        }
+    }
+
+    pub async fn run_lazy_worker_forever(&self) {
+        loop {
+            if let Err(err) = self.run_lazy_worker().await {
+                error!(error = %err, "indexer lazy worker loop failed");
                 sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
             } else {
                 return;
@@ -92,6 +115,20 @@ impl IndexerService {
         self.clickhouse
             .get_progress(self.config.chain_id, &self.config.worker_id)
             .await
+    }
+
+    pub async fn get_worker_progresses(&self) -> LedgerResult<Vec<IndexerWorkerProgress>> {
+        self.clickhouse
+            .list_worker_progress(self.config.chain_id)
+            .await
+    }
+
+    pub async fn get_storage_stats(&self) -> LedgerResult<IndexerStorageStats> {
+        self.clickhouse.storage_stats(self.config.chain_id).await
+    }
+
+    pub async fn get_rpc_head(&self) -> LedgerResult<u64> {
+        self.get_latest_block_number_with_retry().await
     }
 
     pub fn lazy_enabled(&self) -> bool {
@@ -139,14 +176,23 @@ impl IndexerService {
         from_block: Option<u32>,
         to_block: Option<u32>,
         direction: Option<AddressTxDirection>,
+        known_only: bool,
     ) -> LedgerResult<AddressTxQueryResponse> {
         let address = normalize_address(address)?;
         let limit = limit
             .unwrap_or(self.config.query_limit_default)
             .min(self.config.query_limit_max);
-        let coverage = self
-            .prepare_lazy_query(&address, from_block, to_block)
-            .await?;
+        let coverage = if known_only {
+            match (from_block, to_block) {
+                (Some(from_block), Some(to_block)) => {
+                    Some(self.lazy_coverage(from_block, to_block).await?)
+                }
+                _ => None,
+            }
+        } else {
+            self.prepare_lazy_query(&address, from_block, to_block)
+                .await?
+        };
         let refs = self
             .clickhouse
             .query_address_refs(
@@ -172,14 +218,23 @@ impl IndexerService {
         from_block: Option<u32>,
         to_block: Option<u32>,
         direction: Option<AddressTxDirection>,
+        known_only: bool,
     ) -> LedgerResult<AddressTxHashesResponse> {
         let address = normalize_address(address)?;
         let limit = limit
             .unwrap_or(self.config.query_limit_default)
             .min(self.config.query_limit_max);
-        let coverage = self
-            .prepare_lazy_query(&address, from_block, to_block)
-            .await?;
+        let coverage = if known_only {
+            match (from_block, to_block) {
+                (Some(from_block), Some(to_block)) => {
+                    Some(self.lazy_coverage(from_block, to_block).await?)
+                }
+                _ => None,
+            }
+        } else {
+            self.prepare_lazy_query(&address, from_block, to_block)
+                .await?
+        };
         let tx_hashes = self
             .clickhouse
             .query_address_hashes(
@@ -234,6 +289,7 @@ impl IndexerService {
                 "invalid lazy index range: from_block {from_block} > to_block {to_block}"
             )));
         }
+        validate_lazy_range(from_block, to_block, self.config.lazy_max_range_blocks)?;
 
         let request_id = lazy_request_id(self.config.chain_id, from_block, to_block);
         if let Some(existing) = self
@@ -285,7 +341,10 @@ impl IndexerService {
         from_block: u32,
         to_block: u32,
     ) -> LedgerResult<LazyIndexCoverage> {
-        let legacy_progress = self.get_progress().await?;
+        let legacy_progress = self
+            .clickhouse
+            .get_legacy_progress(self.config.chain_id, &self.config.worker_id)
+            .await?;
         let legacy_range = legacy_coverage_range(
             u32::try_from(self.config.start_block).ok(),
             legacy_progress.and_then(|value| u32::try_from(value).ok()),
@@ -399,26 +458,79 @@ impl IndexerService {
 
     async fn run_worker_once(&self) -> LedgerResult<()> {
         self.bootstrap().await?;
-        if self.config.lazy_enabled {
-            return self.run_lazy_worker().await;
+        match self.config.worker_mode {
+            IndexerWorkerMode::Lazy => self.run_lazy_worker().await,
+            IndexerWorkerMode::Live | IndexerWorkerMode::History => {
+                self.run_continuous_worker().await
+            }
         }
-        let mut next_block = self
+    }
+
+    async fn run_continuous_worker(&self) -> LedgerResult<()> {
+        let mut latest_block = self.get_latest_block_number_with_retry().await?;
+        let mut progress = self
             .clickhouse
-            .get_progress(self.config.chain_id, &self.config.worker_id)
-            .await?
-            .map(|block| block + 1)
-            .unwrap_or(self.config.start_block);
+            .get_worker_progress(self.config.chain_id, &self.config.worker_id)
+            .await?;
+        let range_end = self.resolve_continuous_range_end(progress.as_ref()).await?;
+        let mut target_block = self.target_block(latest_block, range_end);
+
+        if progress.is_none() {
+            let range_start = self.initial_range_start(target_block);
+            if range_start > 0 {
+                let initial = self.progress_record(
+                    range_start - 1,
+                    String::new(),
+                    range_start,
+                    latest_block,
+                    0,
+                    String::new(),
+                    None,
+                    range_end,
+                )?;
+                self.clickhouse.upsert_worker_progress(&initial).await?;
+                progress = Some(initial);
+            }
+        }
+
+        let mut next_block = progress
+            .as_ref()
+            .map(|item| u64::from(item.last_indexed_block).saturating_add(1))
+            .unwrap_or_else(|| self.initial_range_start(target_block));
 
         loop {
-            let latest_block = self.get_latest_block_number_with_retry().await?;
-            let target_block = self
-                .config
-                .end_block
-                .map(|end_block| end_block.min(latest_block))
-                .unwrap_or(latest_block);
+            latest_block = self.get_latest_block_number_with_retry().await?;
+            target_block = self.target_block(latest_block, range_end);
+
+            if self.config.worker_mode == IndexerWorkerMode::Live
+                && let Some(current) = progress.as_ref()
+                && !current.last_indexed_hash.is_empty()
+                && let Some(rewound) = self.reconcile_live_tip(current, latest_block).await?
+            {
+                next_block = u64::from(rewound.last_indexed_block).saturating_add(1);
+                progress = Some(rewound);
+                continue;
+            }
 
             if next_block > target_block {
-                if self.config.live_follow && self.config.end_block.is_none() {
+                if self.config.worker_mode == IndexerWorkerMode::Live
+                    && self.config.live_follow
+                    && range_end.is_none()
+                {
+                    if let Some(current) = progress.as_ref() {
+                        let refreshed = self.progress_record(
+                            u64::from(current.last_indexed_block),
+                            current.last_indexed_hash.clone(),
+                            u64::from(current.range_start),
+                            latest_block,
+                            0,
+                            String::new(),
+                            current.last_success_at.clone(),
+                            range_end,
+                        )?;
+                        self.clickhouse.upsert_worker_progress(&refreshed).await?;
+                        progress = Some(refreshed);
+                    }
                     sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
                     continue;
                 }
@@ -432,17 +544,312 @@ impl IndexerService {
                 end_block = batch_end,
                 concurrency = self.config.rpc_concurrency,
                 rpc_batch_request_size = self.config.rpc_batch_request_size.max(1),
+                include_receipts = self.config.history_include_receipts,
+                history_receipt_mode = self.config.history_receipt_mode.as_str(),
                 "index batch"
             );
-            let refs = self.fetch_batch_refs(next_block, batch_end).await?;
-            self.clickhouse.insert_refs(&refs).await?;
-            self.clickhouse
-                .set_progress(self.config.chain_id, &self.config.worker_id, batch_end)
+            let blocks = self
+                .fetch_block_range(next_block, batch_end, self.config.history_include_receipts)
                 .await?;
+            let expected_parent = if next_block > 0 {
+                self.clickhouse
+                    .get_canonical_block(
+                        self.config.chain_id,
+                        u32::try_from(next_block - 1).map_err(|_| {
+                            LedgerError::AnalysisInvariant(
+                                "indexer parent block exceeds UInt32".to_owned(),
+                            )
+                        })?,
+                    )
+                    .await?
+                    .map(|block| block.block_hash)
+            } else {
+                None
+            };
+            validate_block_chain(&blocks, expected_parent.as_deref())?;
+            self.persist_full_block_facts(&blocks).await?;
+
+            let last = blocks.last().ok_or_else(|| {
+                LedgerError::AnalysisInvariant("index batch returned no blocks".to_owned())
+            })?;
+            let range_start = progress
+                .as_ref()
+                .map(|item| u64::from(item.range_start))
+                .unwrap_or(next_block);
+            let updated = self.progress_record(
+                batch_end,
+                last.block.block_hash.clone(),
+                range_start,
+                latest_block,
+                0,
+                String::new(),
+                Some(now_clickhouse()),
+                range_end,
+            )?;
+            self.clickhouse.upsert_worker_progress(&updated).await?;
+            progress = Some(updated);
             next_block = batch_end + 1;
+            if self.config.inter_batch_delay_ms > 0 {
+                sleep(Duration::from_millis(self.config.inter_batch_delay_ms)).await;
+            }
         }
 
         Ok(())
+    }
+
+    async fn resolve_continuous_range_end(
+        &self,
+        progress: Option<&IndexerWorkerProgress>,
+    ) -> LedgerResult<Option<u64>> {
+        if let Some(end_block) = self.config.end_block {
+            return Ok(Some(end_block));
+        }
+        if self.config.worker_mode != IndexerWorkerMode::History {
+            return Ok(None);
+        }
+        if let Some(range_end) = progress.and_then(|progress| progress.range_end) {
+            return Ok(Some(u64::from(range_end)));
+        }
+        let boundary = self
+            .clickhouse
+            .get_worker_progress(
+                self.config.chain_id,
+                &self.config.history_boundary_worker_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                LedgerError::AnalysisInvariant(format!(
+                    "history boundary worker {} has no persisted progress",
+                    self.config.history_boundary_worker_id
+                ))
+            })?;
+        Ok(Some(u64::from(boundary.range_start).saturating_sub(1)))
+    }
+
+    fn target_block(&self, latest_block: u64, range_end: Option<u64>) -> u64 {
+        let lag = match self.config.worker_mode {
+            IndexerWorkerMode::Live => self.config.live_head_lag_blocks,
+            IndexerWorkerMode::History => self.config.history_head_lag_blocks,
+            IndexerWorkerMode::Lazy => 0,
+        };
+        let safe_head = latest_block.saturating_sub(lag);
+        range_end
+            .map(|end_block| end_block.min(safe_head))
+            .unwrap_or(safe_head)
+    }
+
+    fn initial_range_start(&self, target_block: u64) -> u64 {
+        match self.config.worker_mode {
+            IndexerWorkerMode::Live => target_block
+                .saturating_sub(self.config.live_bootstrap_blocks.saturating_sub(1))
+                .max(self.config.start_block),
+            IndexerWorkerMode::History | IndexerWorkerMode::Lazy => self.config.start_block,
+        }
+    }
+
+    fn progress_record(
+        &self,
+        last_indexed_block: u64,
+        last_indexed_hash: String,
+        range_start: u64,
+        head_block: u64,
+        retry_count: u32,
+        last_error: String,
+        last_success_at: Option<String>,
+        range_end: Option<u64>,
+    ) -> LedgerResult<IndexerWorkerProgress> {
+        let last_indexed_block = u32::try_from(last_indexed_block).map_err(|_| {
+            LedgerError::AnalysisInvariant("indexer cursor exceeds UInt32".to_owned())
+        })?;
+        let range_start = u32::try_from(range_start).map_err(|_| {
+            LedgerError::AnalysisInvariant("indexer range start exceeds UInt32".to_owned())
+        })?;
+        let head_block = u32::try_from(head_block).map_err(|_| {
+            LedgerError::AnalysisInvariant("indexer head exceeds UInt32".to_owned())
+        })?;
+        let range_end = range_end
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    LedgerError::AnalysisInvariant("indexer range end exceeds UInt32".to_owned())
+                })
+            })
+            .transpose()?;
+        Ok(IndexerWorkerProgress {
+            chain_id: self.config.chain_id,
+            worker_id: self.config.worker_id.clone(),
+            worker_kind: self.config.worker_mode.as_str().to_owned(),
+            last_indexed_block,
+            last_indexed_hash,
+            range_start,
+            range_end,
+            rpc_url: sanitized_rpc_url(&self.config.rpc_url),
+            retry_count,
+            last_error,
+            last_success_at,
+            head_block: Some(head_block),
+            lag_blocks: Some(head_block.saturating_sub(last_indexed_block)),
+        })
+    }
+
+    async fn record_worker_failure(&self, retry_count: u32, message: &str) -> LedgerResult<()> {
+        let Some(mut progress) = self
+            .clickhouse
+            .get_worker_progress(self.config.chain_id, &self.config.worker_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        progress.retry_count = retry_count;
+        progress.last_error = message.chars().take(1_000).collect();
+        self.clickhouse.upsert_worker_progress(&progress).await
+    }
+
+    async fn persist_full_block_facts(&self, blocks: &[IndexedBlockFacts]) -> LedgerResult<()> {
+        let refs = blocks
+            .iter()
+            .flat_map(|block| block.refs.iter().cloned())
+            .collect::<Vec<_>>();
+        let transactions = blocks
+            .iter()
+            .flat_map(|block| block.transactions.iter().cloned())
+            .collect::<Vec<_>>();
+        let logs = blocks
+            .iter()
+            .flat_map(|block| block.logs.iter().cloned())
+            .collect::<Vec<_>>();
+        let indexed_blocks = blocks
+            .iter()
+            .map(|block| IndexedBlock {
+                chain_id: block.block.chain_id,
+                block_number: block.block.block_number,
+                block_hash: block.block.block_hash.clone(),
+            })
+            .collect::<Vec<_>>();
+        let canonical_blocks = blocks
+            .iter()
+            .map(|block| block.block.clone())
+            .collect::<Vec<_>>();
+
+        self.clickhouse.insert_refs(&refs).await?;
+        self.clickhouse
+            .insert_raw_transactions(&transactions)
+            .await?;
+        self.clickhouse.insert_raw_logs(&logs).await?;
+        self.clickhouse
+            .insert_indexed_blocks(&indexed_blocks)
+            .await?;
+        self.clickhouse
+            .insert_canonical_blocks(&canonical_blocks)
+            .await
+    }
+
+    async fn persist_sparse_block_facts(&self, blocks: &[IndexedBlockFacts]) -> LedgerResult<()> {
+        let refs = blocks
+            .iter()
+            .flat_map(|block| block.refs.iter().cloned())
+            .collect::<Vec<_>>();
+        let indexed_blocks = blocks
+            .iter()
+            .map(|block| IndexedBlock {
+                chain_id: block.block.chain_id,
+                block_number: block.block.block_number,
+                block_hash: block.block.block_hash.clone(),
+            })
+            .collect::<Vec<_>>();
+        let canonical_blocks = blocks
+            .iter()
+            .map(|block| block.block.clone())
+            .collect::<Vec<_>>();
+        self.clickhouse.insert_refs(&refs).await?;
+        self.clickhouse
+            .insert_indexed_blocks(&indexed_blocks)
+            .await?;
+        self.clickhouse
+            .insert_canonical_blocks(&canonical_blocks)
+            .await
+    }
+
+    async fn reconcile_live_tip(
+        &self,
+        progress: &IndexerWorkerProgress,
+        latest_block: u64,
+    ) -> LedgerResult<Option<IndexerWorkerProgress>> {
+        let old_tip = u64::from(progress.last_indexed_block);
+        if old_tip <= latest_block {
+            let remote_tip = self.get_block_header_with_retry(old_tip).await?;
+            let remote_hash = block_hash_from_payload(&remote_tip, old_tip)?;
+            if remote_hash == progress.last_indexed_hash {
+                return Ok(None);
+            }
+        }
+
+        let search_tip = old_tip.min(latest_block);
+        let search_floor = search_tip.saturating_sub(self.config.reorg_lookback_blocks);
+        let mut common_ancestor = None;
+        for block_number in (search_floor..=search_tip).rev() {
+            let block_number_u32 = u32::try_from(block_number).map_err(|_| {
+                LedgerError::AnalysisInvariant("reorg search block exceeds UInt32".to_owned())
+            })?;
+            let Some(stored) = self
+                .clickhouse
+                .get_canonical_block(self.config.chain_id, block_number_u32)
+                .await?
+            else {
+                continue;
+            };
+            let remote = self.get_block_header_with_retry(block_number).await?;
+            if block_hash_from_payload(&remote, block_number)? == stored.block_hash {
+                common_ancestor = Some(stored);
+                break;
+            }
+        }
+
+        let ancestor = common_ancestor.ok_or_else(|| {
+            LedgerError::AnalysisInvariant(format!(
+                "no common canonical ancestor found within {} blocks of {search_tip}",
+                self.config.reorg_lookback_blocks
+            ))
+        })?;
+        let orphan_from = ancestor.block_number.saturating_add(1);
+        let old_tip_u32 = u32::try_from(old_tip)
+            .map_err(|_| LedgerError::AnalysisInvariant("reorg tip exceeds UInt32".to_owned()))?;
+        let orphaned = self
+            .clickhouse
+            .mark_canonical_range_orphaned(self.config.chain_id, orphan_from, old_tip_u32)
+            .await?;
+        let latest_u32 = u32::try_from(latest_block)
+            .map_err(|_| LedgerError::AnalysisInvariant("reorg head exceeds UInt32".to_owned()))?;
+        let reorganization = ChainReorganization {
+            event_id: Uuid::new_v4().to_string(),
+            chain_id: self.config.chain_id,
+            worker_id: self.config.worker_id.clone(),
+            previous_tip: old_tip_u32,
+            common_ancestor: ancestor.block_number,
+            new_head: latest_u32,
+            depth: old_tip_u32.saturating_sub(ancestor.block_number),
+        };
+        self.clickhouse
+            .insert_reorganization(&reorganization)
+            .await?;
+        let rewound = self.progress_record(
+            u64::from(ancestor.block_number),
+            ancestor.block_hash.clone(),
+            u64::from(progress.range_start),
+            latest_block,
+            0,
+            String::new(),
+            Some(now_clickhouse()),
+            self.config.end_block,
+        )?;
+        self.clickhouse.upsert_worker_progress(&rewound).await?;
+        warn!(
+            previous_tip = old_tip_u32,
+            common_ancestor = ancestor.block_number,
+            depth = reorganization.depth,
+            orphaned_blocks = orphaned,
+            "chain reorganization detected; live cursor rewound"
+        );
+        Ok(Some(rewound))
     }
 
     async fn run_lazy_worker(&self) -> LedgerResult<()> {
@@ -459,6 +866,24 @@ impl IndexerService {
                 sleep(Duration::from_millis(self.config.poll_interval_ms)).await;
                 continue;
             };
+
+            if let Err(error) = validate_lazy_range(
+                request.from_block,
+                request.to_block,
+                self.config.lazy_max_range_blocks,
+            ) {
+                request.status = "failed".to_owned();
+                request.last_error = error.to_string();
+                self.clickhouse.upsert_indexing_request(&request).await?;
+                warn!(
+                    request_id = request.request_id,
+                    from_block = request.from_block,
+                    to_block = request.to_block,
+                    max_range_blocks = self.config.lazy_max_range_blocks,
+                    "rejected oversized lazy indexing request"
+                );
+                continue;
+            }
 
             if request.next_block > request.to_block {
                 request.status = "completed".to_owned();
@@ -481,14 +906,31 @@ impl IndexerService {
                 .clickhouse
                 .indexed_block_numbers(self.config.chain_id, request.next_block, batch_end)
                 .await?;
-            let legacy_progress = self.get_progress().await?;
-            let missing_blocks = missing_block_numbers(
+            let incomplete_receipt_blocks = if self.config.history_include_receipts {
+                self.clickhouse
+                    .block_numbers_missing_receipts(
+                        self.config.chain_id,
+                        request.next_block,
+                        batch_end,
+                    )
+                    .await?
+            } else {
+                Vec::new()
+            };
+            let legacy_progress = self
+                .clickhouse
+                .get_legacy_progress(self.config.chain_id, &self.config.worker_id)
+                .await?;
+            let mut missing_blocks = missing_block_numbers(
                 request.next_block,
                 batch_end,
                 u32::try_from(self.config.start_block).ok(),
                 legacy_progress.and_then(|value| u32::try_from(value).ok()),
                 &indexed.into_iter().collect(),
             );
+            missing_blocks.extend(incomplete_receipt_blocks);
+            missing_blocks.sort_unstable();
+            missing_blocks.dedup();
 
             info!(
                 request_id = request.request_id,
@@ -499,24 +941,16 @@ impl IndexerService {
             );
 
             if !missing_blocks.is_empty() {
-                match self.fetch_block_numbers(&missing_blocks).await {
+                match self
+                    .fetch_block_numbers(&missing_blocks, self.config.history_include_receipts)
+                    .await
+                {
                     Ok(blocks) => {
-                        let refs = blocks
-                            .iter()
-                            .flat_map(|block| block.refs.iter().cloned())
-                            .collect::<Vec<_>>();
-                        let indexed_blocks = blocks
-                            .into_iter()
-                            .map(|block| IndexedBlock {
-                                chain_id: self.config.chain_id,
-                                block_number: block.block_number,
-                                block_hash: block.block_hash,
-                            })
-                            .collect::<Vec<_>>();
-                        self.clickhouse.insert_refs(&refs).await?;
-                        self.clickhouse
-                            .insert_indexed_blocks(&indexed_blocks)
-                            .await?;
+                        if self.config.history_include_receipts {
+                            self.persist_full_block_facts(&blocks).await?;
+                        } else {
+                            self.persist_sparse_block_facts(&blocks).await?;
+                        }
                     }
                     Err(error) => {
                         request.last_error = error.to_string();
@@ -576,11 +1010,12 @@ impl IndexerService {
         Ok(updated_refs.len())
     }
 
-    async fn fetch_batch_refs(
+    async fn fetch_block_range(
         &self,
         start_block: u64,
         end_block: u64,
-    ) -> LedgerResult<Vec<AddressTxRef>> {
+        include_receipts: bool,
+    ) -> LedgerResult<Vec<IndexedBlockFacts>> {
         let block_numbers = (start_block..=end_block)
             .map(|block_number| {
                 u32::try_from(block_number).map_err(|_| {
@@ -590,18 +1025,15 @@ impl IndexerService {
                 })
             })
             .collect::<LedgerResult<Vec<_>>>()?;
-        Ok(self
-            .fetch_block_numbers(&block_numbers)
-            .await?
-            .into_iter()
-            .flat_map(|block| block.refs)
-            .collect())
+        self.fetch_block_numbers(&block_numbers, include_receipts)
+            .await
     }
 
     async fn fetch_block_numbers(
         &self,
         block_numbers: &[u32],
-    ) -> LedgerResult<Vec<IndexedBlockResult>> {
+        include_receipts: bool,
+    ) -> LedgerResult<Vec<IndexedBlockFacts>> {
         if block_numbers.is_empty() {
             return Ok(Vec::new());
         }
@@ -627,7 +1059,14 @@ impl IndexerService {
                 let chain_id = self.config.chain_id;
                 let block_numbers = groups[next_group].clone();
                 join_set.spawn(async move {
-                    fetch_block_group_refs_with_retry(rpc, config, chain_id, block_numbers).await
+                    fetch_block_group_with_retry(
+                        rpc,
+                        config,
+                        chain_id,
+                        block_numbers,
+                        include_receipts,
+                    )
+                    .await
                 });
                 next_group += 1;
             }
@@ -644,7 +1083,7 @@ impl IndexerService {
             }
         }
 
-        blocks.sort_by_key(|block| block.block_number);
+        blocks.sort_by_key(|block| block.block.block_number);
         Ok(blocks)
     }
 
@@ -672,6 +1111,96 @@ impl IndexerService {
             }
         }
     }
+
+    async fn get_block_header_with_retry(
+        &self,
+        block_number: u64,
+    ) -> LedgerResult<serde_json::Value> {
+        let mut attempt = 0_u32;
+        loop {
+            match self.rpc.get_block_header(block_number).await {
+                Ok(payload) if payload.is_null() => {
+                    return Err(LedgerError::TransientIngestion(format!(
+                        "block {block_number} returned null header"
+                    )));
+                }
+                Ok(payload) => return Ok(payload),
+                Err(err) if is_rate_limit_error(&err) && attempt < self.config.rpc_max_retries => {
+                    let delay_ms = retry_delay_ms(
+                        self.config.rpc_retry_base_ms,
+                        self.config.rpc_retry_max_ms,
+                        attempt,
+                    );
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+fn validate_block_chain(
+    blocks: &[IndexedBlockFacts],
+    expected_parent_hash: Option<&str>,
+) -> LedgerResult<()> {
+    let Some(first) = blocks.first() else {
+        return Err(LedgerError::AnalysisInvariant(
+            "cannot validate an empty block batch".to_owned(),
+        ));
+    };
+    if let Some(expected_parent_hash) = expected_parent_hash
+        && first.block.parent_hash != expected_parent_hash
+    {
+        return Err(LedgerError::TransientIngestion(format!(
+            "block {} parent {} does not match stored canonical parent {expected_parent_hash}",
+            first.block.block_number, first.block.parent_hash
+        )));
+    }
+    for pair in blocks.windows(2) {
+        let parent = &pair[0].block;
+        let child = &pair[1].block;
+        if child.block_number != parent.block_number.saturating_add(1) {
+            return Err(LedgerError::TransientIngestion(format!(
+                "non-contiguous block batch: {} followed by {}",
+                parent.block_number, child.block_number
+            )));
+        }
+        if child.parent_hash != parent.block_hash {
+            return Err(LedgerError::TransientIngestion(format!(
+                "block {} parent {} does not match block {} hash {}",
+                child.block_number, child.parent_hash, parent.block_number, parent.block_hash
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn block_hash_from_payload(payload: &serde_json::Value, block_number: u64) -> LedgerResult<String> {
+    payload
+        .get("hash")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(|| {
+            LedgerError::MalformedEvidence(format!(
+                "block {block_number} header payload missing hash"
+            ))
+        })
+}
+
+fn sanitized_rpc_url(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return value.split('?').next().unwrap_or(value).to_owned();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn now_clickhouse() -> String {
+    Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
 }
 
 fn hash_api_key(token: &str) -> String {
@@ -680,51 +1209,81 @@ fn hash_api_key(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-#[derive(Clone, Debug)]
-struct IndexedBlockResult {
-    block_number: u32,
-    block_hash: String,
-    refs: Vec<AddressTxRef>,
-}
-
-async fn fetch_block_group_refs_with_retry(
+async fn fetch_block_group_with_retry(
     rpc: Arc<IndexerRpcClient>,
     config: IndexerConfig,
     chain_id: u32,
     block_numbers: Vec<u64>,
-) -> LedgerResult<Vec<IndexedBlockResult>> {
+    include_receipts: bool,
+) -> LedgerResult<Vec<IndexedBlockFacts>> {
     let mut attempt = 0_u32;
     loop {
         if config.rpc_request_delay_ms > 0 {
             sleep(Duration::from_millis(config.rpc_request_delay_ms)).await;
         }
-        match rpc.get_blocks_with_transactions(&block_numbers).await {
+        let fetch_result = if include_receipts {
+            let result = if config.worker_mode == IndexerWorkerMode::History
+                && config.history_receipt_mode == IndexerHistoryReceiptMode::Transaction
+            {
+                rpc.get_blocks_with_transactions_and_transaction_receipts(
+                    &block_numbers,
+                    config.rpc_request_delay_ms,
+                )
+                .await
+            } else {
+                rpc.get_blocks_with_transactions_and_receipts(&block_numbers)
+                    .await
+            };
+            result.map(|items| {
+                items
+                    .into_iter()
+                    .map(|(block_number, block, receipts)| (block_number, block, Some(receipts)))
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            rpc.get_blocks_with_transactions(&block_numbers)
+                .await
+                .map(|items| {
+                    items
+                        .into_iter()
+                        .map(|(block_number, block)| (block_number, block, None))
+                        .collect::<Vec<_>>()
+                })
+        };
+        match fetch_result {
             Ok(block_payloads) => {
                 let mut blocks = Vec::new();
-                for (block_number, block_payload) in block_payloads {
+                for (block_number, block_payload, receipts_payload) in block_payloads {
                     if block_payload.is_null() {
                         warn!(block_number, "block payload missing, retry later");
                         return Err(LedgerError::TransientIngestion(format!(
                             "block {block_number} returned null payload"
                         )));
                     }
-                    let block_number = u32::try_from(block_number).map_err(|_| {
+                    let expected_block_number = u32::try_from(block_number).map_err(|_| {
                         LedgerError::AnalysisInvariant("indexed block exceeds UInt32".to_owned())
                     })?;
-                    let block_hash = block_payload
-                        .get("hash")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            LedgerError::MalformedEvidence(format!(
-                                "block {block_number} payload missing hash"
-                            ))
-                        })?
-                        .to_ascii_lowercase();
-                    blocks.push(IndexedBlockResult {
-                        block_number,
-                        block_hash,
-                        refs: extract_block_refs(chain_id, &block_payload)?,
-                    });
+                    if receipts_payload
+                        .as_ref()
+                        .is_some_and(serde_json::Value::is_null)
+                    {
+                        return Err(LedgerError::TransientIngestion(format!(
+                            "block {block_number} returned null receipts"
+                        )));
+                    }
+                    let facts = extract_block_facts(
+                        chain_id,
+                        &config.worker_id,
+                        &block_payload,
+                        receipts_payload.as_ref(),
+                    )?;
+                    if facts.block.block_number != expected_block_number {
+                        return Err(LedgerError::MalformedEvidence(format!(
+                            "requested block {expected_block_number} but RPC returned {}",
+                            facts.block.block_number
+                        )));
+                    }
+                    blocks.push(facts);
                 }
                 return Ok(blocks);
             }
@@ -768,6 +1327,19 @@ fn lazy_request_id(chain_id: u32, from_block: u32, to_block: u32) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("{chain_id}:{from_block}:{to_block}").as_bytes());
     format!("lazy_{}", hex::encode(hasher.finalize()))
+}
+
+fn validate_lazy_range(from_block: u32, to_block: u32, max_range_blocks: u64) -> LedgerResult<u64> {
+    let requested_blocks = u64::from(to_block)
+        .saturating_sub(u64::from(from_block))
+        .saturating_add(1);
+    if requested_blocks > max_range_blocks.max(1) {
+        return Err(LedgerError::MalformedEvidence(format!(
+            "lazy index range contains {requested_blocks} blocks; maximum is {}. Provide an explicit bounded from_block/to_block range or use the opt-in history worker",
+            max_range_blocks.max(1)
+        )));
+    }
+    Ok(requested_blocks)
 }
 
 fn legacy_coverage_range(
@@ -832,7 +1404,11 @@ impl TransactionEndpoints {
 
 #[cfg(test)]
 mod tests {
-    use super::{lazy_request_id, legacy_coverage_range, missing_block_numbers};
+    use super::{
+        lazy_request_id, legacy_coverage_range, missing_block_numbers, sanitized_rpc_url,
+        validate_block_chain, validate_lazy_range,
+    };
+    use crate::indexer::models::{CanonicalBlock, IndexedBlockFacts};
     use std::collections::BTreeSet;
 
     #[test]
@@ -845,6 +1421,13 @@ mod tests {
             lazy_request_id(8453, 100, 200),
             lazy_request_id(8453, 100, 201)
         );
+    }
+
+    #[test]
+    fn lazy_ranges_are_bounded_and_never_become_implicit_full_history() {
+        assert_eq!(validate_lazy_range(100, 199, 100).unwrap(), 100);
+        let error = validate_lazy_range(0, 250_000, 250_000).unwrap_err();
+        assert!(error.to_string().contains("maximum is 250000"));
     }
 
     #[test]
@@ -863,5 +1446,51 @@ mod tests {
             missing_block_numbers(1, 10, Some(1), Some(5), &indexed),
             vec![7, 9, 10]
         );
+    }
+
+    #[test]
+    fn block_chain_validation_rejects_a_changed_parent_hash() {
+        let blocks = vec![
+            block_facts(10, "0x10", "0x09"),
+            block_facts(11, "0x11", "0xdead"),
+        ];
+        let error = validate_block_chain(&blocks, Some("0x09")).unwrap_err();
+        assert!(error.to_string().contains("does not match block 10 hash"));
+    }
+
+    #[test]
+    fn block_chain_validation_accepts_contiguous_canonical_blocks() {
+        let blocks = vec![
+            block_facts(10, "0x10", "0x09"),
+            block_facts(11, "0x11", "0x10"),
+        ];
+        validate_block_chain(&blocks, Some("0x09")).unwrap();
+    }
+
+    #[test]
+    fn progress_rpc_url_drops_credentials_and_query_parameters() {
+        assert_eq!(
+            sanitized_rpc_url("https://user:secret@example.com/rpc?token=hidden"),
+            "https://example.com/rpc"
+        );
+    }
+
+    fn block_facts(block_number: u32, block_hash: &str, parent_hash: &str) -> IndexedBlockFacts {
+        IndexedBlockFacts {
+            block: CanonicalBlock {
+                chain_id: 4663,
+                block_number,
+                block_hash: block_hash.to_owned(),
+                parent_hash: parent_hash.to_owned(),
+                timestamp: 1,
+                l1_block_number: Some(1),
+                finality_state: "soft_confirmed".to_owned(),
+                is_canonical: 1,
+                worker_id: "robinhood_live".to_owned(),
+            },
+            transactions: Vec::new(),
+            logs: Vec::new(),
+            refs: Vec::new(),
+        }
     }
 }

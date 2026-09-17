@@ -102,7 +102,15 @@ pub fn derive_basic_flows(bundle: &RawTransactionBundle) -> Vec<AssetFlow> {
     flows.extend(trace_native_flows(tx_hash, bundle.trace.as_ref(), &[]));
 
     for log in &bundle.receipt.logs {
-        if log.topics.len() < 3 || !log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC) {
+        // ERC-20 Transfer has exactly three topics and a 32-byte amount in data.
+        // ERC-721 reuses the same topic but indexes tokenId as a fourth topic.
+        if log.topics.len() != 3
+            || log
+                .data
+                .strip_prefix("0x")
+                .is_none_or(|data| data.len() != 64)
+            || !log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC)
+        {
             continue;
         }
         flows.push(AssetFlow {

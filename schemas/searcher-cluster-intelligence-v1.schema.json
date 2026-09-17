@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ledgerflow.top/schemas/searcher-cluster-intelligence-v1.schema.json",
+  "title": "LedgerFlow Searcher Cluster Intelligence v1",
+  "type": "object",
+  "required": [
+    "contract_version",
+    "chain_id",
+    "data_source",
+    "seed",
+    "cluster",
+    "members",
+    "relationships",
+    "windows",
+    "partial_24h",
+    "executions",
+    "changes",
+    "economic_limitations",
+    "assets",
+    "limitations"
+  ],
+  "properties": {
+    "contract_version": { "const": "searcher-cluster-intelligence.v1" },
+    "chain_id": { "type": "integer", "minimum": 1 },
+    "data_source": {
+      "type": "object",
+      "required": [
+        "chain_id", "data_source", "indexed_from_block", "indexed_to_block",
+        "chain_head", "ingestion_lag", "last_updated_at", "history_mode",
+        "full_history_available", "available", "limitation"
+      ],
+      "properties": {
+        "chain_id": { "type": "integer", "minimum": 1 },
+        "data_source": { "type": "string" },
+        "indexed_from_block": { "type": ["integer", "null"], "minimum": 0 },
+        "indexed_to_block": { "type": ["integer", "null"], "minimum": 0 },
+        "chain_head": { "type": ["integer", "null"], "minimum": 0 },
+        "ingestion_lag": { "type": ["integer", "null"], "minimum": 0 },
+        "last_updated_at": { "type": ["string", "null"], "format": "date-time" },
+        "history_mode": { "type": "string" },
+        "full_history_available": { "type": "boolean" },
+        "available": { "type": "boolean" },
+        "limitation": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "seed": {
+      "type": "object",
+      "required": ["seed_address", "seed_role", "seed_role_confidence", "seed_role_evidence", "role_semantics"],
+      "properties": {
+        "seed_address": { "$ref": "#/$defs/address" },
+        "seed_role": { "type": ["string", "null"] },
+        "seed_role_confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "seed_role_evidence": { "type": "object" },
+        "role_semantics": { "type": "string" }
+      }
+    },
+    "cluster": {
+      "type": "object",
+      "required": ["cluster_id", "kind", "status", "progress", "coverage_is_partial", "retry_count"],
+      "properties": {
+        "cluster_id": { "type": "string", "format": "uuid" },
+        "kind": { "enum": ["searcher_candidate", "execution_candidate", "unresolved"] },
+        "status": {
+          "enum": [
+            "queued", "seed_classification", "relationship_discovery", "cluster_building",
+            "execution_reconstruction", "economic_verification", "baseline_building",
+            "ready", "stale", "failed"
+          ]
+        },
+        "progress": { "type": "object" },
+        "coverage_is_partial": { "type": "boolean" },
+        "retry_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "address", "candidate_role", "membership_state", "evidence_state", "confidence",
+          "evidence", "supporting_transactions", "include_in_economic_scope",
+          "include_in_behavior_scope", "discovery_depth", "user_overridden"
+        ],
+        "properties": {
+          "address": { "$ref": "#/$defs/address" },
+          "candidate_role": { "type": "string" },
+          "membership_state": { "enum": ["candidate", "included", "excluded"] },
+          "evidence_state": { "enum": ["observed", "candidate", "inferred", "unverified"] },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "supporting_transactions": { "$ref": "#/$defs/txHashes" },
+          "supporting_transaction_count": { "type": "integer", "minimum": 0 },
+          "include_in_economic_scope": { "type": "boolean" },
+          "include_in_behavior_scope": { "type": "boolean" },
+          "discovery_depth": { "type": "integer", "minimum": 0, "maximum": 2 },
+          "user_overridden": { "type": "boolean" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "relationships": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "source_address", "related_address", "relationship_type", "evidence_state",
+          "interaction_count", "value_transferred", "supporting_transactions",
+          "confidence", "evidence_reason", "discovery_depth"
+        ],
+        "properties": {
+          "source_address": { "$ref": "#/$defs/address" },
+          "related_address": { "$ref": "#/$defs/address" },
+          "relationship_type": { "type": "string" },
+          "evidence_state": { "enum": ["observed", "candidate", "inferred", "unverified"] },
+          "interaction_count": { "type": "integer", "minimum": 1 },
+          "value_transferred": { "type": "array", "items": { "$ref": "#/$defs/amount" } },
+          "supporting_transactions": { "$ref": "#/$defs/txHashes" },
+          "supporting_transaction_count": { "type": "integer", "minimum": 0 },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "evidence_reason": { "type": "string", "minLength": 1 },
+          "discovery_depth": { "type": "integer", "minimum": 1, "maximum": 2 }
+        },
+        "additionalProperties": true
+      }
+    },
+    "windows": { "type": "array", "items": { "type": "object" } },
+    "partial_24h": { "type": "object" },
+    "executions": { "type": "array", "items": { "type": "object" } },
+    "execution_page": {
+      "type": "object",
+      "required": ["offset", "limit", "returned", "total", "has_more"],
+      "properties": {
+        "offset": { "type": "integer", "minimum": 0 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "returned": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "has_more": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "changes": { "type": "array", "items": { "type": "object" } },
+    "economic_limitations": { "type": "array", "items": { "type": "object" } },
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["address", "symbol", "name", "decimals", "status"],
+        "properties": {
+          "address": { "$ref": "#/$defs/address" },
+          "symbol": { "type": ["string", "null"] },
+          "name": { "type": ["string", "null"] },
+          "decimals": { "type": ["integer", "null"], "minimum": 0, "maximum": 255 },
+          "status": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "limitations": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "address": { "type": "string", "pattern": "^0x[0-9a-f]{40}$" },
+    "txHashes": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^0x[0-9a-f]{64}$" }
+    },
+    "amount": {
+      "type": "object",
+      "required": ["asset", "amount_raw"],
+      "properties": {
+        "asset": { "type": "string" },
+        "amount_raw": { "type": "string", "pattern": "^-?[0-9]+$" }
+      }
+    }
+  },
+  "additionalProperties": false
+}

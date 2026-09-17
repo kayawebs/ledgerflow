@@ -1,0 +1,32 @@
+{
+  "schema_version": "ledgerflow.protocol-precision-report.v1",
+  "run_at": "2026-08-12T00:04:22Z",
+  "chain_id": 8453,
+  "scope": "direct top-level calls to reviewed Base protocol deployments",
+  "fixture": "tests/fixtures/base_protocol_ground_truth.jsonl",
+  "fixture_sha256": "b41489cba17d8a00fd18bcadd0e7e268f85d36571d8505a30efea1736484604a",
+  "dataset_rows": 95,
+  "reviewed_positive": 86,
+  "reviewed_negative": 9,
+  "true_positive": 86,
+  "false_positive": 0,
+  "false_negative": 0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "per_protocol": {
+    "uniswap_v2": {"reviewed": 10, "correct": 10},
+    "uniswap_v3": {"reviewed": 10, "correct": 10},
+    "uniswap_v4": {"reviewed": 10, "correct": 10},
+    "aerodrome": {"reviewed": 10, "correct": 10},
+    "pancakeswap": {"reviewed": 10, "correct": 10},
+    "balancer": {"reviewed": 9, "correct": 9},
+    "morpho_blue": {"reviewed": 9, "correct": 9},
+    "aave": {"reviewed": 9, "correct": 9},
+    "moonwell": {"reviewed": 9, "correct": 9}
+  },
+  "live_api_representatives": {"matched": 9, "total": 9, "negative_controls_rejected": 1},
+  "limitations": [
+    "proxy variants and internal-only protocol paths are outside this corpus",
+    "new deployments require a reviewed database import before they can be named"
+  ]
+}

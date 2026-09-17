@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::core::errors::{LedgerError, LedgerResult};
 use crate::domain::entities::{RecognizerResult, TransactionAnalysis};
@@ -106,6 +106,110 @@ fn log_signals(analysis: &TransactionAnalysis) -> Vec<LogSignal> {
         .collect()
 }
 
+pub struct ProtocolDeploymentEvidenceRecognizer;
+
+impl Recognizer for ProtocolDeploymentEvidenceRecognizer {
+    fn recognizer_id(&self) -> &str {
+        "protocol_deployment_evidence"
+    }
+    fn version(&self) -> &str {
+        "1.0.0"
+    }
+    fn order(&self) -> u32 {
+        15
+    }
+    fn description(&self) -> &str {
+        "Recognizes protocols only from versioned database deployment evidence for contracts touched by the transaction."
+    }
+
+    fn recognize(&self, analysis: &TransactionAnalysis) -> LedgerResult<Option<RecognizerResult>> {
+        let mut matches = analysis
+            .normalized_execution_facts
+            .derived_facts
+            .get("protocol_evidence")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.get("confidence")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|confidence| confidence >= 0.5)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        matches.sort_by(|a, b| {
+            b.get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or_default()
+                .total_cmp(
+                    &a.get("confidence")
+                        .and_then(Value::as_f64)
+                        .unwrap_or_default(),
+                )
+                .then_with(|| {
+                    a.get("protocol_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .cmp(
+                            b.get("protocol_name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        )
+                })
+        });
+        let primary = &matches[0];
+        let protocol = primary
+            .get("protocol_name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::MalformedEvidence(
+                    "protocol deployment evidence missing protocol_name".to_owned(),
+                )
+            })?;
+        let protocols = matches
+            .iter()
+            .filter_map(|item| item.get("protocol_name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        let evidence_refs = matches
+            .iter()
+            .filter_map(|item| {
+                let address = item.get("address")?.as_str()?;
+                Some(EvidenceRef {
+                    kind: EvidenceKind::DerivedFact,
+                    reference: format!("{}:protocol-deployment:{address}", analysis.tx_hash),
+                    tx_hash: Some(analysis.tx_hash.clone()),
+                    metadata: json!({
+                        "source": item.get("source"),
+                        "adapter_version": item.get("adapter_version"),
+                    }),
+                })
+            })
+            .collect();
+        Ok(Some(RecognizerResult {
+            recognizer_id: self.recognizer_id().to_owned(),
+            recognizer_version: self.version().to_owned(),
+            label: "database_protocol_interaction".to_owned(),
+            confidence: primary
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or_default() as f32,
+            evidence_refs,
+            attributes: json!({
+                "protocol": protocol,
+                "protocols": protocols,
+                "source": "protocol_deployments",
+                "matches": matches,
+            }),
+            unresolved_points: Vec::new(),
+            warnings: Vec::new(),
+        }))
+    }
+}
+
 fn topic_to_address(topic: &str) -> Option<String> {
     let trimmed = topic.trim_start_matches("0x");
     if trimmed.len() < 40 {
@@ -124,11 +228,10 @@ fn is_known_liquidation_selector(selector: &str) -> bool {
     )
 }
 
-const MORPHO_BLUE_CORE: &str = "0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb";
 const MORPHO_BLUE_LIQUIDATE_TOPIC: &str =
     "0xa4946ede45d0c6f06a0f5ce92c9ad3b4751452d2fe0e25010783bcab57a67e41";
 const AAVE_LIQUIDATION_CALL_TOPIC: &str =
-    "0xe413a321e8681d83188be0d2364605a8f594ac97918daee13129e6b4f89b8f3";
+    "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286";
 
 #[derive(Clone, Debug)]
 struct LiquidationSignals {
@@ -145,7 +248,10 @@ impl LiquidationSignals {
     fn from_analysis(analysis: &TransactionAnalysis) -> Self {
         Self {
             sender: analysis.from_address.to_lowercase(),
-            target: analysis.to_address.as_ref().map(|value| value.to_lowercase()),
+            target: analysis
+                .to_address
+                .as_ref()
+                .map(|value| value.to_lowercase()),
             selector: analysis
                 .normalized_execution_facts
                 .selector
@@ -204,18 +310,20 @@ impl LiquidationProtocolAdapter for MorphoBlueLiquidationAdapter {
     fn detect(&self, signals: &LiquidationSignals) -> Option<LiquidationDetection> {
         let matched_selectors = signals.matched_liquidation_selectors();
         let event_log = signals.logs.iter().find(|log| {
-            log.address.eq_ignore_ascii_case(MORPHO_BLUE_CORE)
-                && log
-                    .topics
-                    .first()
-                    .map(|topic| topic == MORPHO_BLUE_LIQUIDATE_TOPIC)
-                    .unwrap_or(false)
+            log.topics
+                .first()
+                .map(|topic| topic == MORPHO_BLUE_LIQUIDATE_TOPIC)
+                .unwrap_or(false)
         });
         if event_log.is_none() && !matched_selectors.contains("0x267a47ca") {
             return None;
         }
-        let borrower = event_log.and_then(|log| log.topics.get(3)).and_then(|value| topic_to_address(value));
-        let liquidator = event_log.and_then(|log| log.topics.get(2)).and_then(|value| topic_to_address(value));
+        let borrower = event_log
+            .and_then(|log| log.topics.get(3))
+            .and_then(|value| topic_to_address(value));
+        let liquidator = event_log
+            .and_then(|log| log.topics.get(2))
+            .and_then(|value| topic_to_address(value));
         let market_id = event_log.and_then(|log| log.topics.get(1)).cloned();
         Some(LiquidationDetection {
             protocol: self.protocol_id(),
@@ -230,7 +338,7 @@ impl LiquidationProtocolAdapter for MorphoBlueLiquidationAdapter {
                 "borrower": borrower,
                 "liquidator": liquidator,
                 "market_id": market_id,
-                "protocol_contract": MORPHO_BLUE_CORE,
+                "protocol_contract": event_log.map(|log| log.address.clone()),
                 "internal_call_count": signals.internal_call_count,
             }),
             warnings: if event_log.is_some() {
@@ -313,7 +421,11 @@ impl LiquidationProtocolAdapter for CompoundLiquidationAdapter {
         }
         Some(LiquidationDetection {
             protocol: self.protocol_id(),
-            confidence: if signals.selector == "0xf5e3c462" { 0.93 } else { 0.85 },
+            confidence: if signals.selector == "0xf5e3c462" {
+                0.93
+            } else {
+                0.85
+            },
             matched_selectors,
             matched_event_topic: None,
             attributes: json!({
@@ -346,7 +458,11 @@ impl LiquidationProtocolAdapter for EulerLiquidationAdapter {
         }
         Some(LiquidationDetection {
             protocol: self.protocol_id(),
-            confidence: if signals.selector == "0xc1342574" { 0.93 } else { 0.84 },
+            confidence: if signals.selector == "0xc1342574" {
+                0.93
+            } else {
+                0.84
+            },
             matched_selectors,
             matched_event_topic: None,
             attributes: json!({
@@ -738,8 +854,9 @@ impl Recognizer for SwapFlowRecognizer {
             }),
             unresolved_points: vec![UnresolvedItem {
                 code: "protocol_unresolved".to_owned(),
-                message: "Swap-like token exchange detected, but protocol classification is unresolved."
-                    .to_owned(),
+                message:
+                    "Swap-like token exchange detected, but protocol classification is unresolved."
+                        .to_owned(),
                 evidence_refs: Vec::new(),
             }],
             warnings: Vec::new(),
@@ -818,7 +935,11 @@ impl Recognizer for DepositWithdrawPatternRecognizer {
 
     fn recognize(&self, analysis: &TransactionAnalysis) -> LedgerResult<Option<RecognizerResult>> {
         let sender = analysis.from_address.to_lowercase();
-        let target = analysis.to_address.clone().unwrap_or_default().to_lowercase();
+        let target = analysis
+            .to_address
+            .clone()
+            .unwrap_or_default()
+            .to_lowercase();
         if target.is_empty() {
             return Ok(None);
         }
@@ -869,7 +990,11 @@ fn arbitrage_subject_deltas(
 ) -> Option<(&'static str, String, Vec<(String, String, i128)>)> {
     let all_deltas = token_net_delta_entries(analysis);
     let mut candidates = vec![("sender", analysis.from_address.to_lowercase())];
-    if let Some(target) = analysis.to_address.as_ref().map(|value| value.to_lowercase()) {
+    if let Some(target) = analysis
+        .to_address
+        .as_ref()
+        .map(|value| value.to_lowercase())
+    {
         if !candidates
             .iter()
             .any(|(_, address)| address.eq_ignore_ascii_case(&target))
@@ -1120,6 +1245,7 @@ impl Recognizer for FailingRecognizer {
 pub fn builtin_recognizers() -> Vec<Arc<dyn Recognizer>> {
     vec![
         Arc::new(SelectorPresenceRecognizer),
+        Arc::new(ProtocolDeploymentEvidenceRecognizer),
         Arc::new(FailedExecutionClassifier),
         Arc::new(Erc20TransferFlowRecognizer),
         Arc::new(Erc20ApprovalRecognizer),

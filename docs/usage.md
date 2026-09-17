@@ -7,10 +7,10 @@ If you only want the standalone top-level address indexer, read [docs/indexer.md
 The main operator workflow is now:
 
 1. open the web product shell
-2. register or sign in by email verification code
-3. create an address cluster for your bot and EOA set
-4. let the worker backfill and analyze history
-5. review cluster coverage, spend summary, and single-tx detail from the dashboard
+2. register by email verification, or sign in with a password or email code
+3. create a monitor or address cluster for the relevant bot and contract set
+4. let the seed workers analyze bounded evidence transactions while the live indexer keeps following the head
+5. review verified events, explicit evidence limitations, entity relationships, and single-tx detail from the dashboard
 
 ## What this starter is for
 
@@ -29,7 +29,7 @@ The first version is intentionally narrow. If a transaction is only partially un
 - Rust 1.87+ or current stable toolchain
 - Docker and Docker Compose if you want the quickest local setup
 - PostgreSQL 15+ if you want to run the app outside Docker
-- network access to a Base-compatible RPC endpoint
+- network access to the local Robinhood Nitro JSON-RPC endpoint
 
 ## Configuration
 
@@ -39,10 +39,10 @@ LedgerFlow reads configuration from environment variables.
 | --- | --- | --- |
 | `LEDGERFLOW_BIND_ADDR` | HTTP bind address for Axum | `127.0.0.1:3000` for host runs, `0.0.0.0:8080` in Docker |
 | `LEDGERFLOW_DATABASE_URL` | PostgreSQL connection string | `postgres://postgres:postgres@127.0.0.1:5532/ledgerflow` for host runs |
-| `LEDGERFLOW_RPC_URL` | Base RPC endpoint | `http://127.0.0.1:18545` for host runs. Docker Compose routes containers through `http://rpc-gateway:8545` by default. |
+| `LEDGERFLOW_RPC_URL` | Robinhood Chain RPC endpoint | Local Nitro for host runs. Docker Compose routes ordinary workers through `http://rpc-gateway:8545` by default. |
 | `LEDGERFLOW_INDEXER_API_BASE_URL` | Indexer API base URL used by analysis-side cluster backfill | `http://127.0.0.1:8090` for host runs, `http://indexer:8090` in Docker |
 | `LEDGERFLOW_INDEXER_API_BEARER_TOKEN` | Optional Bearer token sent to the indexer API | unset |
-| `LEDGERFLOW_DEFAULT_CHAIN_ID` | Default chain for callers that omit it | `8453` |
+| `LEDGERFLOW_DEFAULT_CHAIN_ID` | Default chain for callers that omit it | `4663` |
 | `LEDGERFLOW_TRACE_ENABLED` | Enables trace fetch attempts | `false` |
 | `LEDGERFLOW_CLUSTER_BACKFILL_QUERY_LIMIT` | Per-request limit used when analysis reads tx refs from the indexer | `10000` |
 | `LEDGERFLOW_CLUSTER_AUTO_BACKFILL_ON_CREATE` | Start a background historical backfill immediately after cluster creation | `true` |
@@ -51,7 +51,7 @@ LedgerFlow reads configuration from environment variables.
 | `LEDGERFLOW_PLUGINS` | Comma-separated plugin packs to load | `sample_builtin_pack` |
 | `LEDGERFLOW_WEB_BIND_ADDR` | Web process bind address | `127.0.0.1:3001` for host runs, `0.0.0.0:3000` in Docker |
 | `LEDGERFLOW_WEB_BASE_URL` | Public base URL used in verification email links | `http://127.0.0.1:3001` for host runs |
-| `LEDGERFLOW_API_BASE_URL` | Upstream analysis API used by the web process | `http://127.0.0.1:3000` for host runs, `http://app:8080` in Docker |
+| `LEDGERFLOW_API_BASE_URL` | Upstream analysis API used by the web process | `http://127.0.0.1:3000` for host runs, `http://app:3000` in Docker |
 | `LEDGERFLOW_SESSION_COOKIE_NAME` | Session cookie name for the web product | `ledgerflow_session` |
 | `LEDGERFLOW_EMAIL_DELIVERY_MODE` | Email delivery mode: `auto`, `log`, `postmark`, or `resend` | `auto` |
 | `LEDGERFLOW_EMAIL_FROM` | Sender address when using real email delivery | `noreply@yourdomain.xyz` |
@@ -59,20 +59,35 @@ LedgerFlow reads configuration from environment variables.
 | `LEDGERFLOW_POSTMARK_MESSAGE_STREAM` | Optional Postmark message stream | `outbound` |
 | `LEDGERFLOW_RESEND_API_KEY` | Optional Resend API key for verification emails | unset |
 | `LEDGERFLOW_VERIFICATION_TTL_MINUTES` | Verification code lifetime | `15` |
-| `LEDGERFLOW_SESSION_TTL_DAYS` | Passwordless session lifetime | `30` |
+| `LEDGERFLOW_SESSION_TTL_DAYS` | Authenticated session lifetime | `30` |
+| `LEDGERFLOW_REGISTRY_SYNC_POLL_INTERVAL_MS` | How often the registry worker checks PostgreSQL for due endpoints | `60000` |
+| `LEDGERFLOW_REGISTRY_SYNC_RPC_CONCURRENCY` | Concurrent on-chain validations for official deployments | `4` |
+| `LEDGERFLOW_REGISTRY_SYNC_MAX_ENDPOINTS_PER_TICK` | Maximum due database endpoints claimed per tick | `32` |
+| `LEDGERFLOW_REGISTRY_SYNC_RUN_ONCE` | Exit after one due-source pass; useful for manual verification | `false` |
+| `LEDGERFLOW_DISCOVERY_BATCH_SIZE` | Canonical blocks projected per factory/ERC-8056 discovery pass | `500` |
+| `LEDGERFLOW_DISCOVERY_LOOKBACK_BLOCKS` | Reorg reconciliation depth for discovery datasets | `128` |
+| `LEDGERFLOW_ADDRESS_PRODUCER_BATCH_SIZE` | Canonical blocks aggregated into each address evidence window | `250` |
+| `LEDGERFLOW_ADDRESS_PRODUCER_REORG_LOOKBACK_BLOCKS` | Address observation rewind depth after a canonical hash change | `128` |
+| `LEDGERFLOW_ADDRESS_WORKER_CONCURRENCY` | Concurrent address jobs sharing the throttled RPC gateway | `4` |
+| `LEDGERFLOW_ECONOMIC_VERIFIER_BATCH_SIZE` | Maximum jobs claimed sequentially per verifier iteration | `2` |
+| `LEDGERFLOW_ECONOMIC_VERIFIER_MAX_NEW_JOBS_PER_PASS` | Maximum new seed evidence jobs scheduled per pass | `10` |
+| `LEDGERFLOW_ECONOMIC_VERIFIER_MAX_PENDING_JOBS` | Queue/running/retry capacity guard | `50` |
+| `LEDGERFLOW_ECONOMIC_VERIFIER_MAX_CANDIDATES_PER_SEED` | Representative transactions considered per MEV seed | `2` |
+| `LEDGERFLOW_ECONOMIC_VERIFIER_MAX_ATTEMPTS` | Bounded attempts before a failed job stops being claimable | `3` |
+| `LEDGERFLOW_ECONOMIC_VERIFIER_STALE_CLAIM_SECONDS` | Restart recovery threshold for abandoned running claims | `120` |
 
-If `LEDGERFLOW_EMAIL_DELIVERY_MODE=auto`, the web process prefers Postmark when both `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_POSTMARK_SERVER_TOKEN` are configured; otherwise it falls back to Resend when `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_RESEND_API_KEY` are configured. If neither provider is configured, it falls back to log-only mode and the auth page plus `/health` will say so explicitly. You can also use unprefixed aliases `EMAIL_FROM`, `POSTMARK_SERVER_TOKEN`, and `RESEND_API_KEY`.
+If `LEDGERFLOW_EMAIL_DELIVERY_MODE=auto`, the web process prefers Postmark when both `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_POSTMARK_SERVER_TOKEN` are configured; otherwise it falls back to Resend when `LEDGERFLOW_EMAIL_FROM` and `LEDGERFLOW_RESEND_API_KEY` are configured. If neither provider is configured, it falls back to log-only mode; `/health` exposes that operational status while the account UI stays provider-neutral. You can also use unprefixed aliases `EMAIL_FROM`, `POSTMARK_SERVER_TOKEN`, and `RESEND_API_KEY`.
 
 The checked-in `.env.example` is the easiest starting point. Copy it to `.env` before using Docker Compose, because the compose stack reads `.env` as the runtime config file.
 
 
 ### RPC gateway variables
 
-Docker Compose includes an `rpc-gateway` service between LedgerFlow processes and the Base RPC tunnel. It is meant to smooth bursts from the indexer, analysis API, and workers while still allowing sustained indexing within the node's capacity.
+Docker Compose includes an `rpc-gateway` service between LedgerFlow processes and the local Robinhood Nitro RPC. It smooths bursts from the indexer, analysis API, and workers while allowing sustained indexing within the node's capacity.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `LEDGERFLOW_RPC_GATEWAY_UPSTREAM_URL` | Upstream Base RPC endpoint reached by the gateway | `http://host.docker.internal:18545` |
+| `LEDGERFLOW_RPC_GATEWAY_UPSTREAM_URL` | Upstream Robinhood RPC endpoint reached by the gateway | `http://host.docker.internal:18545` |
 | `LEDGERFLOW_RPC_GATEWAY_HOST_PORT` | Optional host port for inspecting the gateway | `18555` |
 | `LEDGERFLOW_RPC_GATEWAY_MAX_IN_FLIGHT` | Maximum simultaneous upstream RPC requests | `8` |
 | `LEDGERFLOW_RPC_GATEWAY_RPS` | Token refill rate for upstream requests | `20` |
@@ -90,7 +105,7 @@ If you are running only `ledgerflow indexer`, the main variables are:
 | Variable | Purpose | Example |
 | --- | --- | --- |
 | `LEDGERFLOW_INDEXER_BIND_ADDR` | Indexer API bind address | `0.0.0.0:8090` |
-| `LEDGERFLOW_INDEXER_RPC_URL` | Base RPC endpoint used for block polling | `http://host.docker.internal:18545` in Docker via nginx proxy, `http://127.0.0.1:18545` for local runs on the host |
+| `LEDGERFLOW_INDEXER_RPC_URL` | RPC endpoint used by this worker | local Nitro directly for `live`; throttled gateway/archive endpoint for lazy/history |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_URL` | ClickHouse HTTP endpoint | `http://127.0.0.1:8123` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE` | ClickHouse database name | `ledgerflow_indexer` |
 | `LEDGERFLOW_INDEXER_CLICKHOUSE_USER` | ClickHouse username | `ledgerflow` in Docker |
@@ -99,14 +114,25 @@ If you are running only `ledgerflow indexer`, the main variables are:
 | `LEDGERFLOW_INDEXER_END_BLOCK` | Optional bounded stop block | unset |
 | `LEDGERFLOW_INDEXER_BATCH_SIZE` | Blocks claimed and committed per indexing batch | `200` |
 | `LEDGERFLOW_INDEXER_RPC_CONCURRENCY` | Parallel block fetch count inside a batch | `4` |
-| `LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE` | Block requests packed into one JSON-RPC batch request, without increasing total block concurrency | `1` |
+| `LEDGERFLOW_INDEXER_RPC_BATCH_REQUEST_SIZE` | Basic/lazy block requests grouped per JSON-RPC call; keep `1` when the node does not support JSON-RPC batches | `1` for local Robinhood Nitro |
 | `LEDGERFLOW_INDEXER_RPC_REQUEST_DELAY_MS` | Per-request delay before a block fetch task runs | `25` |
+| `LEDGERFLOW_INDEXER_RPC_REQUEST_TIMEOUT_MS` | Hard timeout for one RPC HTTP request | `30000` |
 | `LEDGERFLOW_INDEXER_RPC_RETRY_BASE_MS` | Base retry delay after rate-limit responses | `1000` |
 | `LEDGERFLOW_INDEXER_RPC_RETRY_MAX_MS` | Maximum retry delay | `15000` |
 | `LEDGERFLOW_INDEXER_RPC_MAX_RETRIES` | Retry count for rate-limit responses | `10` |
-| `LEDGERFLOW_INDEXER_LAZY_ENABLED` | Queue block ranges from address queries and avoid cold-start history scans | `true` |
-| `LEDGERFLOW_INDEXER_LIVE_FOLLOW` | Continue following new blocks when lazy mode is disabled | `true` |
-| `LEDGERFLOW_INDEXER_WORKER_ID` | Progress key | `base_mainnet_top_level` |
+| `LEDGERFLOW_INDEXER_WORKER_MODE` | Worker role: `live`, `lazy`, or `history` | `live` for the API service |
+| `LEDGERFLOW_INDEXER_API_ENABLED` | Bind and serve the indexer HTTP API | `true`; worker-only services set `false` |
+| `LEDGERFLOW_INDEXER_LAZY_ENABLED` | Allow address queries to enqueue uncovered ranges | `true` |
+| `LEDGERFLOW_INDEXER_LAZY_WORKER_ENABLED` | Consume the lazy queue inside this process | `false` on live; Compose runs `indexer-lazy` separately |
+| `LEDGERFLOW_INDEXER_LIVE_FOLLOW` | Continue polling after the configured target is reached | `true` |
+| `LEDGERFLOW_INDEXER_LIVE_HEAD_LAG_BLOCKS` | Safety distance behind the RPC head | `2` |
+| `LEDGERFLOW_INDEXER_LIVE_BOOTSTRAP_BLOCKS` | Canonical window indexed on a fresh live cursor | `128` |
+| `LEDGERFLOW_INDEXER_HISTORY_HEAD_LAG_BLOCKS` | Minimum distance of a history worker from head | `128` |
+| `LEDGERFLOW_INDEXER_HISTORY_BOUNDARY_WORKER_ID` | Live progress row whose persisted range start freezes a new history worker's upper bound | `robinhood_live` |
+| `LEDGERFLOW_INDEXER_HISTORY_RECEIPT_MODE` | Receipt strategy: block-wide RPC or one transaction receipt at a time | `transaction` for local Robinhood Nitro |
+| `LEDGERFLOW_INDEXER_REORG_LOOKBACK_BLOCKS` | Maximum common-ancestor search depth | `128` |
+| `LEDGERFLOW_INDEXER_INTER_BATCH_DELAY_MS` | Low-priority delay after each committed batch | `0` live; set a positive value for history |
+| `LEDGERFLOW_INDEXER_WORKER_ID` | Persisted progress key | `robinhood_live` |
 
 ## Run with Docker
 
@@ -116,13 +142,13 @@ This is the shortest path to a local instance.
 2. Start the stack:
 
 ```bash
-docker-compose up --build db app worker web
+docker compose up -d --build
 ```
 
 The services will be available at:
 
-- API: `http://127.0.0.1:8180`
-- Web: `http://127.0.0.1:3000`
+- API: `http://127.0.0.1:3000`
+- Web: `http://127.0.0.1:3001`
 - Indexer API: `http://127.0.0.1:8090`
 
 The API service runs migrations on startup. The web service is a separate process that proxies the API and exposes a minimal operator UI.
@@ -130,8 +156,76 @@ The API service runs migrations on startup. The web service is a separate proces
 If you only want the standalone top-level indexer:
 
 ```bash
-docker-compose up --build clickhouse indexer
+docker compose up --build clickhouse rpc-gateway indexer indexer-lazy
 ```
+
+Full history is not required for seed intelligence or live monitoring. Start
+the optional historical fact pass only for a deliberate research workload:
+
+```bash
+docker compose --profile full-history up -d indexer-history
+```
+
+On its first successful start, `indexer-history` persists an immutable
+`range_end` from the live worker's `range_start - 1`; subsequent restarts reuse
+that value instead of chasing the moving head. Its default fast mode does not
+fetch receipts or logs and therefore is not sufficient for profit, gas,
+failure, protocol, or asset-flow conclusions. Lazy address requests are capped
+by `LEDGERFLOW_INDEXER_LAZY_MAX_RANGE_BLOCKS` and must not be used as an
+implicit genesis-to-head scan.
+
+The `registry-sync` service has no public port. Its endpoint URLs, chain IDs,
+parser kinds, intervals, cursors, snapshots, and run history live in PostgreSQL.
+To execute a single due-source pass on the host, run:
+
+```bash
+LEDGERFLOW_REGISTRY_SYNC_RUN_ONCE=true cargo run --bin ledgerflow_registry_sync
+```
+
+The `discovery-worker`, `address-producer`, and `behavior-worker` services also have no public ports.
+They read canonical facts from ClickHouse and persist independent PostgreSQL
+cursors. To run one address-production pass on the host:
+
+```bash
+LEDGERFLOW_ADDRESS_PRODUCER_RUN_ONCE=true \
+  cargo run --bin ledgerflow_address_fact_producer
+```
+
+To evaluate one statistical behavior window on the host:
+
+```bash
+LEDGERFLOW_BEHAVIOR_WORKER_RUN_ONCE=true \
+  cargo run --bin ledgerflow_behavior_worker
+```
+
+The behavior rule is intentionally candidate-only. Defaults require at least
+100 sender transactions across 8 producer windows, a 1,000-block span, and 2
+transactions per 1,000 blocks within the latest 50,000 blocks. Configure these
+with `LEDGERFLOW_BEHAVIOR_MIN_TRANSACTION_COUNT`,
+`LEDGERFLOW_BEHAVIOR_MIN_ACTIVE_WINDOWS`,
+`LEDGERFLOW_BEHAVIOR_MIN_SPAN_BLOCKS`,
+`LEDGERFLOW_BEHAVIOR_MIN_TX_PER_1000_BLOCKS`, and
+`LEDGERFLOW_BEHAVIOR_LOOKBACK_BLOCKS`. Change
+`LEDGERFLOW_BEHAVIOR_RULE_VERSION` whenever rule semantics change; model claims
+expire according to `LEDGERFLOW_BEHAVIOR_ASSERTION_TTL_HOURS`.
+
+The private analysis API exposes the review workflow:
+
+```bash
+curl 'http://127.0.0.1:3000/behavior-reviews?chain_id=4663&status=pending&limit=50'
+
+curl -X POST 'http://127.0.0.1:3000/behavior-reviews/REVIEW_ID/decision' \
+  -H 'content-type: application/json' \
+  -d '{"decision":"accept","reviewer":"operator@example.com","rationale":"Reviewed canonical samples"}'
+```
+
+Valid decisions are `accept`, `reject`, and `retract`. Keep port 3000 private;
+the decision endpoint is an operator surface, not a public Web endpoint.
+
+Only event signatures and ABI field positions are defined in code. Factories,
+pools, Tokens, protocol contracts, and participant addresses are discovered at
+runtime and stored in PostgreSQL; unknown event topics are not treated as
+addresses without ABI evidence.
 
 ## Run locally with Cargo
 
@@ -240,7 +334,7 @@ Current web console actions:
 
 - homepage
 - pricing page
-- email-code register/login
+- email-verified registration plus password or email-code login
 - create an address cluster
 - inspect cluster coverage
 - load a cluster spend summary
@@ -640,6 +734,50 @@ If you enable tracing against an RPC that does not support trace methods, the AP
 - task/opportunity/attempt rollups are scaffolded but not yet fully wired into API usage
 
 ## Development workflow
+
+### Seed-first cold start
+
+The `seed-worker` has no public port. It periodically projects official labels,
+protocol deployments, active pools/assets, and repeated MEV-like execution
+evidence into `intelligence_seed_addresses`, then enqueues only effective
+priority 0-39 addresses for expensive enrichment. `mev_actor` rows with
+`candidate` status are selection signals, never verified identities.
+
+S2A also persists neutral first-hop observations and schedules bounded evidence
+analysis. For each selected MEV seed, at most the latest eight explicit
+candidate transaction hashes are sent through the existing deterministic
+analysis pipeline. It does not request full address history. Related call
+targets and pools are queued at priorities 22-28. A completed job with missing
+evidence analysis is requeued automatically; a transaction failure uses the
+normal failed-job retry path.
+
+```bash
+LEDGERFLOW_SEED_WORKER_RUN_ONCE=true \
+  cargo run --bin ledgerflow_seed_worker
+
+curl -fsS 'http://127.0.0.1:3000/intelligence/seeds/summary?chain_id=4663'
+curl -fsS 'http://127.0.0.1:3000/intelligence/seeds?chain_id=4663&seed_kind=mev_actor&status=candidate&limit=25'
+curl -fsS 'http://127.0.0.1:3000/intelligence/seeds/relationships?chain_id=4663&relationship_type=transaction_pool&limit=25'
+curl -fsS 'http://127.0.0.1:3000/intelligence/seeds/coverage?chain_id=4663&seed_kind=mev_actor&limit=25'
+```
+
+The relationship API proves only the named observation. It must not be read as
+ownership, identity, intent, profit, or economic causality. Coverage responses
+set `full_history_coverage` to `false`; an absent analysis remains unknown, not
+zero.
+
+Relevant limits:
+
+```bash
+LEDGERFLOW_SEED_MAX_EVIDENCE_TRANSACTIONS_PER_SEED=8
+LEDGERFLOW_SEED_MAX_RELATED_ADDRESSES=5000
+LEDGERFLOW_SEED_MAX_QUEUED_PRIORITY=39
+LEDGERFLOW_ADDRESS_WORKER_MAX_PRIORITY=39
+```
+
+The Compose address worker receives `LEDGERFLOW_INDEXER_API_BASE_URL` for
+existing full-history workflows. The explicit evidence path itself does not
+depend on an Indexer history request.
 
 Useful commands:
 

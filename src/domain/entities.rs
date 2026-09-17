@@ -209,6 +209,7 @@ pub struct Attempt {
 pub struct AppUser {
     pub user_id: Uuid,
     pub email: String,
+    pub workspace_plan: String,
     pub email_verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }

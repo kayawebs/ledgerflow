@@ -273,6 +273,7 @@ fn block_request_includes_transactions(payload: &Value) -> bool {
 }
 
 struct TokenBucket {
+    acquisition_order: Mutex<()>,
     state: Mutex<TokenBucketState>,
     refill_per_sec: f64,
     capacity: f64,
@@ -286,6 +287,7 @@ struct TokenBucketState {
 impl TokenBucket {
     fn new(refill_per_sec: f64, capacity: f64) -> Self {
         Self {
+            acquisition_order: Mutex::new(()),
             state: Mutex::new(TokenBucketState {
                 tokens: capacity,
                 last_refill: Instant::now(),
@@ -296,6 +298,10 @@ impl TokenBucket {
     }
 
     async fn acquire(&self, requested_cost: f64) {
+        // Preserve arrival order while waiting for enough tokens. Without this
+        // gate, cheap requests can consume every refill and starve an older
+        // trace request indefinitely.
+        let _turn = self.acquisition_order.lock().await;
         let cost = requested_cost.clamp(0.1, self.capacity.max(0.1));
         loop {
             let wait = {

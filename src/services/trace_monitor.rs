@@ -32,8 +32,6 @@ const UNISWAP_V3_SWAP_TOPIC: &str =
 const DEX_SWAP_TOPICS: [&str; 2] = [UNISWAP_V2_SWAP_TOPIC, UNISWAP_V3_SWAP_TOPIC];
 const ERC20_TRANSFER_TOPIC_HEX: &str =
     "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const BASE_USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
-const BASE_USDBC: &str = "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca";
 const FAST_ARBITRAGE_SOURCE_RPC_LOGS: &str = "rpc_logs";
 const FAST_ARBITRAGE_SOURCE_CRYPTOHOUSE: &str = "cryptohouse";
 const DEFAULT_CRYPTOHOUSE_URL: &str = "https://crypto-clickhouse.clickhouse.com/?user=crypto";
@@ -695,6 +693,7 @@ impl TraceMonitorService {
         }
 
         let transfers = erc20_transfers_from_cryptohouse_rows(&body)?;
+        let stable_profit_tokens = self.load_stable_profit_tokens().await?;
         let mut by_tx = BTreeMap::<String, Vec<Erc20TransferLite>>::new();
         for transfer in transfers {
             by_tx
@@ -703,10 +702,37 @@ impl TraceMonitorService {
                 .push(transfer);
         }
         for (candidate, _) in candidates {
-            candidate.confirmation =
-                conservative_arbitrage_confirmation(candidate, by_tx.get(&candidate.tx_hash));
+            candidate.confirmation = conservative_arbitrage_confirmation(
+                candidate,
+                by_tx.get(&candidate.tx_hash),
+                &stable_profit_tokens,
+            );
         }
         Ok(())
+    }
+
+    async fn load_stable_profit_tokens(&self) -> LedgerResult<BTreeSet<String>> {
+        let rows = sqlx::query(
+            r#"
+            select distinct labels.address
+            from effective_address_labels labels
+            join erc20_token_metadata metadata
+              on metadata.chain_id = labels.chain_id
+             and lower(metadata.token_address) = labels.address
+             and metadata.fetch_status = 'ok'
+            where labels.chain_id = $1
+              and labels.label = 'stablecoin'
+            "#,
+        )
+        .bind(self.config.chain_id as i64)
+        .fetch_all(self.repository.pool())
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String, _>("address").ok())
+            .map(|address| address.to_ascii_lowercase())
+            .collect())
     }
 
     fn fast_arbitrage_source(&self) -> String {
@@ -1050,7 +1076,7 @@ impl TraceMonitorService {
             where chain_id = $1
               and block_timestamp >= now() - ($2::text || ' minutes')::interval
               and swap_log_count >= $3
-              and ($5 = false or confirmation_status <> 'candidate')
+              and ($5 = false or confirmation_status like 'confirmed_%')
             order by block_timestamp desc nulls last, block_number desc, score desc
             limit $4
             "#,
@@ -1415,12 +1441,39 @@ impl TraceMonitorService {
               distinct_pool_count = excluded.distinct_pool_count,
               route = excluded.route,
               route_fingerprint = excluded.route_fingerprint,
-              confirmation_status = excluded.confirmation_status,
-              profit_recipient = excluded.profit_recipient,
-              profit_token_address = excluded.profit_token_address,
-              profit_amount_raw = excluded.profit_amount_raw,
-              confirmation_metadata = excluded.confirmation_metadata,
-              metadata = excluded.metadata,
+              confirmation_status = case
+                when arbitrage_candidates.confirmation_status like 'confirmed_%'
+                  then arbitrage_candidates.confirmation_status
+                when excluded.confirmation_status = 'candidate'
+                  and arbitrage_candidates.confirmation_status <> 'candidate'
+                  then arbitrage_candidates.confirmation_status
+                else excluded.confirmation_status
+              end,
+              profit_recipient = coalesce(
+                excluded.profit_recipient,
+                arbitrage_candidates.profit_recipient
+              ),
+              profit_token_address = coalesce(
+                excluded.profit_token_address,
+                arbitrage_candidates.profit_token_address
+              ),
+              profit_amount_raw = coalesce(
+                excluded.profit_amount_raw,
+                arbitrage_candidates.profit_amount_raw
+              ),
+              confirmation_metadata = case
+                when excluded.confirmation_status = 'candidate'
+                  and arbitrage_candidates.confirmation_status <> 'candidate'
+                  then arbitrage_candidates.confirmation_metadata
+                else arbitrage_candidates.confirmation_metadata
+                  || excluded.confirmation_metadata
+              end,
+              metadata = case
+                when excluded.confirmation_status = 'candidate'
+                  and arbitrage_candidates.confirmation_status <> 'candidate'
+                  then arbitrage_candidates.metadata
+                else arbitrage_candidates.metadata || excluded.metadata
+              end,
               updated_at = now()
             "#,
         )
@@ -1947,6 +2000,7 @@ fn erc20_transfers_from_cryptohouse_rows(body: &str) -> LedgerResult<Vec<Erc20Tr
 fn conservative_arbitrage_confirmation(
     candidate: &FastSwapAccumulator,
     transfers: Option<&Vec<Erc20TransferLite>>,
+    stable_profit_tokens: &BTreeSet<String>,
 ) -> FastArbitrageConfirmation {
     let Some(sender) = candidate.sender_address.as_deref() else {
         return FastArbitrageConfirmation {
@@ -1959,7 +2013,7 @@ fn conservative_arbitrage_confirmation(
     };
     let mut stable_token_nets = BTreeMap::<String, i128>::new();
     for transfer in transfers.into_iter().flatten() {
-        if !is_conservative_profit_token(&transfer.token_address) {
+        if !stable_profit_tokens.contains(&transfer.token_address) {
             continue;
         }
         let entry = stable_token_nets
@@ -1992,7 +2046,8 @@ fn conservative_arbitrage_confirmation(
                 profit_amount_raw: Some(net.to_string()),
                 metadata: json!({
                     "method": "erc20_transfer_net_to_sender",
-                    "scope": "usdc_and_usdbc_only",
+                    "scope": "database_stablecoin_labels",
+                    "eligible_token_count": stable_profit_tokens.len(),
                     "reason": "sender has positive stable-token net transfer and no stable-token net outflow",
                     "stable_token_nets": stable_token_nets_json
                 }),
@@ -2003,7 +2058,8 @@ fn conservative_arbitrage_confirmation(
     FastArbitrageConfirmation {
         metadata: json!({
             "method": "erc20_transfer_net_to_sender",
-            "scope": "usdc_and_usdbc_only",
+            "scope": "database_stablecoin_labels",
+            "eligible_token_count": stable_profit_tokens.len(),
             "reason": if has_negative_stable_net {
                 "sender has stable-token net outflow"
             } else {
@@ -2013,10 +2069,6 @@ fn conservative_arbitrage_confirmation(
         }),
         ..Default::default()
     }
-}
-
-fn is_conservative_profit_token(token_address: &str) -> bool {
-    matches!(token_address, BASE_USDC | BASE_USDBC)
 }
 
 fn parse_erc20_amount_i128(value: &str) -> Option<i128> {
@@ -2294,6 +2346,7 @@ mod tests {
                 status: 1,
                 gas_used: None,
                 effective_gas_price: None,
+                l1_fee: None,
                 logs: vec![
                     crate::ingestion::models::RawLog {
                         log_index: 1,

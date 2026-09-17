@@ -92,13 +92,13 @@ chain ID. Native asset pricing must also be chain-local:
 LEDGERFLOW_DEFAULT_CHAIN_ID=4663
 LEDGERFLOW_DATABASE_URL=postgres://.../ledgerflow_robinhood
 LEDGERFLOW_RPC_URL=http://127.0.0.1:8545
-LEDGERFLOW_WRAPPED_NATIVE_TOKEN_ADDRESS=<verified wrapped native token address>
 LEDGERFLOW_NATIVE_TOKEN_SYMBOL=ETH
 ```
 
-If the wrapped-native address is unknown, omit it. Native balances will be
-observed but excluded from USD portfolio valuation instead of incorrectly using
-another chain's wrapped token.
+The wrapped-native address comes from the active `wrapped_native` database
+assertion produced by registry sync. Native balances are excluded from USD
+portfolio valuation until that assertion exists; no chain address is embedded
+in application configuration or code.
 
 ## Rolling migration
 

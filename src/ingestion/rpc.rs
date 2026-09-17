@@ -4,8 +4,22 @@ use serde_json::{Value, json};
 
 use crate::core::errors::{LedgerError, LedgerResult};
 
+fn parse_chain_id(value: &Value) -> LedgerResult<u64> {
+    let raw = value.as_str().ok_or_else(|| {
+        LedgerError::MalformedEvidence("eth_chainId response was not a string".to_owned())
+    })?;
+    u64::from_str_radix(raw.trim_start_matches("0x"), 16).map_err(|error| {
+        LedgerError::MalformedEvidence(format!("invalid eth_chainId response {raw}: {error}"))
+    })
+}
+
 #[async_trait]
 pub trait RpcClient: Send + Sync {
+    async fn get_chain_id(&self) -> LedgerResult<u64> {
+        Err(LedgerError::TransientIngestion(
+            "eth_chainId is not implemented for this rpc client".to_owned(),
+        ))
+    }
     async fn get_transaction(&self, chain_id: u64, tx_hash: &str) -> LedgerResult<Value>;
     async fn get_receipt(&self, chain_id: u64, tx_hash: &str) -> LedgerResult<Value>;
     async fn get_block(&self, chain_id: u64, block_number: u64) -> LedgerResult<Value>;
@@ -35,6 +49,11 @@ pub trait RpcClient: Send + Sync {
     ) -> LedgerResult<String> {
         Err(LedgerError::UnsupportedTrace(
             "eth_call is not implemented for this rpc client".to_owned(),
+        ))
+    }
+    async fn get_logs(&self, _chain_id: u64, _filter: Value) -> LedgerResult<Vec<Value>> {
+        Err(LedgerError::TransientIngestion(
+            "eth_getLogs is not implemented for this rpc client".to_owned(),
         ))
     }
 }
@@ -120,6 +139,11 @@ impl HttpRpcClient {
 
 #[async_trait]
 impl RpcClient for HttpRpcClient {
+    async fn get_chain_id(&self) -> LedgerResult<u64> {
+        let value = self.call("eth_chainId", json!([])).await?;
+        parse_chain_id(&value)
+    }
+
     async fn get_transaction(&self, _chain_id: u64, tx_hash: &str) -> LedgerResult<Value> {
         self.call("eth_getTransactionByHash", json!([tx_hash]))
             .await
@@ -204,5 +228,30 @@ impl RpcClient for HttpRpcClient {
         result.as_str().map(ToOwned::to_owned).ok_or_else(|| {
             LedgerError::MalformedEvidence("eth_call response was not a string".to_owned())
         })
+    }
+
+    async fn get_logs(&self, _chain_id: u64, filter: Value) -> LedgerResult<Vec<Value>> {
+        let result = self.call("eth_getLogs", json!([filter])).await?;
+        result.as_array().cloned().ok_or_else(|| {
+            LedgerError::MalformedEvidence("eth_getLogs response was not an array".to_owned())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::parse_chain_id;
+
+    #[test]
+    fn parses_base_chain_id_exactly() {
+        assert_eq!(parse_chain_id(&json!("0x2105")).unwrap(), 8453);
+    }
+
+    #[test]
+    fn rejects_non_string_or_invalid_chain_id() {
+        assert!(parse_chain_id(&json!(8453)).is_err());
+        assert!(parse_chain_id(&json!("0xnot-hex")).is_err());
     }
 }

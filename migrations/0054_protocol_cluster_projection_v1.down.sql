@@ -1,0 +1,4 @@
+drop index if exists idx_protocol_cluster_members_cluster_rank;
+drop index if exists idx_protocol_launch_trade_cluster_projection;
+drop index if exists idx_protocol_launches_creator_cluster;
+drop table if exists protocol_cluster_projection_checkpoints;

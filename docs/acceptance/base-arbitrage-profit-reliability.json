@@ -1,0 +1,22 @@
+{
+  "schema_version": "ledgerflow.arbitrage-profit-reliability-report.v1",
+  "run_at": "2026-08-12T00:07:29Z",
+  "chain_id": 8453,
+  "method": "archive_balance_snapshot_receipt_trace_reconciliation_v1",
+  "fixture": "tests/fixtures/base_arbitrage_profit_cases.jsonl",
+  "fixture_sha256": "dcac404dd78b8d730cdb4a26ec21d07548d2b6b8aae4130035475bbc121d3090",
+  "reviewed_cases": 6,
+  "verified_exact": 3,
+  "fail_closed_null": 3,
+  "false_numeric_claims": 0,
+  "verified": [
+    {"tx_hash": "0x1ae5d1351545e3f71caa9db955d4b4a98a4e1bafe098949212b3262015fd8737", "profit_raw": "5119", "profit_token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"},
+    {"tx_hash": "0x921b70cbfd389ead780ef510f24556c5e3967478a41a2fd7b6f990df6b2f92dc", "profit_raw": "3631844744188", "profit_token_address": "0x4200000000000000000000000000000000000006"},
+    {"tx_hash": "0xe529680c4cab9f3725fd0a7d0e83addcf7a5dbb28335f27b32719b338202f915", "profit_raw": "3896", "profit_token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"}
+  ],
+  "limitations": [
+    "only an explicit configured searcher/arbitrage-executor accounting scope is eligible",
+    "multi-asset, fee-on-transfer, same-block ambiguous or unreconciled native cases remain null",
+    "unlike assets are never combined without a deterministic price input"
+  ]
+}

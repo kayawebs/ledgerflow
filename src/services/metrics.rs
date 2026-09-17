@@ -1,4 +1,7 @@
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::json;
@@ -46,7 +49,14 @@ impl ClusterMetricsService {
                 .repository
                 .list_classified_transactions_for_cluster(cluster_id, Some(start), Some(now))
                 .await?;
-            snapshots.push(self.build_snapshot(cluster.cluster_id, cluster.chain_id, window, start, now, &txs));
+            snapshots.push(self.build_snapshot(
+                cluster.cluster_id,
+                cluster.chain_id,
+                window,
+                start,
+                now,
+                &txs,
+            ));
         }
 
         self.repository
@@ -63,7 +73,9 @@ impl ClusterMetricsService {
             .get_cluster(cluster_id)
             .await?
             .ok_or_else(|| LedgerError::NotFound(format!("cluster {cluster_id} not found")))?;
-        self.repository.list_cluster_metrics_snapshots(cluster_id).await
+        self.repository
+            .list_cluster_metrics_snapshots(cluster_id)
+            .await
     }
 
     fn build_snapshot(
@@ -122,7 +134,11 @@ impl ClusterMetricsService {
 }
 
 fn snapshot_id(cluster_id: Uuid, window: &MetricsWindow, timestamp: DateTime<Utc>) -> Uuid {
-    let key = format!("{cluster_id}:{}:{}", metrics_window_key(window), timestamp.format("%Y-%m-%dT%H"));
+    let key = format!(
+        "{cluster_id}:{}:{}",
+        metrics_window_key(window),
+        timestamp.format("%Y-%m-%dT%H")
+    );
     stable_uuid_from_key(&key)
 }
 
@@ -150,11 +166,7 @@ fn sum_positive_metric(txs: &[ClassifiedTransaction], field: &str) -> Option<f64
     let mut sum = 0.0f64;
     let mut seen = false;
     for tx in txs {
-        if let Some(value) = tx
-            .raw_json
-            .get(field)
-            .and_then(|value| value.as_f64())
-        {
+        if let Some(value) = tx.raw_json.get(field).and_then(|value| value.as_f64()) {
             seen = true;
             sum += value;
         }

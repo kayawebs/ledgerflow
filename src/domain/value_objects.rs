@@ -62,3 +62,31 @@ pub struct AddressTxRef {
     pub from_address: Option<String>,
     pub to_address: Option<String>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AddressTxDiscovery {
+    pub refs: Vec<AddressTxRef>,
+    /// `None` means the source cannot prove block-range completeness. It must
+    /// never be interpreted as complete by an intelligence consumer.
+    pub coverage_complete: Option<bool>,
+    pub indexed_block_count: Option<u64>,
+    pub requested_block_count: Option<u64>,
+}
+
+/// Auditable, URL-free runtime provenance for a chain data plane. Optional
+/// fields remain null when a source cannot prove them; callers must not infer
+/// full-history coverage from a live indexed range.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ChainDataSourceStatus {
+    pub chain_id: u64,
+    pub data_source: String,
+    pub indexed_from_block: Option<u64>,
+    pub indexed_to_block: Option<u64>,
+    pub chain_head: Option<u64>,
+    pub ingestion_lag: Option<u64>,
+    pub last_updated_at: Option<DateTime<Utc>>,
+    pub history_mode: String,
+    pub full_history_available: bool,
+    pub available: bool,
+    pub limitation: Option<String>,
+}

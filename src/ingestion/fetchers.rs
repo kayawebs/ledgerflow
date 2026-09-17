@@ -199,6 +199,10 @@ impl TransactionBundleFetcher {
                 .get("effectiveGasPrice")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
+            l1_fee: receipt_payload
+                .get("l1Fee")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             logs,
         };
 

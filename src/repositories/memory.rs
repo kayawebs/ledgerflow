@@ -183,6 +183,40 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
         Ok(analyses)
     }
 
+    async fn list_analyses_for_observed_addresses(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> LedgerResult<Vec<TransactionAnalysis>> {
+        let address_set = addresses
+            .iter()
+            .map(|item| item.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let analyses = self
+            .analyses
+            .read()
+            .await
+            .values()
+            .filter(|analysis| analysis.chain_id == chain_id)
+            .filter(|analysis| {
+                address_set.contains(&analysis.from_address.to_ascii_lowercase())
+                    || analysis
+                        .to_address
+                        .as_ref()
+                        .is_some_and(|item| address_set.contains(&item.to_ascii_lowercase()))
+                    || analysis.derived_flows.iter().any(|flow| {
+                        address_set.contains(&flow.from_address.to_ascii_lowercase())
+                            || address_set.contains(&flow.to_address.to_ascii_lowercase())
+                    })
+            })
+            .filter(|analysis| within_range(analysis.block_timestamp, start, end))
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(analyses)
+    }
+
     async fn create_cluster_backfill_run(&self, run: &ClusterBackfillRun) -> LedgerResult<()> {
         let mut runs = self.cluster_backfill_runs.write().await;
         runs.entry(run.cluster_id).or_default().push(run.clone());
@@ -608,9 +642,54 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
                         .any(|role| role.as_str() == Some("portfolio_refresh"))
                 })
                 .unwrap_or(false);
+            let suspected_token = candidate
+                .metadata
+                .get("roles")
+                .and_then(Value::as_array)
+                .map(|roles| {
+                    roles
+                        .iter()
+                        .any(|role| role.as_str() == Some("suspected_token"))
+                })
+                .unwrap_or(false);
+            let canonical_address_facts = candidate.metadata.get("source").and_then(Value::as_str)
+                == Some("canonical_address_facts");
             match jobs.get_mut(&key) {
                 Some(existing)
-                    if existing.status != "completed" || manual_lookup || portfolio_refresh =>
+                    if {
+                        let token_role_is_new = suspected_token
+                            && !existing
+                                .metadata
+                                .get("roles")
+                                .and_then(Value::as_array)
+                                .is_some_and(|roles| {
+                                    roles
+                                        .iter()
+                                        .any(|role| role.as_str() == Some("suspected_token"))
+                                });
+                        let existing_roles = existing
+                            .metadata
+                            .get("roles")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        let canonical_role_is_new = canonical_address_facts
+                            && candidate
+                                .metadata
+                                .get("roles")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .any(|role| !existing_roles.contains(role));
+                        existing.status != "completed"
+                            || manual_lookup
+                            || portfolio_refresh
+                            || token_role_is_new
+                            || canonical_role_is_new
+                    } =>
                 {
                     existing.last_seen_at = now;
                     existing.updated_at = now;
@@ -618,7 +697,11 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
                     existing.metadata =
                         merge_json(existing.metadata.clone(), candidate.metadata.clone());
                     if existing.status == "failed"
-                        || (existing.status == "completed" && (manual_lookup || portfolio_refresh))
+                        || (existing.status == "completed"
+                            && (manual_lookup
+                                || portfolio_refresh
+                                || suspected_token
+                                || canonical_address_facts))
                     {
                         existing.status = "pending".to_owned();
                         existing.available_at = now;
@@ -654,11 +737,62 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
     }
 
     async fn claim_next_address_analysis_job(&self) -> LedgerResult<Option<AddressAnalysisJob>> {
+        self.claim_next_address_analysis_job_up_to(i32::MAX).await
+    }
+
+    async fn claim_next_address_analysis_job_up_to(
+        &self,
+        maximum_priority: i32,
+    ) -> LedgerResult<Option<AddressAnalysisJob>> {
         let mut jobs = self.address_jobs.write().await;
         let now = Utc::now();
         let selected = jobs
             .iter()
-            .filter(|(_, job)| job.status == "pending" && job.available_at <= now)
+            .filter(|(_, job)| {
+                job.priority <= maximum_priority
+                    && (matches!(job.status.as_str(), "pending" | "failed")
+                        && job.available_at <= now
+                        || job.status == "running"
+                            && job.claimed_at.unwrap_or(job.updated_at)
+                                < now - chrono::Duration::minutes(5))
+            })
+            .min_by(|(_, left), (_, right)| {
+                left.priority
+                    .cmp(&right.priority)
+                    .then_with(|| left.first_seen_at.cmp(&right.first_seen_at))
+            })
+            .map(|(key, _)| key.clone());
+        let Some(key) = selected else {
+            return Ok(None);
+        };
+        let Some(job) = jobs.get_mut(&key) else {
+            return Ok(None);
+        };
+        job.status = "running".to_owned();
+        job.attempts += 1;
+        job.claimed_at = Some(now);
+        job.updated_at = now;
+        Ok(Some(job.clone()))
+    }
+
+    async fn claim_next_address_analysis_job_for_chain_up_to(
+        &self,
+        chain_id: u64,
+        maximum_priority: i32,
+    ) -> LedgerResult<Option<AddressAnalysisJob>> {
+        let mut jobs = self.address_jobs.write().await;
+        let now = Utc::now();
+        let selected = jobs
+            .iter()
+            .filter(|(_, job)| {
+                job.chain_id == chain_id
+                    && job.priority <= maximum_priority
+                    && (matches!(job.status.as_str(), "pending" | "failed")
+                        && job.available_at <= now
+                        || job.status == "running"
+                            && job.claimed_at.unwrap_or(job.updated_at)
+                                < now - chrono::Duration::minutes(5))
+            })
             .min_by(|(_, left), (_, right)| {
                 left.priority
                     .cmp(&right.priority)
@@ -715,6 +849,34 @@ impl AnalysisRepository for InMemoryAnalysisRepository {
             );
         }
         Ok(())
+    }
+
+    async fn list_protocol_address_metadata(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+        _block_number: Option<u64>,
+    ) -> LedgerResult<Vec<ProtocolAddressMetadata>> {
+        let addresses = addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut rows = self
+            .protocol_metadata
+            .read()
+            .await
+            .values()
+            .filter(|item| {
+                item.chain_id == chain_id && addresses.contains(&item.address.to_ascii_lowercase())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| {
+            a.address
+                .cmp(&b.address)
+                .then_with(|| a.protocol_name.cmp(&b.protocol_name))
+        });
+        Ok(rows)
     }
 
     async fn complete_address_analysis_job(
@@ -884,7 +1046,27 @@ fn merge_json(left: serde_json::Value, right: serde_json::Value) -> serde_json::
     match (left, right) {
         (serde_json::Value::Object(mut left), serde_json::Value::Object(right)) => {
             for (key, value) in right {
-                left.insert(key, value);
+                if key == "roles" {
+                    let mut roles = left
+                        .get("roles")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<std::collections::BTreeSet<_>>();
+                    roles.extend(
+                        value
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    );
+                    left.insert(key, serde_json::json!(roles));
+                } else {
+                    left.insert(key, value);
+                }
             }
             serde_json::Value::Object(left)
         }

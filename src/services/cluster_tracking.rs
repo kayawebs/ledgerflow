@@ -38,7 +38,11 @@ impl ClusterTrackingService {
             .await?
             .ok_or_else(|| LedgerError::NotFound(format!("cluster {cluster_id} not found")))?;
 
-        if let Some(state) = self.repository.get_cluster_tracking_state(cluster_id).await? {
+        if let Some(state) = self
+            .repository
+            .get_cluster_tracking_state(cluster_id)
+            .await?
+        {
             return Ok(state);
         }
 
@@ -85,7 +89,9 @@ impl ClusterTrackingService {
         state.metadata = json!({
             "source": "enabled_via_api"
         });
-        self.repository.upsert_cluster_tracking_state(&state).await?;
+        self.repository
+            .upsert_cluster_tracking_state(&state)
+            .await?;
         Ok(state)
     }
 
@@ -98,7 +104,9 @@ impl ClusterTrackingService {
         state.metadata = json!({
             "source": "paused_via_api"
         });
-        self.repository.upsert_cluster_tracking_state(&state).await?;
+        self.repository
+            .upsert_cluster_tracking_state(&state)
+            .await?;
         Ok(state)
     }
 

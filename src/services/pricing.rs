@@ -145,26 +145,11 @@ struct FlowAmount {
     stable: Option<StableToken>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct StableToken {
-    address: &'static str,
-    symbol: &'static str,
+    symbol: String,
+    decimals: u8,
 }
-
-const STABLE_TOKENS: &[StableToken] = &[
-    StableToken {
-        address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-        symbol: "USDC",
-    },
-    StableToken {
-        address: "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
-        symbol: "USDbC",
-    },
-    StableToken {
-        address: "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
-        symbol: "USDT",
-    },
-];
 
 impl PriceService {
     pub fn new(pool: PgPool) -> Self {
@@ -179,11 +164,44 @@ impl PriceService {
         self
     }
 
+    pub async fn wrapped_native_token_address(
+        &self,
+        chain_id: u64,
+    ) -> LedgerResult<Option<String>> {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            select assertions.address
+            from address_label_assertions assertions
+            join intelligence_sources sources
+              on sources.source_key = assertions.source_key
+             and sources.status = 'active'
+            join erc20_token_metadata metadata
+              on metadata.chain_id = assertions.chain_id
+             and metadata.token_address = assertions.address
+             and metadata.fetch_status = 'ok'
+            where assertions.chain_id = $1
+              and assertions.label_key = 'wrapped_native'
+              and assertions.status = 'active'
+              and assertions.assertion_value
+              and (assertions.expires_at is null or assertions.expires_at > now())
+            order by assertions.confidence * sources.trust_score desc,
+                     assertions.observed_at desc, assertions.assertion_id desc
+            limit 1
+            "#,
+        )
+        .bind(chain_id as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))
+    }
+
     pub async fn observe_analysis(
         &self,
         analysis: &mut TransactionAnalysis,
     ) -> LedgerResult<PriceAnalysisSummary> {
-        let observations = derive_tx_execution_observations(analysis);
+        let stable_tokens = self.load_stable_tokens(analysis.chain_id).await?;
+        let observations =
+            derive_tx_execution_observations_with_stable_tokens(analysis, &stable_tokens);
         let mut observations_written = 0usize;
         for observation in &observations {
             self.insert_observation(analysis, observation).await?;
@@ -224,7 +242,7 @@ impl PriceService {
     ) -> LedgerResult<Option<PriceQuote>> {
         let token_address = token_address.to_ascii_lowercase();
         let amount_decimal_f64 = parse_amount_decimal(amount_raw, decimals)?;
-        if let Some(stable) = stable_token(&token_address) {
+        if let Some(stable) = self.load_stable_token(chain_id, &token_address).await? {
             return Ok(Some(PriceQuote {
                 token_address,
                 quote_symbol: DEFAULT_QUOTE_SYMBOL.to_owned(),
@@ -321,7 +339,7 @@ impl PriceService {
     ) -> LedgerResult<Option<PriceQuote>> {
         let token_address = token_address.to_ascii_lowercase();
         let amount_decimal_f64 = parse_amount_decimal(amount_raw, decimals)?;
-        if let Some(stable) = stable_token(&token_address) {
+        if let Some(stable) = self.load_stable_token(chain_id, &token_address).await? {
             return Ok(Some(PriceQuote {
                 token_address,
                 quote_symbol: DEFAULT_QUOTE_SYMBOL.to_owned(),
@@ -427,6 +445,78 @@ impl PriceService {
         .map_err(|err| LedgerError::Persistence(err.to_string()))
     }
 
+    async fn load_stable_token(
+        &self,
+        chain_id: u64,
+        token_address: &str,
+    ) -> LedgerResult<Option<StableToken>> {
+        Ok(self
+            .load_stable_tokens(chain_id)
+            .await?
+            .get(&token_address.to_ascii_lowercase())
+            .cloned())
+    }
+
+    async fn load_stable_tokens(
+        &self,
+        chain_id: u64,
+    ) -> LedgerResult<BTreeMap<String, StableToken>> {
+        let rows = sqlx::query(
+            r#"
+            with ranked as (
+              select assertions.address,
+                     coalesce(metadata.symbol, 'USD') as symbol,
+                     coalesce(metadata.decimals, 18) as decimals,
+                     row_number() over (
+                       partition by assertions.address
+                       order by assertions.confidence * sources.trust_score desc,
+                                assertions.observed_at desc,
+                                assertions.assertion_id desc
+                     ) as precedence_rank,
+                     assertions.confidence * sources.trust_score as effective_confidence
+              from address_label_assertions assertions
+              join intelligence_sources sources
+                on sources.source_key = assertions.source_key
+               and sources.status = 'active'
+              join erc20_token_metadata metadata
+                on metadata.chain_id = assertions.chain_id
+               and metadata.token_address = assertions.address
+               and metadata.fetch_status = 'ok'
+              where assertions.chain_id = $1
+                and assertions.label_key = 'stablecoin'
+                and assertions.status = 'active'
+                and assertions.assertion_value
+                and (assertions.expires_at is null or assertions.expires_at > now())
+            )
+            select address, symbol, decimals
+            from ranked
+            where precedence_rank = 1
+            order by effective_confidence desc, address
+            "#,
+        )
+        .bind(chain_id as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        let mut tokens = BTreeMap::new();
+        for row in rows {
+            let address = row
+                .try_get::<String, _>("address")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                .to_ascii_lowercase();
+            let symbol = row
+                .try_get::<String, _>("symbol")
+                .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+            let decimals = row
+                .try_get::<i32, _>("decimals")
+                .ok()
+                .and_then(|value| u8::try_from(value).ok())
+                .unwrap_or(18);
+            tokens.insert(address, StableToken { symbol, decimals });
+        }
+        Ok(tokens)
+    }
+
     async fn attach_flow_quotes(
         &self,
         analysis: &mut TransactionAnalysis,
@@ -516,7 +606,10 @@ impl PriceService {
         if request.quote_symbol != DEFAULT_QUOTE_SYMBOL {
             return Ok(None);
         }
-        if stable_token(&request.token_address).is_some() {
+        if let Some(stable) = self
+            .load_stable_token(request.chain_id, &request.token_address)
+            .await?
+        {
             let observation = PriceObservation {
                 chain_id: request.chain_id,
                 token_address: request.token_address.clone(),
@@ -525,11 +618,13 @@ impl PriceService {
                 block_number: request.target_block,
                 block_bucket: request.block_bucket,
                 price_decimal: "1".to_owned(),
-                source: SOURCE_STABLE_ANCHOR.to_owned(),
+                source: format!("{SOURCE_STABLE_ANCHOR}:{}", stable.symbol),
                 confidence: 0.99,
                 tx_hash: None,
                 metadata: json!({
-                    "method": "known_stable_anchor",
+                    "method": "database_stable_anchor",
+                    "asset_role": "stablecoin",
+                    "symbol": stable.symbol,
                     "request_id": request.request_id,
                     "state_block": request.target_block,
                     "historical_state": request.target_block.is_some(),
@@ -558,6 +653,7 @@ impl PriceService {
         let Some(rpc_client) = self.rpc_client.as_ref() else {
             return Ok(false);
         };
+        let stable_tokens = self.load_stable_tokens(request.chain_id).await?;
         let candidates = self.load_pool_candidates(request).await?;
         for candidate in candidates {
             let Some(relative_price) = self
@@ -567,7 +663,7 @@ impl PriceService {
                 continue;
             };
             let (quote_usd_price, quote_confidence, quote_source) =
-                match stable_token(&candidate.quote_token) {
+                match stable_token(&stable_tokens, &candidate.quote_token) {
                     Some(stable) => (
                         1.0,
                         0.99,
@@ -634,31 +730,38 @@ impl PriceService {
     ) -> LedgerResult<Vec<PoolPriceCandidate>> {
         let rows = sqlx::query(
             r#"
-            select address, protocol_name, confidence, metadata
-            from address_protocol_metadata
-            where chain_id = $1
-              and protocol_family = 'dex'
-              and contract_role = 'dex_pool'
+            with stable_addresses as materialized (
+              select coalesce(
+                array_agg(distinct labels.address),
+                array[]::text[]
+              ) as addresses
+              from address_label_assertions labels
+              join intelligence_sources sources
+                on sources.source_key = labels.source_key
+               and sources.status = 'active'
+              where labels.chain_id = $1
+                and labels.label_key = 'stablecoin'
+                and labels.status = 'active'
+                and labels.assertion_value
+                and (labels.expires_at is null or labels.expires_at > now())
+            )
+            select pools.address, pools.protocol_name, pools.confidence, pools.metadata
+            from address_protocol_metadata pools
+            cross join stable_addresses stable
+            where pools.chain_id = $1
+              and pools.protocol_family = 'dex'
+              and pools.contract_role = 'dex_pool'
               and (
-                lower(metadata->>'token0') = $2
-                or lower(metadata->>'token1') = $2
+                lower(pools.metadata->>'token0') = $2
+                or lower(pools.metadata->>'token1') = $2
               )
             order by
-              case
-                when lower(metadata->>'token0') in (
-                  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
-                  '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca',
-                  '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2'
-                ) then 0
-                when lower(metadata->>'token1') in (
-                  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
-                  '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca',
-                  '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2'
-                ) then 0
-                else 1
-              end,
-              confidence desc,
-              updated_at desc
+              case when
+                lower(pools.metadata->>'token0') = any(stable.addresses)
+                or lower(pools.metadata->>'token1') = any(stable.addresses)
+              then 0 else 1 end,
+              pools.confidence desc,
+              pools.updated_at desc
             limit 20
             "#,
         )
@@ -853,11 +956,8 @@ impl PriceService {
     }
 
     async fn token_decimals(&self, chain_id: u64, token_address: &str) -> LedgerResult<u8> {
-        if let Some(stable) = stable_token(&token_address.to_ascii_lowercase()) {
-            return Ok(match stable.symbol {
-                "USDC" | "USDbC" | "USDT" => 6,
-                _ => 18,
-            });
+        if let Some(stable) = self.load_stable_token(chain_id, token_address).await? {
+            return Ok(stable.decimals);
         }
         let row = sqlx::query(
             r#"
@@ -1318,10 +1418,18 @@ impl PriceService {
 }
 
 pub fn derive_tx_execution_observations(analysis: &TransactionAnalysis) -> Vec<PriceObservation> {
+    let stable_tokens = stable_tokens_from_flow_metadata(analysis);
+    derive_tx_execution_observations_with_stable_tokens(analysis, &stable_tokens)
+}
+
+fn derive_tx_execution_observations_with_stable_tokens(
+    analysis: &TransactionAnalysis,
+    stable_tokens: &BTreeMap<String, StableToken>,
+) -> Vec<PriceObservation> {
     let flows = analysis
         .derived_flows
         .iter()
-        .filter_map(flow_amount)
+        .filter_map(|flow| flow_amount(flow, stable_tokens))
         .collect::<Vec<_>>();
     let block_bucket = analysis.block_number.map(block_bucket);
     let mut observations = BTreeMap::<String, PriceObservation>::new();
@@ -1375,7 +1483,7 @@ pub fn derive_tx_execution_observations(analysis: &TransactionAnalysis) -> Vec<P
     }
 
     for stable in flows.iter().filter(|item| item.stable.is_some()) {
-        let Some(stable_token) = stable.stable else {
+        let Some(stable_token) = stable.stable.as_ref() else {
             continue;
         };
         observations
@@ -1476,7 +1584,10 @@ fn attach_pricing_summary(analysis: &mut TransactionAnalysis, summary: &PriceAna
     }
 }
 
-fn flow_amount(flow: &AssetFlow) -> Option<FlowAmount> {
+fn flow_amount(
+    flow: &AssetFlow,
+    stable_tokens: &BTreeMap<String, StableToken>,
+) -> Option<FlowAmount> {
     if flow.asset_type != AssetType::Erc20 {
         return None;
     }
@@ -1488,7 +1599,7 @@ fn flow_amount(flow: &AssetFlow) -> Option<FlowAmount> {
     }
     Some(FlowAmount {
         flow: flow.clone(),
-        stable: stable_token(&token_address),
+        stable: stable_token(stable_tokens, &token_address),
         token_address,
         amount_decimal,
         symbol: token_symbol(flow),
@@ -1511,11 +1622,51 @@ fn token_symbol(flow: &AssetFlow) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn stable_token(address: &str) -> Option<StableToken> {
-    STABLE_TOKENS
+fn stable_token(
+    stable_tokens: &BTreeMap<String, StableToken>,
+    address: &str,
+) -> Option<StableToken> {
+    stable_tokens.get(&address.to_ascii_lowercase()).cloned()
+}
+
+fn stable_tokens_from_flow_metadata(
+    analysis: &TransactionAnalysis,
+) -> BTreeMap<String, StableToken> {
+    analysis
+        .derived_flows
         .iter()
-        .copied()
-        .find(|token| token.address == address)
+        .filter_map(|flow| {
+            let address = flow.token_address.as_deref()?.to_ascii_lowercase();
+            let symbol = token_symbol(flow)?;
+            is_stable_symbol(&symbol).then(|| {
+                (
+                    address,
+                    StableToken {
+                        symbol,
+                        decimals: token_decimals(flow),
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn is_stable_symbol(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "USDC"
+            | "USDBC"
+            | "USDT"
+            | "DAI"
+            | "USDS"
+            | "PYUSD"
+            | "FRAX"
+            | "LUSD"
+            | "GHO"
+            | "USD0"
+            | "USDG"
+            | "USDE"
+    )
 }
 
 fn pair_confidence(stable: &FlowAmount, token: &FlowAmount) -> Option<f32> {

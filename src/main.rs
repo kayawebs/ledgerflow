@@ -9,9 +9,17 @@ use ledgerflow::{
     recognition::registry::RecognizerRegistry,
     repositories::sqlx::SqlxAnalysisRepository,
     services::{
-        analysis::AnalysisService, cluster_backfill::ClusterBackfillService,
-        discovery::ClusterDiscoveryService, indexer_client::IndexerHttpClient,
-        pricing::PriceService, token_metadata::TokenMetadataService,
+        analysis::AnalysisService,
+        behavior_assertions::BehaviorReviewService,
+        cluster_backfill::ClusterBackfillService,
+        discovery::ClusterDiscoveryService,
+        indexer_client::IndexerHttpClient,
+        observation_intelligence::{ObservationIntelligenceConfig, ObservationIntelligenceService},
+        pricing::PriceService,
+        searcher_cluster_intelligence::{
+            SearcherClusterConfig, SearcherClusterIntelligenceService,
+        },
+        token_metadata::TokenMetadataService,
     },
 };
 use std::sync::Arc as StdArc;
@@ -32,6 +40,8 @@ async fn main() {
         .run(repository.pool())
         .await
         .expect("migrations should succeed");
+    let behavior_review_service = Arc::new(BehaviorReviewService::new(repository.pool().clone()));
+    let pilot_pool = repository.pool().clone();
     let rpc_client = StdArc::new(HttpRpcClient::new(config.rpc_url.clone()));
     let fetcher = TransactionBundleFetcher::new(rpc_client.clone(), config.trace_enabled);
     let token_metadata_service = Arc::new(TokenMetadataService::new(
@@ -56,6 +66,38 @@ async fn main() {
             config.indexer_api_bearer_token.clone(),
         )) as Arc<dyn ClusterTxSource>
     });
+    let observation_components = config.indexer_api_base_url.clone().map(|url| {
+        let observation_source = Arc::new(
+            IndexerHttpClient::new(url, config.indexer_api_bearer_token.clone()).known_only(),
+        ) as Arc<dyn ClusterTxSource>;
+        let observation_service = Arc::new(ObservationIntelligenceService::new(
+            pilot_pool.clone(),
+            rpc_client.clone(),
+            service.clone(),
+            observation_source.clone(),
+            ObservationIntelligenceConfig {
+                chain_id: config.default_chain_id,
+                ..ObservationIntelligenceConfig::default()
+            },
+        ));
+        let searcher_cluster_service = Arc::new(SearcherClusterIntelligenceService::new(
+            pilot_pool.clone(),
+            rpc_client.clone(),
+            service.clone(),
+            observation_source,
+            SearcherClusterConfig {
+                chain_id: config.default_chain_id,
+                ..SearcherClusterConfig::default()
+            },
+        ));
+        (observation_service, searcher_cluster_service)
+    });
+    let observation_service = observation_components
+        .as_ref()
+        .map(|(observation, _)| observation.clone());
+    let searcher_cluster_service = observation_components
+        .as_ref()
+        .map(|(_, cluster)| cluster.clone());
     let discovery_service = tx_source
         .clone()
         .map(|source| Arc::new(ClusterDiscoveryService::new(source, rpc_client.clone())));
@@ -79,7 +121,12 @@ async fn main() {
             service,
             backfill_service,
             rpc_client,
+            behavior_review_service,
             config.cluster_auto_backfill_on_create,
+            config.default_chain_id,
+            pilot_pool,
+            observation_service,
+            searcher_cluster_service,
         ),
     )
     .await

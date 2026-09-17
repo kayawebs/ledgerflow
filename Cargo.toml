@@ -5,22 +5,29 @@ edition = "2024"
 description = "Evidence-first Base transaction analysis platform starter in Rust"
 
 [dependencies]
+argon2 = "0.5"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 hex = "0.4"
+jsonschema = { version = "0.33", default-features = false }
+k256 = { version = "0.13", features = ["ecdsa"] }
+num-bigint = "0.4"
+pulldown-cmark = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 sha2 = "0.10"
+sha3 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 urlencoding = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
 tower = "0.5"

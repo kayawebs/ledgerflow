@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ledgerflow.local/schemas/evidence-pack-v1.schema.json",
+  "title": "LedgerFlow Pilot Evidence Pack v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "project_id", "chain_id", "tx_hash", "subject", "event_type", "severity", "conclusion", "entities", "asset_flows", "protocol_path", "profit_and_cost", "technical_evidence", "limitations", "ruleset_id", "inputs_digest", "created_at"],
+  "properties": {
+    "schema_version": {"const": "ledgerflow.evidence-pack.v1"}, "event_id": {"type": "string", "format": "uuid"}, "project_id": {"type": "string", "minLength": 1}, "chain_id": {"const": 8453}, "block_number": {"type": ["integer", "null"]}, "tx_hash": {"type": "string", "pattern": "^0x[0-9a-fA-F]{64}$"}, "subject": {"type": "object"}, "event_type": {"enum": ["large_asset_flow", "treasury_movement", "protocol_revenue", "dex_arbitrage", "liquidation", "high_cost_failure", "repeated_failed_attempts", "unknown_material_interaction"]}, "severity": {"enum": ["info", "low", "medium", "high", "critical"]}, "conclusion": {"type": "string"}, "entities": {"type": "array"}, "asset_flows": {"type": "array"}, "protocol_path": {"type": "array"}, "profit_and_cost": {}, "technical_evidence": {}, "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1}, "limitations": {"type": "array", "items": {"type": "string"}}, "ruleset_id": {"type": "string"}, "inputs_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "created_at": {"type": "string", "format": "date-time"}
+  }
+}

@@ -57,10 +57,14 @@ impl BehaviorClassifier {
                     .and_then(|value| value.as_str())
                     .map(str::to_owned)
             })
-            .or_else(|| labels
-            .iter()
-            .find(|label| !matches!(label.as_str(), "selector_present" | "failed_execution"))
-            .cloned())
+            .or_else(|| {
+                labels
+                    .iter()
+                    .find(|label| {
+                        !matches!(label.as_str(), "selector_present" | "failed_execution")
+                    })
+                    .cloned()
+            })
             .or_else(|| analysis.to_address.clone())
             .or_else(|| labels.first().cloned());
 
@@ -69,7 +73,10 @@ impl BehaviorClassifier {
         let (volume_usd, external_inflow_usd, external_outflow_usd) =
             self.estimate_native_volume(&address, &analysis.derived_flows);
         let gas_cost_usd = parse_native_usd(
-            analysis.accounting_outputs.get("gas_cost_raw").and_then(|value| value.as_str()),
+            analysis
+                .accounting_outputs
+                .get("gas_cost_raw")
+                .and_then(|value| value.as_str()),
             self.native_token_price_usd,
         );
         let estimated_pnl_usd = match (external_inflow_usd, external_outflow_usd, gas_cost_usd) {
@@ -167,7 +174,12 @@ impl BehaviorClassifier {
 fn classify_token_direction(
     address: &str,
     derived_facts: &serde_json::Value,
-) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     let mut incoming: BTreeMap<String, i128> = BTreeMap::new();
     let mut outgoing: BTreeMap<String, i128> = BTreeMap::new();
 
@@ -220,10 +232,15 @@ fn classify_behavior_tag(
     estimated_pnl_usd: Option<f64>,
     gas_cost_usd: Option<f64>,
 ) -> BehaviorTag {
-    if labels.iter().any(|label| label == "liquidation_like_activity") {
+    if labels
+        .iter()
+        .any(|label| label == "liquidation_like_activity")
+    {
         return BehaviorTag::Liquidation;
     }
-    if labels.iter().any(|label| label == "arbitrage_like_activity")
+    if labels
+        .iter()
+        .any(|label| label == "arbitrage_like_activity")
         || (token_in.is_some()
             && token_out.is_some()
             && estimated_pnl_usd.unwrap_or_default() > gas_cost_usd.unwrap_or_default())
@@ -256,8 +273,15 @@ fn parse_native_usd(raw: Option<&str>, native_token_price_usd: f64) -> Option<f6
     Some((value / ERC20_DECIMALS_ASSUMPTION) * native_token_price_usd)
 }
 
-pub fn alert_bucket_key(cluster_id: Uuid, scope: &str, triggered_at: chrono::DateTime<Utc>) -> Uuid {
-    let key = format!("{cluster_id}:{scope}:{}", triggered_at.format("%Y-%m-%dT%H"));
+pub fn alert_bucket_key(
+    cluster_id: Uuid,
+    scope: &str,
+    triggered_at: chrono::DateTime<Utc>,
+) -> Uuid {
+    let key = format!(
+        "{cluster_id}:{scope}:{}",
+        triggered_at.format("%Y-%m-%dT%H")
+    );
     stable_uuid_from_key(&key)
 }
 

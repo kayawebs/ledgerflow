@@ -1,4 +1,7 @@
 /target
 /.sqlx
 .env
+*.local.env
+config/intelligence/*.local.json
 .idea/
+/reports/

@@ -1,6 +1,6 @@
 {
   "dataset_key": "base-core-contracts",
-  "dataset_version": "1.0.0",
+  "dataset_version": "1.1.0",
   "chain_id": 8453,
   "source": {
     "source_key": "ledgerflow_curated_base",
@@ -186,12 +186,12 @@
       "token_metadata": null,
       "protocol_deployments": [
         {
-          "protocol_key": "uniswap",
+          "protocol_key": "uniswap_v2",
           "display_name": "Uniswap",
           "protocol_family": "dex",
           "contract_role": "router",
           "confidence": 0.99,
-          "metadata": {"deployment": "v2_router"}
+          "metadata": {"deployment": "v2_router", "protocol_version": "v2"}
         }
       ],
       "metadata": {"legacy_label": "uniswap_v2_router"}
@@ -220,12 +220,12 @@
       "token_metadata": null,
       "protocol_deployments": [
         {
-          "protocol_key": "uniswap",
+          "protocol_key": "uniswap_v3",
           "display_name": "Uniswap",
           "protocol_family": "dex",
           "contract_role": "router",
           "confidence": 0.99,
-          "metadata": {"deployment": "swaprouter02"}
+          "metadata": {"deployment": "swaprouter02", "protocol_version": "v3"}
         }
       ],
       "metadata": {"legacy_label": "uniswap_v3_swaprouter02"}
@@ -265,7 +265,7 @@
       "metadata": {"legacy_label": "uniswap_universal_router"}
     },
     {
-      "address": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+      "address": "0xcf77a3ba9a5ca399b7c97c74d54e5b1beb874e43",
       "address_kind": "contract",
       "labels": [
         {

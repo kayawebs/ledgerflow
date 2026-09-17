@@ -566,6 +566,57 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             .collect()
     }
 
+    async fn list_analyses_for_observed_addresses(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> LedgerResult<Vec<TransactionAnalysis>> {
+        let rows = sqlx::query(
+            r#"
+            select payload
+            from transaction_analysis analysis
+            where chain_id = $1
+              and (
+                from_address = any($2)
+                or to_address = any($2)
+                or exists (
+                  select 1
+                  from jsonb_array_elements(
+                    case
+                      when jsonb_typeof(analysis.payload->'derived_flows') = 'array'
+                        then analysis.payload->'derived_flows'
+                      else '[]'::jsonb
+                    end
+                  ) as flow
+                  where lower(flow->>'from_address') = any($2)
+                     or lower(flow->>'to_address') = any($2)
+                )
+              )
+              and ($3::timestamptz is null or block_timestamp >= $3)
+              and ($4::timestamptz is null or block_timestamp <= $4)
+            order by block_timestamp asc nulls last, created_at asc
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(addresses)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                let Json(payload): Json<Value> = row
+                    .try_get("payload")
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+                serde_json::from_value(payload)
+                    .map_err(|err| LedgerError::Persistence(err.to_string()))
+            })
+            .collect()
+    }
+
     async fn create_cluster_backfill_run(&self, run: &ClusterBackfillRun) -> LedgerResult<()> {
         sqlx::query(
             r#"
@@ -1288,6 +1339,21 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                     when address_analysis_jobs.status = 'completed'
                       and (
                         excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                        or (
+                          excluded.metadata->'roles' ? 'suspected_token'
+                          and not (coalesce(address_analysis_jobs.metadata->'roles', '[]'::jsonb) ? 'suspected_token')
+                        )
+                        or (
+                          excluded.metadata->>'source' = 'canonical_address_facts'
+                          and not (
+                            case
+                              when jsonb_typeof(address_analysis_jobs.metadata->'roles') = 'array'
+                                then address_analysis_jobs.metadata->'roles'
+                              else '[]'::jsonb
+                            end
+                            @> (excluded.metadata->'roles')
+                          )
+                        )
                         or excluded.metadata->'roles' ?| array[
                           'suspected_pool',
                           'suspected_router',
@@ -1306,6 +1372,21 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                         address_analysis_jobs.status = 'completed'
                         and (
                           excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                          or (
+                            excluded.metadata->'roles' ? 'suspected_token'
+                            and not (coalesce(address_analysis_jobs.metadata->'roles', '[]'::jsonb) ? 'suspected_token')
+                          )
+                          or (
+                            excluded.metadata->>'source' = 'canonical_address_facts'
+                            and not (
+                              case
+                                when jsonb_typeof(address_analysis_jobs.metadata->'roles') = 'array'
+                                  then address_analysis_jobs.metadata->'roles'
+                                else '[]'::jsonb
+                              end
+                              @> (excluded.metadata->'roles')
+                            )
+                          )
                           or excluded.metadata->'roles' ?| array[
                             'suspected_pool',
                             'suspected_router',
@@ -1325,6 +1406,21 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                         address_analysis_jobs.status = 'completed'
                         and (
                           excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                          or (
+                            excluded.metadata->'roles' ? 'suspected_token'
+                            and not (coalesce(address_analysis_jobs.metadata->'roles', '[]'::jsonb) ? 'suspected_token')
+                          )
+                          or (
+                            excluded.metadata->>'source' = 'canonical_address_facts'
+                            and not (
+                              case
+                                when jsonb_typeof(address_analysis_jobs.metadata->'roles') = 'array'
+                                  then address_analysis_jobs.metadata->'roles'
+                                else '[]'::jsonb
+                              end
+                              @> (excluded.metadata->'roles')
+                            )
+                          )
                           or excluded.metadata->'roles' ?| array[
                             'suspected_pool',
                             'suspected_router',
@@ -1338,10 +1434,48 @@ impl AnalysisRepository for SqlxAnalysisRepository {
                       ) then now()
                     else address_analysis_jobs.available_at
                   end,
-                  metadata = address_analysis_jobs.metadata || excluded.metadata,
+                  metadata = (address_analysis_jobs.metadata || excluded.metadata)
+                    || jsonb_build_object(
+                      'roles',
+                      (
+                        select coalesce(
+                          jsonb_agg(unique_roles.role order by unique_roles.role),
+                          '[]'::jsonb
+                        )
+                        from (
+                          select distinct jsonb_array_elements_text(
+                            case
+                              when jsonb_typeof(address_analysis_jobs.metadata->'roles') = 'array'
+                                then address_analysis_jobs.metadata->'roles'
+                              else '[]'::jsonb
+                            end
+                            || case
+                              when jsonb_typeof(excluded.metadata->'roles') = 'array'
+                                then excluded.metadata->'roles'
+                              else '[]'::jsonb
+                            end
+                          ) as role
+                        ) unique_roles
+                      )
+                    ),
                   updated_at = now()
                 where address_analysis_jobs.status <> 'completed'
                   or excluded.metadata->>'source' in ('address_summary', 'address_analysis_page')
+                  or (
+                    excluded.metadata->'roles' ? 'suspected_token'
+                    and not (coalesce(address_analysis_jobs.metadata->'roles', '[]'::jsonb) ? 'suspected_token')
+                  )
+                  or (
+                    excluded.metadata->>'source' = 'canonical_address_facts'
+                    and not (
+                      case
+                        when jsonb_typeof(address_analysis_jobs.metadata->'roles') = 'array'
+                          then address_analysis_jobs.metadata->'roles'
+                        else '[]'::jsonb
+                      end
+                      @> (excluded.metadata->'roles')
+                    )
+                  )
                   or excluded.metadata->'roles' ?| array[
                     'suspected_pool',
                     'suspected_router',
@@ -1366,6 +1500,89 @@ impl AnalysisRepository for SqlxAnalysisRepository {
     }
 
     async fn claim_next_address_analysis_job(&self) -> LedgerResult<Option<AddressAnalysisJob>> {
+        self.claim_next_address_analysis_job_up_to(i32::MAX).await
+    }
+
+    async fn claim_next_address_analysis_job_up_to(
+        &self,
+        maximum_priority: i32,
+    ) -> LedgerResult<Option<AddressAnalysisJob>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        // Keep the production seed path eligible for the narrow partial
+        // index. Callers with a broader ceiling retain the generic query.
+        let claim_query = if maximum_priority <= 39 {
+            r#"
+            with candidate as (
+              select chain_id, address
+              from address_analysis_jobs
+              where priority <= $1
+                and priority <= 39
+                and status in ('pending', 'failed', 'running')
+                and ((
+                  status in ('pending', 'failed') and available_at <= now()
+                ) or (
+                  status = 'running'
+                  and coalesce(claimed_at, updated_at) < now() - interval '5 minutes'
+                ))
+              order by priority asc, first_seen_at asc
+              limit 1
+              for update skip locked
+            )
+            update address_analysis_jobs jobs
+            set status = 'running',
+                attempts = jobs.attempts + 1,
+                claimed_at = now(),
+                updated_at = now()
+            from candidate
+            where jobs.chain_id = candidate.chain_id and jobs.address = candidate.address
+            returning jobs.*
+            "#
+        } else {
+            r#"
+            with candidate as (
+              select chain_id, address
+              from address_analysis_jobs
+              where priority <= $1
+                and ((
+                  status in ('pending', 'failed') and available_at <= now()
+                ) or (
+                  status = 'running'
+                  and coalesce(claimed_at, updated_at) < now() - interval '5 minutes'
+                ))
+              order by priority asc, first_seen_at asc
+              limit 1
+              for update skip locked
+            )
+            update address_analysis_jobs jobs
+            set status = 'running',
+                attempts = jobs.attempts + 1,
+                claimed_at = now(),
+                updated_at = now()
+            from candidate
+            where jobs.chain_id = candidate.chain_id and jobs.address = candidate.address
+            returning jobs.*
+            "#
+        };
+        let row = sqlx::query(claim_query)
+            .bind(maximum_priority)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        tx.commit()
+            .await
+            .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        row.map(row_to_address_job).transpose()
+    }
+
+    async fn claim_next_address_analysis_job_for_chain_up_to(
+        &self,
+        chain_id: u64,
+        maximum_priority: i32,
+    ) -> LedgerResult<Option<AddressAnalysisJob>> {
         let mut tx = self
             .pool
             .begin()
@@ -1376,7 +1593,15 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             with candidate as (
               select chain_id, address
               from address_analysis_jobs
-              where status = 'pending' and available_at <= now()
+              where chain_id = $1
+                and priority <= $2
+                and status in ('pending', 'failed', 'running')
+                and ((
+                  status in ('pending', 'failed') and available_at <= now()
+                ) or (
+                  status = 'running'
+                  and coalesce(claimed_at, updated_at) < now() - interval '5 minutes'
+                ))
               order by priority asc, first_seen_at asc
               limit 1
               for update skip locked
@@ -1391,6 +1616,8 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             returning jobs.*
             "#,
         )
+        .bind(chain_id as i64)
+        .bind(maximum_priority)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
@@ -1407,12 +1634,12 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             .await
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         let normalized_address = profile.address.to_ascii_lowercase();
-        let address_kind = if profile.address_type == "eoa" {
-            "eoa"
-        } else if profile.bytecode_length.unwrap_or_default() > 0 {
-            "contract"
-        } else {
-            "unknown"
+        let address_kind = match profile.address_type.as_str() {
+            "system" => "system",
+            "precompile" => "precompile",
+            "eoa" => "eoa",
+            _ if profile.bytecode_length.unwrap_or_default() > 0 => "contract",
+            _ => "unknown",
         };
         sqlx::query(
             r#"
@@ -1423,6 +1650,8 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             values ($1,$2,$3,$4,$5,$6,$7,$8)
             on conflict (chain_id, address) do update set
               address_kind = case
+                when chain_addresses.address_kind in ('system', 'precompile')
+                  then chain_addresses.address_kind
                 when excluded.address_kind = 'unknown' then chain_addresses.address_kind
                 else excluded.address_kind
               end,
@@ -1814,6 +2043,87 @@ impl AnalysisRepository for SqlxAnalysisRepository {
             .await
             .map_err(|err| LedgerError::Persistence(err.to_string()))?;
         Ok(())
+    }
+
+    async fn list_protocol_address_metadata(
+        &self,
+        chain_id: u64,
+        addresses: &[String],
+        block_number: Option<u64>,
+    ) -> LedgerResult<Vec<ProtocolAddressMetadata>> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let normalized = addresses
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let rows = sqlx::query(
+            r#"
+            select d.chain_id,d.address,p.protocol_family,d.protocol_key,d.contract_role,
+                   d.source_key,d.method_version,
+                   least(1.0,d.confidence*s.trust_score) as effective_confidence,
+                   d.metadata,d.first_seen_at,d.last_seen_at,d.updated_at
+            from protocol_deployments d
+            join protocols p on p.protocol_key=d.protocol_key
+            join intelligence_sources s on s.source_key=d.source_key and s.status='active'
+            where d.chain_id=$1 and d.address=any($2) and d.status='active'
+              and ($3::bigint is null or d.valid_from_block is null or d.valid_from_block <= $3)
+              and ($3::bigint is null or d.valid_to_block is null or d.valid_to_block >= $3)
+            order by effective_confidence desc,d.address,d.protocol_key,d.contract_role
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(&normalized)
+        .bind(block_number.map(|value| value as i64))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| LedgerError::Persistence(err.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ProtocolAddressMetadata {
+                    chain_id: row
+                        .try_get::<i64, _>("chain_id")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                        as u64,
+                    address: row
+                        .try_get("address")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    protocol_family: row
+                        .try_get("protocol_family")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    protocol_name: row
+                        .try_get("protocol_key")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    contract_role: row
+                        .try_get("contract_role")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    source: row
+                        .try_get("source_key")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    adapter_version: row
+                        .try_get("method_version")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    confidence: row
+                        .try_get::<f64, _>("effective_confidence")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                        as f32,
+                    metadata: row
+                        .try_get::<Json<Value>, _>("metadata")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                        .0,
+                    first_seen_at: row
+                        .try_get("first_seen_at")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    last_seen_at: row
+                        .try_get("last_seen_at")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    updated_at: row
+                        .try_get("updated_at")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                })
+            })
+            .collect()
     }
 
     async fn complete_address_analysis_job(

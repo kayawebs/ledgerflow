@@ -1,0 +1,35 @@
+{
+  "schema_version": "ledgerflow.protocol-market-seeds.v1",
+  "dataset_key": "robinhood-market-derived-domains",
+  "dataset_version": "1.0.0",
+  "source": {
+    "source_key": "ledgerflow_deterministic_market_facts",
+    "display_name": "LedgerFlow deterministic market facts",
+    "source_kind": "onchain",
+    "trust_score": 1.0,
+    "owner": "LedgerFlow",
+    "homepage": "https://ledgerflow.top",
+    "metadata": {
+      "scope": "derived only from persisted transaction and evidence facts",
+      "ownership_claims": false
+    }
+  },
+  "domains": [
+    {
+      "domain_key": "robinhood:verified-arbitrage",
+      "chain_id": 4663,
+      "protocol_key": "ledgerflow_verified_arbitrage",
+      "protocol_family": "execution_intelligence",
+      "display_name_en": "Verified Arbitrage Execution",
+      "display_name_zh": "已验证套利执行",
+      "domain_kind": "dex_execution",
+      "cluster_method_version": "verified-execution-relationships.v1",
+      "metadata": {
+        "cluster_scope": "verified_arbitrage_transactions_only",
+        "economic_source": "economic_verification_results",
+        "global_ownership_claim": false
+      },
+      "seeds": []
+    }
+  ]
+}

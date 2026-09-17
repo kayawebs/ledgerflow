@@ -1,0 +1,23 @@
+project:
+  project_id: base-profit-verification
+  name: Base Public Profit Verification
+  chain_id: 8453
+  monitoring_start_block: 49851159
+  continuous_monitoring: false
+  enabled: true
+entities:
+  # Public on-chain addresses used only as an explicit accounting scope. Their
+  # economic identity is not inferred by LedgerFlow.
+  - { entity_id: public-scope-sender, address: "0xaa3242ec58e5d0f6fe2fbb0ed8b76bd72672968d", role: searcher, label: Public accounting scope sender, include: true }
+  - { entity_id: public-scope-executor, address: "0x47c553cf1c109c99c2376a3c0c220b19121f4e98", role: arbitrage_executor, label: Public accounting scope executor, include: true }
+  - { entity_id: base-weth, address: "0x4200000000000000000000000000000000000006", role: token, label: Base WETH9, include: false }
+  - { entity_id: base-usdc, address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", role: token, label: USDC, include: false }
+  - { entity_id: base-messenger, address: "0x4200000000000000000000000000000000000007", role: bridge, label: L2 Cross Domain Messenger, include: false }
+  - { entity_id: base-standard-bridge, address: "0x4200000000000000000000000000000000000010", role: bridge, label: L2 Standard Bridge, include: false }
+  - { entity_id: base-sequencer-fee-vault, address: "0x4200000000000000000000000000000000000011", role: protocol_revenue, label: Sequencer Fee Vault, include: false }
+  - { entity_id: base-gas-oracle, address: "0x420000000000000000000000000000000000000F", role: system, label: Gas Price Oracle, include: false }
+  - { entity_id: base-l1-block, address: "0x4200000000000000000000000000000000000015", role: system, label: L1 Block, include: false }
+  - { entity_id: aave-v3-pool, address: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5", role: protocol, label: Aave V3 Pool, include: false }
+rules:
+  - { rule_id: verified-arbitrage, event_type: dex_arbitrage, severity: high, enabled: true }
+telegram: []

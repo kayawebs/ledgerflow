@@ -1,0 +1,29 @@
+project:
+  project_id: example-base-project
+  name: Example Base Economic Monitoring Pilot
+  chain_id: 8453
+  monitoring_start_block: 49830979
+  continuous_monitoring: true
+  enabled: true
+entities:
+  - { entity_id: base-weth, address: "0x4200000000000000000000000000000000000006", role: token, label: Base WETH9, include: true }
+  - { entity_id: base-usdc, address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", role: token, label: USDC, include: true }
+  - { entity_id: base-messenger, address: "0x4200000000000000000000000000000000000007", role: bridge, label: L2 Cross Domain Messenger, include: true }
+  - { entity_id: base-standard-bridge, address: "0x4200000000000000000000000000000000000010", role: bridge, label: L2 Standard Bridge, include: true }
+  - { entity_id: base-sequencer-fee-vault, address: "0x4200000000000000000000000000000000000011", role: protocol_revenue, label: Sequencer Fee Vault, include: true }
+  - { entity_id: base-token-factory, address: "0xF10122D428B4bc8A9d050D06a2037259b4c4B83B", role: system, label: Optimism Mintable ERC20 Factory, include: true }
+  - { entity_id: base-gas-oracle, address: "0x420000000000000000000000000000000000000F", role: system, label: Gas Price Oracle, include: true }
+  - { entity_id: base-l1-block, address: "0x4200000000000000000000000000000000000015", role: system, label: L1 Block, include: true }
+  - { entity_id: base-message-passer, address: "0x4200000000000000000000000000000000000016", role: bridge, label: L2 to L1 Message Passer, include: true }
+  - { entity_id: base-erc721-bridge, address: "0x4200000000000000000000000000000000000014", role: bridge, label: L2 ERC721 Bridge, include: true }
+  - { entity_id: aave-v3-pool, address: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5", role: protocol, label: Aave V3 Pool, include: true }
+rules:
+  - { rule_id: large-flow, event_type: large_asset_flow, severity: high, threshold: { amount_raw: "1000000000" }, enabled: true }
+  - { rule_id: treasury, event_type: treasury_movement, severity: high, threshold: { amount_raw: "1" }, enabled: true }
+  - { rule_id: revenue, event_type: protocol_revenue, severity: high, threshold: { amount_raw: "1" }, enabled: true }
+  - { rule_id: arbitrage, event_type: dex_arbitrage, severity: high, enabled: true }
+  - { rule_id: liquidation, event_type: liquidation, severity: high, enabled: true }
+  - { rule_id: high-cost-failure, event_type: high_cost_failure, severity: medium, threshold: { gas_cost_raw: "1000000000000000" }, enabled: true }
+  - { rule_id: repeated-failures, event_type: repeated_failed_attempts, severity: high, threshold: { count: 3, window_minutes: 60 }, enabled: true }
+  - { rule_id: unknown, event_type: unknown_material_interaction, severity: medium, threshold: { amount_raw: "1000000000" }, enabled: true }
+telegram: []

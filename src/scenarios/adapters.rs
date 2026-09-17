@@ -451,9 +451,6 @@ fn build_subject_scope(initiator: &str, actor_addresses: &[String]) -> SubjectSc
     let mut addresses = BTreeSet::new();
     addresses.insert(initiator.to_owned());
     for address in actor_addresses {
-        if is_shared_execution_infrastructure(address) {
-            continue;
-        }
         addresses.insert(address.to_lowercase());
     }
     let addresses = addresses.into_iter().collect::<Vec<_>>();
@@ -467,19 +464,6 @@ fn build_subject_scope(initiator: &str, actor_addresses: &[String]) -> SubjectSc
         label: label.to_owned(),
         addresses,
     }
-}
-
-fn is_shared_execution_infrastructure(address: &str) -> bool {
-    matches!(
-        address.to_ascii_lowercase().as_str(),
-        // 0x Base Settler. This is shared exchange infrastructure, not a
-        // strategy-owned executor, so it must not be counted as user scope.
-        "0x7747f8d2a76bd6345cc29622a946a929647f2359"
-            | "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24"
-            | "0x2626664c2603336e57b271c5c0b26f421741e481"
-            | "0x6ff5693b99212da76ad316178a184ab56d299b43"
-            | "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
-    )
 }
 
 fn build_net_effect(
@@ -849,17 +833,11 @@ fn token_descriptor(
             if let Some(token) = token_lookup.get(token_address) {
                 return token;
             }
-            let address = token_address.unwrap_or_default().to_lowercase();
-            let (symbol, name, decimals) = match address.as_str() {
-                "0x4200000000000000000000000000000000000006" => ("WETH", "Wrapped Ether", Some(18)),
-                "0x091a5abe6616e26268e5eecff256c2212fce2707" => ("BondETH", "Bond ETH", Some(18)),
-                _ => ("Unknown ERC20", "Unlabeled token", None),
-            };
             json!({
-                "symbol": symbol,
-                "name": name,
+                "symbol": "Unknown ERC20",
+                "name": "Unlabeled token",
                 "address": token_address,
-                "decimals": decimals,
+                "decimals": null,
             })
         }
     }
@@ -1125,10 +1103,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subject_scope_excludes_shared_settlers() {
+    fn subject_scope_deduplicates_actor_addresses() {
         let scope = build_subject_scope(
             "0x1111111111111111111111111111111111111111",
-            &["0x7747f8d2a76bd6345cc29622a946a929647f2359".to_owned()],
+            &["0x1111111111111111111111111111111111111111".to_owned()],
         );
 
         assert_eq!(scope.label, "initiator scope");

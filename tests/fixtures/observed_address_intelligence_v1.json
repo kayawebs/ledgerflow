@@ -1,0 +1,50 @@
+[
+  {
+    "fixture_id": "base-public-accounting-scope-sender",
+    "chain_id": 8453,
+    "address": "0xaa3242ec58e5d0f6fe2fbb0ed8b76bd72672968d",
+    "expected_scope": "execution_eoa_candidate",
+    "selection_evidence": "Existing public deterministic-accounting scope configuration",
+    "ownership_attribution": null
+  },
+  {
+    "fixture_id": "base-public-executor",
+    "chain_id": 8453,
+    "address": "0x47c553cf1c109c99c2376a3c0c220b19121f4e98",
+    "expected_scope": "executor_contract_candidate",
+    "selection_evidence": "Existing public Base pilot executor configuration",
+    "ownership_attribution": null
+  },
+  {
+    "fixture_id": "base-transfer-aggregation-candidate",
+    "chain_id": 8453,
+    "address": "0x0629da86af5a4ae1ba5e1589b13702558d0fb056",
+    "expected_scope": "transfer_aggregation_candidate",
+    "selection_evidence": "User-supplied address with RPC-discovered ERC-20 transfer activity",
+    "ownership_attribution": null
+  },
+  {
+    "fixture_id": "robinhood-high-frequency-candidate-a",
+    "chain_id": 4663,
+    "address": "0x0a0256a9166041101c90be87bbebb8242a3ba015",
+    "expected_scope": "high_frequency_execution_candidate",
+    "selection_evidence": "Existing production candidate transactions on Robinhood Chain",
+    "ownership_attribution": null
+  },
+  {
+    "fixture_id": "robinhood-high-frequency-candidate-b",
+    "chain_id": 4663,
+    "address": "0x6746e5f5356ab2c7a6873affc22c6d026a514e4c",
+    "expected_scope": "high_frequency_execution_candidate",
+    "selection_evidence": "Existing production candidate transactions on Robinhood Chain",
+    "ownership_attribution": null
+  },
+  {
+    "fixture_id": "base-low-activity-asset-transfer-control",
+    "chain_id": 8453,
+    "address": "0x17eb9c18f38a56bd03c80cf3e3446685bd356271",
+    "expected_scope": "ordinary_asset_transfer_wallet_candidate",
+    "selection_evidence": "Public Base direct USDC transfer 0x68b4d43408c9ee4a5fd5f57b848a46668596f3b82767024441e60e95bf0e7371; EOA bytecode empty, sender nonce 3, and one indexed transaction in the latest 10,000 blocks at fixture selection",
+    "ownership_attribution": null
+  }
+]

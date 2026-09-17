@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Form, Json, Router,
@@ -7,17 +11,29 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc, Weekday};
+use pulldown_cmark::{Options as MarkdownOptions, Parser as MarkdownParser, html};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json as SqlJson};
-use tracing::info;
+use tokio::sync::{Mutex, RwLock};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 mod chain_registry;
+mod execution_intelligence;
+mod public_product;
 
 use chain_registry::{ChainRegistry, ChainRoute};
+use execution_intelligence::{
+    ArbitrageCandidateInput, EntityBehavior, EntityEconomicIntelligence, EntityEvidenceState,
+    EntityIdentityClaim, EntityProfile, EntityReference, EntityRelationship,
+    EntityRelationshipKind, EntityTimelineItem, EventSeverity, ExecutionEvent,
+    ExecutionEventStatus, ExecutionEventType, ObservationMonitoringState, ObservedObject,
+    PilotEventInput, WorkspaceCapability, WorkspaceKind, WorkspacePlan, WorkspaceRange,
+    WorkspaceRef, adapt_arbitrage_candidate, adapt_pilot_event,
+};
 
 use crate::{
     core::errors::{LedgerError, LedgerResult},
@@ -29,18 +45,24 @@ use crate::{
         },
         enums::{AddressHitDirection, ClusterBackfillStatus, VerificationPurpose},
     },
+    pilot::{PilotEvidencePack, repository::load_public_events},
     services::{
         auth::{
             AuthService, LogVerificationSender, PostmarkVerificationSender,
-            ResendVerificationSender, VerificationSender, verification_purpose_from_str,
-            verification_purpose_to_str,
+            ResendVerificationSender, VerificationSender, normalize_email,
+            verification_purpose_from_str, verification_purpose_to_str,
         },
+        behavior_assertions::BehaviorReviewItem,
         portal::{DashboardClusterRecord, PortalService},
     },
 };
 
-const DEFAULT_PRICE_ETH: &str = "0.5";
 const SWAP_BLOCK_RANGE_MAX_BLOCKS: u64 = 2_000;
+// Observation pages must never turn a missing range into a genesis-to-head lazy
+// indexing request. The live indexer already owns current blocks, so profiles
+// query a bounded recent window and expose the resulting coverage explicitly.
+const OBSERVATION_RECENT_BLOCK_LOOKBACK: u64 = 50_000;
+const OBSERVATION_RECENT_TX_LIMIT: u32 = 100;
 const UNISWAP_V2_SWAP_TOPIC_HEX: &str =
     "d78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const UNISWAP_V3_SWAP_TOPIC_HEX: &str =
@@ -54,12 +76,27 @@ pub struct WebState {
     pub session_cookie_name: String,
     pub pool: PgPool,
     pub client: Client,
+    pub rpc_url: String,
     pub cryptohouse_url: String,
     pub auth_service: Arc<AuthService>,
     pub portal_service: Arc<PortalService>,
     pub email_delivery_mode: &'static str,
     pub email_delivery_ready: bool,
     pub chain_registry: Arc<ChainRegistry>,
+    today_cache: Arc<RwLock<BTreeMap<u64, TodayCacheEntry>>>,
+    today_cache_miss_lock: Arc<Mutex<()>>,
+    today_cache_ttl: Duration,
+    public_evidence_feed_url: Option<String>,
+    public_evidence_cache: Arc<RwLock<Option<PublicEvidenceCacheEntry>>>,
+    public_evidence_cache_miss_lock: Arc<Mutex<()>>,
+    public_evidence_cache_ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct PublicEvidenceCacheEntry {
+    loaded_at: Instant,
+    packs: Vec<PilotEvidencePack>,
+    source: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +124,12 @@ pub struct WebConfig {
     pub email_delivery_mode: EmailDeliveryMode,
     pub verification_ttl_minutes: i64,
     pub session_ttl_days: i64,
+    pub rpc_url: String,
     pub cryptohouse_url: String,
+    pub database_max_connections: u32,
+    pub today_cache_ttl_seconds: u64,
+    pub public_evidence_feed_url: Option<String>,
+    pub public_evidence_cache_ttl_seconds: u64,
 }
 
 impl WebConfig {
@@ -128,10 +170,33 @@ impl WebConfig {
                 .ok()
                 .and_then(|value| value.parse::<i64>().ok())
                 .unwrap_or(30),
+            rpc_url: std::env::var("LEDGERFLOW_RPC_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8545".to_owned()),
             cryptohouse_url: std::env::var("LEDGERFLOW_TRACE_MONITOR_CRYPTOHOUSE_URL")
                 .unwrap_or_else(|_| {
                     "https://crypto-clickhouse.clickhouse.com/?user=crypto".to_owned()
                 }),
+            database_max_connections: std::env::var("LEDGERFLOW_WEB_DATABASE_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(16)
+                .clamp(5, 64),
+            today_cache_ttl_seconds: std::env::var("LEDGERFLOW_WEB_TODAY_CACHE_TTL_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(60)
+                .clamp(5, 300),
+            public_evidence_feed_url: std::env::var("LEDGERFLOW_PUBLIC_EVIDENCE_FEED_URL")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            public_evidence_cache_ttl_seconds: std::env::var(
+                "LEDGERFLOW_PUBLIC_EVIDENCE_CACHE_TTL_SECONDS",
+            )
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(15)
+            .clamp(5, 300),
         }
     }
 }
@@ -185,6 +250,10 @@ fn public_base_url_from_env() -> Option<String> {
 struct AuthPageQuery {
     notice: Option<String>,
     mode: Option<String>,
+    method: Option<String>,
+    stage: Option<String>,
+    email: Option<String>,
+    purpose: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +283,414 @@ struct DashboardQuery {
 #[derive(Debug, Deserialize, Clone)]
 struct TodayQuery {
     chain_id: Option<u64>,
+    workspace: Option<String>,
+    range: Option<String>,
+    entity: Option<String>,
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ExecutionUiQuery {
+    chain_id: Option<u64>,
+    workspace: Option<String>,
+    range: Option<String>,
+    status: Option<String>,
+    severity: Option<String>,
+    event_type: Option<String>,
+    protocol: Option<String>,
+    entity: Option<String>,
+    confidence: Option<String>,
+    queue: Option<String>,
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct EntityPageQuery {
+    chain_id: Option<u64>,
+    workspace: Option<String>,
+    range: Option<String>,
+    tab: Option<String>,
+    address: Option<String>,
+    cluster_id: Option<String>,
+    add: Option<u8>,
+    notice: Option<String>,
+    activity_filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddWorkspaceEntityForm {
+    workspace_id: Uuid,
+    chain_id: u64,
+    address: String,
+    entity_kind: String,
+    role: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnableObservationMonitoringForm {
+    workspace_id: Uuid,
+    chain_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClusterMemberOverrideForm {
+    workspace_id: Uuid,
+    chain_id: u64,
+    action: String,
+    role: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ObjectBriefQuery {
+    chain_id: Option<u64>,
+    workspace: Option<String>,
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceNotificationForm {
+    workspace_id: Uuid,
+    destination_type: String,
+    display_name: String,
+    destination_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BehaviorReviewPageQuery {
+    chain_id: Option<u64>,
+    status: Option<String>,
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BehaviorReviewDecisionPayload {
+    decision: String,
+    reviewer: String,
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BehaviorReviewDecisionForm {
+    chain_id: u64,
+    status: Option<String>,
+    decision: String,
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WatchlistPageQuery {
+    chain_id: Option<u64>,
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MonitorPageQuery {
+    chain_id: Option<u64>,
+    workspace: Option<String>,
+    range: Option<String>,
+    tab: Option<String>,
+    step: Option<u8>,
+    name: Option<String>,
+    subject: Option<String>,
+    addresses: Option<String>,
+    entity_kind: Option<String>,
+    role: Option<String>,
+    label: Option<String>,
+    event_type: Option<String>,
+    threshold: Option<String>,
+    threshold_asset: Option<String>,
+    severity: Option<String>,
+    destination_name: Option<String>,
+    destination_ref: Option<String>,
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateMonitorForm {
+    workspace_id: Uuid,
+    chain_id: u64,
+    name: String,
+    addresses: String,
+    entity_kind: String,
+    role: Option<String>,
+    label: Option<String>,
+    event_type: String,
+    threshold: Option<String>,
+    threshold_asset: Option<String>,
+    severity: String,
+    destination_name: String,
+    destination_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WorkspaceOnboardingQuery {
+    step: Option<u8>,
+    workspace_id: Option<Uuid>,
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceStartForm {
+    name: String,
+    workspace_type: String,
+    chain_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceEntitiesForm {
+    workspace_id: Uuid,
+    addresses: String,
+    entity_kind: String,
+    role: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceGoalsForm {
+    workspace_id: Uuid,
+    mev_activity: Option<String>,
+    liquidations: Option<String>,
+    large_transfers: Option<String>,
+    revenue_changes: Option<String>,
+    failed_execution: Option<String>,
+    execution_success: Option<String>,
+    competitor_activity: Option<String>,
+    failed_attempts: Option<String>,
+    profit_attribution: Option<String>,
+    ecosystem_activity: Option<String>,
+    searcher_landscape: Option<String>,
+    protocol_changes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceDestinationForm {
+    workspace_id: Uuid,
+    destination_type: String,
+    display_name: Option<String>,
+    destination_ref: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PilotPageQuery {
+    submitted: Option<u8>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PublicEvidenceQuery {
+    chain: Option<String>,
+    event_type: Option<String>,
+    protocol: Option<String>,
+    status: Option<String>,
+    date: Option<String>,
+    confidence: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PilotInterestForm {
+    name: String,
+    email: String,
+    organization: String,
+    chain_id: u64,
+    addresses: String,
+    use_case: String,
+    contact: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct InvestigationPageQuery {
+    chain_id: Option<u64>,
+    workspace: Option<String>,
+    range: Option<String>,
+    status: Option<String>,
+    new: Option<u8>,
+    event_id: Option<String>,
+    entity: Option<String>,
+    notice: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateInvestigationForm {
+    workspace_id: Uuid,
+    chain_id: u64,
+    title: String,
+    event_id: Option<String>,
+    entity: Option<String>,
+    working_conclusion: Option<String>,
+    open_questions: Option<String>,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateInvestigationForm {
+    status: String,
+    working_conclusion: Option<String>,
+    open_questions: Option<String>,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WatchlistEntryForm {
+    chain_id: u64,
+    subject: String,
+    label: Option<String>,
+    return_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchPageQuery {
+    chain_id: Option<u64>,
+    workspace: Option<String>,
+    q: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WatchlistEntryRow {
+    entry_id: Uuid,
+    chain_id: u64,
+    subject_type: String,
+    subject_key: String,
+    label: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceEntityRow {
+    workspace_entity_id: Uuid,
+    address: String,
+    entity_kind: String,
+    role: Option<String>,
+    label: Option<String>,
+    created_at: DateTime<Utc>,
+    monitoring_enabled: bool,
+    observation_status: String,
+    observation_progress: serde_json::Value,
+    observation_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceNotificationRow {
+    destination_type: String,
+    display_name: String,
+    destination_ref: Option<String>,
+    enabled: bool,
+    operational: bool,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct UserMonitorRow {
+    monitor_id: Uuid,
+    chain_id: u64,
+    name: String,
+    status: String,
+    entity_count: i64,
+    rule_count: i64,
+    destination_count: i64,
+    delivery_count: i64,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct UserMonitorRuleRow {
+    rule_id: Uuid,
+    monitor_id: Uuid,
+    monitor_name: String,
+    event_type: String,
+    threshold_value: Option<String>,
+    threshold_asset: Option<String>,
+    severity: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct UserMonitorDestinationRow {
+    destination_id: Uuid,
+    monitor_name: String,
+    destination_type: String,
+    display_name: String,
+    destination_ref: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct UserMonitorDeliveryRow {
+    delivery_id: Uuid,
+    monitor_name: String,
+    event_id: Option<String>,
+    destination_name: Option<String>,
+    status: String,
+    attempt_count: i32,
+    last_error: Option<String>,
+    delivered_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct InvestigationRow {
+    investigation_id: Uuid,
+    workspace_id: Uuid,
+    chain_id: u64,
+    title: String,
+    status: String,
+    working_conclusion: Option<String>,
+    open_questions: Option<String>,
+    notes: Option<String>,
+    related_event_ids: Vec<String>,
+    related_entities: Vec<String>,
+    evidence: serde_json::Value,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceReportRow {
+    snapshot_id: Uuid,
+    cluster_id: Uuid,
+    cluster_name: String,
+    chain_id: u64,
+    window_key: String,
+    window_start: Option<DateTime<Utc>>,
+    window_end: Option<DateTime<Utc>>,
+    generated_at: DateTime<Utc>,
+    report_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct GlobalAlertRow {
+    alert_id: Uuid,
+    cluster_id: Uuid,
+    chain_id: u64,
+    cluster_name: String,
+    alert_type: String,
+    severity: String,
+    title: String,
+    message: String,
+    triggered_at: DateTime<Utc>,
+    is_read: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ClusterGraphEdgeRow {
+    cluster_id: Uuid,
+    cluster_name: String,
+    chain_id: u64,
+    source_address: String,
+    counterparty_address: String,
+    tx_count: i64,
+    flow_count: i64,
+    token_count: i64,
+    last_seen_at: Option<DateTime<Utc>>,
+    sample_tx_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct SearchResultRow {
+    result_type: String,
+    title: String,
+    detail: String,
+    href: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -241,7 +718,7 @@ struct SwapBlockRangeQuery {
     pool_limit: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ArbitrageRecentRow {
     tx_hash: String,
     block_number: i64,
@@ -254,6 +731,26 @@ struct ArbitrageRecentRow {
     confirmation_status: String,
     profit_token_address: Option<String>,
     profit_amount_raw: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TxCandidateContext {
+    chain_id: u64,
+    tx_hash: String,
+    block_number: i64,
+    block_timestamp: Option<DateTime<Utc>>,
+    detection_source: String,
+    sender_address: Option<String>,
+    entry_contract: Option<String>,
+    score: i32,
+    swap_log_count: i32,
+    distinct_pool_count: i32,
+    route: String,
+    route_fingerprint: String,
+    confirmation_status: String,
+    profit_token_address: Option<String>,
+    profit_amount_raw: Option<String>,
+    pool_addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -278,16 +775,146 @@ struct ArbitrageHotRouteRow {
     sample_tx_hashes: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TodayCandidateRow {
+    tx_hash: String,
+    block_number: i64,
+    block_timestamp: Option<DateTime<Utc>>,
+    detection_source: String,
+    sender_address: Option<String>,
+    entry_contract: Option<String>,
+    score: i32,
+    swap_log_count: i32,
+    distinct_pool_count: i32,
+    route: String,
+    route_fingerprint: String,
+    confirmation_status: String,
+}
+
+#[derive(Debug, Clone)]
+struct TodayActorRow {
+    address: String,
+    label: Option<String>,
+    candidate_count: i64,
+    swap_count: i64,
+    last_seen: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct TodayProtocolRow {
+    display_name: String,
+    protocol_family: String,
+    deployment_count: i64,
+    last_seen: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct TodayHourlyPoint {
+    bucket: DateTime<Utc>,
+    candidate_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct TodayMonitorProgress {
+    worker_id: String,
+    last_processed_block: i64,
+    last_processed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct TodayMetrics {
+    arbitrage_24h: i64,
+    arbitrage_previous_24h: i64,
+    confirmed_arbitrage_24h: i64,
+    active_candidate_senders_24h: i64,
+    multi_swap_24h: i64,
+    multi_swap_previous_24h: i64,
+    analyzed_transactions_24h: i64,
+    analyzed_transactions_previous_24h: i64,
+    failed_transactions_24h: i64,
+    effective_labels: i64,
+    labels_updated_24h: i64,
+    labels_updated_previous_24h: i64,
+    tracked_actors: i64,
+    tracked_eoas: i64,
+    tracked_contracts: i64,
+    ready_token_metadata: i64,
+    active_protocol_deployments: i64,
+    latest_observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct TodaySnapshot {
+    captured_at: DateTime<Utc>,
+    metrics: TodayMetrics,
+    candidates: Vec<TodayCandidateRow>,
+    actors: Vec<TodayActorRow>,
+    hot_pools: Vec<ArbitrageHotPoolRow>,
+    hot_routes: Vec<ArbitrageHotRouteRow>,
+    protocols: Vec<TodayProtocolRow>,
+    hourly_activity: Vec<TodayHourlyPoint>,
+    monitor: Option<TodayMonitorProgress>,
+    api_online: bool,
+    rpc_chain_id: Option<u64>,
+    rpc_head_block: Option<u64>,
+    indexer_progress: Option<IndexerProgressPayload>,
+}
+
+#[derive(Debug, Clone)]
+struct TodayCacheEntry {
+    snapshot: TodaySnapshot,
+    expires_at: Instant,
+    refreshing: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OverviewRangeMetrics {
+    failed_transactions: i64,
+    actors_requiring_review: i64,
+}
+
+#[derive(Debug, Clone)]
+struct MonitoredSystemRow {
+    cluster_id: Uuid,
+    chain_id: u64,
+    name: String,
+    address_count: i64,
+    tracking_status: Option<String>,
+    alert_count: i64,
+    latest_event_at: Option<DateTime<Utc>>,
+    last_update: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HealthPayload {
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JsonRpcQuantityResponse {
+    result: Option<String>,
+    error: Option<serde_json::Value>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct AddressAnalysisQuery {
     address: Option<String>,
     chain_id: Option<u64>,
+    notice: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct PageNoticeQuery {
     notice: Option<String>,
     created_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct TxAnalysisPageQuery {
+    notice: Option<String>,
+    created_key: Option<String>,
+    chain_id: Option<u64>,
+    tx_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -314,6 +941,14 @@ struct ClusterDetailQuery {
 struct RequestCodeForm {
     email: String,
     purpose: String,
+    password: Option<String>,
+    password_confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PasswordLoginForm {
+    email: String,
+    password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,6 +1025,8 @@ struct AnalysisEnvelope {
     evidence_pack: EvidencePack,
     #[serde(default)]
     address_intelligence: AddressIntelligenceEnvelope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate_context: Option<TxCandidateContext>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -404,6 +1041,30 @@ struct AddressSummaryEnvelope {
     behavior_rows: Vec<AddressBehaviorSummaryRow>,
     recent_txs: Vec<AddressRecentTxRow>,
     queued: bool,
+    #[serde(default)]
+    job: Option<AddressJobSummary>,
+    #[serde(default)]
+    observed_txs: Vec<IndexerAddressRef>,
+    #[serde(default)]
+    observed_coverage: Option<IndexerLazyCoveragePayload>,
+    #[serde(default)]
+    indexer_head_block: Option<u64>,
+    #[serde(default)]
+    indexer_last_indexed_block: Option<u64>,
+    #[serde(default)]
+    indexer_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct AddressJobSummary {
+    status: String,
+    attempts: u32,
+    priority: i32,
+    last_error: Option<String>,
+    available_at: Option<DateTime<Utc>>,
+    claimed_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+    updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -433,13 +1094,17 @@ struct TxAnalysisShareRecord {
     snapshot: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct IndexerProgressPayload {
     chain_id: u64,
     worker_id: String,
     last_indexed_block: u64,
     #[serde(default)]
-    contiguous_indexed_through_block: Option<u64>,
+    query_target_block: Option<u64>,
+    #[serde(default)]
+    rpc_head_block: Option<u64>,
+    #[serde(default)]
+    live_lag_blocks: Option<u64>,
     #[serde(default)]
     max_stored_indexed_block: Option<u64>,
     #[serde(default)]
@@ -448,16 +1113,47 @@ struct IndexerProgressPayload {
     pending_indexing_requests: u64,
     #[serde(default)]
     endpoint_backfill_pending_rows: Option<u64>,
+    #[serde(default)]
+    canonical_block_count: u64,
+    #[serde(default)]
+    raw_transaction_count: u64,
+    #[serde(default)]
+    raw_log_count: u64,
+    #[serde(default)]
+    raw_trace_count: u64,
+    #[serde(default)]
+    orphaned_block_count: u64,
+    #[serde(default)]
+    reorg_count: u64,
+    #[serde(default)]
+    workers: Vec<IndexerWorkerProgressPayload>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
+struct IndexerWorkerProgressPayload {
+    worker_id: String,
+    worker_kind: String,
+    last_indexed_block: u64,
+    #[serde(default)]
+    range_start: u64,
+    #[serde(default)]
+    retry_count: u64,
+    #[serde(default)]
+    last_error: String,
+    #[serde(default)]
+    last_success_at: Option<String>,
+    #[serde(default)]
+    lag_blocks: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct IndexerAddressRefsPayload {
     address: String,
     refs: Vec<IndexerAddressRef>,
     coverage: Option<IndexerLazyCoveragePayload>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct IndexerLazyCoveragePayload {
     from_block: u64,
     to_block: u64,
@@ -466,13 +1162,17 @@ struct IndexerLazyCoveragePayload {
     complete: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct IndexerAddressRef {
     chain_id: u64,
     tx_hash: String,
     block_number: u64,
     tx_index: u32,
     direction: AddressHitDirection,
+    #[serde(default)]
+    from_address: Option<String>,
+    #[serde(default)]
+    to_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -723,7 +1423,7 @@ fn section_title(tab: &DashboardTab) -> &'static str {
         DashboardTab::ClusterGraph => "Cluster graph",
         DashboardTab::IndexerProgress => "Indexer progress",
         DashboardTab::IndexerLookup => "Indexer address lookup",
-        DashboardTab::IndexerApiKeys => "Indexer API keys",
+        DashboardTab::IndexerApiKeys => "Workspace API access",
     }
 }
 
@@ -744,7 +1444,7 @@ impl DashboardTab {
 
 pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(config.database_max_connections)
         .connect(&config.database_url)
         .await
         .map_err(|err| LedgerError::Persistence(err.to_string()))?;
@@ -856,6 +1556,7 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         session_cookie_name: config.session_cookie_name.clone(),
         pool: pool.clone(),
         client,
+        rpc_url: config.rpc_url.clone(),
         cryptohouse_url: config.cryptohouse_url.clone(),
         auth_service: Arc::new(AuthService::new(
             pool.clone(),
@@ -868,24 +1569,173 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         email_delivery_mode,
         email_delivery_ready,
         chain_registry,
+        today_cache: Arc::new(RwLock::new(BTreeMap::new())),
+        today_cache_miss_lock: Arc::new(Mutex::new(())),
+        today_cache_ttl: Duration::from_secs(config.today_cache_ttl_seconds),
+        public_evidence_feed_url: config.public_evidence_feed_url.clone(),
+        public_evidence_cache: Arc::new(RwLock::new(None)),
+        public_evidence_cache_miss_lock: Arc::new(Mutex::new(())),
+        public_evidence_cache_ttl: Duration::from_secs(config.public_evidence_cache_ttl_seconds),
     };
+
+    // Warm the expensive shared snapshot after the server starts. The cache is
+    // user-independent and stale-while-revalidate, so page requests never need
+    // to repeat the same inventory aggregates for every signed-in user.
+    let warm_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = load_today_snapshot(&warm_state, warm_state.default_chain_id).await {
+            warn!(%error, "initial today snapshot warmup failed");
+        }
+    });
 
     Ok(Router::new()
         .route("/assets/ledgerflow-mark.svg", get(brand_mark_svg))
-        .route("/assets/chainactors-og.png", get(chainactors_og_png))
+        .route(
+            "/schemas/evidence-pack-v1.json",
+            get(public_evidence_schema),
+        )
+        .route(
+            "/schemas/execution-event-v1.json",
+            get(public_execution_event_schema),
+        )
         .route("/", get(homepage))
-        .route("/pricing", get(pricing))
+        .route("/solutions", get(public_solutions_page))
+        .route("/research", get(public_research_page))
+        .route("/research/{slug}", get(public_research_article_page))
+        .route("/research/{slug}/content.md", get(public_research_markdown))
+        .route("/evidence", get(public_evidence_page))
+        .route("/evidence/{slug}", get(public_evidence_detail_page))
+        .route(
+            "/public/evidence/events.json",
+            get(public_evidence_events_json),
+        )
+        .route("/api", get(public_api_page))
+        .route("/about", get(public_about_page))
+        .route("/pilot", get(pilot_page))
+        .route("/pilot/submit", post(submit_pilot_interest))
+        .route("/reports", get(legacy_public_reports_redirect))
+        .route("/reports/{slug}", get(legacy_public_report_redirect))
+        .route(
+            "/reports/{slug}/content.md",
+            get(legacy_public_report_markdown_redirect),
+        )
+        .route("/cases", get(legacy_public_cases_redirect))
+        .route("/cases/{slug}", get(legacy_public_case_redirect))
+        .route("/products", get(legacy_public_products_redirect))
+        .route("/pricing", get(legacy_public_pricing_redirect))
         .route("/auth", get(auth_page))
         .route("/auth/request-code", post(request_code))
+        .route("/auth/password-login", post(password_login))
         .route("/verify", get(verify_page))
         .route("/auth/verify", post(verify_code))
         .route("/auth/logout", post(logout))
         .route("/app", get(app_home))
-        .route("/app/today", get(today_page))
-        .route("/app/clusters", get(clusters_page))
+        .route("/app/onboarding", get(workspace_onboarding_page))
+        .route(
+            "/app/onboarding/workspace",
+            post(start_workspace_onboarding),
+        )
+        .route("/app/onboarding/entities", post(save_workspace_entities))
+        .route("/app/onboarding/goals", post(save_workspace_goals))
+        .route(
+            "/app/onboarding/destination",
+            post(complete_workspace_onboarding),
+        )
+        .route("/app/demo-workspace", post(create_demo_workspace))
+        .route("/app/overview", get(today_page))
+        .route("/app/observations", get(entities_page))
+        .route("/app/observations/add", post(add_workspace_entity))
+        .route(
+            "/app/observations/{observation_id}",
+            get(observation_intelligence_page),
+        )
+        .route(
+            "/app/observations/{observation_id}/monitoring",
+            post(enable_observation_monitoring),
+        )
+        .route(
+            "/app/observations/{observation_id}/retry",
+            post(retry_observation_analysis),
+        )
+        .route(
+            "/app/observations/{observation_id}/cluster/members/{member_address}",
+            post(override_observation_cluster_member),
+        )
+        .route(
+            "/app/observations/{observation_id}/briefs/{brief_id}",
+            get(observation_brief_page),
+        )
+        .route(
+            "/observations/{observation_id}",
+            get(observation_intelligence_page),
+        )
+        .route("/app/events", get(live_events_page))
+        .route("/app/events/{event_id}", get(execution_event_page))
+        .route(
+            "/app/events/{event_id}/evidence.json",
+            get(execution_event_evidence_json),
+        )
+        .route("/app/monitors", get(monitors_page))
+        .route("/app/monitors/create", post(create_monitor))
+        .route("/app/investigations", get(investigations_page))
+        .route("/app/investigations/create", post(create_investigation))
+        .route(
+            "/app/investigations/{investigation_id}",
+            get(investigation_detail_page),
+        )
+        .route(
+            "/app/investigations/{investigation_id}/update",
+            post(update_investigation),
+        )
+        .route("/app/entities", get(legacy_entities_redirect))
+        .route("/app/entities/add", post(add_workspace_entity))
+        .route(
+            "/app/entities/{entity_id}",
+            get(legacy_entity_detail_redirect),
+        )
+        .route("/entities/{entity_id}", get(legacy_entity_detail_redirect))
+        .route("/app/reports", get(reports_page))
+        .route(
+            "/app/reports/{snapshot_id}/report.json",
+            get(workspace_report_json),
+        )
+        .route(
+            "/demo/base-public/weekly-report",
+            get(public_demo_weekly_report),
+        )
+        .route(
+            "/demo/base-public/weekly-report.md",
+            get(public_demo_weekly_report_markdown),
+        )
+        .route(
+            "/demo/base-public/events.json",
+            get(public_demo_events_json),
+        )
+        .route("/app/api", get(indexer_api_keys_page))
+        .route("/app/schemas", get(workspace_schemas_page))
+        .route("/app/settings", get(workspace_settings_page))
+        .route(
+            "/app/settings/notifications",
+            post(save_workspace_notification),
+        )
+        .route("/app/today", get(legacy_today_redirect))
+        .route("/app/bots", get(legacy_bots_redirect))
+        .route(
+            "/app/bots/reviews/{review_id}/decision",
+            post(decide_behavior_review),
+        )
+        .route("/app/watchlist", get(legacy_watchlist_redirect))
+        .route("/app/watchlist/add", post(add_watchlist_entry))
+        .route(
+            "/app/watchlist/{entry_id}/delete",
+            post(delete_watchlist_entry),
+        )
+        .route("/app/alerts", get(legacy_alerts_redirect))
+        .route("/app/search", get(global_search_page))
+        .route("/app/clusters", get(legacy_clusters_redirect))
         .route("/app/clusters/status", get(cluster_status))
         .route("/app/clusters/{cluster_id}", get(cluster_analysis_page))
-        .route("/app/address-analysis", get(address_analysis_page))
+        .route("/app/address-analysis", get(legacy_address_redirect))
         .route("/app/clusters/create", post(create_cluster))
         .route("/app/clusters/{cluster_id}/update", post(update_cluster))
         .route("/app/clusters/{cluster_id}/delete", post(delete_cluster))
@@ -909,19 +1759,19 @@ pub async fn build_router(config: WebConfig) -> LedgerResult<Router> {
         .route("/app/tx-analysis/run", post(run_tx_analysis))
         .route("/app/tx-analysis/share", post(create_tx_analysis_share))
         .route("/share/tx/{share_id}", get(public_tx_analysis_share))
-        .route("/app/arbitrage", get(arbitrage_page))
+        .route("/app/arbitrage", get(legacy_arbitrage_redirect))
         .route("/api/arbitrage", get(arbitrage_api))
         .route("/api/swaps/block-range", get(swaps_block_range_api))
-        .route("/app/cluster-graph", get(cluster_graph_page))
-        .route("/app/indexer/progress", get(indexer_progress_page))
-        .route("/app/indexer/address-lookup", get(indexer_lookup_page))
-        .route("/app/indexer/api-keys", get(indexer_api_keys_page))
+        .route("/app/cluster-graph", get(legacy_graph_redirect))
+        .route("/app/indexer/progress", get(app_home))
+        .route("/app/indexer/address-lookup", get(app_home))
+        .route("/app/indexer/api-keys", get(legacy_api_redirect))
         .route("/app/indexer/api-keys/create", post(create_indexer_api_key))
         .route(
             "/app/indexer/api-keys/{key_id}/revoke",
             post(revoke_indexer_api_key),
         )
-        .route("/dashboard", get(dashboard))
+        .route("/dashboard", get(app_home))
         .route("/dashboard/cluster-status", get(cluster_status))
         .route("/dashboard/clusters/create", post(create_cluster))
         .route("/dashboard/tx/run", post(run_tx_analysis))
@@ -947,12 +1797,102 @@ async fn brand_mark_svg() -> Response {
         .into_response()
 }
 
-async fn chainactors_og_png() -> Response {
+async fn public_evidence_schema() -> Response {
     (
-        [(header::CONTENT_TYPE, "image/png")],
-        include_bytes!("../../assets/chainactors-og.png").as_slice(),
+        [(
+            header::CONTENT_TYPE,
+            "application/schema+json; charset=utf-8",
+        )],
+        include_str!("../../schemas/evidence-pack-v1.schema.json"),
     )
         .into_response()
+}
+
+async fn public_execution_event_schema() -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/schema+json; charset=utf-8",
+        )],
+        include_str!("../../schemas/execution-event-v1.schema.json"),
+    )
+        .into_response()
+}
+
+async fn load_public_evidence_snapshot(
+    state: &WebState,
+) -> Result<PublicEvidenceCacheEntry, WebError> {
+    if let Some(entry) = state.public_evidence_cache.read().await.as_ref()
+        && entry.loaded_at.elapsed() < state.public_evidence_cache_ttl
+    {
+        return Ok(entry.clone());
+    }
+    let _guard = state.public_evidence_cache_miss_lock.lock().await;
+    if let Some(entry) = state.public_evidence_cache.read().await.as_ref()
+        && entry.loaded_at.elapsed() < state.public_evidence_cache_ttl
+    {
+        return Ok(entry.clone());
+    }
+
+    let mut source = "local public projects".to_owned();
+    let mut packs = match load_public_events(&state.pool, 5_000).await {
+        Ok(packs) => packs,
+        Err(error) => {
+            warn!(%error, "local public Evidence Pack query failed");
+            Vec::new()
+        }
+    };
+    if packs.is_empty()
+        && let Some(feed_url) = state.public_evidence_feed_url.as_deref()
+    {
+        match state.client.get(feed_url).send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<Vec<PilotEvidencePack>>().await {
+                    Ok(remote) => match public_product::validate_public_packs(remote) {
+                        Ok(validated) => {
+                            packs = validated;
+                            source = "live public Base publication feed".to_owned();
+                        }
+                        Err(error) => warn!(%error, "remote public evidence feed was rejected"),
+                    },
+                    Err(error) => {
+                        warn!(%error, "remote public evidence feed returned invalid JSON")
+                    }
+                }
+            }
+            Ok(response) => warn!(status=%response.status(), "remote public evidence feed failed"),
+            Err(error) => warn!(%error, "remote public evidence feed unavailable"),
+        }
+    }
+    if packs.is_empty() {
+        packs = public_product::embedded_public_evidence_packs().map_err(WebError::internal)?;
+        source = "embedded public Base corpus (live feed fallback)".to_owned();
+    } else {
+        packs = public_product::validate_public_packs(packs).map_err(WebError::internal)?;
+    }
+    packs.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    let entry = PublicEvidenceCacheEntry {
+        loaded_at: Instant::now(),
+        packs,
+        source,
+    };
+    *state.public_evidence_cache.write().await = Some(entry.clone());
+    Ok(entry)
+}
+
+async fn public_evidence_events_json(State(state): State<WebState>) -> Result<Response, WebError> {
+    let snapshot = load_public_evidence_snapshot(&state).await?;
+    let mut response = Json(snapshot.packs).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=15, stale-if-error=300"),
+    );
+    Ok(response)
 }
 
 async fn homepage(
@@ -961,22 +1901,226 @@ async fn homepage(
 ) -> Result<Html<String>, WebError> {
     let user = current_user(&state, &headers).await?;
     Ok(Html(render_marketing_page(
-        "ChainActors",
+        "LedgerFlow",
         user.as_ref(),
         render_homepage_content(user.as_ref()),
     )))
 }
 
-async fn pricing(
+async fn public_research_page(
     State(state): State<WebState>,
     headers: HeaderMap,
 ) -> Result<Html<String>, WebError> {
     let user = current_user(&state, &headers).await?;
     Ok(Html(render_marketing_page(
-        "Pricing",
+        "Research · LedgerFlow",
         user.as_ref(),
-        render_pricing_content(),
+        render_public_research_content(),
     )))
+}
+
+async fn public_research_article_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<Html<String>, WebError> {
+    let user = current_user(&state, &headers).await?;
+    let report = public_product::report(&slug)
+        .ok_or_else(|| WebError::from(LedgerError::NotFound(format!("public report {slug}"))))?;
+    Ok(Html(render_marketing_page(
+        report.title,
+        user.as_ref(),
+        render_public_report_content(report),
+    )))
+}
+
+async fn public_research_markdown(Path(slug): Path<String>) -> Result<Response, WebError> {
+    let report = public_product::report(&slug)
+        .ok_or_else(|| WebError::from(LedgerError::NotFound(format!("public report {slug}"))))?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        report.markdown,
+    )
+        .into_response())
+}
+
+async fn public_evidence_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<PublicEvidenceQuery>,
+) -> Result<Html<String>, WebError> {
+    let user = current_user(&state, &headers).await?;
+    let snapshot = load_public_evidence_snapshot(&state).await?;
+    let records = public_product::published_evidence_records(&snapshot.packs);
+    Ok(Html(render_marketing_page(
+        "Evidence Explorer · LedgerFlow",
+        user.as_ref(),
+        render_public_evidence_content(&records, &query, &snapshot.source),
+    )))
+}
+
+async fn public_evidence_detail_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> Result<Html<String>, WebError> {
+    let user = current_user(&state, &headers).await?;
+    let snapshot = load_public_evidence_snapshot(&state).await?;
+    let records = public_product::published_evidence_records(&snapshot.packs);
+    let record = records
+        .iter()
+        .find(|record| record.slug == slug)
+        .ok_or_else(|| {
+            WebError::from(LedgerError::NotFound(format!(
+                "public evidence record {slug}"
+            )))
+        })?;
+    Ok(Html(render_marketing_page(
+        &record.title,
+        user.as_ref(),
+        render_public_evidence_detail_content(record),
+    )))
+}
+
+async fn public_solutions_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, WebError> {
+    let user = current_user(&state, &headers).await?;
+    Ok(Html(render_marketing_page(
+        "Solutions · LedgerFlow",
+        user.as_ref(),
+        render_public_solutions_content(),
+    )))
+}
+
+async fn legacy_public_reports_redirect() -> Redirect {
+    Redirect::permanent("/research")
+}
+
+async fn legacy_public_report_redirect(Path(slug): Path<String>) -> Redirect {
+    Redirect::permanent(&format!("/research/{}", urlencoding::encode(slug.trim())))
+}
+
+async fn legacy_public_report_markdown_redirect(Path(slug): Path<String>) -> Redirect {
+    Redirect::permanent(&format!(
+        "/research/{}/content.md",
+        urlencoding::encode(slug.trim())
+    ))
+}
+
+async fn legacy_public_cases_redirect() -> Redirect {
+    Redirect::permanent("/evidence")
+}
+
+async fn legacy_public_case_redirect(Path(slug): Path<String>) -> Redirect {
+    Redirect::permanent(&format!("/evidence/{}", urlencoding::encode(slug.trim())))
+}
+
+async fn legacy_public_products_redirect() -> Redirect {
+    Redirect::permanent("/solutions")
+}
+
+async fn legacy_public_pricing_redirect() -> Redirect {
+    Redirect::permanent("/solutions#engagement-model")
+}
+
+async fn public_api_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, WebError> {
+    let user = current_user(&state, &headers).await?;
+    Ok(Html(render_marketing_page(
+        "API · LedgerFlow",
+        user.as_ref(),
+        render_public_api_content(),
+    )))
+}
+
+async fn public_about_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, WebError> {
+    let user = current_user(&state, &headers).await?;
+    Ok(Html(render_marketing_page(
+        "About · LedgerFlow",
+        user.as_ref(),
+        render_public_about_content(),
+    )))
+}
+
+async fn pilot_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<PilotPageQuery>,
+) -> Result<Html<String>, WebError> {
+    let user = current_user(&state, &headers).await?;
+    Ok(Html(render_marketing_page(
+        "Pilot · LedgerFlow",
+        user.as_ref(),
+        render_pilot_content(query.submitted == Some(1), user.as_ref()),
+    )))
+}
+
+async fn submit_pilot_interest(
+    State(state): State<WebState>,
+    Form(form): Form<PilotInterestForm>,
+) -> Result<Redirect, WebError> {
+    let name = form.name.trim();
+    if name.is_empty() || name.chars().count() > 120 {
+        return Err(WebError::bad_request(
+            "name must contain between 1 and 120 characters".to_owned(),
+        ));
+    }
+    let email = normalize_email(&form.email)?;
+    let organization = form.organization.trim();
+    if organization.is_empty() || organization.chars().count() > 160 {
+        return Err(WebError::bad_request(
+            "organization must contain between 1 and 160 characters".to_owned(),
+        ));
+    }
+    if !matches!(form.chain_id, 8453 | 4663) {
+        return Err(WebError::bad_request(
+            "select Base or Robinhood Chain".to_owned(),
+        ));
+    }
+    let addresses = parse_monitor_addresses(&form.addresses)?;
+    if addresses.len() < 10 {
+        return Err(WebError::bad_request(
+            "a Pilot scope must contain between 10 and 30 unique addresses or contracts".to_owned(),
+        ));
+    }
+    let use_case = form.use_case.trim();
+    if use_case.is_empty() || use_case.chars().count() > 4000 {
+        return Err(WebError::bad_request(
+            "use case must contain between 1 and 4000 characters".to_owned(),
+        ));
+    }
+    let contact = form.contact.trim();
+    if contact.is_empty() || contact.chars().count() > 500 {
+        return Err(WebError::bad_request(
+            "contact must contain between 1 and 500 characters".to_owned(),
+        ));
+    }
+    sqlx::query(
+        r#"
+        insert into pilot_interest_submissions (
+          name, email, organization, chain_id, addresses, use_case, contact,
+          status, source, metadata
+        ) values ($1,$2,$3,$4,$5,$6,$7,'new','public_website','{}'::jsonb)
+        "#,
+    )
+    .bind(name)
+    .bind(email)
+    .bind(organization)
+    .bind(form.chain_id as i64)
+    .bind(addresses)
+    .bind(use_case)
+    .bind(contact)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("pilot request persistence failed: {error}")))?;
+    Ok(Redirect::to("/pilot?submitted=1"))
 }
 
 async fn auth_page(
@@ -984,23 +2128,31 @@ async fn auth_page(
     headers: HeaderMap,
     Query(query): Query<AuthPageQuery>,
 ) -> Result<Response, WebError> {
-    if current_user(&state, &headers).await?.is_some() {
-        return Ok(Redirect::to("/app/today").into_response());
+    if let Some(user) = current_user(&state, &headers).await? {
+        return Ok(Redirect::to(authenticated_landing_path(&state, &user).await?).into_response());
     }
     let notice = query.notice.as_deref().and_then(render_notice_message);
-    let mode = query.mode.as_deref().unwrap_or("signup");
-    Ok(Html(render_marketing_page(
-        "Sign in",
-        None,
-        render_auth_content(
-            notice,
-            None,
-            mode,
-            state.email_delivery_mode,
-            state.email_delivery_ready,
-        ),
-    ))
-    .into_response())
+    let mode = normalize_auth_mode(query.mode.as_deref());
+    let method = normalize_login_method(query.method.as_deref());
+    if query.stage.as_deref() == Some("verify") {
+        let purpose = match query.purpose.as_deref() {
+            Some("login") => "login",
+            Some("signup") => "signup",
+            _ => mode,
+        };
+        let email = query.email.as_deref().unwrap_or_default();
+        if email.is_empty() {
+            return Ok(render_auth_page_response(
+                notice,
+                Some("enter your email to request a verification code".to_owned()),
+                mode,
+                method,
+                None,
+            ));
+        }
+        return Ok(render_verify_page_response(email, purpose, notice, None));
+    }
+    Ok(render_auth_page_response(notice, None, mode, method, None))
 }
 
 async fn request_code(
@@ -1010,28 +2162,68 @@ async fn request_code(
 ) -> Result<Response, WebError> {
     let purpose = parse_purpose(&form.purpose)?;
     let user_agent = user_agent(&headers);
+    let (mode, method, signup_password) = match purpose {
+        VerificationPurpose::Signup => {
+            let password = form.password.as_deref().unwrap_or_default();
+            let password_confirm = form.password_confirm.as_deref().unwrap_or_default();
+            if password != password_confirm {
+                return Ok(render_auth_page_response(
+                    None,
+                    Some("passwords do not match".to_owned()),
+                    "signup",
+                    "password",
+                    Some(&form.email),
+                ));
+            }
+            ("signup", "password", Some(password))
+        }
+        VerificationPurpose::Login => ("login", "code", None),
+    };
     match state
         .auth_service
-        .request_code(&form.email, purpose.clone(), None, user_agent.as_deref())
+        .request_code(
+            &form.email,
+            purpose.clone(),
+            signup_password,
+            None,
+            user_agent.as_deref(),
+        )
         .await
     {
-        Ok(email) => Ok(redirect_response(&format!(
-            "/verify?email={}&purpose={}&notice=code-sent",
-            urlencoding::encode(&email),
-            verification_purpose_to_str(&purpose)
+        Ok(email) => Ok(redirect_response(&verification_auth_path(
+            &email,
+            verification_purpose_to_str(&purpose),
+            Some("code-sent"),
         ))),
-        Err(err) => Ok(Html(render_marketing_page(
-            "Sign in",
+        Err(err) => Ok(render_auth_page_response(
             None,
-            render_auth_content(
-                None,
-                Some(err.to_string()),
-                verification_purpose_to_str(&purpose),
-                state.email_delivery_mode,
-                state.email_delivery_ready,
-            ),
-        ))
-        .into_response()),
+            Some(auth_error_message(&err)),
+            mode,
+            method,
+            Some(&form.email),
+        )),
+    }
+}
+
+async fn password_login(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<PasswordLoginForm>,
+) -> Result<Response, WebError> {
+    let user_agent = user_agent(&headers);
+    match state
+        .auth_service
+        .login_with_password(&form.email, &form.password, user_agent.as_deref())
+        .await
+    {
+        Ok((user, session_token)) => signed_in_response(&state, &user, &session_token).await,
+        Err(err) => Ok(render_auth_page_response(
+            None,
+            Some(auth_error_message(&err)),
+            "login",
+            "password",
+            Some(&form.email),
+        )),
     }
 }
 
@@ -1040,21 +2232,19 @@ async fn verify_page(
     headers: HeaderMap,
     Query(query): Query<VerifyPageQuery>,
 ) -> Result<Response, WebError> {
-    if current_user(&state, &headers).await?.is_some() {
-        return Ok(Redirect::to("/app/today").into_response());
+    if let Some(user) = current_user(&state, &headers).await? {
+        return Ok(Redirect::to(authenticated_landing_path(&state, &user).await?).into_response());
     }
-    let notice = query.notice.as_deref().and_then(render_notice_message);
-    Ok(Html(render_marketing_page(
-        "Verify email",
-        None,
-        render_verify_content(
-            query.email.as_deref().unwrap_or_default(),
-            query.purpose.as_deref().unwrap_or("signup"),
-            notice,
-            None,
-        ),
-    ))
-    .into_response())
+    let purpose = if query.purpose.as_deref() == Some("login") {
+        "login"
+    } else {
+        "signup"
+    };
+    Ok(redirect_response(&verification_auth_path(
+        query.email.as_deref().unwrap_or_default(),
+        purpose,
+        query.notice.as_deref(),
+    )))
 }
 
 async fn verify_code(
@@ -1069,25 +2259,13 @@ async fn verify_code(
         .verify_code(&form.email, purpose, &form.code, user_agent.as_deref())
         .await
     {
-        Ok((_user, session_token)) => {
-            let mut response = Redirect::to("/app/today?notice=signed-in").into_response();
-            response.headers_mut().insert(
-                header::SET_COOKIE,
-                HeaderValue::from_str(&session_cookie(
-                    &state.session_cookie_name,
-                    &session_token,
-                    60 * 60 * 24 * 30,
-                ))
-                .map_err(|err| WebError::internal(err.to_string()))?,
-            );
-            Ok(response)
-        }
-        Err(err) => Ok(Html(render_marketing_page(
-            "Verify email",
+        Ok((user, session_token)) => signed_in_response(&state, &user, &session_token).await,
+        Err(err) => Ok(render_verify_page_response(
+            &form.email,
+            &form.purpose,
             None,
-            render_verify_content(&form.email, &form.purpose, None, Some(err.to_string())),
-        ))
-        .into_response()),
+            Some(auth_error_message(&err)),
+        )),
     }
 }
 
@@ -1102,6 +2280,123 @@ async fn logout(State(state): State<WebState>, headers: HeaderMap) -> Result<Res
             .map_err(|err| WebError::internal(err.to_string()))?,
     );
     Ok(response)
+}
+
+async fn authenticated_landing_path(
+    state: &WebState,
+    user: &AppUser,
+) -> Result<&'static str, WebError> {
+    let configured = sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists (
+          select 1 from intelligence_workspaces
+          where user_id = $1
+            and status <> 'archived'
+            and onboarding_completed_at is not null
+        )
+        "#,
+    )
+    .bind(user.user_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("resolve workspace landing failed: {error}")))?;
+    Ok(if configured {
+        "/app/overview?notice=signed-in"
+    } else {
+        "/app/onboarding?notice=welcome"
+    })
+}
+
+async fn signed_in_response(
+    state: &WebState,
+    user: &AppUser,
+    session_token: &str,
+) -> Result<Response, WebError> {
+    let mut response = Redirect::to(authenticated_landing_path(state, user).await?).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&session_cookie(
+            &state.session_cookie_name,
+            session_token,
+            60 * 60 * 24 * 30,
+        ))
+        .map_err(|err| WebError::internal(err.to_string()))?,
+    );
+    Ok(response)
+}
+
+fn render_auth_page_response(
+    notice: Option<&str>,
+    error: Option<String>,
+    mode: &str,
+    method: &str,
+    email: Option<&str>,
+) -> Response {
+    Html(render_marketing_page(
+        "Login / Register",
+        None,
+        render_auth_content(notice, error, mode, method, email),
+    ))
+    .into_response()
+}
+
+fn render_verify_page_response(
+    email: &str,
+    purpose: &str,
+    notice: Option<&str>,
+    error: Option<String>,
+) -> Response {
+    Html(render_marketing_page(
+        "Verify email",
+        None,
+        render_verify_content(email, purpose, notice, error),
+    ))
+    .into_response()
+}
+
+fn verification_auth_path(email: &str, purpose: &str, notice: Option<&str>) -> String {
+    let purpose = if purpose == "login" {
+        "login"
+    } else {
+        "signup"
+    };
+    let mut path = format!(
+        "/auth?mode={}&stage=verify&email={}&purpose={}",
+        purpose,
+        urlencoding::encode(email),
+        purpose
+    );
+    if let Some(notice) = notice {
+        path.push_str("&notice=");
+        path.push_str(&urlencoding::encode(notice));
+    }
+    path
+}
+
+fn normalize_auth_mode(mode: Option<&str>) -> &'static str {
+    if mode == Some("signup") {
+        "signup"
+    } else {
+        "login"
+    }
+}
+
+fn normalize_login_method(method: Option<&str>) -> &'static str {
+    if method == Some("code") {
+        "code"
+    } else {
+        "password"
+    }
+}
+
+fn auth_error_message(error: &LedgerError) -> String {
+    match error {
+        LedgerError::AnalysisInvariant(message) | LedgerError::NotFound(message) => message.clone(),
+        LedgerError::TransientIngestion(_) => {
+            "unable to send the verification email; please try again".to_owned()
+        }
+        _ => "authentication failed; please try again".to_owned(),
+    }
 }
 
 async fn dashboard(Query(query): Query<DashboardQuery>) -> Result<Response, WebError> {
@@ -1138,8 +2433,1115 @@ async fn dashboard(Query(query): Query<DashboardQuery>) -> Result<Response, WebE
     Ok(Redirect::to(&location).into_response())
 }
 
-async fn app_home() -> Response {
-    Redirect::to("/app/today").into_response()
+async fn app_home(State(state): State<WebState>, headers: HeaderMap) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    Ok(Redirect::to(authenticated_landing_path(&state, &user).await?).into_response())
+}
+
+async fn workspace_onboarding_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceOnboardingQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let step = query.step.unwrap_or(1).clamp(1, 2);
+    let workspace = if let Some(workspace_id) = query.workspace_id {
+        load_owned_workspace_setup(&state, user.user_id, workspace_id).await?
+    } else {
+        None
+    };
+    if step > 1 && workspace.is_none() {
+        return Ok(Redirect::to("/app/onboarding?notice=start-workspace-first").into_response());
+    }
+    Ok(Html(render_workspace_onboarding_page(
+        &user,
+        step,
+        workspace.as_ref(),
+        query.notice.as_deref(),
+        &state.chain_registry,
+    ))
+    .into_response())
+}
+
+async fn start_workspace_onboarding(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<WorkspaceStartForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let workspace_type = form.workspace_type.trim();
+    if !matches!(
+        workspace_type,
+        "protocol" | "chain" | "searcher" | "wallet" | "fund_research" | "custom"
+    ) {
+        return Err(WebError::bad_request("invalid workspace type".to_owned()));
+    }
+    if state.chain_registry.resolve(form.chain_id).is_none() {
+        return Err(WebError::bad_request(
+            "unsupported workspace network".to_owned(),
+        ));
+    }
+    let name = form.name.trim();
+    if name.is_empty() || name.len() > 160 {
+        return Err(WebError::bad_request(
+            "workspace name is required".to_owned(),
+        ));
+    }
+    let mut transaction =
+        state.pool.begin().await.map_err(|error| {
+            WebError::internal(format!("begin workspace creation failed: {error}"))
+        })?;
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(user.user_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("lock workspace draft failed: {error}")))?;
+    let reusable_workspace_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        select workspaces.workspace_id
+        from intelligence_workspaces workspaces
+        where workspaces.user_id = $1
+          and workspaces.status = 'draft'
+          and not workspaces.is_demo
+          and workspaces.onboarding_completed_at is null
+          and not exists (
+            select 1 from workspace_entities entities
+            where entities.workspace_id = workspaces.workspace_id
+          )
+          and not exists (
+            select 1 from workspace_monitoring_goals goals
+            where goals.workspace_id = workspaces.workspace_id
+          )
+          and not exists (
+            select 1 from workspace_notification_destinations destinations
+            where destinations.workspace_id = workspaces.workspace_id
+          )
+          and not exists (
+            select 1 from user_monitors monitors
+            where monitors.workspace_id = workspaces.workspace_id
+          )
+          and not exists (
+            select 1 from execution_investigations investigations
+            where investigations.workspace_id = workspaces.workspace_id
+          )
+        order by workspaces.created_at desc
+        limit 1
+        "#,
+    )
+    .bind(user.user_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("load reusable workspace failed: {error}")))?;
+    let workspace_id = if let Some(workspace_id) = reusable_workspace_id {
+        sqlx::query(
+            r#"
+            delete from intelligence_workspaces workspaces
+            where workspaces.user_id = $1
+              and workspaces.workspace_id <> $2
+              and workspaces.status = 'draft'
+              and not workspaces.is_demo
+              and workspaces.onboarding_completed_at is null
+              and not exists (
+                select 1 from workspace_entities entities
+                where entities.workspace_id = workspaces.workspace_id
+              )
+              and not exists (
+                select 1 from workspace_monitoring_goals goals
+                where goals.workspace_id = workspaces.workspace_id
+              )
+              and not exists (
+                select 1 from workspace_notification_destinations destinations
+                where destinations.workspace_id = workspaces.workspace_id
+              )
+              and not exists (
+                select 1 from user_monitors monitors
+                where monitors.workspace_id = workspaces.workspace_id
+              )
+              and not exists (
+                select 1 from execution_investigations investigations
+                where investigations.workspace_id = workspaces.workspace_id
+              )
+            "#,
+        )
+        .bind(user.user_id)
+        .bind(workspace_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("remove duplicate drafts failed: {error}")))?;
+        sqlx::query(
+            r#"
+            update intelligence_workspaces
+            set name = $1,
+                workspace_type = $2,
+                chain_id = $3,
+                metadata = metadata || jsonb_build_object('source', 'workspace_onboarding'),
+                updated_at = now()
+            where workspace_id = $4 and user_id = $5
+            "#,
+        )
+        .bind(name)
+        .bind(workspace_type)
+        .bind(form.chain_id as i64)
+        .bind(workspace_id)
+        .bind(user.user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("reuse workspace draft failed: {error}")))?;
+        workspace_id
+    } else {
+        sqlx::query_scalar::<_, Uuid>(
+            r#"
+            insert into intelligence_workspaces
+              (user_id, name, workspace_type, chain_id, status, is_demo, metadata)
+            values ($1, $2, $3, $4, 'draft', false,
+                    jsonb_build_object('source', 'workspace_onboarding'))
+            returning workspace_id
+            "#,
+        )
+        .bind(user.user_id)
+        .bind(name)
+        .bind(workspace_type)
+        .bind(form.chain_id as i64)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("create workspace failed: {error}")))?
+    };
+    transaction.commit().await.map_err(|error| {
+        WebError::internal(format!("commit workspace creation failed: {error}"))
+    })?;
+    Ok(redirect_response(&format!(
+        "/app/onboarding?step=2&workspace_id={workspace_id}"
+    )))
+}
+
+async fn save_workspace_entities(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<WorkspaceEntitiesForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    ensure_owned_workspace(&state, user.user_id, form.workspace_id).await?;
+    let addresses = parse_monitor_addresses(&form.addresses)?;
+    let entity_kind = form.entity_kind.trim();
+    if !matches!(entity_kind, "address" | "contract" | "pool" | "protocol") {
+        return Err(WebError::bad_request("invalid entity kind".to_owned()));
+    }
+    let first_address = addresses.first().cloned();
+    let role = clean_optional_text(form.role.clone());
+    let label = clean_optional_text(form.label.clone());
+    let chain_id: i64 =
+        sqlx::query_scalar("select chain_id from intelligence_workspaces where workspace_id=$1")
+            .bind(form.workspace_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|error| {
+                WebError::internal(format!("load workspace network failed: {error}"))
+            })?;
+    let mut transaction = state.pool.begin().await.map_err(|error| {
+        WebError::internal(format!(
+            "begin workspace entity transaction failed: {error}"
+        ))
+    })?;
+    for address in &addresses {
+        sqlx::query(
+            r#"
+            insert into workspace_entities
+              (workspace_id, address, entity_kind, role, label, metadata)
+            values ($1, $2, $3, $4, $5, '{"source":"workspace_onboarding"}'::jsonb)
+            on conflict (workspace_id, address) do update
+            set entity_kind = excluded.entity_kind, role = excluded.role,
+                label = excluded.label, updated_at = now()
+            "#,
+        )
+        .bind(form.workspace_id)
+        .bind(address)
+        .bind(entity_kind)
+        .bind(&role)
+        .bind(&label)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("save workspace entity failed: {error}")))?;
+    }
+    let status = if WorkspacePlan::parse(&user.workspace_plan)
+        .allows(WorkspaceCapability::CustomMonitoredEntities)
+    {
+        "active"
+    } else {
+        "draft"
+    };
+    sqlx::query(
+        r#"
+        update intelligence_workspaces
+        set status = $1, onboarding_completed_at = now(),
+            metadata = metadata || jsonb_build_object('experience','observation_v3'),
+            updated_at = now()
+        where workspace_id = $2 and user_id = $3
+        "#,
+    )
+    .bind(status)
+    .bind(form.workspace_id)
+    .bind(user.user_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| {
+        WebError::internal(format!("complete observation workspace failed: {error}"))
+    })?;
+    transaction.commit().await.map_err(|error| {
+        WebError::internal(format!("commit workspace entities failed: {error}"))
+    })?;
+    for address in &addresses {
+        if WorkspacePlan::parse(&user.workspace_plan)
+            .allows(WorkspaceCapability::CustomMonitoredEntities)
+        {
+            ensure_default_observation_monitor(
+                &state,
+                user.user_id,
+                form.workspace_id,
+                chain_id as u64,
+                address,
+                entity_kind,
+                role.as_deref(),
+                label.as_deref(),
+            )
+            .await?;
+        }
+        let result: Result<serde_json::Value, WebError> = api_post_json(
+            &state,
+            chain_id as u64,
+            "/observations",
+            &json!({"chain_id":chain_id as u64,"address":address,"source":"workspace_onboarding"}),
+        )
+        .await;
+        let (analysis_status, progress, error) = match result {
+            Ok(_) => (
+                "queued",
+                json!({"percent":0,"stage":"queued","message":"Queued for historical activity discovery"}),
+                None,
+            ),
+            Err(error) => (
+                "failed",
+                json!({"percent":0,"stage":"failed","message":"Analysis could not be queued; retry is available"}),
+                Some(error.to_string()),
+            ),
+        };
+        sqlx::query(
+            r#"update workspace_entities set observation_enabled=true,observation_status=$3,
+               observation_progress=$4,observation_error=$5,updated_at=now()
+               where workspace_id=$1 and lower(address)=lower($2)"#,
+        )
+        .bind(form.workspace_id)
+        .bind(address)
+        .bind(analysis_status)
+        .bind(progress)
+        .bind(error)
+        .execute(&state.pool)
+        .await
+        .map_err(|error| WebError::internal(format!("save observation state failed: {error}")))?;
+    }
+    let destination = first_address
+        .map(|address| {
+            format!(
+                "/app/observations/{}?workspace=workspace:{}&notice=observation-added",
+                urlencoding::encode(&address),
+                form.workspace_id,
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "/app/observations?workspace=workspace:{}&notice=workspace-configured",
+                form.workspace_id,
+            )
+        });
+    Ok(redirect_response(&destination))
+}
+
+async fn save_workspace_goals(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<WorkspaceGoalsForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    ensure_owned_workspace(&state, user.user_id, form.workspace_id).await?;
+    let goals = [
+        ("mev_activity", form.mev_activity),
+        ("liquidations", form.liquidations),
+        ("large_transfers", form.large_transfers),
+        ("revenue_changes", form.revenue_changes),
+        ("failed_execution", form.failed_execution),
+        ("execution_success", form.execution_success),
+        ("competitor_activity", form.competitor_activity),
+        ("failed_attempts", form.failed_attempts),
+        ("profit_attribution", form.profit_attribution),
+        ("ecosystem_activity", form.ecosystem_activity),
+        ("searcher_landscape", form.searcher_landscape),
+        ("protocol_changes", form.protocol_changes),
+    ]
+    .into_iter()
+    .filter_map(|(goal, selected)| selected.map(|_| goal))
+    .collect::<Vec<_>>();
+    if goals.is_empty() {
+        return Err(WebError::bad_request(
+            "choose at least one monitoring goal".to_owned(),
+        ));
+    }
+    let mut transaction = state.pool.begin().await.map_err(|error| {
+        WebError::internal(format!("begin workspace goal transaction failed: {error}"))
+    })?;
+    sqlx::query("delete from workspace_monitoring_goals where workspace_id = $1")
+        .bind(form.workspace_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("reset workspace goals failed: {error}")))?;
+    for goal in goals {
+        sqlx::query(
+            r#"
+            insert into workspace_monitoring_goals
+              (workspace_id, goal_type, enabled, configuration)
+            values ($1, $2, true, '{}'::jsonb)
+            "#,
+        )
+        .bind(form.workspace_id)
+        .bind(goal)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("save workspace goal failed: {error}")))?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| WebError::internal(format!("commit workspace goals failed: {error}")))?;
+    Ok(redirect_response(&format!(
+        "/app/onboarding?step=4&workspace_id={}",
+        form.workspace_id
+    )))
+}
+
+async fn complete_workspace_onboarding(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<WorkspaceDestinationForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let workspace = load_owned_workspace_setup(&state, user.user_id, form.workspace_id)
+        .await?
+        .ok_or_else(|| WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "workspace was not found".to_owned(),
+        })?;
+    let destination_type = form.destination_type.trim();
+    if !matches!(destination_type, "telegram" | "webhook" | "email" | "none") {
+        return Err(WebError::bad_request(
+            "invalid notification destination".to_owned(),
+        ));
+    }
+    let plan = WorkspacePlan::parse(&user.workspace_plan);
+    let destination_ref = clean_optional_text(form.destination_ref);
+    let destination_name = clean_optional_text(form.display_name)
+        .unwrap_or_else(|| format!("{} {}", workspace.name, destination_type));
+    let operational = destination_type == "telegram"
+        && plan.allows(WorkspaceCapability::TelegramAlerts)
+        && destination_ref.is_some();
+    let mut transaction = state.pool.begin().await.map_err(|error| {
+        WebError::internal(format!("begin workspace completion failed: {error}"))
+    })?;
+    if destination_type != "none" {
+        sqlx::query(
+            r#"
+            insert into workspace_notification_destinations
+              (workspace_id, destination_type, display_name, destination_ref,
+               enabled, operational, metadata)
+            values ($1, $2, $3, $4, true, $5,
+                    jsonb_build_object('source', 'workspace_onboarding'))
+            "#,
+        )
+        .bind(form.workspace_id)
+        .bind(destination_type)
+        .bind(&destination_name)
+        .bind(&destination_ref)
+        .bind(operational)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            WebError::internal(format!("save workspace destination failed: {error}"))
+        })?;
+    }
+    if plan.allows(WorkspaceCapability::CustomMonitoredEntities) {
+        let monitor_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            insert into user_monitors
+              (user_id, workspace_id, chain_id, name, status, metadata)
+            values ($1,$2,$3,$4,'active',
+                    jsonb_build_object('source', 'workspace_onboarding'))
+            returning monitor_id
+            "#,
+        )
+        .bind(user.user_id)
+        .bind(form.workspace_id)
+        .bind(workspace.chain_id as i64)
+        .bind(format!("{} Core Monitor", workspace.name))
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| {
+            WebError::internal(format!("create onboarding monitor failed: {error}"))
+        })?;
+        sqlx::query(
+            r#"
+            insert into user_monitor_entities
+              (monitor_id, address, entity_kind, role, label, metadata)
+            select $1, address,
+                   case when entity_kind in ('contract', 'pool', 'protocol')
+                        then 'contract' else 'address' end,
+                   role, label, jsonb_build_object('source', 'workspace_onboarding')
+            from workspace_entities where workspace_id = $2
+            on conflict (monitor_id, address) do nothing
+            "#,
+        )
+        .bind(monitor_id)
+        .bind(form.workspace_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("copy onboarding entities failed: {error}")))?;
+        let goals = sqlx::query_scalar::<_, String>(
+            r#"
+            select goal_type from workspace_monitoring_goals
+            where workspace_id = $1 and enabled
+            order by goal_type
+            "#,
+        )
+        .bind(form.workspace_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("load onboarding goals failed: {error}")))?;
+        let mut event_types = HashSet::new();
+        for goal in goals {
+            let event_type = match goal.as_str() {
+                "mev_activity" | "profit_attribution" => "dex_arbitrage",
+                "liquidations" => "liquidation",
+                "large_transfers" => "large_asset_flow",
+                "revenue_changes" => "protocol_revenue",
+                "failed_execution" | "failed_attempts" => "repeated_failed_attempts",
+                _ => "unknown_material_interaction",
+            };
+            if event_types.insert(event_type) {
+                sqlx::query(
+                    r#"
+                    insert into user_monitor_rules
+                      (monitor_id, event_type, severity, enabled,
+                       include_filters, exclude_filters)
+                    values ($1,$2,'medium',true,'{}'::jsonb,'{}'::jsonb)
+                    "#,
+                )
+                .bind(monitor_id)
+                .bind(event_type)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    WebError::internal(format!("create onboarding rule failed: {error}"))
+                })?;
+            }
+        }
+        if operational {
+            sqlx::query(
+                r#"
+                insert into user_monitor_destinations
+                  (monitor_id, destination_type, display_name, destination_ref,
+                   enabled, metadata)
+                values ($1,'telegram',$2,$3,true,
+                        jsonb_build_object('source', 'workspace_onboarding'))
+                "#,
+            )
+            .bind(monitor_id)
+            .bind(&destination_name)
+            .bind(&destination_ref)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                WebError::internal(format!("create onboarding destination failed: {error}"))
+            })?;
+        }
+    }
+    let status = if plan.allows(WorkspaceCapability::CustomMonitoredEntities) {
+        "active"
+    } else {
+        "draft"
+    };
+    sqlx::query(
+        r#"
+        update intelligence_workspaces
+        set status = $1, onboarding_completed_at = now(), updated_at = now()
+        where workspace_id = $2 and user_id = $3
+        "#,
+    )
+    .bind(status)
+    .bind(form.workspace_id)
+    .bind(user.user_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("complete workspace failed: {error}")))?;
+    transaction.commit().await.map_err(|error| {
+        WebError::internal(format!("commit workspace completion failed: {error}"))
+    })?;
+    let first_entity = sqlx::query_scalar::<_, String>(
+        "select address from workspace_entities where workspace_id = $1 order by created_at, address limit 1",
+    )
+    .bind(form.workspace_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load first workspace entity failed: {error}")))?;
+    let destination = first_entity
+        .map(|address| {
+            format!(
+                "/app/observations/{}?workspace=workspace:{}&notice=workspace-configured",
+                urlencoding::encode(&address),
+                form.workspace_id,
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "/app/observations?workspace=workspace:{}&notice=workspace-configured",
+                form.workspace_id,
+            )
+        });
+    Ok(redirect_response(&destination))
+}
+
+async fn create_demo_workspace(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let config: crate::pilot::PilotConfig = serde_yaml::from_str(include_str!(
+        "../../config/pilots/demo-base-public.yaml"
+    ))
+    .map_err(|error| {
+        WebError::internal(format!("load demo workspace configuration failed: {error}"))
+    })?;
+    let focus_entity = config
+        .entities
+        .iter()
+        .find(|entity| entity.include && entity.role.contains("arbitrage_executor"))
+        .or_else(|| config.entities.iter().find(|entity| entity.include))
+        .map(|entity| entity.address.to_ascii_lowercase());
+    if let Some(existing) = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        select workspace_id from intelligence_workspaces
+        where user_id = $1 and is_demo and status <> 'archived'
+        limit 1
+        "#,
+    )
+    .bind(user.user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load demo workspace failed: {error}")))?
+    {
+        let destination = focus_entity
+            .as_deref()
+            .map(|address| {
+                format!(
+                    "/app/observations/{}?workspace=workspace:{existing}",
+                    urlencoding::encode(address)
+                )
+            })
+            .unwrap_or_else(|| format!("/app/observations?workspace=workspace:{existing}"));
+        return Ok(redirect_response(&destination));
+    }
+    let mut transaction = state.pool.begin().await.map_err(|error| {
+        WebError::internal(format!("begin demo workspace transaction failed: {error}"))
+    })?;
+    let workspace_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        insert into intelligence_workspaces
+          (user_id, name, workspace_type, chain_id, status, is_demo,
+           onboarding_completed_at, metadata)
+        values ($1, $2, 'demo', $3, 'active', true,
+                now(), jsonb_build_object('source_project_id', $4, 'public_data_only', true))
+        returning workspace_id
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(&config.project.name)
+    .bind(config.project.chain_id as i64)
+    .bind(&config.project.project_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("create demo workspace failed: {error}")))?;
+    for entity in config.entities.iter().filter(|entity| entity.include) {
+        let entity_kind = if entity.role.contains("protocol") {
+            "protocol"
+        } else if entity.role.contains("pool") {
+            "pool"
+        } else if entity.role.contains("contract") || entity.role.contains("executor") {
+            "contract"
+        } else {
+            "address"
+        };
+        sqlx::query(
+            r#"
+            insert into workspace_entities
+              (workspace_id, address, entity_kind, role, label, metadata)
+            values ($1, lower($2), $3, $4, $5,
+                    jsonb_build_object('source', 'public_demo_config', 'entity_id', $6))
+            on conflict (workspace_id, address) do nothing
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(&entity.address)
+        .bind(entity_kind)
+        .bind(&entity.role)
+        .bind(&entity.label)
+        .bind(&entity.entity_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("save demo entity failed: {error}")))?;
+    }
+    for rule in config.rules.iter().filter(|rule| rule.enabled) {
+        let goal = serde_json::to_value(&rule.event_type)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "execution_intelligence".to_owned());
+        sqlx::query(
+            r#"
+            insert into workspace_monitoring_goals
+              (workspace_id, goal_type, enabled, configuration)
+            values ($1, $2, true, jsonb_build_object('source', 'public_demo_rule'))
+            on conflict (workspace_id, goal_type) do nothing
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(goal)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("save demo goal failed: {error}")))?;
+    }
+    let demo_monitor_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        insert into user_monitors
+          (user_id, workspace_id, chain_id, name, status, metadata)
+        values ($1,$2,$3,'Public Base Demo Monitor','active',
+                jsonb_build_object('source', 'public_demo_config', 'read_only', true))
+        returning monitor_id
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(workspace_id)
+    .bind(config.project.chain_id as i64)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("create demo monitor failed: {error}")))?;
+    sqlx::query(
+        r#"
+        insert into user_monitor_entities
+          (monitor_id, address, entity_kind, role, label, metadata)
+        select $1, address,
+               case when entity_kind in ('contract', 'pool', 'protocol')
+                    then 'contract' else 'address' end,
+               role, label, jsonb_build_object('source', 'public_demo_config')
+        from workspace_entities where workspace_id = $2
+        on conflict (monitor_id, address) do nothing
+        "#,
+    )
+    .bind(demo_monitor_id)
+    .bind(workspace_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("copy demo monitor entities failed: {error}")))?;
+    for rule in config.rules.iter().filter(|rule| rule.enabled) {
+        let event_type = serde_json::to_value(&rule.event_type)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown_material_interaction".to_owned());
+        let severity = serde_json::to_value(&rule.severity)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "medium".to_owned());
+        sqlx::query(
+            r#"
+            insert into user_monitor_rules
+              (monitor_id, event_type, severity, enabled,
+               include_filters, exclude_filters)
+            values ($1,$2,$3,true,'{}'::jsonb,'{}'::jsonb)
+            "#,
+        )
+        .bind(demo_monitor_id)
+        .bind(event_type)
+        .bind(severity)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("save demo monitor rule failed: {error}")))?;
+    }
+    let demo_packs: Vec<PilotEvidencePack> =
+        serde_json::from_str(include_str!("../../demo/base-public/events.json"))
+            .map_err(|error| WebError::internal(format!("load demo evidence failed: {error}")))?;
+    if let Some(pack) = demo_packs.first() {
+        let related_entities = pack
+            .entities
+            .iter()
+            .filter_map(|entity| entity.get("address").and_then(serde_json::Value::as_str))
+            .map(|address| address.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let open_questions = if pack.limitations.is_empty() {
+            None
+        } else {
+            Some(pack.limitations.join("\n"))
+        };
+        sqlx::query(
+            r#"
+            insert into execution_investigations (
+              user_id, workspace_id, chain_id, title, status, working_conclusion,
+              open_questions, notes, related_event_ids, related_entities, evidence
+            ) values ($1,$2,$3,$4,'in_review',$5,$6,$7,$8,$9,$10)
+            "#,
+        )
+        .bind(user.user_id)
+        .bind(workspace_id)
+        .bind(pack.chain_id as i64)
+        .bind(format!(
+            "Demo evidence review · {}",
+            truncate_middle(&pack.tx_hash, 9)
+        ))
+        .bind(&pack.conclusion)
+        .bind(open_questions)
+        .bind("Generated from the public Base demo Evidence Pack; no customer data is included.")
+        .bind(vec![format!("pilot-{}", pack.event_id)])
+        .bind(related_entities)
+        .bind(SqlJson(serde_json::to_value(pack).map_err(|error| {
+            WebError::internal(format!("serialize demo evidence failed: {error}"))
+        })?))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("save demo investigation failed: {error}")))?;
+    }
+    transaction
+        .commit()
+        .await
+        .map_err(|error| WebError::internal(format!("commit demo workspace failed: {error}")))?;
+    let destination = focus_entity
+        .as_deref()
+        .map(|address| {
+            format!(
+                "/app/observations/{}?workspace=workspace:{workspace_id}&notice=demo-workspace-ready",
+                urlencoding::encode(address)
+            )
+        })
+        .unwrap_or_else(|| {
+            format!("/app/observations?workspace=workspace:{workspace_id}&notice=demo-workspace-ready")
+        });
+    Ok(redirect_response(&destination))
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceSetupRow {
+    workspace_id: Uuid,
+    name: String,
+    workspace_type: String,
+    chain_id: u64,
+}
+
+async fn load_owned_workspace_setup(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+) -> Result<Option<WorkspaceSetupRow>, WebError> {
+    let row = sqlx::query(
+        r#"
+        select workspace_id, name, workspace_type, chain_id
+        from intelligence_workspaces
+        where workspace_id = $1 and user_id = $2 and status <> 'archived'
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load workspace setup failed: {error}")))?;
+    Ok(row.map(|row| WorkspaceSetupRow {
+        workspace_id: row.get("workspace_id"),
+        name: row.get("name"),
+        workspace_type: row.get("workspace_type"),
+        chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+    }))
+}
+
+async fn ensure_owned_workspace(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+) -> Result<(), WebError> {
+    if load_owned_workspace_setup(state, user_id, workspace_id)
+        .await?
+        .is_some()
+    {
+        Ok(())
+    } else {
+        Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "workspace was not found".to_owned(),
+        })
+    }
+}
+
+fn render_workspace_onboarding_page(
+    user: &AppUser,
+    step: u8,
+    workspace: Option<&WorkspaceSetupRow>,
+    notice: Option<&str>,
+    chain_registry: &ChainRegistry,
+) -> String {
+    let plan = WorkspacePlan::parse(&user.workspace_plan);
+    let progress = (1..=2)
+        .map(|current| {
+            let label = match current {
+                1 => "Workspace",
+                _ => "Observe",
+            };
+            format!(
+                r#"<li class="{}"><span>{}</span><strong>{}</strong></li>"#,
+                if current == step {
+                    "active"
+                } else if current < step {
+                    "complete"
+                } else {
+                    ""
+                },
+                current,
+                label,
+            )
+        })
+        .collect::<String>();
+    let workspace_id = workspace
+        .map(|workspace| workspace.workspace_id.to_string())
+        .unwrap_or_default();
+    let workspace_name = workspace
+        .map(|workspace| workspace.name.as_str())
+        .unwrap_or("Your workspace");
+    let network_options = chain_registry
+        .routes()
+        .iter()
+        .map(|route| {
+            format!(
+                r#"<option value="{}" {}>{}</option>"#,
+                route.chain_id,
+                if route.chain_id == chain_registry.default_chain_id() {
+                    "selected"
+                } else {
+                    ""
+                },
+                escape_html(&route.display_name),
+            )
+        })
+        .collect::<String>();
+    let content = match step {
+        1 => format!(
+            r#"<div class="onboard-heading"><span>STEP 1 OF 2</span><h1>Create an observation workspace</h1><p>A workspace groups the onchain objects you care about and the intelligence LedgerFlow builds around them.</p></div>
+<form class="onboard-form" method="post" action="/app/onboarding/workspace">
+  <div class="onboard-choice-grid">
+    <label><input type="radio" name="workspace_type" value="protocol" checked><strong>Protocol</strong><small>DEX, lending, vault, or application execution</small></label>
+    <label><input type="radio" name="workspace_type" value="chain"><strong>Chain</strong><small>Ecosystem activity and searcher landscape</small></label>
+    <label><input type="radio" name="workspace_type" value="searcher"><strong>Searcher</strong><small>Execution performance and competitors</small></label>
+    <label><input type="radio" name="workspace_type" value="wallet"><strong>Wallet</strong><small>Behavior, counterparties, and material economic activity</small></label>
+    <label><input type="radio" name="workspace_type" value="custom"><strong>Custom</strong><small>A scoped set of addresses and contracts</small></label>
+  </div>
+  <div class="onboard-fields"><label><span>Workspace name</span><input name="name" value="My Observation Workspace" placeholder="Base MEV Research" autocomplete="off" maxlength="160" required><small>Use a recognizable name for the objects you want to understand.</small></label><label><span>Network</span><select name="chain_id">{network_options}</select><small>Choose the network that contains the first object.</small></label></div>
+  <div class="onboard-actions"><a href="/">Back to public site</a><button type="submit">Continue</button></div>
+</form>"#
+        ),
+        2 => format!(
+            r#"<div class="onboard-heading"><span>STEP 2 OF 2 · {workspace_name}</span><h1>Observe your first object</h1><p>Enter an address or contract. LedgerFlow will immediately open the available Intelligence Profile; monitoring remains optional.</p></div>
+<form class="onboard-form" method="post" action="/app/onboarding/entities"><input type="hidden" name="workspace_id" value="{workspace_id}"><input type="hidden" name="entity_kind" value="address">
+  <div class="onboard-fields"><label class="wide"><span>Address or contract</span><textarea name="addresses" rows="5" placeholder="0x..." required></textarea><small>LedgerFlow resolves EOA/contract type automatically. Start with one object; additional addresses can be observed later.</small></label><label><span>Optional name</span><input name="label" placeholder="Searcher A / Executor"></label></div>
+  <div class="onboard-actions"><a href="/app/onboarding">Back</a><button type="submit">Generate Intelligence Profile</button></div>
+</form>"#,
+            workspace_name = escape_html(workspace_name),
+            workspace_id = escape_html(&workspace_id),
+        ),
+        3 => {
+            let workspace_type = workspace
+                .map(|workspace| workspace.workspace_type.as_str())
+                .unwrap_or("custom");
+            let checked = |types: &[&str]| {
+                if types.contains(&workspace_type) {
+                    "checked"
+                } else {
+                    ""
+                }
+            };
+            format!(
+                r#"<div class="onboard-heading"><span>STEP 3 OF 4 · {workspace_name}</span><h1>Generate the first intelligence profile</h1><p>Select evidence areas to emphasize in the initial profile. These choices seed later monitoring rules but never change the underlying evidence standard.</p></div>
+<form class="onboard-form" method="post" action="/app/onboarding/goals"><input type="hidden" name="workspace_id" value="{workspace_id}">
+  <div class="onboard-check-grid">
+    <label><input type="checkbox" name="mev_activity" value="1" {protocol}><strong>MEV activity</strong><small>Arbitrage and execution around monitored systems</small></label>
+    <label><input type="checkbox" name="liquidations" value="1" {protocol}><strong>Liquidations</strong><small>Verified liquidation activity and attempts</small></label>
+    <label><input type="checkbox" name="large_transfers" value="1" checked><strong>Large transfers</strong><small>Material asset movement involving monitored entities</small></label>
+    <label><input type="checkbox" name="revenue_changes" value="1" {protocol}><strong>Revenue changes</strong><small>Protocol revenue and treasury movement evidence</small></label>
+    <label><input type="checkbox" name="failed_execution" value="1" checked><strong>Failed execution</strong><small>Repeated or economically material failed attempts</small></label>
+    <label><input type="checkbox" name="execution_success" value="1" {searcher}><strong>Execution success</strong><small>Observed successful execution behavior</small></label>
+    <label><input type="checkbox" name="competitor_activity" value="1" {searcher}><strong>Competitor activity</strong><small>Related searcher and executor activity</small></label>
+    <label><input type="checkbox" name="failed_attempts" value="1" {searcher}><strong>Failed attempts</strong><small>Attempt frequency and deterministic gas evidence</small></label>
+    <label><input type="checkbox" name="profit_attribution" value="1" {searcher}><strong>Profit attribution</strong><small>Only when deterministic settlement evidence exists</small></label>
+    <label><input type="checkbox" name="ecosystem_activity" value="1" {chain}><strong>Ecosystem activity</strong><small>Material activity around monitored contracts</small></label>
+    <label><input type="checkbox" name="searcher_landscape" value="1" {chain}><strong>Searcher landscape</strong><small>Evidence-backed automated actor changes</small></label>
+    <label><input type="checkbox" name="protocol_changes" value="1" {chain}><strong>Protocol changes</strong><small>Changed execution patterns, not guessed intent</small></label>
+  </div>
+  <div class="onboard-actions"><a href="/app/onboarding?step=2&amp;workspace_id={workspace_id}">Back</a><button type="submit">Continue</button></div>
+</form>"#,
+                workspace_name = escape_html(workspace_name),
+                workspace_id = escape_html(&workspace_id),
+                protocol = checked(&["protocol"]),
+                searcher = checked(&["searcher"]),
+                chain = checked(&["chain"]),
+            )
+        }
+        _ => format!(
+            r#"<div class="onboard-heading"><span>STEP 4 OF 4 · {workspace_name}</span><h1>Enable monitoring when ready</h1><p>Review the entity profile first, then optionally configure a notification destination. Telegram delivery is operational for Pilot and Enterprise workspaces.</p></div>
+<form class="onboard-form" method="post" action="/app/onboarding/destination"><input type="hidden" name="workspace_id" value="{workspace_id}">
+  <div class="onboard-fields"><label><span>Channel</span><select name="destination_type"><option value="telegram">Telegram</option><option value="webhook">Webhook · configuration only</option><option value="email">Email · configuration only</option><option value="none">Configure later</option></select></label><label><span>Display name</span><input name="display_name" placeholder="Operations alerts"></label><label class="wide"><span>Destination reference</span><input name="destination_ref" placeholder="Telegram chat/group reference"><small>Secrets remain server-side. This field never accepts a bot token or private key.</small></label></div>
+  <div class="onboard-actions"><a href="/app/onboarding?step=3&amp;workspace_id={workspace_id}">Back</a><button type="submit">Open First Entity Profile</button></div>
+</form>"#,
+            workspace_name = escape_html(workspace_name),
+            workspace_id = escape_html(&workspace_id),
+        ),
+    };
+    let notice = notice
+        .map(|value| {
+            format!(
+                r#"<div class="onboard-notice">{}</div>"#,
+                escape_html(value)
+            )
+        })
+        .unwrap_or_default();
+    let access_note = if plan == WorkspacePlan::Free {
+        r#"<aside class="onboard-access"><strong>Free workspace setup</strong><p>You can configure a workspace and explore the real public-data Demo Workspace. Approved Pilot access enables private monitoring, reports, alerts, and investigations for an evaluation period.</p><a href="/pilot">Apply for Pilot access →</a></aside>"#
+    } else {
+        r#"<aside class="onboard-access"><strong>Private intelligence boundary</strong><p>Workspace events and evidence are scoped to the monitored entities you configure here.</p></aside>"#
+    };
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Configure Workspace · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}
+.onboard-body{{min-height:100vh;background:#090a0f;color:#f5f3ff}}.onboard-shell{{max-width:1120px;margin:0 auto;padding:28px 32px 56px}}.onboard-top{{display:flex;align-items:center;justify-content:space-between;margin-bottom:42px}}.onboard-top a{{color:inherit;text-decoration:none}}.onboard-top form button{{background:none;border:0;color:#a9a4b7;font-size:13px;cursor:pointer}}.onboard-layout{{display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:28px}}.onboard-progress{{display:grid;grid-template-columns:repeat(4,1fr);list-style:none;padding:0;margin:0 0 38px;gap:8px}}.onboard-progress li{{border-top:2px solid #262331;padding-top:10px;display:flex;gap:9px;color:#777181;font-size:13px}}.onboard-progress li.active,.onboard-progress li.complete{{border-color:#8b5cf6;color:#eee9ff}}.onboard-progress span{{display:grid;place-items:center;width:23px;height:23px;border:1px solid currentColor;border-radius:50%}}.onboard-heading>span{{font-size:12px;letter-spacing:.13em;color:#a78bfa}}.onboard-heading h1{{font-size:34px;margin:10px 0 12px}}.onboard-heading p{{font-size:15px;line-height:1.65;color:#aaa4b8;max-width:700px}}.onboard-form{{margin-top:28px}}.onboard-choice-grid,.onboard-check-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}.onboard-choice-grid label,.onboard-check-grid label{{display:grid;grid-template-columns:auto 1fr;column-gap:11px;align-items:start;background:#111018;border:1px solid #2a2734;border-radius:10px;padding:16px;cursor:pointer}}.onboard-choice-grid input,.onboard-check-grid input{{grid-row:1/3;margin-top:3px;accent-color:#8b5cf6}}.onboard-choice-grid strong,.onboard-check-grid strong{{font-size:14px}}.onboard-choice-grid small,.onboard-check-grid small{{font-size:12px;color:#958fa2;margin-top:4px;line-height:1.45}}.onboard-choice-grid + .onboard-fields{{margin-top:24px}}.onboard-fields{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}.onboard-fields.three{{grid-template-columns:repeat(3,minmax(0,1fr))}}.onboard-fields label{{display:flex;flex-direction:column;gap:8px;font-size:13px;color:#bbb4c8}}.onboard-fields .wide{{grid-column:1/-1}}.onboard-fields input,.onboard-fields select,.onboard-fields textarea{{background:#111018;border:1px solid #312d3b;border-radius:8px;color:#fff;padding:12px;font:inherit;font-size:14px}}.onboard-fields small{{font-size:12px;color:#837d8d;line-height:1.45}}.onboard-fields input:-webkit-autofill{{-webkit-text-fill-color:#fff;box-shadow:0 0 0 1000px #111018 inset}}.onboard-actions{{display:flex;justify-content:space-between;align-items:center;margin-top:26px}}.onboard-actions a{{color:#aaa4b8;font-size:13px}}.onboard-actions button{{border:0;border-radius:8px;background:#7c3aed;color:#fff;padding:12px 20px;font-size:14px;font-weight:700;cursor:pointer}}.onboard-access{{background:#111018;border:1px solid #2c2837;border-radius:12px;padding:20px;height:max-content;position:sticky;top:24px}}.onboard-access strong{{font-size:14px}}.onboard-access p,.onboard-access a{{font-size:13px;line-height:1.6;color:#9d96aa}}.onboard-access a{{color:#bca7ff}}.onboard-demo{{border-top:1px solid #292632;margin-top:22px;padding-top:18px}}.onboard-demo button{{width:100%;border:1px solid #52456f;background:transparent;color:#eee9ff;border-radius:8px;padding:10px;font-size:13px;cursor:pointer}}.onboard-notice{{padding:11px 13px;border:1px solid #4b3d6b;background:#171224;border-radius:8px;font-size:13px;margin-bottom:18px}}@media(max-width:850px){{.onboard-layout{{grid-template-columns:1fr}}.onboard-access{{position:static}}}}@media(max-width:680px){{.onboard-shell{{padding:20px}}.onboard-choice-grid,.onboard-check-grid,.onboard-fields,.onboard-fields.three{{grid-template-columns:1fr}}.onboard-progress strong{{display:none}}}}
+</style></head><body class="onboard-body"><div class="onboard-shell"><header class="onboard-top"><a href="/">{brand}</a><form method="post" action="/auth/logout"><button type="submit">Sign out · {email}</button></form></header><ol class="onboard-progress" style="grid-template-columns:repeat(2,1fr)">{progress}</ol>{notice}<div class="onboard-layout"><main>{content}</main><div>{access_note}<form class="onboard-demo" method="post" action="/app/demo-workspace"><button type="submit">Explore Demo Workspace</button></form></div></div></div></body></html>"#,
+        styles = shared_styles(),
+        brand = brand_wordmark_html(),
+        email = escape_html(&user.email),
+    )
+}
+
+async fn legacy_today_redirect(Query(query): Query<TodayQuery>) -> Response {
+    let mut params = Vec::new();
+    if let Some(chain_id) = query.chain_id {
+        params.push(format!("chain_id={chain_id}"));
+    }
+    if let Some(workspace) = query.workspace {
+        params.push(format!("workspace={}", urlencoding::encode(&workspace)));
+    }
+    if let Some(range) = query.range {
+        params.push(format!("range={}", urlencoding::encode(&range)));
+    }
+    redirect_with_query("/app/overview", &params)
+}
+
+async fn legacy_bots_redirect(Query(query): Query<BehaviorReviewPageQuery>) -> Response {
+    let mut params = vec!["tab=searchers".to_owned()];
+    if let Some(chain_id) = query.chain_id {
+        params.push(format!("chain_id={chain_id}"));
+    }
+    if let Some(notice) = query.notice {
+        params.push(format!("notice={}", urlencoding::encode(&notice)));
+    }
+    redirect_with_query("/app/entities", &params)
+}
+
+async fn legacy_watchlist_redirect(Query(query): Query<WatchlistPageQuery>) -> Response {
+    legacy_monitor_redirect(query, "entities")
+}
+
+async fn legacy_alerts_redirect(Query(query): Query<WatchlistPageQuery>) -> Response {
+    legacy_monitor_redirect(query, "delivery")
+}
+
+fn legacy_monitor_redirect(query: WatchlistPageQuery, tab: &str) -> Response {
+    let mut params = vec![format!("tab={tab}")];
+    if let Some(chain_id) = query.chain_id {
+        params.push(format!("chain_id={chain_id}"));
+    }
+    if let Some(notice) = query.notice {
+        params.push(format!("notice={}", urlencoding::encode(&notice)));
+    }
+    redirect_with_query("/app/monitors", &params)
+}
+
+async fn legacy_clusters_redirect(Query(query): Query<ClustersPageQuery>) -> Response {
+    let mut params = vec!["tab=clusters".to_owned()];
+    if let Some(cluster_id) = query.cluster_id {
+        params.push(format!("cluster_id={}", urlencoding::encode(&cluster_id)));
+    }
+    if let Some(notice) = query.notice {
+        params.push(format!("notice={}", urlencoding::encode(&notice)));
+    }
+    redirect_with_query("/app/observations", &params)
+}
+
+async fn legacy_address_redirect(Query(query): Query<AddressAnalysisQuery>) -> Response {
+    let address = query
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut params = Vec::new();
+    if let Some(chain_id) = query.chain_id {
+        params.push(format!("chain_id={chain_id}"));
+    }
+    if let Some(notice) = query.notice {
+        params.push(format!("notice={}", urlencoding::encode(&notice)));
+    }
+    let path = address
+        .map(|address| format!("/app/observations/{}", urlencoding::encode(address)))
+        .unwrap_or_else(|| "/app/observations".to_owned());
+    redirect_with_query(&path, &params)
+}
+
+async fn legacy_arbitrage_redirect(Query(_query): Query<ArbitragePageQuery>) -> Response {
+    Redirect::to("/app/events?event_type=dex_arbitrage").into_response()
+}
+
+async fn legacy_graph_redirect(Query(query): Query<PageNoticeQuery>) -> Response {
+    let mut params = vec!["tab=clusters".to_owned()];
+    if let Some(notice) = query.notice {
+        params.push(format!("notice={}", urlencoding::encode(&notice)));
+    }
+    redirect_with_query("/app/observations", &params)
+}
+
+async fn legacy_api_redirect(Query(query): Query<PageNoticeQuery>) -> Response {
+    let mut params = Vec::new();
+    if let Some(notice) = query.notice {
+        params.push(format!("notice={}", urlencoding::encode(&notice)));
+    }
+    if let Some(created_key) = query.created_key {
+        params.push(format!("created_key={}", urlencoding::encode(&created_key)));
+    }
+    redirect_with_query("/app/api", &params)
+}
+
+fn redirect_with_query(path: &str, params: &[String]) -> Response {
+    let destination = if params.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{}", params.join("&"))
+    };
+    Redirect::to(&destination).into_response()
 }
 
 async fn today_page(
@@ -1150,21 +3552,2669 @@ async fn today_page(
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
-    let selected_chain_id = query
-        .chain_id
-        .filter(|chain_id| state.chain_registry.resolve(*chain_id).is_some())
-        .unwrap_or(state.default_chain_id);
     let clusters = state
         .portal_service
         .list_clusters_for_user(user.user_id)
         .await?;
-    Ok(Html(render_today_page(
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let selected_chain_id = workspace
+        .chain_id
+        .or(query
+            .chain_id
+            .filter(|chain_id| state.chain_registry.resolve(*chain_id).is_some()))
+        .unwrap_or(state.default_chain_id);
+    let range = WorkspaceRange::parse(query.range.as_deref());
+    if !workspace_is_operational(workspace) {
+        return Ok(Html(render_workspace_access_gate(
+            &state,
+            &user,
+            "overview",
+            "Workspace Overview",
+            selected_chain_id,
+            &workspaces,
+            workspace,
+            range,
+        ))
+        .into_response());
+    }
+    let workspace_id = workspace_database_id(workspace)
+        .ok_or_else(|| WebError::internal("workspace database id is unavailable".to_owned()))?;
+    let reviews_path =
+        format!("/behavior-reviews?chain_id={selected_chain_id}&status=pending&limit=10");
+    let (snapshot, mut events, workspace_entities, mut reviews, investigations) = tokio::try_join!(
+        load_today_snapshot(&state, selected_chain_id),
+        load_execution_events(&state, selected_chain_id, range, 60),
+        load_workspace_entities(&state, workspace),
+        async {
+            Ok::<_, WebError>(
+                api_get_json::<Vec<BehaviorReviewItem>>(&state, selected_chain_id, &reviews_path)
+                    .await
+                    .unwrap_or_default(),
+            )
+        },
+        load_investigations(
+            &state,
+            user.user_id,
+            workspace_id,
+            Some(selected_chain_id),
+            None,
+            5
+        ),
+    )?;
+    if workspace.kind == WorkspaceKind::Demo {
+        events = load_demo_execution_events()?;
+    }
+    let workspace_addresses = workspace_entities
+        .iter()
+        .map(|entity| entity.address.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    events.retain(|event| execution_event_matches_workspace(event, &workspace_addresses));
+    reviews.retain(|review| workspace_addresses.contains(&review.address.to_ascii_lowercase()));
+    let observation_snapshots =
+        load_workspace_observation_snapshots(&state, selected_chain_id, &workspace_entities).await;
+    Ok(Html(render_execution_overview_page(
         &state,
         &user,
         selected_chain_id,
         &clusters,
+        &workspaces,
+        workspace,
+        range,
+        &snapshot,
+        &events,
+        &workspace_entities,
+        &reviews,
+        &investigations,
+        &observation_snapshots,
     ))
     .into_response())
+}
+
+async fn load_workspace_observation_snapshots(
+    state: &WebState,
+    chain_id: u64,
+    entities: &[WorkspaceEntityRow],
+) -> HashMap<String, serde_json::Value> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for entity in entities.iter().take(30) {
+        let state = state.clone();
+        let address = entity.address.clone();
+        tasks.spawn(async move {
+            let observation_path = format!(
+                "/observations/{}?chain_id={chain_id}&timeline_limit=1",
+                urlencoding::encode(&address)
+            );
+            let cluster_path = format!(
+                "/observations/{}/cluster?chain_id={chain_id}&execution_limit=1",
+                urlencoding::encode(&address)
+            );
+            let (observation, cluster) = tokio::join!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    api_get_json::<serde_json::Value>(&state, chain_id, &observation_path),
+                ),
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    api_get_json::<serde_json::Value>(&state, chain_id, &cluster_path),
+                )
+            );
+            let mut result = observation.ok().and_then(Result::ok);
+            let cluster = cluster.ok().and_then(Result::ok);
+            if let Some(cluster) = cluster {
+                if result.is_none() {
+                    result = Some(json!({}));
+                }
+                if let Some(object) = result.as_mut().and_then(serde_json::Value::as_object_mut) {
+                    object.insert("candidate_cluster".to_owned(), cluster);
+                }
+            }
+            (address, result)
+        });
+    }
+    let mut snapshots = HashMap::new();
+    while let Some(result) = tasks.join_next().await {
+        if let Ok((address, Some(snapshot))) = result {
+            snapshots.insert(address, snapshot);
+        }
+    }
+    snapshots
+}
+
+async fn behavior_reviews_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<BehaviorReviewPageQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let chain_id = query
+        .chain_id
+        .filter(|chain_id| state.chain_registry.resolve(*chain_id).is_some())
+        .unwrap_or(state.default_chain_id);
+    let status = query.status.as_deref().unwrap_or("pending");
+    let path = format!(
+        "/behavior-reviews?chain_id={chain_id}&status={}&limit=100",
+        urlencoding::encode(status)
+    );
+    let (reviews, error) =
+        match api_get_json::<Vec<BehaviorReviewItem>>(&state, chain_id, &path).await {
+            Ok(reviews) => (reviews, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+    let content = render_behavior_reviews_content(chain_id, status, &reviews, error.as_deref());
+    Ok(Html(render_app_workspace_page(
+        &state,
+        &user,
+        "bots",
+        "Automation Candidate Review",
+        chain_id,
+        query.notice.as_deref().and_then(render_notice_message),
+        content,
+    ))
+    .into_response())
+}
+
+async fn decide_behavior_review(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(review_id): Path<Uuid>,
+    Form(form): Form<BehaviorReviewDecisionForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let decision = form.decision.trim().to_ascii_lowercase();
+    if !matches!(decision.as_str(), "accept" | "reject" | "retract") {
+        return Err(WebError::bad_request("invalid review decision".to_owned()));
+    }
+    let payload = BehaviorReviewDecisionPayload {
+        decision,
+        reviewer: user.email.clone(),
+        rationale: form
+            .rationale
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+    };
+    let notice = match api_post_json::<_, BehaviorReviewItem>(
+        &state,
+        form.chain_id,
+        &format!("/behavior-reviews/{review_id}/decision"),
+        &payload,
+    )
+    .await
+    {
+        Ok(_) => "behavior-review-saved",
+        Err(_) => "behavior-review-error",
+    };
+    Ok(redirect_response(&format!(
+        "/app/bots?chain_id={}&status={}&notice={notice}",
+        form.chain_id,
+        urlencoding::encode(form.status.as_deref().unwrap_or("pending")),
+    )))
+}
+
+async fn monitors_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<MonitorPageQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let clusters = state
+        .portal_service
+        .list_clusters_for_user(user.user_id)
+        .await?;
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let chain_id = workspace
+        .chain_id
+        .or(query
+            .chain_id
+            .filter(|value| state.chain_registry.resolve(*value).is_some()))
+        .unwrap_or(state.default_chain_id);
+    let range = WorkspaceRange::parse(query.range.as_deref());
+    if !workspace_is_operational(workspace) {
+        return Ok(Html(render_workspace_access_gate(
+            &state,
+            &user,
+            "monitors",
+            "Monitors",
+            chain_id,
+            &workspaces,
+            workspace,
+            range,
+        ))
+        .into_response());
+    }
+    let workspace_id = workspace_database_id(workspace)
+        .ok_or_else(|| WebError::internal("workspace database id is unavailable".to_owned()))?;
+    let (monitors, rules, destinations, deliveries, mut legacy_entries, mut alerts) = tokio::try_join!(
+        load_user_monitors(&state, user.user_id, workspace_id, chain_id),
+        load_user_monitor_rules(&state, user.user_id, workspace_id, chain_id),
+        load_user_monitor_destinations(&state, user.user_id, workspace_id, chain_id),
+        load_user_monitor_deliveries(&state, user.user_id, workspace_id, chain_id),
+        load_watchlist_entries(&state, user.user_id, chain_id),
+        load_global_alerts(&state, user.user_id, chain_id),
+    )?;
+    if workspace.legacy_cluster_id.is_none() {
+        legacy_entries.clear();
+        alerts.clear();
+    }
+    Ok(Html(render_monitors_page(
+        &state,
+        &user,
+        chain_id,
+        &clusters,
+        &workspaces,
+        workspace,
+        range,
+        &query,
+        &monitors,
+        &rules,
+        &destinations,
+        &deliveries,
+        &legacy_entries,
+        &alerts,
+    ))
+    .into_response())
+}
+
+async fn create_monitor(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateMonitorForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    if !WorkspacePlan::parse(&user.workspace_plan)
+        .allows(WorkspaceCapability::CustomMonitoredEntities)
+    {
+        return Ok(Redirect::to("/app/monitors?notice=pilot-required").into_response());
+    }
+    ensure_owned_workspace(&state, user.user_id, form.workspace_id).await?;
+    if state.chain_registry.resolve(form.chain_id).is_none() {
+        return Err(WebError::bad_request(
+            "unsupported monitor network".to_owned(),
+        ));
+    }
+    let name = form.name.trim();
+    if name.is_empty() {
+        return Err(WebError::bad_request("monitor name is required".to_owned()));
+    }
+    let addresses = parse_monitor_addresses(&form.addresses)?;
+    let entity_kind = match form.entity_kind.as_str() {
+        "address" | "contract" => form.entity_kind.as_str(),
+        _ => return Err(WebError::bad_request("invalid entity kind".to_owned())),
+    };
+    let valid_event_types = [
+        "dex_arbitrage",
+        "backrun",
+        "liquidation",
+        "liquidation_attempt",
+        "repeated_failed_attempts",
+        "large_asset_flow",
+        "protocol_revenue",
+        "treasury_movement",
+        "solver_execution",
+        "unknown_material_interaction",
+    ];
+    if !valid_event_types.contains(&form.event_type.as_str()) {
+        return Err(WebError::bad_request("invalid event type".to_owned()));
+    }
+    if !matches!(
+        form.severity.as_str(),
+        "low" | "medium" | "high" | "critical"
+    ) {
+        return Err(WebError::bad_request("invalid severity".to_owned()));
+    }
+    let threshold = form
+        .threshold
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .map_err(|_| WebError::bad_request("threshold must be a valid number".to_owned()))
+        })
+        .transpose()?;
+    let destination_name = form.destination_name.trim();
+    let destination_ref = form
+        .destination_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if destination_name.is_empty() || destination_ref.is_none() {
+        return Err(WebError::bad_request(
+            "Telegram destination name and chat/group reference are required".to_owned(),
+        ));
+    }
+    let mut transaction = state.pool.begin().await.map_err(|error| {
+        WebError::internal(format!("begin monitor transaction failed: {error}"))
+    })?;
+    let monitor_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        insert into user_monitors (user_id, workspace_id, chain_id, name, status, metadata)
+        values ($1, $2, $3, $4, 'active', '{"source":"execution_intelligence_ui"}'::jsonb)
+        returning monitor_id
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(form.workspace_id)
+    .bind(form.chain_id as i64)
+    .bind(name)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("create monitor failed: {error}")))?;
+    for address in addresses {
+        sqlx::query(
+            r#"
+            insert into user_monitor_entities
+              (monitor_id, address, entity_kind, role, label, metadata)
+            values ($1, $2, $3, $4, $5, '{}'::jsonb)
+            "#,
+        )
+        .bind(monitor_id)
+        .bind(address)
+        .bind(entity_kind)
+        .bind(
+            form.role
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        )
+        .bind(
+            form.label
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("save monitor entity failed: {error}")))?;
+    }
+    sqlx::query(
+        r#"
+        insert into user_monitor_rules
+          (monitor_id, event_type, threshold_value, threshold_asset, severity, enabled)
+        values ($1, $2, $3, $4, $5, true)
+        "#,
+    )
+    .bind(monitor_id)
+    .bind(&form.event_type)
+    .bind(threshold)
+    .bind(
+        form.threshold_asset
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    )
+    .bind(&form.severity)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("save monitor rule failed: {error}")))?;
+    sqlx::query(
+        r#"
+        insert into user_monitor_destinations
+          (monitor_id, destination_type, display_name, destination_ref, enabled, metadata)
+        values ($1, 'telegram', $2, $3, true, '{"secret_source":"server_configuration"}'::jsonb)
+        "#,
+    )
+    .bind(monitor_id)
+    .bind(destination_name)
+    .bind(destination_ref)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("save monitor destination failed: {error}")))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| WebError::internal(format!("commit monitor failed: {error}")))?;
+    Ok(redirect_response(&format!(
+        "/app/monitors?chain_id={}&notice=monitor-created",
+        form.chain_id
+    )))
+}
+
+fn parse_monitor_addresses(value: &str) -> Result<Vec<String>, WebError> {
+    let mut addresses = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in value
+        .split(|character: char| character.is_whitespace() || character == ',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let normalized = candidate.to_ascii_lowercase();
+        if !is_evm_hex_value(&normalized, 40) {
+            return Err(WebError::bad_request(format!(
+                "invalid monitor address: {candidate}"
+            )));
+        }
+        if seen.insert(normalized.clone()) {
+            addresses.push(normalized);
+        }
+    }
+    if addresses.is_empty() || addresses.len() > 30 {
+        return Err(WebError::bad_request(
+            "a monitor requires between 1 and 30 addresses/contracts".to_owned(),
+        ));
+    }
+    Ok(addresses)
+}
+
+async fn watchlist_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<WatchlistPageQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let chain_id = query
+        .chain_id
+        .filter(|chain_id| state.chain_registry.resolve(*chain_id).is_some())
+        .unwrap_or(state.default_chain_id);
+    let entries = load_watchlist_entries(&state, user.user_id, chain_id).await?;
+    let content = render_watchlist_content(chain_id, &entries);
+    Ok(Html(render_app_workspace_page(
+        &state,
+        &user,
+        "watchlist",
+        "Watchlist",
+        chain_id,
+        query.notice.as_deref().and_then(render_notice_message),
+        content,
+    ))
+    .into_response())
+}
+
+async fn add_watchlist_entry(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<WatchlistEntryForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let subject = form.subject.trim().to_ascii_lowercase();
+    let subject_type = if is_evm_hex_value(&subject, 40) {
+        "address"
+    } else if is_evm_hex_value(&subject, 64) {
+        "transaction"
+    } else if let Ok(cluster_id) = Uuid::parse_str(&subject) {
+        let owned_chain_id =
+            ensure_user_owns_cluster(&state, user.user_id, &cluster_id.to_string()).await?;
+        if owned_chain_id != form.chain_id {
+            return Err(WebError::bad_request(
+                "cluster chain does not match selected chain".to_owned(),
+            ));
+        }
+        "cluster"
+    } else {
+        return Err(WebError::bad_request(
+            "watchlist subject must be an address, transaction hash, or owned cluster UUID"
+                .to_owned(),
+        ));
+    };
+    sqlx::query(
+        r#"
+        insert into user_watchlist_entries (
+          user_id, chain_id, subject_type, subject_key, label, metadata
+        )
+        values ($1,$2,$3,$4,$5,'{"source":"web"}'::jsonb)
+        on conflict (user_id, chain_id, subject_type, subject_key) do update set
+          label = coalesce(excluded.label, user_watchlist_entries.label),
+          updated_at = now()
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(form.chain_id as i64)
+    .bind(subject_type)
+    .bind(&subject)
+    .bind(
+        form.label
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
+    )
+    .execute(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("save watchlist entry failed: {error}")))?;
+    let fallback = format!(
+        "/app/watchlist?chain_id={}&notice=watchlist-saved",
+        form.chain_id
+    );
+    let location = form
+        .return_to
+        .as_deref()
+        .filter(|value| value.starts_with("/app/") && !value.starts_with("//"))
+        .map(|value| append_notice(value, "watchlist-saved"))
+        .unwrap_or(fallback);
+    Ok(redirect_response(&location))
+}
+
+async fn delete_watchlist_entry(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(entry_id): Path<Uuid>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let chain_id = sqlx::query_scalar::<_, i64>(
+        r#"
+        delete from user_watchlist_entries
+        where entry_id = $1 and user_id = $2
+        returning chain_id
+        "#,
+    )
+    .bind(entry_id)
+    .bind(user.user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("delete watchlist entry failed: {error}")))?
+    .unwrap_or(state.default_chain_id as i64)
+    .max(0) as u64;
+    Ok(redirect_response(&format!(
+        "/app/watchlist?chain_id={chain_id}&notice=watchlist-deleted"
+    )))
+}
+
+async fn global_alerts_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<WatchlistPageQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let chain_id = query
+        .chain_id
+        .filter(|chain_id| state.chain_registry.resolve(*chain_id).is_some())
+        .unwrap_or(state.default_chain_id);
+    let alerts = load_global_alerts(&state, user.user_id, chain_id).await?;
+    let content = render_global_alerts_content(&alerts);
+    Ok(Html(render_app_workspace_page(
+        &state,
+        &user,
+        "alerts",
+        "Monitor Alerts",
+        chain_id,
+        query.notice.as_deref().and_then(render_notice_message),
+        content,
+    ))
+    .into_response())
+}
+
+async fn global_search_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchPageQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let chain_id = workspace
+        .chain_id
+        .or(query
+            .chain_id
+            .filter(|chain_id| state.chain_registry.resolve(*chain_id).is_some()))
+        .unwrap_or(state.default_chain_id);
+    let term = query.q.as_deref().map(str::trim).unwrap_or_default();
+    if is_evm_hex_value(term, 64) {
+        return Ok(Redirect::to(&tx_analysis_href(chain_id, term)).into_response());
+    }
+    if is_evm_hex_value(term, 40) {
+        let workspace_addresses = load_workspace_addresses(&state, workspace).await?;
+        if workspace_addresses.contains(&term.to_ascii_lowercase()) {
+            return Ok(Redirect::to(&format!(
+                "/app/entities/{}?workspace={}&chain_id={chain_id}",
+                urlencoding::encode(term),
+                urlencoding::encode(&workspace.id)
+            ))
+            .into_response());
+        }
+    }
+    let results = if term.is_empty() {
+        Vec::new()
+    } else {
+        load_workspace_search_results(&state, workspace, chain_id, term).await?
+    };
+    let content = render_search_content(chain_id, &workspace.id, term, &results);
+    Ok(Html(render_private_workspace_shell(
+        &state,
+        &user,
+        "search",
+        "Workspace Search",
+        chain_id,
+        &workspaces,
+        workspace,
+        WorkspaceRange::Last24Hours,
+        content,
+    ))
+    .into_response())
+}
+
+async fn load_workspace_search_results(
+    state: &WebState,
+    workspace: &WorkspaceRef,
+    chain_id: u64,
+    term: &str,
+) -> Result<Vec<SearchResultRow>, WebError> {
+    let Some(workspace_id) = workspace_database_id(workspace) else {
+        return Ok(Vec::new());
+    };
+    let contains = format!("%{}%", term.trim());
+    let rows = sqlx::query(
+        r#"
+        select address, entity_kind, role, label
+        from workspace_entities
+        where workspace_id = $1
+          and (address ilike $2 or coalesce(label, '') ilike $2
+               or coalesce(role, '') ilike $2 or entity_kind ilike $2)
+        order by coalesce(label, role, address), address
+        limit 40
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(contains)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("search workspace entities failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let address = row.get::<String, _>("address");
+            let entity_kind = row.get::<String, _>("entity_kind");
+            let role = row.get::<Option<String>, _>("role");
+            let label = row.get::<Option<String>, _>("label");
+            SearchResultRow {
+                result_type: entity_kind.clone(),
+                title: label.unwrap_or_else(|| truncate_middle(&address, 10)),
+                detail: role.unwrap_or_else(|| "Role unavailable".to_owned()),
+                href: format!(
+                    "/app/observations/{}?workspace={}&chain_id={chain_id}",
+                    urlencoding::encode(&address),
+                    urlencoding::encode(&workspace.id)
+                ),
+            }
+        })
+        .collect())
+}
+
+fn is_evm_hex_value(value: &str, body_len: usize) -> bool {
+    value
+        .strip_prefix("0x")
+        .is_some_and(|body| body.len() == body_len && body.chars().all(|ch| ch.is_ascii_hexdigit()))
+}
+
+fn append_notice(path: &str, notice: &str) -> String {
+    format!(
+        "{}{}notice={}",
+        path,
+        if path.contains('?') { "&" } else { "?" },
+        urlencoding::encode(notice)
+    )
+}
+
+async fn load_watchlist_entries(
+    state: &WebState,
+    user_id: Uuid,
+    chain_id: u64,
+) -> Result<Vec<WatchlistEntryRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select entry_id, chain_id, subject_type, subject_key, label, created_at
+        from user_watchlist_entries
+        where user_id = $1 and chain_id = $2
+        order by created_at desc, entry_id desc
+        "#,
+    )
+    .bind(user_id)
+    .bind(chain_id as i64)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load watchlist failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| WatchlistEntryRow {
+            entry_id: row.get("entry_id"),
+            chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+            subject_type: row.get("subject_type"),
+            subject_key: row.get("subject_key"),
+            label: row.get("label"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+async fn load_user_monitors(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    chain_id: u64,
+) -> Result<Vec<UserMonitorRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select monitors.monitor_id, monitors.chain_id, monitors.name, monitors.status,
+               monitors.updated_at,
+               (select count(*)::bigint from user_monitor_entities entities
+                where entities.monitor_id = monitors.monitor_id) as entity_count,
+               (select count(*)::bigint from user_monitor_rules rules
+                where rules.monitor_id = monitors.monitor_id and rules.enabled) as rule_count,
+               (select count(*)::bigint from user_monitor_destinations destinations
+                where destinations.monitor_id = monitors.monitor_id and destinations.enabled) as destination_count,
+               (select count(*)::bigint from user_monitor_delivery_history deliveries
+                where deliveries.monitor_id = monitors.monitor_id) as delivery_count
+        from user_monitors monitors
+        where monitors.user_id = $1 and monitors.chain_id = $2
+          and monitors.workspace_id = $3
+          and monitors.status <> 'archived'
+        order by monitors.updated_at desc, monitors.monitor_id
+        "#,
+    )
+    .bind(user_id)
+    .bind(chain_id as i64)
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load monitors failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UserMonitorRow {
+            monitor_id: row.get("monitor_id"),
+            chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+            name: row.get("name"),
+            status: row.get("status"),
+            entity_count: row.get("entity_count"),
+            rule_count: row.get("rule_count"),
+            destination_count: row.get("destination_count"),
+            delivery_count: row.get("delivery_count"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect())
+}
+
+async fn load_user_monitor_rules(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    chain_id: u64,
+) -> Result<Vec<UserMonitorRuleRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select rules.rule_id, rules.monitor_id, monitors.name as monitor_name,
+               rules.event_type, rules.threshold_value::text as threshold_value,
+               rules.threshold_asset, rules.severity, rules.enabled
+        from user_monitor_rules rules
+        join user_monitors monitors on monitors.monitor_id = rules.monitor_id
+        where monitors.user_id = $1 and monitors.chain_id = $2
+          and monitors.workspace_id = $3
+          and monitors.status <> 'archived'
+        order by rules.updated_at desc, rules.rule_id
+        "#,
+    )
+    .bind(user_id)
+    .bind(chain_id as i64)
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load monitor rules failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UserMonitorRuleRow {
+            rule_id: row.get("rule_id"),
+            monitor_id: row.get("monitor_id"),
+            monitor_name: row.get("monitor_name"),
+            event_type: row.get("event_type"),
+            threshold_value: row.get("threshold_value"),
+            threshold_asset: row.get("threshold_asset"),
+            severity: row.get("severity"),
+            enabled: row.get("enabled"),
+        })
+        .collect())
+}
+
+async fn load_user_monitor_destinations(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    chain_id: u64,
+) -> Result<Vec<UserMonitorDestinationRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select destinations.destination_id, monitors.name as monitor_name,
+               destinations.destination_type, destinations.display_name,
+               destinations.destination_ref, destinations.enabled
+        from user_monitor_destinations destinations
+        join user_monitors monitors on monitors.monitor_id = destinations.monitor_id
+        where monitors.user_id = $1 and monitors.chain_id = $2
+          and monitors.workspace_id = $3
+          and monitors.status <> 'archived'
+        order by destinations.updated_at desc, destinations.destination_id
+        "#,
+    )
+    .bind(user_id)
+    .bind(chain_id as i64)
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load monitor destinations failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UserMonitorDestinationRow {
+            destination_id: row.get("destination_id"),
+            monitor_name: row.get("monitor_name"),
+            destination_type: row.get("destination_type"),
+            display_name: row.get("display_name"),
+            destination_ref: row.get("destination_ref"),
+            enabled: row.get("enabled"),
+        })
+        .collect())
+}
+
+async fn load_user_monitor_deliveries(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    chain_id: u64,
+) -> Result<Vec<UserMonitorDeliveryRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select deliveries.delivery_id, monitors.name as monitor_name,
+               deliveries.event_id, destinations.display_name as destination_name,
+               deliveries.status, deliveries.attempt_count, deliveries.last_error,
+               deliveries.delivered_at, deliveries.created_at
+        from user_monitor_delivery_history deliveries
+        join user_monitors monitors on monitors.monitor_id = deliveries.monitor_id
+        left join user_monitor_destinations destinations
+          on destinations.destination_id = deliveries.destination_id
+        where monitors.user_id = $1 and monitors.chain_id = $2
+          and monitors.workspace_id = $3
+        order by deliveries.created_at desc, deliveries.delivery_id
+        limit 200
+        "#,
+    )
+    .bind(user_id)
+    .bind(chain_id as i64)
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load monitor deliveries failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| UserMonitorDeliveryRow {
+            delivery_id: row.get("delivery_id"),
+            monitor_name: row.get("monitor_name"),
+            event_id: row.get("event_id"),
+            destination_name: row.get("destination_name"),
+            status: row.get("status"),
+            attempt_count: row.get("attempt_count"),
+            last_error: row.get("last_error"),
+            delivered_at: row.get("delivered_at"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+async fn load_investigations(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    chain_id: Option<u64>,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<InvestigationRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select investigation_id, workspace_id, chain_id, title, status, working_conclusion,
+               open_questions, notes, related_event_ids, related_entities,
+               evidence, created_at, updated_at
+        from execution_investigations
+        where user_id = $1
+          and workspace_id = $2
+          and ($3::bigint is null or chain_id = $3)
+          and ($4::text is null or status = $4)
+        order by updated_at desc, investigation_id
+        limit $5
+        "#,
+    )
+    .bind(user_id)
+    .bind(workspace_id)
+    .bind(chain_id.map(|value| value as i64))
+    .bind(status)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load investigations failed: {error}")))?;
+    Ok(rows.into_iter().map(investigation_from_row).collect())
+}
+
+async fn load_investigation(
+    state: &WebState,
+    user_id: Uuid,
+    investigation_id: Uuid,
+) -> Result<Option<InvestigationRow>, WebError> {
+    let row = sqlx::query(
+        r#"
+        select investigation_id, workspace_id, chain_id, title, status, working_conclusion,
+               open_questions, notes, related_event_ids, related_entities,
+               evidence, created_at, updated_at
+        from execution_investigations
+        where investigation_id = $1 and user_id = $2
+        "#,
+    )
+    .bind(investigation_id)
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load investigation failed: {error}")))?;
+    Ok(row.map(investigation_from_row))
+}
+
+fn investigation_from_row(row: sqlx::postgres::PgRow) -> InvestigationRow {
+    InvestigationRow {
+        investigation_id: row.get("investigation_id"),
+        workspace_id: row.get("workspace_id"),
+        chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+        title: row.get("title"),
+        status: row.get("status"),
+        working_conclusion: row.get("working_conclusion"),
+        open_questions: row.get("open_questions"),
+        notes: row.get("notes"),
+        related_event_ids: row.get("related_event_ids"),
+        related_entities: row.get("related_entities"),
+        evidence: row.get::<SqlJson<serde_json::Value>, _>("evidence").0,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+async fn load_workspace_reports(
+    state: &WebState,
+    user_id: Uuid,
+    workspace: &WorkspaceRef,
+    chain_id: u64,
+    limit: i64,
+) -> Result<Vec<WorkspaceReportRow>, WebError> {
+    let Some(cluster_id) = workspace.legacy_cluster_id else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        r#"
+        select snapshots.snapshot_id, snapshots.cluster_id, clusters.name as cluster_name,
+               snapshots.chain_id, snapshots.window_key, snapshots.window_start,
+               snapshots.window_end, snapshots.generated_at, snapshots.report_json
+        from cluster_strategy_report_snapshots snapshots
+        join address_clusters clusters on clusters.cluster_id = snapshots.cluster_id
+        join app_user_clusters links on links.cluster_id = snapshots.cluster_id
+        where links.user_id = $1 and snapshots.chain_id = $2
+          and snapshots.cluster_id = $4
+        order by snapshots.generated_at desc, snapshots.snapshot_id
+        limit $3
+        "#,
+    )
+    .bind(user_id)
+    .bind(chain_id as i64)
+    .bind(limit)
+    .bind(cluster_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load workspace reports failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| WorkspaceReportRow {
+            snapshot_id: row.get("snapshot_id"),
+            cluster_id: row.get("cluster_id"),
+            cluster_name: row.get("cluster_name"),
+            chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+            window_key: row.get("window_key"),
+            window_start: row.get("window_start"),
+            window_end: row.get("window_end"),
+            generated_at: row.get("generated_at"),
+            report_json: row.get::<SqlJson<serde_json::Value>, _>("report_json").0,
+        })
+        .collect())
+}
+
+async fn load_global_alerts(
+    state: &WebState,
+    user_id: Uuid,
+    chain_id: u64,
+) -> Result<Vec<GlobalAlertRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select alerts.alert_id, alerts.cluster_id, alerts.chain_id,
+               clusters.name as cluster_name, alerts.alert_type, alerts.severity,
+               alerts.title, alerts.message, alerts.triggered_at, alerts.is_read
+        from app_user_clusters links
+        join address_clusters clusters on clusters.cluster_id = links.cluster_id
+        join cluster_alerts alerts on alerts.cluster_id = clusters.cluster_id
+        where links.user_id = $1 and alerts.chain_id = $2
+        order by alerts.is_read asc, alerts.triggered_at desc
+        limit 200
+        "#,
+    )
+    .bind(user_id)
+    .bind(chain_id as i64)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load global alerts failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| GlobalAlertRow {
+            alert_id: row.get("alert_id"),
+            cluster_id: row.get("cluster_id"),
+            chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+            cluster_name: row.get("cluster_name"),
+            alert_type: row.get("alert_type"),
+            severity: row.get("severity"),
+            title: row.get("title"),
+            message: row.get("message"),
+            triggered_at: row.get("triggered_at"),
+            is_read: row.get("is_read"),
+        })
+        .collect())
+}
+
+async fn load_search_results(
+    state: &WebState,
+    user_id: Uuid,
+    chain_id: u64,
+    term: &str,
+) -> Result<Vec<SearchResultRow>, WebError> {
+    let contains = format!("%{}%", term.trim());
+    let normalized = term.trim().to_ascii_lowercase();
+    let prefix = format!("{normalized}%");
+    // EVM addresses are normalized lowercase. The exclusive `g` suffix is
+    // above every hexadecimal character, turning a prefix lookup into a range
+    // that can use the existing (chain_id, address) B-tree index.
+    let address_prefix_upper = format!("{normalized}g");
+    let (clusters, addresses, transactions, protocols) = tokio::try_join!(
+        sqlx::query(
+            r#"
+            select clusters.cluster_id, clusters.name, clusters.owner_label,
+                   count(addresses.address)::bigint as address_count
+            from app_user_clusters links
+            join address_clusters clusters on clusters.cluster_id = links.cluster_id
+            left join cluster_addresses addresses on addresses.cluster_id = clusters.cluster_id
+            where links.user_id = $1 and clusters.chain_id = $2
+              and (clusters.name ilike $3 or clusters.owner_label ilike $3
+                   or coalesce(clusters.description, '') ilike $3)
+            group by clusters.cluster_id, clusters.name, clusters.owner_label
+            order by clusters.name
+            limit 10
+            "#,
+        )
+        .bind(user_id)
+        .bind(chain_id as i64)
+        .bind(&contains)
+        .fetch_all(&state.pool),
+        sqlx::query(
+            r#"
+            with seeds as (
+              (select address, confidence
+               from address_labels
+               where chain_id = $1 and label = $3
+               order by confidence desc, updated_at desc
+               limit 50)
+              union all
+              (select address, confidence
+               from address_labels
+               where chain_id = $1 and $3 like '0x%'
+                 and address >= $3 and address < $4
+               order by confidence desc, updated_at desc
+               limit 50)
+              union all
+              (select lower(token_address) as address, 1.0::real as confidence
+               from erc20_token_metadata
+               where chain_id = $1
+                 and (lower(coalesce(symbol, '')) = $3
+                      or lower(coalesce(name, '')) like $2)
+               order by fetched_at desc nulls last
+               limit 50)
+            ), candidates as (
+              select address, max(confidence) as confidence
+              from seeds
+              group by address
+              order by max(confidence) desc, address
+              limit 15
+            )
+            select candidates.address, label_rows.labels, metadata.symbol,
+                   metadata.name as token_name
+            from candidates
+            left join lateral (
+              select string_agg(distinct labels.label, ', ' order by labels.label) as labels
+              from address_labels labels
+              where labels.chain_id = $1 and labels.address = candidates.address
+            ) label_rows on true
+            left join erc20_token_metadata metadata
+              on metadata.chain_id = $1
+             and metadata.token_address = candidates.address
+            order by candidates.confidence desc, candidates.address
+            limit 15
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(&prefix)
+        .bind(&normalized)
+        .bind(&address_prefix_upper)
+        .fetch_all(&state.pool),
+        sqlx::query(
+            r#"
+            select tx_hash, nullif(payload ->> 'block_number', '')::bigint as block_number,
+                   block_timestamp, analysis_status
+            from transaction_analysis
+            where chain_id = $1 and lower(tx_hash) like $2
+            order by block_number desc nulls last
+            limit 10
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(&prefix)
+        .fetch_all(&state.pool),
+        sqlx::query(
+            r#"
+            select deployments.address, protocols.protocol_key, protocols.display_name,
+                   protocols.protocol_family, deployments.contract_role
+            from protocol_deployments deployments
+            join protocols on protocols.protocol_key = deployments.protocol_key
+            where deployments.chain_id = $1 and deployments.status = 'active'
+              and (lower(deployments.address) like $2
+                   or lower(protocols.protocol_key) = $3
+                   or lower(protocols.display_name) like $4
+                   or lower(deployments.contract_role) = $3)
+            order by deployments.confidence desc, deployments.updated_at desc
+            limit 15
+            "#,
+        )
+        .bind(chain_id as i64)
+        .bind(&prefix)
+        .bind(&normalized)
+        .bind(&prefix)
+        .fetch_all(&state.pool),
+    )
+    .map_err(|error| WebError::internal(format!("global search failed: {error}")))?;
+
+    let mut results = Vec::new();
+    for row in clusters {
+        let cluster_id: Uuid = row.get("cluster_id");
+        results.push(SearchResultRow {
+            result_type: "cluster".to_owned(),
+            title: row.get("name"),
+            detail: format!(
+                "{} · {} addresses",
+                row.get::<String, _>("owner_label"),
+                row.get::<i64, _>("address_count")
+            ),
+            href: format!("/app/clusters/{cluster_id}"),
+        });
+    }
+    for row in addresses {
+        let address: String = row.get("address");
+        let symbol = row.get::<Option<String>, _>("symbol");
+        let name = row.get::<Option<String>, _>("token_name");
+        let labels: Option<String> = row.get("labels");
+        results.push(SearchResultRow {
+            result_type: "address".to_owned(),
+            title: symbol
+                .or(name)
+                .unwrap_or_else(|| truncate_middle(&address, 10)),
+            detail: format!(
+                "{} · {}",
+                truncate_middle(&address, 10),
+                labels.unwrap_or_else(|| "unlabeled".to_owned())
+            ),
+            href: format!(
+                "/app/address-analysis?chain_id={chain_id}&address={}",
+                urlencoding::encode(&address)
+            ),
+        });
+    }
+    for row in transactions {
+        let tx_hash: String = row.get("tx_hash");
+        results.push(SearchResultRow {
+            result_type: "transaction".to_owned(),
+            title: truncate_middle(&tx_hash, 12),
+            detail: format!(
+                "block {} · {}",
+                row.get::<Option<i64>, _>("block_number")
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_owned()),
+                row.get::<String, _>("analysis_status")
+            ),
+            href: tx_analysis_href(chain_id, &tx_hash),
+        });
+    }
+    for row in protocols {
+        let address: String = row.get("address");
+        results.push(SearchResultRow {
+            result_type: "protocol".to_owned(),
+            title: row.get("display_name"),
+            detail: format!(
+                "{} · {} · {}",
+                row.get::<String, _>("protocol_family"),
+                row.get::<String, _>("contract_role"),
+                truncate_middle(&address, 8),
+            ),
+            href: format!(
+                "/app/address-analysis?chain_id={chain_id}&address={}",
+                urlencoding::encode(&address)
+            ),
+        });
+    }
+    Ok(results)
+}
+
+async fn load_cluster_graph_edges(
+    state: &WebState,
+    user_id: Uuid,
+) -> Result<Vec<ClusterGraphEdgeRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select addresses.cluster_id, clusters.name as cluster_name, clusters.chain_id,
+               lower(addresses.address) as source_address,
+               case
+                 when lower(flows.from_address) = lower(addresses.address)
+                   then lower(flows.to_address)
+                 else lower(flows.from_address)
+               end as counterparty_address,
+               count(distinct flows.tx_hash)::bigint as tx_count,
+               count(*)::bigint as flow_count,
+               count(distinct coalesce(lower(flows.token_address), 'native'))::bigint as token_count,
+               max(analysis.block_timestamp) as last_seen_at,
+               (array_agg(distinct flows.tx_hash order by flows.tx_hash))[1] as sample_tx_hash
+        from app_user_clusters links
+        join address_clusters clusters on clusters.cluster_id = links.cluster_id
+        join cluster_addresses addresses on addresses.cluster_id = clusters.cluster_id
+        join flows on flows.chain_id = clusters.chain_id
+          and (
+            lower(flows.from_address) = lower(addresses.address)
+            or lower(flows.to_address) = lower(addresses.address)
+          )
+        left join transaction_analysis analysis
+          on analysis.chain_id = flows.chain_id and analysis.tx_hash = flows.tx_hash
+        where links.user_id = $1
+          and lower(flows.from_address) <> lower(flows.to_address)
+        group by addresses.cluster_id, clusters.name, clusters.chain_id,
+                 lower(addresses.address),
+                 case
+                   when lower(flows.from_address) = lower(addresses.address)
+                     then lower(flows.to_address)
+                   else lower(flows.from_address)
+                 end
+        order by tx_count desc, flow_count desc, last_seen_at desc nulls last
+        limit 250
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load cluster graph failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ClusterGraphEdgeRow {
+            cluster_id: row.get("cluster_id"),
+            cluster_name: row.get("cluster_name"),
+            chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+            source_address: row.get("source_address"),
+            counterparty_address: row.get("counterparty_address"),
+            tx_count: row.get("tx_count"),
+            flow_count: row.get("flow_count"),
+            token_count: row.get("token_count"),
+            last_seen_at: row.get("last_seen_at"),
+            sample_tx_hash: row.get("sample_tx_hash"),
+        })
+        .collect())
+}
+
+async fn load_entity_graph_edges(
+    state: &WebState,
+    user_id: Uuid,
+    address: &str,
+) -> Result<Vec<ClusterGraphEdgeRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select addresses.cluster_id, clusters.name as cluster_name, clusters.chain_id,
+               lower(addresses.address) as source_address,
+               case
+                 when lower(flows.from_address) = lower(addresses.address)
+                   then lower(flows.to_address)
+                 else lower(flows.from_address)
+               end as counterparty_address,
+               count(distinct flows.tx_hash)::bigint as tx_count,
+               count(*)::bigint as flow_count,
+               count(distinct coalesce(lower(flows.token_address), 'native'))::bigint as token_count,
+               max(analysis.block_timestamp) as last_seen_at,
+               (array_agg(distinct flows.tx_hash order by flows.tx_hash))[1] as sample_tx_hash
+        from app_user_clusters links
+        join address_clusters clusters on clusters.cluster_id = links.cluster_id
+        join cluster_addresses addresses on addresses.cluster_id = clusters.cluster_id
+        join flows on flows.chain_id = clusters.chain_id
+          and (
+            lower(flows.from_address) = lower(addresses.address)
+            or lower(flows.to_address) = lower(addresses.address)
+          )
+        left join transaction_analysis analysis
+          on analysis.chain_id = flows.chain_id and analysis.tx_hash = flows.tx_hash
+        where links.user_id = $1
+          and lower(addresses.address) = lower($2)
+          and lower(flows.from_address) <> lower(flows.to_address)
+        group by addresses.cluster_id, clusters.name, clusters.chain_id,
+                 lower(addresses.address),
+                 case
+                   when lower(flows.from_address) = lower(addresses.address)
+                     then lower(flows.to_address)
+                   else lower(flows.from_address)
+                 end
+        order by tx_count desc, flow_count desc, last_seen_at desc nulls last
+        limit 50
+        "#,
+    )
+    .bind(user_id)
+    .bind(address)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load entity graph failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ClusterGraphEdgeRow {
+            cluster_id: row.get("cluster_id"),
+            cluster_name: row.get("cluster_name"),
+            chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+            source_address: row.get("source_address"),
+            counterparty_address: row.get("counterparty_address"),
+            tx_count: row.get("tx_count"),
+            flow_count: row.get("flow_count"),
+            token_count: row.get("token_count"),
+            last_seen_at: row.get("last_seen_at"),
+            sample_tx_hash: row.get("sample_tx_hash"),
+        })
+        .collect())
+}
+
+async fn load_today_snapshot(state: &WebState, chain_id: u64) -> Result<TodaySnapshot, WebError> {
+    let now = Instant::now();
+    // Keep the read guard in its own scope. Holding it through the `if let`
+    // body would deadlock the expired-entry path when it acquires a write lock
+    // to mark the background refresh in progress.
+    let cached_entry = {
+        let cache = state.today_cache.read().await;
+        cache.get(&chain_id).cloned()
+    };
+    if let Some(entry) = cached_entry {
+        if entry.expires_at > now {
+            return Ok(entry.snapshot);
+        }
+        let should_refresh = {
+            let mut cache = state.today_cache.write().await;
+            let entry = cache.get_mut(&chain_id).expect("cached entry still exists");
+            if entry.refreshing {
+                false
+            } else {
+                entry.refreshing = true;
+                true
+            }
+        };
+        if should_refresh {
+            let refresh_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(error) = refresh_today_snapshot(&refresh_state, chain_id).await {
+                    if let Some(entry) = refresh_state.today_cache.write().await.get_mut(&chain_id)
+                    {
+                        entry.refreshing = false;
+                    }
+                    warn!(chain_id, %error, "today snapshot refresh failed; serving stale data");
+                }
+            });
+        }
+        return Ok(entry.snapshot);
+    }
+
+    // Serialize only the cold-cache path. Once one request has produced a
+    // snapshot, all other users share it and expired entries refresh in the
+    // background without holding up page rendering.
+    let _guard = state.today_cache_miss_lock.lock().await;
+    let cached_entry = {
+        let cache = state.today_cache.read().await;
+        cache.get(&chain_id).cloned()
+    };
+    if let Some(entry) = cached_entry {
+        return Ok(entry.snapshot);
+    }
+    refresh_today_snapshot(state, chain_id).await
+}
+
+async fn refresh_today_snapshot(
+    state: &WebState,
+    chain_id: u64,
+) -> Result<TodaySnapshot, WebError> {
+    let snapshot = load_today_snapshot_uncached(state, chain_id).await?;
+    state.today_cache.write().await.insert(
+        chain_id,
+        TodayCacheEntry {
+            snapshot: snapshot.clone(),
+            expires_at: Instant::now() + state.today_cache_ttl,
+            refreshing: false,
+        },
+    );
+    Ok(snapshot)
+}
+
+async fn load_today_snapshot_uncached(
+    state: &WebState,
+    chain_id: u64,
+) -> Result<TodaySnapshot, WebError> {
+    let captured_at = Utc::now();
+    let database_snapshot = async {
+        tokio::try_join!(
+            load_today_metrics(state, chain_id),
+            load_today_candidates(state, chain_id, 8),
+            load_today_actors(state, chain_id, 5),
+            load_today_hot_pools(state, chain_id, 4),
+            load_today_hot_routes(state, chain_id, 3),
+            load_today_protocols(state, chain_id, 4),
+            load_today_hourly_activity(state, chain_id),
+        )
+    };
+
+    // Customer pages need product availability, not infrastructure topology.
+    // Probe only the chain-scoped analysis service and avoid RPC, worker, and
+    // storage progress calls on the Overview request path.
+    let upstream_timeout = Duration::from_millis(1_500);
+    let (database_snapshot, api_health) = tokio::join!(
+        database_snapshot,
+        tokio::time::timeout(
+            upstream_timeout,
+            api_get_json::<HealthPayload>(state, chain_id, "/health"),
+        ),
+    );
+    let (metrics, candidates, actors, hot_pools, hot_routes, protocols, hourly_activity) =
+        database_snapshot?;
+    let api_health = api_health.ok().and_then(Result::ok);
+
+    Ok(TodaySnapshot {
+        captured_at,
+        metrics,
+        candidates,
+        actors,
+        hot_pools,
+        hot_routes,
+        protocols,
+        hourly_activity,
+        monitor: None,
+        api_online: api_health
+            .map(|payload| payload.status.eq_ignore_ascii_case("ok"))
+            .unwrap_or(false),
+        rpc_chain_id: None,
+        rpc_head_block: None,
+        indexer_progress: None,
+    })
+}
+
+async fn load_execution_workspaces(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_plan: WorkspacePlan,
+) -> Result<Vec<WorkspaceRef>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select workspaces.workspace_id, workspaces.name, workspaces.workspace_type,
+               workspaces.chain_id, workspaces.status, workspaces.is_demo,
+               workspaces.legacy_cluster_id, workspaces.onboarding_completed_at,
+               count(entities.workspace_entity_id)::bigint as entity_count
+        from intelligence_workspaces workspaces
+        left join workspace_entities entities on entities.workspace_id = workspaces.workspace_id
+        where workspaces.user_id = $1 and workspaces.status <> 'archived'
+        group by workspaces.workspace_id
+        order by workspaces.is_demo, workspaces.onboarding_completed_at desc nulls last,
+                 workspaces.created_at
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load workspaces failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let workspace_id = row.get::<Uuid, _>("workspace_id");
+            let is_demo = row.get::<bool, _>("is_demo");
+            WorkspaceRef {
+                id: format!("workspace:{workspace_id}"),
+                name: row.get("name"),
+                kind: if is_demo {
+                    WorkspaceKind::Demo
+                } else {
+                    WorkspaceKind::Named
+                },
+                workspace_plan,
+                chain_id: Some(row.get::<i64, _>("chain_id").max(0) as u64),
+                monitored_entity_count: row.get::<i64, _>("entity_count").max(0) as usize,
+                workspace_type: row.get("workspace_type"),
+                status: row.get("status"),
+                legacy_cluster_id: row.get("legacy_cluster_id"),
+                onboarding_complete: row
+                    .get::<Option<DateTime<Utc>>, _>("onboarding_completed_at")
+                    .is_some(),
+            }
+        })
+        .collect())
+}
+
+fn selected_execution_workspace<'a>(
+    workspaces: &'a [WorkspaceRef],
+    selected: Option<&str>,
+) -> Option<&'a WorkspaceRef> {
+    selected
+        .and_then(|id| workspaces.iter().find(|workspace| workspace.id == id))
+        .or_else(|| workspaces.first())
+}
+
+fn workspace_is_operational(workspace: &WorkspaceRef) -> bool {
+    workspace.kind == WorkspaceKind::Demo
+        || workspace
+            .workspace_plan
+            .allows(WorkspaceCapability::CustomMonitoredEntities)
+}
+
+fn workspace_database_id(workspace: &WorkspaceRef) -> Option<Uuid> {
+    workspace
+        .id
+        .strip_prefix("workspace:")
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+async fn load_execution_events(
+    state: &WebState,
+    chain_id: u64,
+    range: WorkspaceRange,
+    limit: i64,
+) -> Result<Vec<ExecutionEvent>, WebError> {
+    let interval = range.postgres_interval();
+    let pilot_rows = sqlx::query(
+        r#"
+        select event_id, chain_id, block_number, tx_hash, event_type, severity,
+               conclusion, evidence_pack, created_at
+        from pilot_events
+        where chain_id = $1
+          and created_at >= now() - $2::interval
+        order by created_at desc
+        limit $3
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(interval)
+    .bind(limit)
+    .fetch_all(&state.pool);
+    let candidate_rows = sqlx::query(
+        r#"
+        select candidates.chain_id, candidates.tx_hash, candidates.block_number,
+               candidates.block_timestamp, candidates.detection_source,
+               candidates.sender_address, candidates.entry_contract, candidates.score,
+               candidates.swap_log_count, candidates.distinct_pool_count,
+               candidates.route, candidates.route_fingerprint,
+               candidates.confirmation_status, candidates.profit_token_address,
+               candidates.profit_amount_raw,
+               case when verification.verification_id is null then null else
+                 verification.evidence || jsonb_build_object(
+                   'result_status', verification.result_status,
+                   'severity', verification.severity,
+                   'confidence', verification.confidence,
+                   'conclusion', verification.conclusion,
+                   'profit_recipient', verification.profit_recipient,
+                   'gas_cost_raw', verification.gas_cost_raw,
+                   'ruleset_id', verification.ruleset_id,
+                   'inputs_digest', verification.inputs_digest,
+                   'limitations', to_jsonb(verification.limitations)
+                 )
+               end as economic_verification,
+               coalesce((
+                 select array_agg(pools.pool_address order by pools.route_position nulls last,
+                                  pools.first_log_index, pools.pool_address)
+                 from arbitrage_candidate_pools pools
+                 where pools.chain_id = candidates.chain_id
+                   and pools.tx_hash = candidates.tx_hash
+               ), array[]::text[]) as pool_addresses
+        from arbitrage_candidates candidates
+        left join economic_verification_results verification
+          on verification.chain_id = candidates.chain_id
+         and lower(verification.tx_hash) = lower(candidates.tx_hash)
+        where candidates.chain_id = $1
+          and candidates.block_timestamp >= now() - $2::interval
+        order by candidates.block_timestamp desc nulls last,
+                 candidates.block_number desc, candidates.score desc
+        limit $3
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(interval)
+    .bind(limit)
+    .fetch_all(&state.pool);
+    let (pilot_rows, candidate_rows) = tokio::try_join!(pilot_rows, candidate_rows)
+        .map_err(|error| WebError::internal(format!("load execution events failed: {error}")))?;
+
+    let mut events = Vec::with_capacity(pilot_rows.len() + candidate_rows.len());
+    let mut verified_transactions = HashSet::new();
+    for row in pilot_rows {
+        let tx_hash: String = row.get("tx_hash");
+        verified_transactions.insert(tx_hash.to_ascii_lowercase());
+        events.push(adapt_pilot_event(PilotEventInput {
+            event_id: row.get::<Uuid, _>("event_id").to_string(),
+            chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+            block_number: row.get("block_number"),
+            tx_hash,
+            event_type: row.get("event_type"),
+            severity: row.get("severity"),
+            conclusion: row.get("conclusion"),
+            evidence_pack: row.get::<SqlJson<serde_json::Value>, _>("evidence_pack").0,
+            created_at: row.get("created_at"),
+        }));
+    }
+    for row in candidate_rows {
+        let tx_hash: String = row.get("tx_hash");
+        if verified_transactions.contains(&tx_hash.to_ascii_lowercase()) {
+            continue;
+        }
+        events.push(adapt_arbitrage_candidate(candidate_input_from_row(
+            row, tx_hash,
+        )));
+    }
+    events.sort_by(|left, right| {
+        execution_status_rank(left.status)
+            .cmp(&execution_status_rank(right.status))
+            .then_with(|| {
+                execution_severity_rank(right.severity).cmp(&execution_severity_rank(left.severity))
+            })
+            .then_with(|| right.occurred_at.cmp(&left.occurred_at))
+    });
+    events.truncate(limit.max(0) as usize);
+    Ok(events)
+}
+
+async fn load_execution_event_by_id(
+    state: &WebState,
+    event_id: &str,
+) -> Result<Option<ExecutionEvent>, WebError> {
+    if let Some(raw_id) = event_id.strip_prefix("pilot-") {
+        let Ok(event_uuid) = Uuid::parse_str(raw_id) else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            r#"
+            select event_id, chain_id, block_number, tx_hash, event_type, severity,
+                   conclusion, evidence_pack, created_at
+            from pilot_events
+            where event_id = $1
+            "#,
+        )
+        .bind(event_uuid)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|error| WebError::internal(format!("load pilot event failed: {error}")))?;
+        if let Some(row) = row {
+            return Ok(Some(adapt_pilot_event(PilotEventInput {
+                event_id: row.get::<Uuid, _>("event_id").to_string(),
+                chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+                block_number: row.get("block_number"),
+                tx_hash: row.get("tx_hash"),
+                event_type: row.get("event_type"),
+                severity: row.get("severity"),
+                conclusion: row.get("conclusion"),
+                evidence_pack: row.get::<SqlJson<serde_json::Value>, _>("evidence_pack").0,
+                created_at: row.get("created_at"),
+            })));
+        }
+        return Ok(load_demo_execution_events()?
+            .into_iter()
+            .find(|event| event.id == event_id));
+    }
+
+    let Some(raw_hash) = event_id.strip_prefix("arb-") else {
+        return Ok(None);
+    };
+    let tx_hash = format!("0x{}", raw_hash.trim_start_matches("0x"));
+    let row = sqlx::query(
+        r#"
+        select candidates.chain_id, candidates.tx_hash, candidates.block_number,
+               candidates.block_timestamp, candidates.detection_source,
+               candidates.sender_address, candidates.entry_contract, candidates.score,
+               candidates.swap_log_count, candidates.distinct_pool_count,
+               candidates.route, candidates.route_fingerprint,
+               candidates.confirmation_status, candidates.profit_token_address,
+               candidates.profit_amount_raw,
+               case when verification.verification_id is null then null else
+                 verification.evidence || jsonb_build_object(
+                   'result_status', verification.result_status,
+                   'severity', verification.severity,
+                   'confidence', verification.confidence,
+                   'conclusion', verification.conclusion,
+                   'profit_recipient', verification.profit_recipient,
+                   'gas_cost_raw', verification.gas_cost_raw,
+                   'ruleset_id', verification.ruleset_id,
+                   'inputs_digest', verification.inputs_digest,
+                   'limitations', to_jsonb(verification.limitations)
+                 )
+               end as economic_verification,
+               coalesce((
+                 select array_agg(pools.pool_address order by pools.route_position nulls last,
+                                  pools.first_log_index, pools.pool_address)
+                 from arbitrage_candidate_pools pools
+                 where pools.chain_id = candidates.chain_id
+                   and pools.tx_hash = candidates.tx_hash
+               ), array[]::text[]) as pool_addresses
+        from arbitrage_candidates candidates
+        left join economic_verification_results verification
+          on verification.chain_id = candidates.chain_id
+         and lower(verification.tx_hash) = lower(candidates.tx_hash)
+        where lower(candidates.tx_hash) = lower($1)
+        order by candidates.block_timestamp desc nulls last
+        limit 1
+        "#,
+    )
+    .bind(&tx_hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load detected event failed: {error}")))?;
+    Ok(row.map(|row| {
+        let tx_hash: String = row.get("tx_hash");
+        adapt_arbitrage_candidate(candidate_input_from_row(row, tx_hash))
+    }))
+}
+
+fn load_demo_execution_events() -> Result<Vec<ExecutionEvent>, WebError> {
+    let packs: Vec<PilotEvidencePack> =
+        serde_json::from_str(include_str!("../../demo/base-public/events.json"))
+            .map_err(|error| WebError::internal(format!("load demo events failed: {error}")))?;
+    packs
+        .into_iter()
+        .map(|pack| {
+            let event_type = serde_json::to_value(&pack.event_type)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown_material_interaction".to_owned());
+            let severity = serde_json::to_value(&pack.severity)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "medium".to_owned());
+            let event_id = pack.event_id.to_string();
+            let evidence_pack = serde_json::to_value(&pack).map_err(|error| {
+                WebError::internal(format!("serialize demo event failed: {error}"))
+            })?;
+            Ok(adapt_pilot_event(PilotEventInput {
+                event_id,
+                chain_id: pack.chain_id,
+                block_number: pack.block_number.map(|value| value as i64),
+                tx_hash: pack.tx_hash,
+                event_type,
+                severity,
+                conclusion: pack.conclusion,
+                evidence_pack,
+                created_at: pack.created_at,
+            }))
+        })
+        .collect()
+}
+
+fn execution_event_json(event: &ExecutionEvent) -> serde_json::Value {
+    json!({
+        "id": event.id,
+        "source": event.source,
+        "chain_id": event.chain_id,
+        "block_number": event.block_number,
+        "tx_hash": event.tx_hash,
+        "event_type": event.event_type.key(),
+        "status": event.status.key(),
+        "severity": event.severity.key(),
+        "conclusion": event.conclusion,
+        "economic_impact": {
+            "trigger_size": event.economic_impact.trigger_size,
+            "price_impact": event.economic_impact.price_impact,
+            "gross_value_captured": event.economic_impact.gross_value_captured,
+            "gas_cost": event.economic_impact.gas_cost,
+            "net_profit": event.economic_impact.net_profit,
+            "protocol_fees": event.economic_impact.protocol_fees,
+            "rebate": event.economic_impact.rebate,
+            "asset_moved": event.economic_impact.asset_moved,
+            "usd_value": event.economic_impact.usd_value,
+        },
+        "confidence": {
+            "score": event.confidence.score,
+            "level": event.confidence.level.map(|value| value.label()),
+        },
+        "participants": event.participants.iter().map(|entity| json!({
+            "role": entity.role,
+            "address": entity.address,
+            "label": entity.label,
+        })).collect::<Vec<_>>(),
+        "protocols": event.protocols,
+        "timeline": event.timeline.iter().map(|step| json!({
+            "label": step.label,
+            "title": step.title,
+            "detail": step.detail,
+            "status": step.status,
+            "occurred_at": step.occurred_at,
+        })).collect::<Vec<_>>(),
+        "evidence": {
+            "receipt_available": event.evidence.receipt_available,
+            "logs_available": event.evidence.logs_available,
+            "trace_available": event.evidence.trace_available,
+            "token_deltas_available": event.evidence.token_deltas_available,
+            "route_fingerprint": event.evidence.route_fingerprint,
+            "ruleset_id": event.evidence.ruleset_id,
+            "inputs_digest": event.evidence.inputs_digest,
+            "limitations": event.evidence.limitations,
+            "raw": event.evidence.raw,
+        },
+        "occurred_at": event.occurred_at,
+    })
+}
+
+fn candidate_input_from_row(
+    row: sqlx::postgres::PgRow,
+    tx_hash: String,
+) -> ArbitrageCandidateInput {
+    ArbitrageCandidateInput {
+        chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+        tx_hash,
+        block_number: row.get("block_number"),
+        block_timestamp: row.get("block_timestamp"),
+        detection_source: row.get("detection_source"),
+        sender_address: row.get("sender_address"),
+        entry_contract: row.get("entry_contract"),
+        detection_score: row.get("score"),
+        swap_log_count: row.get("swap_log_count"),
+        distinct_pool_count: row.get("distinct_pool_count"),
+        route: row.get("route"),
+        route_fingerprint: row.get("route_fingerprint"),
+        confirmation_status: row.get("confirmation_status"),
+        profit_token_address: row.get("profit_token_address"),
+        profit_amount_raw: row.get("profit_amount_raw"),
+        pool_addresses: row.get("pool_addresses"),
+        economic_verification: row
+            .get::<Option<SqlJson<serde_json::Value>>, _>("economic_verification")
+            .map(|value| value.0),
+    }
+}
+
+fn execution_status_rank(status: ExecutionEventStatus) -> u8 {
+    match status {
+        ExecutionEventStatus::Verified => 0,
+        ExecutionEventStatus::Investigating => 1,
+        ExecutionEventStatus::Detected => 2,
+        ExecutionEventStatus::Resolved => 3,
+        ExecutionEventStatus::Dismissed => 4,
+    }
+}
+
+fn execution_severity_rank(severity: EventSeverity) -> u8 {
+    match severity {
+        EventSeverity::Low => 0,
+        EventSeverity::Medium => 1,
+        EventSeverity::High => 2,
+        EventSeverity::Critical => 3,
+    }
+}
+
+fn filter_execution_events<'a>(
+    events: &'a [ExecutionEvent],
+    query: &ExecutionUiQuery,
+) -> Vec<&'a ExecutionEvent> {
+    events
+        .iter()
+        .filter(|event| {
+            query
+                .status
+                .as_deref()
+                .is_none_or(|value| event.status.key() == value)
+                && query
+                    .severity
+                    .as_deref()
+                    .is_none_or(|value| event.severity.key() == value)
+                && query
+                    .event_type
+                    .as_deref()
+                    .is_none_or(|value| event.event_type.key() == value)
+                && query.protocol.as_deref().is_none_or(|value| {
+                    event
+                        .protocols
+                        .iter()
+                        .any(|protocol| protocol.eq_ignore_ascii_case(value))
+                })
+                && query.entity.as_deref().is_none_or(|value| {
+                    event.participants.iter().any(|entity| {
+                        entity.address.eq_ignore_ascii_case(value)
+                            || entity
+                                .label
+                                .as_deref()
+                                .is_some_and(|label| label.eq_ignore_ascii_case(value))
+                    })
+                })
+                && query.confidence.as_deref().is_none_or(|value| {
+                    event
+                        .confidence
+                        .level
+                        .is_some_and(|level| level.label().eq_ignore_ascii_case(value))
+                })
+        })
+        .collect()
+}
+
+async fn load_overview_range_metrics(
+    state: &WebState,
+    chain_id: u64,
+    range: WorkspaceRange,
+) -> Result<OverviewRangeMetrics, WebError> {
+    let row = sqlx::query(
+        r#"
+        select
+          (select count(*)::bigint
+           from transaction_analysis
+           where chain_id = $1
+             and block_timestamp >= now() - $2::interval
+             and trim(both '"' from lower(coalesce(tx_status, '')))
+                 in ('failed', 'failure', 'reverted')) as failed_transactions,
+          (select count(distinct address)::bigint
+           from behavior_assertion_reviews
+           where chain_id = $1
+             and status = 'pending'
+             and updated_at >= now() - $2::interval) as actors_requiring_review
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(range.postgres_interval())
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load overview metrics failed: {error}")))?;
+    Ok(OverviewRangeMetrics {
+        failed_transactions: row.get("failed_transactions"),
+        actors_requiring_review: row.get("actors_requiring_review"),
+    })
+}
+
+async fn load_monitored_systems(
+    state: &WebState,
+    user_id: Uuid,
+    chain_id: u64,
+) -> Result<Vec<MonitoredSystemRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select clusters.cluster_id, clusters.chain_id, clusters.name,
+               count(distinct addresses.address)::bigint as address_count,
+               tracking.tracking_status,
+               count(distinct alerts.alert_id)::bigint as alert_count,
+               greatest(max(alerts.triggered_at), max(activity.block_timestamp)) as latest_event_at,
+               greatest(clusters.updated_at, coalesce(tracking.updated_at, clusters.updated_at)) as last_update
+        from app_user_clusters links
+        join address_clusters clusters on clusters.cluster_id = links.cluster_id
+        left join cluster_addresses addresses on addresses.cluster_id = clusters.cluster_id
+        left join cluster_tracking_state tracking on tracking.cluster_id = clusters.cluster_id
+        left join cluster_alerts alerts on alerts.cluster_id = clusters.cluster_id
+        left join classified_transactions activity on activity.cluster_id = clusters.cluster_id
+        where links.user_id = $1 and clusters.chain_id = $2
+        group by clusters.cluster_id, clusters.chain_id, clusters.name,
+                 clusters.updated_at, tracking.tracking_status, tracking.updated_at
+        order by last_update desc, clusters.name
+        limit 20
+        "#,
+    )
+    .bind(user_id)
+    .bind(chain_id as i64)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load monitored systems failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| MonitoredSystemRow {
+            cluster_id: row.get("cluster_id"),
+            chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+            name: row.get("name"),
+            address_count: row.get("address_count"),
+            tracking_status: row.get("tracking_status"),
+            alert_count: row.get("alert_count"),
+            latest_event_at: row.get("latest_event_at"),
+            last_update: row.get("last_update"),
+        })
+        .collect())
+}
+
+async fn load_workspace_addresses(
+    state: &WebState,
+    workspace: &WorkspaceRef,
+) -> Result<HashSet<String>, WebError> {
+    let Some(workspace_id) = workspace.id.strip_prefix("workspace:") else {
+        return Ok(HashSet::new());
+    };
+    let workspace_id = Uuid::parse_str(workspace_id)
+        .map_err(|error| WebError::bad_request(format!("invalid workspace id: {error}")))?;
+    let rows = sqlx::query_scalar::<_, String>(
+        "select lower(address) from workspace_entities where workspace_id = $1",
+    )
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load workspace addresses failed: {error}")))?;
+    Ok(rows.into_iter().collect())
+}
+
+async fn load_workspace_entities(
+    state: &WebState,
+    workspace: &WorkspaceRef,
+) -> Result<Vec<WorkspaceEntityRow>, WebError> {
+    let Some(workspace_id) = workspace_database_id(workspace) else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        r#"
+        select objects.workspace_entity_id, lower(objects.address) as address,
+               objects.entity_kind, objects.role, objects.label, objects.created_at,
+               objects.observation_enabled as monitoring_enabled,
+               objects.observation_status,
+               objects.observation_progress,
+               objects.observation_error
+        from workspace_entities objects
+        where objects.workspace_id = $1
+        order by coalesce(objects.label, objects.role, objects.address), objects.address
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load workspace entities failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| WorkspaceEntityRow {
+            workspace_entity_id: row.get("workspace_entity_id"),
+            address: row.get("address"),
+            entity_kind: row.get("entity_kind"),
+            role: row.get("role"),
+            label: row.get("label"),
+            created_at: row.get("created_at"),
+            monitoring_enabled: row.get("monitoring_enabled"),
+            observation_status: row.get("observation_status"),
+            observation_progress: row.get("observation_progress"),
+            observation_error: row.get("observation_error"),
+        })
+        .collect())
+}
+
+async fn load_workspace_notifications(
+    state: &WebState,
+    workspace: &WorkspaceRef,
+) -> Result<Vec<WorkspaceNotificationRow>, WebError> {
+    let Some(workspace_id) = workspace_database_id(workspace) else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(
+        r#"
+        select destination_type, display_name, destination_ref,
+               enabled, operational, updated_at
+        from workspace_notification_destinations
+        where workspace_id = $1
+        order by enabled desc, updated_at desc, destination_id
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load notification settings failed: {error}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| WorkspaceNotificationRow {
+            destination_type: row.get("destination_type"),
+            display_name: row.get("display_name"),
+            destination_ref: row.get("destination_ref"),
+            enabled: row.get("enabled"),
+            operational: row.get("operational"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect())
+}
+
+fn execution_event_matches_workspace(
+    event: &ExecutionEvent,
+    workspace_addresses: &HashSet<String>,
+) -> bool {
+    !workspace_addresses.is_empty()
+        && event.participants.iter().any(|participant| {
+            workspace_addresses.contains(&participant.address.to_ascii_lowercase())
+        })
+}
+
+async fn user_can_access_execution_event(
+    state: &WebState,
+    user_id: Uuid,
+    event: &ExecutionEvent,
+) -> Result<bool, WebError> {
+    let participant_addresses = event
+        .participants
+        .iter()
+        .map(|participant| participant.address.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if participant_addresses.is_empty() {
+        return Ok(false);
+    }
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists (
+          select 1
+          from intelligence_workspaces workspaces
+          join workspace_entities entities on entities.workspace_id = workspaces.workspace_id
+          where workspaces.user_id = $1
+            and workspaces.status <> 'archived'
+            and lower(entities.address) = any($2::text[])
+        )
+        "#,
+    )
+    .bind(user_id)
+    .bind(participant_addresses)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("check workspace event access failed: {error}")))
+}
+
+async fn workspace_can_access_execution_event(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    event: &ExecutionEvent,
+) -> Result<bool, WebError> {
+    let participant_addresses = event
+        .participants
+        .iter()
+        .map(|participant| participant.address.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if participant_addresses.is_empty() {
+        return Ok(false);
+    }
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists (
+          select 1
+          from intelligence_workspaces workspaces
+          join workspace_entities entities on entities.workspace_id = workspaces.workspace_id
+          where workspaces.user_id = $1 and workspaces.workspace_id = $2
+            and workspaces.status <> 'archived'
+            and lower(entities.address) = any($3::text[])
+        )
+        "#,
+    )
+    .bind(user_id)
+    .bind(workspace_id)
+    .bind(participant_addresses)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("check workspace event access failed: {error}")))
+}
+
+async fn load_today_metrics(state: &WebState, chain_id: u64) -> Result<TodayMetrics, WebError> {
+    let row = sqlx::query(
+        r#"
+        with arb as (
+          select
+            count(*) filter (where block_timestamp >= now() - interval '24 hours')::bigint as current_count,
+            count(*) filter (
+              where block_timestamp >= now() - interval '48 hours'
+                and block_timestamp < now() - interval '24 hours'
+            )::bigint as previous_count,
+            count(*) filter (
+              where block_timestamp >= now() - interval '24 hours'
+                and confirmation_status like 'confirmed_%'
+            )::bigint as confirmed_count,
+            count(distinct sender_address) filter (
+              where block_timestamp >= now() - interval '24 hours'
+                and sender_address is not null
+            )::bigint as active_sender_count,
+            max(block_timestamp) as latest_observed_at
+          from arbitrage_candidates
+          where chain_id = $1
+        ), traces as (
+          select
+            count(*) filter (
+              where candidate_kind = 'dex_multi_swap'
+                and block_timestamp >= now() - interval '24 hours'
+            )::bigint as current_count,
+            count(*) filter (
+              where candidate_kind = 'dex_multi_swap'
+                and block_timestamp >= now() - interval '48 hours'
+                and block_timestamp < now() - interval '24 hours'
+            )::bigint as previous_count,
+            max(block_timestamp) as latest_observed_at
+          from trace_monitor_candidates
+          where chain_id = $1
+        ), analyses as (
+          select
+            count(*) filter (where block_timestamp >= now() - interval '24 hours')::bigint as current_count,
+            count(*) filter (
+              where block_timestamp >= now() - interval '48 hours'
+                and block_timestamp < now() - interval '24 hours'
+            )::bigint as previous_count,
+            count(*) filter (
+              where block_timestamp >= now() - interval '24 hours'
+                and trim(both '"' from lower(coalesce(tx_status, ''))) in ('failed', 'failure', 'reverted')
+            )::bigint as failed_count,
+            max(block_timestamp) as latest_observed_at
+          from transaction_analysis
+          where chain_id = $1
+        ), labels as (
+          select
+            count(*)::bigint as total_count,
+            count(*) filter (where updated_at >= now() - interval '24 hours')::bigint as current_count,
+            count(*) filter (
+              where updated_at >= now() - interval '48 hours'
+                and updated_at < now() - interval '24 hours'
+            )::bigint as previous_count,
+            max(updated_at) as latest_observed_at
+          from address_labels
+          where chain_id = $1
+        ), addresses as (
+          select
+            count(*)::bigint as total_count,
+            count(*) filter (where address_kind = 'eoa')::bigint as eoa_count,
+            count(*) filter (where address_kind = 'contract')::bigint as contract_count,
+            max(coalesce(last_seen_at, updated_at)) as latest_observed_at
+          from chain_addresses
+          where chain_id = $1
+        ), tokens as (
+          select count(*) filter (where fetch_status = 'ok')::bigint as ready_count,
+                 max(fetched_at) as latest_observed_at
+          from erc20_token_metadata
+          where chain_id = $1
+        ), deployments as (
+          select count(*) filter (where status = 'active')::bigint as active_count,
+                 max(coalesce(last_seen_at, updated_at)) as latest_observed_at
+          from protocol_deployments
+          where chain_id = $1
+        )
+        select
+          arb.current_count as arbitrage_24h,
+          arb.previous_count as arbitrage_previous_24h,
+          arb.confirmed_count as confirmed_arbitrage_24h,
+          arb.active_sender_count as active_candidate_senders_24h,
+          traces.current_count as multi_swap_24h,
+          traces.previous_count as multi_swap_previous_24h,
+          analyses.current_count as analyzed_transactions_24h,
+          analyses.previous_count as analyzed_transactions_previous_24h,
+          analyses.failed_count as failed_transactions_24h,
+          labels.total_count as effective_labels,
+          labels.current_count as labels_updated_24h,
+          labels.previous_count as labels_updated_previous_24h,
+          addresses.total_count as tracked_actors,
+          addresses.eoa_count as tracked_eoas,
+          addresses.contract_count as tracked_contracts,
+          tokens.ready_count as ready_token_metadata,
+          deployments.active_count as active_protocol_deployments,
+          greatest(
+            arb.latest_observed_at,
+            traces.latest_observed_at,
+            analyses.latest_observed_at,
+            labels.latest_observed_at,
+            addresses.latest_observed_at,
+            tokens.latest_observed_at,
+            deployments.latest_observed_at
+          ) as latest_observed_at
+        from arb
+        cross join traces
+        cross join analyses
+        cross join labels
+        cross join addresses
+        cross join tokens
+        cross join deployments
+        "#,
+    )
+    .bind(chain_id as i64)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load today metrics failed: {err}")))?;
+
+    Ok(TodayMetrics {
+        arbitrage_24h: row.get("arbitrage_24h"),
+        arbitrage_previous_24h: row.get("arbitrage_previous_24h"),
+        confirmed_arbitrage_24h: row.get("confirmed_arbitrage_24h"),
+        active_candidate_senders_24h: row.get("active_candidate_senders_24h"),
+        multi_swap_24h: row.get("multi_swap_24h"),
+        multi_swap_previous_24h: row.get("multi_swap_previous_24h"),
+        analyzed_transactions_24h: row.get("analyzed_transactions_24h"),
+        analyzed_transactions_previous_24h: row.get("analyzed_transactions_previous_24h"),
+        failed_transactions_24h: row.get("failed_transactions_24h"),
+        effective_labels: row.get("effective_labels"),
+        labels_updated_24h: row.get("labels_updated_24h"),
+        labels_updated_previous_24h: row.get("labels_updated_previous_24h"),
+        tracked_actors: row.get("tracked_actors"),
+        tracked_eoas: row.get("tracked_eoas"),
+        tracked_contracts: row.get("tracked_contracts"),
+        ready_token_metadata: row.get("ready_token_metadata"),
+        active_protocol_deployments: row.get("active_protocol_deployments"),
+        latest_observed_at: row.get("latest_observed_at"),
+    })
+}
+
+async fn load_today_candidates(
+    state: &WebState,
+    chain_id: u64,
+    limit: i64,
+) -> Result<Vec<TodayCandidateRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select tx_hash, block_number, block_timestamp, detection_source,
+               sender_address, entry_contract, score, swap_log_count,
+               distinct_pool_count, route, route_fingerprint, confirmation_status
+        from arbitrage_candidates
+        where chain_id = $1
+        order by block_timestamp desc nulls last, block_number desc, score desc
+        limit $2
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load today candidates failed: {err}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| TodayCandidateRow {
+            tx_hash: row.get("tx_hash"),
+            block_number: row.get("block_number"),
+            block_timestamp: row.get("block_timestamp"),
+            detection_source: row.get("detection_source"),
+            sender_address: row.get("sender_address"),
+            entry_contract: row.get("entry_contract"),
+            score: row.get("score"),
+            swap_log_count: row.get("swap_log_count"),
+            distinct_pool_count: row.get("distinct_pool_count"),
+            route: row.get("route"),
+            route_fingerprint: row.get("route_fingerprint"),
+            confirmation_status: row.get("confirmation_status"),
+        })
+        .collect())
+}
+
+async fn load_today_actors(
+    state: &WebState,
+    chain_id: u64,
+    limit: i64,
+) -> Result<Vec<TodayActorRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select
+          candidates.sender_address as address,
+          labels.label,
+          count(*)::bigint as candidate_count,
+          coalesce(sum(candidates.swap_log_count), 0)::bigint as swap_count,
+          max(candidates.block_timestamp) as last_seen
+        from arbitrage_candidates candidates
+        left join lateral (
+          select effective.label
+          from effective_address_labels effective
+          where effective.chain_id = candidates.chain_id
+            and effective.address = candidates.sender_address
+          order by effective.confidence desc, effective.updated_at desc
+          limit 1
+        ) labels on true
+        where candidates.chain_id = $1
+          and candidates.block_timestamp >= now() - interval '24 hours'
+          and candidates.sender_address is not null
+        group by candidates.sender_address, labels.label
+        order by candidate_count desc, swap_count desc, last_seen desc
+        limit $2
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load today actors failed: {err}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| TodayActorRow {
+            address: row.get("address"),
+            label: row.get("label"),
+            candidate_count: row.get("candidate_count"),
+            swap_count: row.get("swap_count"),
+            last_seen: row.get("last_seen"),
+        })
+        .collect())
+}
+
+async fn load_today_hot_pools(
+    state: &WebState,
+    chain_id: u64,
+    limit: i64,
+) -> Result<Vec<ArbitrageHotPoolRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select
+          pools.pool_address,
+          count(distinct pools.tx_hash)::bigint as tx_count,
+          coalesce(sum(pools.swap_log_count), 0)::bigint as swap_log_count,
+          count(distinct candidates.sender_address)::bigint as unique_senders,
+          count(distinct candidates.route_fingerprint)::bigint as unique_routes,
+          max(pools.block_timestamp) as last_seen,
+          coalesce(jsonb_agg(distinct pools.tx_hash) filter (where pools.tx_hash is not null), '[]'::jsonb) as sample_tx_hashes
+        from arbitrage_candidate_pools pools
+        join arbitrage_candidates candidates
+          on candidates.chain_id = pools.chain_id and candidates.tx_hash = pools.tx_hash
+        where pools.chain_id = $1
+          and pools.block_timestamp >= now() - interval '24 hours'
+        group by pools.pool_address
+        order by tx_count desc, swap_log_count desc, last_seen desc
+        limit $2
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load today hot pools failed: {err}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ArbitrageHotPoolRow {
+            pool_address: row.get("pool_address"),
+            tx_count: row.get("tx_count"),
+            swap_log_count: row.get("swap_log_count"),
+            unique_senders: row.get("unique_senders"),
+            unique_routes: row.get("unique_routes"),
+            last_seen: row.get("last_seen"),
+            sample_tx_hashes: json_value_strings(
+                row.get::<Option<serde_json::Value>, _>("sample_tx_hashes"),
+            ),
+        })
+        .collect())
+}
+
+async fn load_today_hot_routes(
+    state: &WebState,
+    chain_id: u64,
+    limit: i64,
+) -> Result<Vec<ArbitrageHotRouteRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select route_fingerprint, route,
+               count(*)::bigint as tx_count,
+               coalesce(sum(swap_log_count), 0)::bigint as swap_log_count,
+               count(distinct sender_address)::bigint as unique_senders,
+               max(block_timestamp) as last_seen,
+               coalesce(jsonb_agg(tx_hash order by block_timestamp desc) filter (where tx_hash is not null), '[]'::jsonb) as sample_tx_hashes
+        from arbitrage_candidates
+        where chain_id = $1
+          and block_timestamp >= now() - interval '24 hours'
+          and route_fingerprint <> ''
+        group by route_fingerprint, route
+        order by tx_count desc, swap_log_count desc, last_seen desc
+        limit $2
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load today hot routes failed: {err}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ArbitrageHotRouteRow {
+            route_fingerprint: row.get("route_fingerprint"),
+            route: row.get("route"),
+            tx_count: row.get("tx_count"),
+            swap_log_count: row.get("swap_log_count"),
+            unique_senders: row.get("unique_senders"),
+            last_seen: row.get("last_seen"),
+            sample_tx_hashes: json_value_strings(
+                row.get::<Option<serde_json::Value>, _>("sample_tx_hashes"),
+            ),
+        })
+        .collect())
+}
+
+async fn load_today_protocols(
+    state: &WebState,
+    chain_id: u64,
+    limit: i64,
+) -> Result<Vec<TodayProtocolRow>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select protocols.display_name, protocols.protocol_family,
+               count(*)::bigint as deployment_count,
+               max(coalesce(deployments.last_seen_at, deployments.updated_at)) as last_seen
+        from protocol_deployments deployments
+        join protocols on protocols.protocol_key = deployments.protocol_key
+        where deployments.chain_id = $1
+          and deployments.status = 'active'
+        group by protocols.protocol_key, protocols.display_name, protocols.protocol_family
+        order by deployment_count desc, last_seen desc
+        limit $2
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(limit)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load today protocols failed: {err}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| TodayProtocolRow {
+            display_name: row.get("display_name"),
+            protocol_family: row.get("protocol_family"),
+            deployment_count: row.get("deployment_count"),
+            last_seen: row.get("last_seen"),
+        })
+        .collect())
+}
+
+async fn load_today_hourly_activity(
+    state: &WebState,
+    chain_id: u64,
+) -> Result<Vec<TodayHourlyPoint>, WebError> {
+    let rows = sqlx::query(
+        r#"
+        select series.bucket,
+               count(candidates.tx_hash)::bigint as candidate_count
+        from generate_series(
+          date_trunc('hour', now()) - interval '23 hours',
+          date_trunc('hour', now()),
+          interval '1 hour'
+        ) as series(bucket)
+        left join arbitrage_candidates candidates
+          on candidates.chain_id = $1
+         and candidates.block_timestamp >= series.bucket
+         and candidates.block_timestamp < series.bucket + interval '1 hour'
+        group by series.bucket
+        order by series.bucket
+        "#,
+    )
+    .bind(chain_id as i64)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load today hourly activity failed: {err}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| TodayHourlyPoint {
+            bucket: row.get("bucket"),
+            candidate_count: row.get("candidate_count"),
+        })
+        .collect())
+}
+
+async fn load_today_monitor_progress(
+    state: &WebState,
+    chain_id: u64,
+) -> Result<Option<TodayMonitorProgress>, WebError> {
+    let row = sqlx::query(
+        r#"
+        select worker_id, last_processed_block, last_processed_at
+        from trace_monitor_progress
+        where chain_id = $1
+        order by updated_at desc
+        limit 1
+        "#,
+    )
+    .bind(chain_id as i64)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load today monitor progress failed: {err}")))?;
+    Ok(row.map(|row| TodayMonitorProgress {
+        worker_id: row.get("worker_id"),
+        last_processed_block: row.get("last_processed_block"),
+        last_processed_at: row.get("last_processed_at"),
+    }))
+}
+
+async fn rpc_quantity(state: &WebState, method: &str) -> Result<u64, WebError> {
+    let response = state
+        .client
+        .post(&state.rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": []
+        }))
+        .send()
+        .await
+        .map_err(WebError::upstream)?;
+    let status = response.status();
+    let payload = response
+        .json::<JsonRpcQuantityResponse>()
+        .await
+        .map_err(WebError::upstream)?;
+    if !status.is_success() || payload.error.is_some() {
+        return Err(WebError::bad_gateway(format!(
+            "rpc method {method} returned an error"
+        )));
+    }
+    let result = payload
+        .result
+        .ok_or_else(|| WebError::bad_gateway(format!("rpc method {method} returned no result")))?;
+    u64::from_str_radix(result.trim_start_matches("0x"), 16)
+        .map_err(|err| WebError::bad_gateway(format!("invalid {method} quantity: {err}")))
 }
 
 async fn clusters_page(
@@ -1245,6 +6295,1065 @@ async fn cluster_analysis_page(
     .await
 }
 
+async fn entities_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<EntityPageQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let clusters = state
+        .portal_service
+        .list_clusters_for_user(user.user_id)
+        .await?;
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let chain_id = workspace
+        .chain_id
+        .or(query
+            .chain_id
+            .filter(|value| state.chain_registry.resolve(*value).is_some()))
+        .unwrap_or(state.default_chain_id);
+    let range = WorkspaceRange::parse(query.range.as_deref());
+    if !workspace_is_operational(workspace) {
+        return Ok(Html(render_workspace_access_gate(
+            &state,
+            &user,
+            "entities",
+            "Entities",
+            chain_id,
+            &workspaces,
+            workspace,
+            range,
+        ))
+        .into_response());
+    }
+    // Object categories are an internal projection. The customer workflow is
+    // deliberately one observation list plus one Intelligence Profile.
+    let tab = "addresses";
+    if let Some(cluster_id) = query.cluster_id.as_deref() {
+        ensure_user_owns_cluster(&state, user.user_id, cluster_id).await?;
+    }
+
+    let workspace_entities = load_workspace_entities(&state, workspace).await?;
+    let workspace_addresses = workspace_entities
+        .iter()
+        .map(|entity| entity.address.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+
+    let address = query
+        .address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(address) = address
+        && !workspace_addresses.contains(&address.to_ascii_lowercase())
+    {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "entity was not found in this workspace".to_owned(),
+        });
+    }
+    let address_future = async {
+        if let Some(address) = address {
+            load_address_summary_for_entities(&state, chain_id, address)
+                .await
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    let reviews_future = async {
+        if tab == "searchers" {
+            let path = format!("/behavior-reviews?chain_id={chain_id}&status=pending&limit=100");
+            Ok::<_, WebError>(
+                api_get_json::<Vec<BehaviorReviewItem>>(&state, chain_id, &path)
+                    .await
+                    .unwrap_or_default(),
+            )
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let graph_future = async {
+        if !clusters.is_empty()
+            && let Some(address) = address
+        {
+            load_entity_graph_edges(&state, user.user_id, address).await
+        } else if !clusters.is_empty() && tab == "clusters" {
+            load_cluster_graph_edges(&state, user.user_id).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let events_future = async {
+        if address.is_some() {
+            load_execution_events(&state, chain_id, WorkspaceRange::Last30Days, 250).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let protocols_future = async {
+        if tab == "protocols" {
+            load_today_protocols(&state, chain_id, 100).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+    let (address_result, mut reviews, graph_edges, events, protocols) = tokio::try_join!(
+        address_future,
+        reviews_future,
+        graph_future,
+        events_future,
+        protocols_future,
+    )?;
+    reviews.retain(|review| workspace_addresses.contains(&review.address.to_ascii_lowercase()));
+    let (summary, address_error) = match address_result {
+        Some(Ok(summary)) => (Some(summary), None),
+        Some(Err(error)) => {
+            warn!(
+                chain_id,
+                address = address.unwrap_or("unknown"),
+                %error,
+                "workspace entity summary unavailable"
+            );
+            (
+                Some(AddressSummaryEnvelope {
+                    chain_id,
+                    address: address.unwrap_or_default().to_ascii_lowercase(),
+                    gas_spent_raw: "0".to_owned(),
+                    ..Default::default()
+                }),
+                Some("Address-level analysis is still loading. Workspace identity, related events, and evidence remain available below.".to_owned()),
+            )
+        }
+        None => (None, None),
+    };
+    Ok(Html(render_entities_page(
+        &state,
+        &user,
+        chain_id,
+        &clusters,
+        &workspaces,
+        workspace,
+        range,
+        tab,
+        &query,
+        summary.as_ref(),
+        address_error.as_deref(),
+        &reviews,
+        &graph_edges,
+        &events,
+        &protocols,
+        &workspace_entities,
+    ))
+    .into_response())
+}
+
+async fn observation_intelligence_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(observation_id): Path<String>,
+    Query(query): Query<EntityPageQuery>,
+) -> Result<Response, WebError> {
+    if !is_evm_hex_value(observation_id.trim(), 40) {
+        return Err(WebError::bad_request(
+            "observed object must be an EVM address or contract".to_owned(),
+        ));
+    }
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let chain_id = workspace
+        .chain_id
+        .or(query
+            .chain_id
+            .filter(|value| state.chain_registry.resolve(*value).is_some()))
+        .unwrap_or(state.default_chain_id);
+    let range = WorkspaceRange::parse(query.range.as_deref());
+    if !workspace_is_operational(workspace) {
+        return Ok(Html(render_workspace_access_gate(
+            &state,
+            &user,
+            "observations",
+            "Observed Object",
+            chain_id,
+            &workspaces,
+            workspace,
+            range,
+        ))
+        .into_response());
+    }
+    let address = observation_id.to_ascii_lowercase();
+    let entities = load_workspace_entities(&state, workspace).await?;
+    let entity = entities
+        .iter()
+        .find(|item| item.address.eq_ignore_ascii_case(&address))
+        .ok_or_else(|| WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "observed object was not found in this workspace".to_owned(),
+        })?;
+    let path = format!(
+        "/observations/{}?chain_id={chain_id}&timeline_limit=250",
+        urlencoding::encode(&address)
+    );
+    let snapshot = match api_get_json::<serde_json::Value>(&state, chain_id, &path).await {
+        Ok(snapshot) => {
+            if let Some(workspace_id) = workspace_database_id(workspace) {
+                let status = snapshot
+                    .pointer("/object/current_status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("queued");
+                let progress = snapshot
+                    .pointer("/object/progress")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"percent":0}));
+                let error = snapshot
+                    .pointer("/object/error")
+                    .and_then(serde_json::Value::as_str);
+                let _ = sqlx::query(
+                    r#"update workspace_entities set observation_status=$3,
+                       observation_progress=$4,observation_error=$5,
+                       last_observation_sync_at=now(),updated_at=now()
+                       where workspace_id=$1 and lower(address)=$2"#,
+                )
+                .bind(workspace_id)
+                .bind(&address)
+                .bind(status)
+                .bind(progress)
+                .bind(error)
+                .execute(&state.pool)
+                .await;
+            }
+            snapshot
+        }
+        Err(error) => {
+            warn!(chain_id, %address, %error, "observation snapshot unavailable; re-enqueueing");
+            let _: Result<serde_json::Value, _> = api_post_json(
+                &state,
+                chain_id,
+                "/observations",
+                &json!({"chain_id":chain_id,"address":address,"source":"workspace_page_recovery"}),
+            )
+            .await;
+            json!({
+                "contract_version":"observed-address-intelligence.v1",
+                "object":{
+                    "chain_id":chain_id,"address":address,"object_type":entity.entity_kind,
+                    "current_status":entity.observation_status,"progress":entity.observation_progress,
+                    "monitoring_enabled":true,"error":entity.observation_error,
+                    "coverage_is_partial":true
+                },
+                "activity_windows":[],"behaviors":[],"relationships":[],"economics":[],
+                "changes":[],"timeline":[],"briefs":[],
+                "limitations":["The chain intelligence API is reconnecting; persisted workspace state is shown."]
+            })
+        }
+    };
+    let cluster_path = format!(
+        "/observations/{}/cluster?chain_id={chain_id}&execution_limit=50",
+        urlencoding::encode(&address)
+    );
+    let cluster_snapshot = api_get_json::<serde_json::Value>(&state, chain_id, &cluster_path).await;
+    let content = match cluster_snapshot {
+        Ok(cluster) => render_searcher_cluster_intelligence_v1(
+            chain_id,
+            workspace,
+            entity,
+            &cluster,
+            query.activity_filter.as_deref(),
+        ),
+        Err(error) if error.message.contains("live intelligence is not available") => format!(
+            r#"<div class="ei-back-link"><a href="/app/observations?workspace={}">← Observed Objects</a></div><div class="notice error"><strong>Live chain intelligence unavailable.</strong> {}</div>"#,
+            urlencoding::encode(&workspace.id),
+            escape_html(&error.message)
+        ),
+        Err(_) => render_observation_intelligence_v1(
+            chain_id,
+            workspace,
+            entity,
+            &snapshot,
+            query.activity_filter.as_deref(),
+        ),
+    };
+    Ok(Html(render_private_workspace_shell(
+        &state,
+        &user,
+        "observations",
+        "Observed Address Intelligence",
+        chain_id,
+        &workspaces,
+        workspace,
+        range,
+        content,
+    ))
+    .into_response())
+}
+
+async fn observation_brief_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path((observation_id, brief_id)): Path<(String, Uuid)>,
+    Query(query): Query<ObjectBriefQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let address = observation_id.to_ascii_lowercase();
+    if !load_workspace_addresses(&state, workspace)
+        .await?
+        .contains(&address)
+    {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "brief object was not found in this workspace".to_owned(),
+        });
+    }
+    let chain_id = workspace
+        .chain_id
+        .or(query.chain_id)
+        .unwrap_or(state.default_chain_id);
+    let brief: serde_json::Value = api_get_json(
+        &state,
+        chain_id,
+        &format!(
+            "/observations/{}/briefs/{brief_id}?chain_id={chain_id}",
+            urlencoding::encode(&address)
+        ),
+    )
+    .await?;
+    if query.format.as_deref() == Some("md") {
+        let mut response = brief
+            .get("markdown")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+            .into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/markdown; charset=utf-8"),
+        );
+        return Ok(response);
+    }
+    let html = brief
+        .get("html")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<article><h1>Brief content unavailable</h1></article>");
+    let content = format!(
+        r#"<div class="ei-back-link"><a href="/app/reports?workspace={}">← Intelligence Briefs</a></div><section class="ca-panel ei-detail-section">{}</section>"#,
+        urlencoding::encode(&workspace.id),
+        html
+    );
+    Ok(Html(render_private_workspace_shell(
+        &state,
+        &user,
+        "reports",
+        brief
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Intelligence Brief"),
+        chain_id,
+        &workspaces,
+        workspace,
+        WorkspaceRange::Last7Days,
+        content,
+    ))
+    .into_response())
+}
+
+async fn retry_observation_analysis(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(observation_id): Path<String>,
+    Form(form): Form<EnableObservationMonitoringForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let workspace = load_owned_workspace_setup(&state, user.user_id, form.workspace_id)
+        .await?
+        .ok_or_else(|| WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "workspace was not found".to_owned(),
+        })?;
+    if workspace.chain_id != form.chain_id {
+        return Err(WebError::bad_request(
+            "workspace network does not match observed object".to_owned(),
+        ));
+    }
+    let address = observation_id.to_ascii_lowercase();
+    let _: serde_json::Value = api_post_json(
+        &state,
+        form.chain_id,
+        &format!(
+            "/observations/{}/retry?chain_id={}",
+            urlencoding::encode(&address),
+            form.chain_id
+        ),
+        &json!({}),
+    )
+    .await?;
+    sqlx::query(
+        r#"update workspace_entities set observation_status='queued',observation_error=null,
+           observation_progress='{"percent":0,"stage":"queued","message":"Retry queued"}'::jsonb,
+           updated_at=now() where workspace_id=$1 and lower(address)=$2"#,
+    )
+    .bind(form.workspace_id)
+    .bind(&address)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("save retry state failed: {error}")))?;
+    Ok(redirect_response(&format!(
+        "/app/observations/{}?workspace=workspace:{}&notice=observation-retried",
+        urlencoding::encode(&address),
+        form.workspace_id
+    )))
+}
+
+async fn override_observation_cluster_member(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path((observation_id, member_address)): Path<(String, String)>,
+    Form(form): Form<ClusterMemberOverrideForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let workspace = load_owned_workspace_setup(&state, user.user_id, form.workspace_id)
+        .await?
+        .ok_or_else(|| WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "workspace was not found".to_owned(),
+        })?;
+    if workspace.chain_id != form.chain_id {
+        return Err(WebError::bad_request(
+            "workspace network does not match candidate cluster".to_owned(),
+        ));
+    }
+    let seed = observation_id.trim().to_ascii_lowercase();
+    let member = member_address.trim().to_ascii_lowercase();
+    if !is_evm_hex_value(&seed, 40) || !is_evm_hex_value(&member, 40) {
+        return Err(WebError::bad_request(
+            "seed and member must be valid EVM addresses".to_owned(),
+        ));
+    }
+    let path = format!(
+        "/observations/{}/cluster/members/{}?chain_id={}",
+        urlencoding::encode(&seed),
+        urlencoding::encode(&member),
+        form.chain_id
+    );
+    let _: serde_json::Value = api_post_json(
+        &state,
+        form.chain_id,
+        &path,
+        &json!({
+            "action":form.action,
+            "role":form.role.filter(|value| !value.trim().is_empty()),
+            "note":form.note.filter(|value| !value.trim().is_empty()),
+            "actor_user_id":user.user_id
+        }),
+    )
+    .await?;
+    Ok(redirect_response(&format!(
+        "/app/observations/{}?workspace=workspace:{}&notice=cluster-member-updated",
+        urlencoding::encode(&seed),
+        form.workspace_id
+    )))
+}
+
+async fn legacy_entities_redirect(Query(query): Query<EntityPageQuery>) -> Response {
+    let mut params = Vec::new();
+    if let Some(workspace) = query.workspace {
+        params.push(format!("workspace={}", urlencoding::encode(&workspace)));
+    }
+    if let Some(chain_id) = query.chain_id {
+        params.push(format!("chain_id={chain_id}"));
+    }
+    if query.add == Some(1) {
+        params.push("add=1".to_owned());
+    }
+    if let Some(notice) = query.notice {
+        params.push(format!("notice={}", urlencoding::encode(&notice)));
+    }
+    let destination = if params.is_empty() {
+        "/app/observations".to_owned()
+    } else {
+        format!("/app/observations?{}", params.join("&"))
+    };
+    redirect_response(&destination)
+}
+
+async fn legacy_entity_detail_redirect(
+    Path(entity_id): Path<String>,
+    Query(query): Query<EntityPageQuery>,
+) -> Response {
+    let mut params = Vec::new();
+    if let Some(workspace) = query.workspace {
+        params.push(format!("workspace={}", urlencoding::encode(&workspace)));
+    }
+    if let Some(chain_id) = query.chain_id {
+        params.push(format!("chain_id={chain_id}"));
+    }
+    let query = if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    };
+    redirect_response(&format!(
+        "/app/observations/{}{}",
+        urlencoding::encode(&entity_id),
+        query
+    ))
+}
+
+async fn add_workspace_entity(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<AddWorkspaceEntityForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    if !WorkspacePlan::parse(&user.workspace_plan)
+        .allows(WorkspaceCapability::CustomMonitoredEntities)
+    {
+        return Ok(Redirect::to("/app/observations?notice=pilot-required").into_response());
+    }
+    let workspace = load_owned_workspace_setup(&state, user.user_id, form.workspace_id)
+        .await?
+        .ok_or_else(|| WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "workspace was not found".to_owned(),
+        })?;
+    if workspace.chain_id != form.chain_id {
+        return Err(WebError::bad_request(
+            "workspace network does not match entity".to_owned(),
+        ));
+    }
+    let entity_kind = form.entity_kind.trim();
+    let address = form.address.trim().to_ascii_lowercase();
+    if entity_kind == "transaction" {
+        if !is_evm_hex_value(&address, 64) {
+            return Err(WebError::bad_request(
+                "transaction must be a valid EVM transaction hash".to_owned(),
+            ));
+        }
+        return Ok(redirect_response(&format!(
+            "/app/tx-analysis?chain_id={}&tx_hash={}&notice=transaction-analysis-opened",
+            form.chain_id,
+            urlencoding::encode(&address),
+        )));
+    }
+    if !is_evm_hex_value(&address, 40) {
+        return Err(WebError::bad_request(
+            "observed object must be a valid EVM address or contract".to_owned(),
+        ));
+    }
+    if !matches!(entity_kind, "address" | "contract" | "pool" | "protocol") {
+        return Err(WebError::bad_request(
+            "invalid observed object type".to_owned(),
+        ));
+    }
+    let role = clean_optional_text(form.role);
+    let label = clean_optional_text(form.label);
+    sqlx::query(
+        r#"
+        insert into workspace_entities
+          (workspace_id, address, entity_kind, role, label, metadata)
+        values ($1,$2,$3,$4,$5,jsonb_build_object('source','observed_object'))
+        on conflict (workspace_id, address) do update
+        set entity_kind = excluded.entity_kind,
+            role = excluded.role,
+            label = excluded.label,
+            metadata = workspace_entities.metadata || excluded.metadata,
+            updated_at = now()
+        "#,
+    )
+    .bind(form.workspace_id)
+    .bind(&address)
+    .bind(entity_kind)
+    .bind(&role)
+    .bind(&label)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("save workspace entity failed: {error}")))?;
+    ensure_default_observation_monitor(
+        &state,
+        user.user_id,
+        form.workspace_id,
+        form.chain_id,
+        &address,
+        entity_kind,
+        role.as_deref(),
+        label.as_deref(),
+    )
+    .await?;
+    let enqueue_result: Result<serde_json::Value, WebError> = api_post_json(
+        &state,
+        form.chain_id,
+        "/observations",
+        &json!({
+            "chain_id": form.chain_id,
+            "address": address,
+            "source": "workspace_observe"
+        }),
+    )
+    .await;
+    let (status, progress, error, notice) = match enqueue_result {
+        Ok(_) => (
+            "queued",
+            json!({"percent":0,"stage":"queued","message":"Queued for historical activity discovery"}),
+            None,
+            "observation-added",
+        ),
+        Err(error) => (
+            "failed",
+            json!({"percent":0,"stage":"failed","message":"Analysis could not be queued; retry is available"}),
+            Some(error.to_string()),
+            "observation-queue-failed",
+        ),
+    };
+    sqlx::query(
+        r#"update workspace_entities set observation_enabled=true,observation_status=$3,
+           observation_progress=$4,observation_error=$5,updated_at=now()
+           where workspace_id=$1 and lower(address)=$2"#,
+    )
+    .bind(form.workspace_id)
+    .bind(&address)
+    .bind(status)
+    .bind(progress)
+    .bind(error)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("save observation state failed: {error}")))?;
+    Ok(redirect_response(&format!(
+        "/app/observations/{}?workspace=workspace:{}&notice={}",
+        urlencoding::encode(&address),
+        form.workspace_id,
+        notice,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn ensure_default_observation_monitor(
+    state: &WebState,
+    user_id: Uuid,
+    workspace_id: Uuid,
+    chain_id: u64,
+    address: &str,
+    entity_kind: &str,
+    role: Option<&str>,
+    label: Option<&str>,
+) -> Result<(), WebError> {
+    let mut transaction = state.pool.begin().await.map_err(|error| {
+        WebError::internal(format!("begin automatic observation setup failed: {error}"))
+    })?;
+    sqlx::query("select pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("automatic-observation:{workspace_id}"))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            WebError::internal(format!("lock automatic observation setup failed: {error}"))
+        })?;
+    let existing_monitor = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        select monitor_id
+        from user_monitors
+        where user_id=$1 and workspace_id=$2 and chain_id=$3 and status='active'
+          and metadata->>'source'='observation_defaults'
+        order by created_at
+        limit 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(workspace_id)
+    .bind(chain_id as i64)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(|error| {
+        WebError::internal(format!("load automatic observation route failed: {error}"))
+    })?;
+    let (monitor_id, created) = if let Some(monitor_id) = existing_monitor {
+        (monitor_id, false)
+    } else {
+        let monitor_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            insert into user_monitors
+              (user_id,workspace_id,chain_id,name,status,metadata)
+            values ($1,$2,$3,'Automatic Observations','active',
+                    jsonb_build_object('source','observation_defaults','hidden',true))
+            returning monitor_id
+            "#,
+        )
+        .bind(user_id)
+        .bind(workspace_id)
+        .bind(chain_id as i64)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| {
+            WebError::internal(format!(
+                "create automatic observation route failed: {error}"
+            ))
+        })?;
+        (monitor_id, true)
+    };
+    sqlx::query(
+        r#"
+        insert into user_monitor_entities
+          (monitor_id,address,entity_kind,role,label,metadata)
+        values ($1,$2,$3,$4,$5,jsonb_build_object('source','observation_defaults'))
+        on conflict (monitor_id,address) do update
+        set entity_kind=excluded.entity_kind,role=excluded.role,label=excluded.label,
+            metadata=user_monitor_entities.metadata || excluded.metadata
+        "#,
+    )
+    .bind(monitor_id)
+    .bind(address)
+    .bind(if matches!(entity_kind, "contract" | "pool" | "protocol") {
+        "contract"
+    } else {
+        "address"
+    })
+    .bind(role)
+    .bind(label)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("attach observed object failed: {error}")))?;
+    if created {
+        for event_type in [
+            "large_asset_flow",
+            "dex_arbitrage",
+            "liquidation",
+            "repeated_failed_attempts",
+            "unknown_material_interaction",
+        ] {
+            sqlx::query(
+                r#"
+                insert into user_monitor_rules
+                  (monitor_id,event_type,severity,enabled,include_filters,exclude_filters)
+                values ($1,$2,'medium',true,'{}'::jsonb,'{}'::jsonb)
+                "#,
+            )
+            .bind(monitor_id)
+            .bind(event_type)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| {
+                WebError::internal(format!("create automatic observation rule failed: {error}"))
+            })?;
+        }
+        sqlx::query(
+            r#"
+            insert into user_monitor_destinations
+              (monitor_id,destination_type,display_name,destination_ref,enabled,metadata)
+            select $1,'telegram',display_name,destination_ref,true,
+                   jsonb_build_object('source','workspace_notification_settings')
+            from workspace_notification_destinations
+            where workspace_id=$2 and destination_type='telegram'
+              and enabled and operational and destination_ref is not null
+            "#,
+        )
+        .bind(monitor_id)
+        .bind(workspace_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            WebError::internal(format!(
+                "attach workspace notification channel failed: {error}"
+            ))
+        })?;
+    }
+    transaction.commit().await.map_err(|error| {
+        WebError::internal(format!(
+            "commit automatic observation setup failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+async fn enable_observation_monitoring(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(observation_id): Path<String>,
+    Form(form): Form<EnableObservationMonitoringForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    if !WorkspacePlan::parse(&user.workspace_plan)
+        .allows(WorkspaceCapability::CustomMonitoredEntities)
+    {
+        return Ok(Redirect::to("/app/observations?notice=pilot-required").into_response());
+    }
+    let workspace = load_owned_workspace_setup(&state, user.user_id, form.workspace_id)
+        .await?
+        .ok_or_else(|| WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "workspace was not found".to_owned(),
+        })?;
+    if workspace.chain_id != form.chain_id {
+        return Err(WebError::bad_request(
+            "workspace network does not match observed object".to_owned(),
+        ));
+    }
+    let address = observation_id.trim().to_ascii_lowercase();
+    if !is_evm_hex_value(&address, 40) {
+        return Err(WebError::bad_request(
+            "observed object must be a valid EVM address".to_owned(),
+        ));
+    }
+    let object = sqlx::query(
+        r#"
+        select entity_kind, role, label
+        from workspace_entities
+        where workspace_id = $1 and lower(address) = $2
+        "#,
+    )
+    .bind(form.workspace_id)
+    .bind(&address)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load observed object failed: {error}")))?
+    .ok_or_else(|| WebError {
+        status: StatusCode::NOT_FOUND,
+        message: "observed object was not found in this workspace".to_owned(),
+    })?;
+    let already_enabled = sqlx::query_scalar::<_, bool>(
+        r#"
+        select exists (
+          select 1
+          from user_monitors monitors
+          join user_monitor_entities objects on objects.monitor_id = monitors.monitor_id
+          where monitors.user_id = $1 and monitors.workspace_id = $2
+            and monitors.status = 'active' and lower(objects.address) = $3
+        )
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(form.workspace_id)
+    .bind(&address)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("check observation monitoring failed: {error}")))?;
+    if already_enabled {
+        return Ok(redirect_response(&format!(
+            "/app/observations/{}?workspace=workspace:{}&notice=monitoring-already-enabled",
+            urlencoding::encode(&address),
+            form.workspace_id,
+        )));
+    }
+    let entity_kind = object.get::<String, _>("entity_kind");
+    let role = object.get::<Option<String>, _>("role");
+    let label = object.get::<Option<String>, _>("label");
+    let display_name = label.as_deref().or(role.as_deref()).unwrap_or(&address);
+    let mut transaction = state.pool.begin().await.map_err(|error| {
+        WebError::internal(format!("begin observation monitoring failed: {error}"))
+    })?;
+    let monitor_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        insert into user_monitors
+          (user_id, workspace_id, chain_id, name, status, metadata)
+        values ($1,$2,$3,$4,'active',
+                jsonb_build_object('source','observation_defaults','object',$5))
+        returning monitor_id
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(form.workspace_id)
+    .bind(form.chain_id as i64)
+    .bind(format!("Watch {}", truncate_middle(display_name, 16)))
+    .bind(&address)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("create object watch failed: {error}")))?;
+    sqlx::query(
+        r#"
+        insert into user_monitor_entities
+          (monitor_id, address, entity_kind, role, label, metadata)
+        values ($1,$2,$3,$4,$5,jsonb_build_object('source','observation_defaults'))
+        "#,
+    )
+    .bind(monitor_id)
+    .bind(&address)
+    .bind(
+        if matches!(entity_kind.as_str(), "contract" | "pool" | "protocol") {
+            "contract"
+        } else {
+            "address"
+        },
+    )
+    .bind(&role)
+    .bind(&label)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("save watched object failed: {error}")))?;
+    for event_type in [
+        "large_asset_flow",
+        "dex_arbitrage",
+        "liquidation",
+        "repeated_failed_attempts",
+        "unknown_material_interaction",
+    ] {
+        sqlx::query(
+            r#"
+            insert into user_monitor_rules
+              (monitor_id, event_type, severity, enabled, include_filters, exclude_filters)
+            values ($1,$2,'medium',true,'{}'::jsonb,'{}'::jsonb)
+            "#,
+        )
+        .bind(monitor_id)
+        .bind(event_type)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| WebError::internal(format!("save default watch rule failed: {error}")))?;
+    }
+    sqlx::query(
+        r#"
+        insert into user_monitor_destinations
+          (monitor_id, destination_type, display_name, destination_ref, enabled, metadata)
+        select $1, 'telegram', display_name, destination_ref, true,
+               jsonb_build_object('source','workspace_notification_settings')
+        from workspace_notification_destinations
+        where workspace_id = $2 and destination_type = 'telegram'
+          and enabled and operational and destination_ref is not null
+        "#,
+    )
+    .bind(monitor_id)
+    .bind(form.workspace_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("attach notification channel failed: {error}")))?;
+    transaction.commit().await.map_err(|error| {
+        WebError::internal(format!("commit observation monitoring failed: {error}"))
+    })?;
+    Ok(redirect_response(&format!(
+        "/app/observations/{}?workspace=workspace:{}&notice=monitoring-enabled",
+        urlencoding::encode(&address),
+        form.workspace_id,
+    )))
+}
+
+async fn load_address_summary_for_entities(
+    state: &WebState,
+    chain_id: u64,
+    address: &str,
+) -> Result<Result<AddressSummaryEnvelope, WebError>, WebError> {
+    let path = format!(
+        "/addresses/summary?chain_id={chain_id}&address={}",
+        urlencoding::encode(address)
+    );
+    let mut payload = match tokio::time::timeout(
+        Duration::from_secs(1),
+        api_get_json::<AddressSummaryEnvelope>(state, chain_id, &path),
+    )
+    .await
+    {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(error)) => return Ok(Err(error)),
+        Err(_) => {
+            return Ok(Err(WebError::bad_gateway(
+                "address summary timed out; profile data is temporarily unavailable".to_owned(),
+            )));
+        }
+    };
+    enrich_address_summary_from_indexer(state, chain_id, &mut payload).await;
+    Ok(Ok(payload))
+}
+
+async fn enrich_address_summary_from_indexer(
+    state: &WebState,
+    chain_id: u64,
+    payload: &mut AddressSummaryEnvelope,
+) {
+    let progress = match tokio::time::timeout(
+        Duration::from_secs(2),
+        indexer_get_json::<IndexerProgressPayload>(state, chain_id, "/progress"),
+    )
+    .await
+    {
+        Ok(Ok(progress)) => progress,
+        Ok(Err(error)) => {
+            payload.indexer_error = Some(error.to_string());
+            return;
+        }
+        Err(_) => {
+            payload.indexer_error =
+                Some("recent activity lookup timed out while reading indexer progress".to_owned());
+            return;
+        }
+    };
+    payload.indexer_head_block = progress.rpc_head_block;
+    payload.indexer_last_indexed_block = progress
+        .max_stored_indexed_block
+        .or(Some(progress.last_indexed_block));
+
+    // Prefer the live worker's actual coverage. Falling back to the aggregate
+    // marker remains bounded and cannot enqueue an implicit full-chain request.
+    let live = progress
+        .workers
+        .iter()
+        .filter(|worker| worker.worker_kind == "live")
+        .max_by_key(|worker| worker.last_indexed_block);
+    let to_block = live
+        .map(|worker| worker.last_indexed_block)
+        .unwrap_or(progress.last_indexed_block);
+    let live_start = live.map(|worker| worker.range_start).unwrap_or(to_block);
+    let from_block = to_block
+        .saturating_sub(OBSERVATION_RECENT_BLOCK_LOOKBACK.saturating_sub(1))
+        .max(live_start);
+    let refs_path = format!(
+        "/addresses/{}/txs?limit={}&from_block={from_block}&to_block={to_block}",
+        urlencoding::encode(&payload.address),
+        OBSERVATION_RECENT_TX_LIMIT,
+    );
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        indexer_get_json::<IndexerAddressRefsPayload>(state, chain_id, &refs_path),
+    )
+    .await
+    {
+        Ok(Ok(refs)) => {
+            payload.observed_txs = refs.refs;
+            payload.observed_coverage = refs.coverage;
+        }
+        Ok(Err(error)) => payload.indexer_error = Some(error.to_string()),
+        Err(_) => {
+            payload.indexer_error =
+                Some("bounded recent address activity lookup timed out".to_owned())
+        }
+    }
+}
+
 async fn address_analysis_page(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -1261,12 +7370,22 @@ async fn address_analysis_page(
     {
         let chain_id = query.chain_id.unwrap_or(state.default_chain_id);
         let path = format!(
-            "/addresses/summary?chain_id={}&address={}&lite=true",
+            "/addresses/summary?chain_id={}&address={}",
             chain_id,
             urlencoding::encode(address)
         );
         match api_get_json::<AddressSummaryEnvelope>(&state, chain_id, &path).await {
-            Ok(payload) => (Some(payload), None),
+            Ok(mut payload) => {
+                let job_address = payload.address.clone();
+                let ((), job) = tokio::join!(
+                    enrich_address_summary_from_indexer(&state, chain_id, &mut payload),
+                    load_address_job_summary(&state, chain_id, &job_address),
+                );
+                if let Ok(job) = job {
+                    payload.job = job;
+                }
+                (Some(payload), None)
+            }
             Err(err) => (None, Some(err.to_string())),
         }
     } else {
@@ -1284,7 +7403,7 @@ async fn address_analysis_page(
         tx_protocol: None,
         tx_sort_by: None,
         tx_sort_dir: None,
-        notice: None,
+        notice: query.notice,
         created_key: None,
     };
     render_dashboard_response(
@@ -1301,13 +7420,537 @@ async fn address_analysis_page(
     .await
 }
 
-async fn tx_analysis_page(
+async fn load_address_job_summary(
+    state: &WebState,
+    chain_id: u64,
+    address: &str,
+) -> Result<Option<AddressJobSummary>, WebError> {
+    let row = sqlx::query(
+        r#"
+        select status, attempts, priority, last_error, available_at, claimed_at,
+               completed_at, updated_at
+        from address_analysis_jobs
+        where chain_id = $1 and lower(address) = lower($2)
+        limit 1
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(address)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load address job failed: {err}")))?;
+    Ok(row.map(|row| AddressJobSummary {
+        status: row.get("status"),
+        attempts: row.get::<i32, _>("attempts").max(0) as u32,
+        priority: row.get("priority"),
+        last_error: row.get("last_error"),
+        available_at: row.get("available_at"),
+        claimed_at: row.get("claimed_at"),
+        completed_at: row.get("completed_at"),
+        updated_at: row.get("updated_at"),
+    }))
+}
+
+async fn investigations_page(
     State(state): State<WebState>,
     headers: HeaderMap,
-    Query(query): Query<PageNoticeQuery>,
+    Query(query): Query<InvestigationPageQuery>,
 ) -> Result<Response, WebError> {
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let clusters = state
+        .portal_service
+        .list_clusters_for_user(user.user_id)
+        .await?;
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let chain_id = workspace
+        .chain_id
+        .or(query
+            .chain_id
+            .filter(|value| state.chain_registry.resolve(*value).is_some()))
+        .unwrap_or(state.default_chain_id);
+    let range = WorkspaceRange::parse(query.range.as_deref());
+    if !workspace_is_operational(workspace) {
+        return Ok(Html(render_workspace_access_gate(
+            &state,
+            &user,
+            "investigations",
+            "Investigations",
+            chain_id,
+            &workspaces,
+            workspace,
+            range,
+        ))
+        .into_response());
+    }
+    let workspace_id = workspace_database_id(workspace)
+        .ok_or_else(|| WebError::internal("workspace database id is unavailable".to_owned()))?;
+    let workspace_addresses = load_workspace_addresses(&state, workspace).await?;
+    let source_event_future = async {
+        if let Some(event_id) = query.event_id.as_deref() {
+            let event = load_execution_event_by_id(&state, event_id).await?;
+            Ok::<_, WebError>(
+                event
+                    .filter(|event| execution_event_matches_workspace(event, &workspace_addresses)),
+            )
+        } else {
+            Ok(None)
+        }
+    };
+    let (investigations, source_event) = tokio::try_join!(
+        load_investigations(
+            &state,
+            user.user_id,
+            workspace_id,
+            Some(chain_id),
+            query.status.as_deref(),
+            200
+        ),
+        source_event_future,
+    )?;
+    if query.event_id.is_some() && source_event.is_none() {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "execution event was not found in this workspace".to_owned(),
+        });
+    }
+    Ok(Html(render_investigations_page(
+        &state,
+        &user,
+        chain_id,
+        &clusters,
+        &workspaces,
+        workspace,
+        range,
+        &query,
+        &investigations,
+        source_event.as_ref(),
+    ))
+    .into_response())
+}
+
+async fn create_investigation(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateInvestigationForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    if !WorkspacePlan::parse(&user.workspace_plan)
+        .allows(WorkspaceCapability::PrivateInvestigations)
+    {
+        return Ok(Redirect::to("/app/investigations?notice=pilot-required").into_response());
+    }
+    let workspace = load_owned_workspace_setup(&state, user.user_id, form.workspace_id)
+        .await?
+        .ok_or_else(|| WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "workspace was not found".to_owned(),
+        })?;
+    if state.chain_registry.resolve(form.chain_id).is_none() {
+        return Err(WebError::bad_request(
+            "unsupported investigation network".to_owned(),
+        ));
+    }
+    if workspace.chain_id != form.chain_id {
+        return Err(WebError::bad_request(
+            "workspace network does not match investigation".to_owned(),
+        ));
+    }
+    let title = form.title.trim();
+    if title.is_empty() {
+        return Err(WebError::bad_request(
+            "investigation title is required".to_owned(),
+        ));
+    }
+    let source_event = if let Some(event_id) = form
+        .event_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let event = load_execution_event_by_id(&state, event_id)
+            .await?
+            .ok_or_else(|| WebError::bad_request("related event was not found".to_owned()))?;
+        if event.chain_id != form.chain_id {
+            return Err(WebError::bad_request(
+                "related event network does not match investigation".to_owned(),
+            ));
+        }
+        if !workspace_can_access_execution_event(&state, user.user_id, form.workspace_id, &event)
+            .await?
+        {
+            return Err(WebError::bad_request(
+                "related event does not belong to this workspace".to_owned(),
+            ));
+        }
+        Some(event)
+    } else {
+        None
+    };
+    let related_event_ids = source_event
+        .as_ref()
+        .map(|event| vec![event.id.clone()])
+        .unwrap_or_default();
+    let related_entities = form
+        .entity
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if is_evm_hex_value(value, 40) {
+                Ok(vec![value.to_ascii_lowercase()])
+            } else {
+                Err(WebError::bad_request(
+                    "related entity must be an EVM address".to_owned(),
+                ))
+            }
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let evidence = source_event
+        .as_ref()
+        .map(execution_event_json)
+        .unwrap_or_else(|| json!({}));
+    let investigation_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        insert into execution_investigations (
+          user_id, workspace_id, chain_id, title, status, working_conclusion, open_questions,
+          notes, related_event_ids, related_entities, evidence
+        ) values ($1,$2,$3,$4,'open',$5,$6,$7,$8,$9,$10)
+        returning investigation_id
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(form.workspace_id)
+    .bind(form.chain_id as i64)
+    .bind(title)
+    .bind(clean_optional_text(form.working_conclusion))
+    .bind(clean_optional_text(form.open_questions))
+    .bind(clean_optional_text(form.notes))
+    .bind(related_event_ids)
+    .bind(related_entities)
+    .bind(SqlJson(evidence))
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("create investigation failed: {error}")))?;
+    Ok(redirect_response(&format!(
+        "/app/investigations/{investigation_id}?notice=investigation-created"
+    )))
+}
+
+async fn investigation_detail_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(investigation_id): Path<Uuid>,
+    Query(query): Query<InvestigationPageQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let investigation = load_investigation(&state, user.user_id, investigation_id)
+        .await?
+        .ok_or_else(|| WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "investigation was not found".to_owned(),
+        })?;
+    let clusters = state
+        .portal_service
+        .list_clusters_for_user(user.user_id)
+        .await?;
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    if workspace_database_id(workspace) != Some(investigation.workspace_id) {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "investigation was not found in this workspace".to_owned(),
+        });
+    }
+    Ok(Html(render_investigation_detail_page(
+        &state,
+        &user,
+        &clusters,
+        &workspaces,
+        workspace,
+        WorkspaceRange::parse(query.range.as_deref()),
+        &investigation,
+        query.notice.as_deref().and_then(render_notice_message),
+    ))
+    .into_response())
+}
+
+async fn update_investigation(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(investigation_id): Path<Uuid>,
+    Form(form): Form<UpdateInvestigationForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    if !WorkspacePlan::parse(&user.workspace_plan)
+        .allows(WorkspaceCapability::PrivateInvestigations)
+    {
+        return Ok(Redirect::to("/app/investigations?notice=pilot-required").into_response());
+    }
+    if !matches!(
+        form.status.as_str(),
+        "open" | "in_review" | "resolved" | "archived"
+    ) {
+        return Err(WebError::bad_request(
+            "invalid investigation status".to_owned(),
+        ));
+    }
+    let updated = sqlx::query(
+        r#"
+        update execution_investigations
+        set status = $1, working_conclusion = $2, open_questions = $3,
+            notes = $4, updated_at = now()
+        where investigation_id = $5 and user_id = $6
+        "#,
+    )
+    .bind(&form.status)
+    .bind(clean_optional_text(form.working_conclusion))
+    .bind(clean_optional_text(form.open_questions))
+    .bind(clean_optional_text(form.notes))
+    .bind(investigation_id)
+    .bind(user.user_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("update investigation failed: {error}")))?;
+    if updated.rows_affected() == 0 {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "investigation was not found".to_owned(),
+        });
+    }
+    Ok(redirect_response(&format!(
+        "/app/investigations/{investigation_id}?notice=investigation-updated"
+    )))
+}
+
+fn clean_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+async fn reports_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<TodayQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let clusters = state
+        .portal_service
+        .list_clusters_for_user(user.user_id)
+        .await?;
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let chain_id = workspace
+        .chain_id
+        .or(query
+            .chain_id
+            .filter(|value| state.chain_registry.resolve(*value).is_some()))
+        .unwrap_or(state.default_chain_id);
+    let range = WorkspaceRange::parse(query.range.as_deref());
+    if !workspace_is_operational(workspace) {
+        return Ok(Html(render_workspace_access_gate(
+            &state,
+            &user,
+            "reports",
+            "Reports",
+            chain_id,
+            &workspaces,
+            workspace,
+            range,
+        ))
+        .into_response());
+    }
+    let reports = load_workspace_reports(&state, user.user_id, workspace, chain_id, 100).await?;
+    let workspace_entities = load_workspace_entities(&state, workspace).await?;
+    let observation_snapshots =
+        load_workspace_observation_snapshots(&state, chain_id, &workspace_entities).await;
+    let object_briefs = workspace_entities
+        .iter()
+        .flat_map(|entity| {
+            observation_snapshots
+                .get(&entity.address)
+                .and_then(|snapshot| snapshot.get("briefs"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .map(|brief| {
+                    (
+                        entity.address.clone(),
+                        entity.label.clone().or(entity.role.clone()),
+                        brief,
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let focus_entity = if let Some(entity) = query.entity.as_deref() {
+        let entity = entity.trim().to_ascii_lowercase();
+        let workspace_addresses = load_workspace_addresses(&state, workspace).await?;
+        if !workspace_addresses.contains(&entity) {
+            return Err(WebError {
+                status: StatusCode::NOT_FOUND,
+                message: "entity was not found in this workspace".to_owned(),
+            });
+        }
+        Some(entity)
+    } else {
+        None
+    };
+    Ok(Html(render_reports_page(
+        &state,
+        &user,
+        chain_id,
+        &clusters,
+        &workspaces,
+        workspace,
+        range,
+        &reports,
+        &object_briefs,
+        focus_entity.as_deref(),
+    ))
+    .into_response())
+}
+
+async fn workspace_report_json(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(snapshot_id): Path<Uuid>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let row = sqlx::query(
+        r#"
+        select snapshots.report_json
+        from cluster_strategy_report_snapshots snapshots
+        join app_user_clusters links on links.cluster_id = snapshots.cluster_id
+        where snapshots.snapshot_id = $1 and links.user_id = $2
+        "#,
+    )
+    .bind(snapshot_id)
+    .bind(user.user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|error| WebError::internal(format!("load report export failed: {error}")))?
+    .ok_or_else(|| WebError {
+        status: StatusCode::NOT_FOUND,
+        message: "workspace report was not found".to_owned(),
+    })?;
+    let report = row.get::<SqlJson<serde_json::Value>, _>("report_json").0;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=ledgerflow-workspace-report.json",
+            ),
+        ],
+        serde_json::to_string_pretty(&report)
+            .map_err(|error| WebError::internal(format!("serialize report failed: {error}")))?,
+    )
+        .into_response())
+}
+
+async fn public_demo_weekly_report() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../../demo/base-public/weekly_report.html"),
+    )
+        .into_response()
+}
+
+async fn public_demo_weekly_report_markdown() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        include_str!("../../demo/base-public/weekly_report.md"),
+    )
+        .into_response()
+}
+
+async fn public_demo_events_json() -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        include_str!("../../demo/base-public/events.json"),
+    )
+        .into_response()
+}
+
+async fn tx_analysis_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<TxAnalysisPageQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let (tx_result, tx_error) = if let Some(tx_hash) = query
+        .tx_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let chain_id = query.chain_id.unwrap_or(state.default_chain_id);
+        let load_path = format!("/analyses/{tx_hash}?chain_id={chain_id}");
+        let result = match api_get_json::<AnalysisEnvelope>(&state, chain_id, &load_path).await {
+            Ok(payload) => Ok(payload),
+            Err(_) => {
+                api_post_json::<_, AnalysisEnvelope>(
+                    &state,
+                    chain_id,
+                    "/analyses/tx",
+                    &AnalyzeTxRequest {
+                        chain_id,
+                        tx_hash: tx_hash.to_owned(),
+                    },
+                )
+                .await
+            }
+        };
+        match result {
+            Ok(payload) => match prepare_tx_analysis_payload(&state, payload).await {
+                Ok(payload) => (Some(payload), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            Err(error) => (None, Some(error.to_string())),
+        }
+    } else {
+        (None, None)
     };
     render_dashboard_response(
         &state,
@@ -1328,13 +7971,202 @@ async fn tx_analysis_page(
             created_key: query.created_key,
         },
         None,
-        None,
-        None,
+        tx_result,
+        tx_error,
         None,
         None,
         None,
     )
     .await
+}
+
+async fn live_events_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<ExecutionUiQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let clusters = state
+        .portal_service
+        .list_clusters_for_user(user.user_id)
+        .await?;
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let selected_chain_id = workspace
+        .chain_id
+        .or(query
+            .chain_id
+            .filter(|chain_id| state.chain_registry.resolve(*chain_id).is_some()))
+        .unwrap_or(state.default_chain_id);
+    let range = WorkspaceRange::parse(query.range.as_deref());
+    if !workspace_is_operational(workspace) {
+        return Ok(Html(render_workspace_access_gate(
+            &state,
+            &user,
+            "events",
+            "Workspace Events",
+            selected_chain_id,
+            &workspaces,
+            workspace,
+            range,
+        ))
+        .into_response());
+    }
+    let (mut events, workspace_addresses) = tokio::try_join!(
+        load_execution_events(&state, selected_chain_id, range, 250),
+        load_workspace_addresses(&state, workspace),
+    )?;
+    if workspace.kind == WorkspaceKind::Demo {
+        events = load_demo_execution_events()?;
+    }
+    events.retain(|event| execution_event_matches_workspace(event, &workspace_addresses));
+    if query.queue.as_deref() == Some("review") {
+        events.retain(event_requires_review);
+    }
+    let filtered = filter_execution_events(&events, &query);
+    Ok(Html(render_live_events_page(
+        &state,
+        &user,
+        selected_chain_id,
+        &clusters,
+        &workspaces,
+        workspace,
+        range,
+        &query,
+        &filtered,
+    ))
+    .into_response())
+}
+
+async fn execution_event_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(event_id): Path<String>,
+    Query(query): Query<ExecutionUiQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let Some(event) = load_execution_event_by_id(&state, &event_id).await? else {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "execution event was not found".to_owned(),
+        });
+    };
+    let clusters = state
+        .portal_service
+        .list_clusters_for_user(user.user_id)
+        .await?;
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    if !workspace_is_operational(workspace) {
+        let chain_id = workspace.chain_id.unwrap_or(state.default_chain_id);
+        return Ok(Html(render_workspace_access_gate(
+            &state,
+            &user,
+            "events",
+            "Execution Event",
+            chain_id,
+            &workspaces,
+            workspace,
+            WorkspaceRange::parse(query.range.as_deref()),
+        ))
+        .into_response());
+    }
+    let workspace_addresses = load_workspace_addresses(&state, workspace).await?;
+    if !execution_event_matches_workspace(&event, &workspace_addresses) {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "execution event was not found in this workspace".to_owned(),
+        });
+    }
+    let related_events = if workspace.kind == WorkspaceKind::Demo {
+        load_demo_execution_events()?
+    } else {
+        load_execution_events(&state, event.chain_id, WorkspaceRange::Last30Days, 500).await?
+    };
+    let related_event_count = related_events
+        .into_iter()
+        .filter(|candidate| {
+            candidate.event_type == event.event_type
+                && execution_event_matches_workspace(candidate, &workspace_addresses)
+        })
+        .count();
+    let range = WorkspaceRange::parse(query.range.as_deref());
+    Ok(Html(render_execution_event_page(
+        &state,
+        &user,
+        &clusters,
+        &workspaces,
+        workspace,
+        range,
+        &event,
+        related_event_count,
+    ))
+    .into_response())
+}
+
+async fn execution_event_evidence_json(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(event_id): Path<String>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let Some(event) = load_execution_event_by_id(&state, &event_id).await? else {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "execution event was not found".to_owned(),
+        });
+    };
+    if !user_can_access_execution_event(&state, user.user_id, &event).await? {
+        return Err(WebError {
+            status: StatusCode::NOT_FOUND,
+            message: "execution event was not found in this workspace".to_owned(),
+        });
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "inline; filename=ledgerflow-execution-event.json",
+            ),
+        ],
+        serde_json::to_string_pretty(&execution_event_json(&event)).map_err(|error| {
+            WebError::internal(format!("serialize execution event failed: {error}"))
+        })?,
+    )
+        .into_response())
+}
+
+fn event_requires_review(event: &ExecutionEvent) -> bool {
+    event.status == ExecutionEventStatus::Detected
+        || event
+            .confidence
+            .level
+            .is_some_and(|level| level.label() == "Low")
+        || !event.evidence.limitations.is_empty()
+        || event.event_type == ExecutionEventType::UnknownMaterialInteraction
 }
 
 async fn arbitrage_page(
@@ -1347,9 +8179,11 @@ async fn arbitrage_page(
     };
     let minutes = query.minutes.unwrap_or(60).clamp(1, 24 * 60);
     let limit = query.limit.unwrap_or(50).clamp(10, 200);
-    let recent = load_arbitrage_recent(&state, minutes, limit).await?;
-    let hot_pools = load_arbitrage_hot_pools(&state, minutes, 25).await?;
-    let hot_routes = load_arbitrage_hot_routes(&state, minutes, 25).await?;
+    let (recent, hot_pools, hot_routes) = tokio::try_join!(
+        load_arbitrage_recent(&state, minutes, limit),
+        load_arbitrage_hot_pools(&state, minutes, 25),
+        load_arbitrage_hot_routes(&state, minutes, 25),
+    )?;
     Ok(Html(render_arbitrage_page(
         &state,
         &user,
@@ -1376,9 +8210,11 @@ async fn arbitrage_api(
     };
     let minutes = query.minutes.unwrap_or(60).clamp(1, 24 * 60);
     let limit = query.limit.unwrap_or(50).clamp(10, 200);
-    let recent = load_arbitrage_recent(&state, minutes, limit).await?;
-    let hot_pools = load_arbitrage_hot_pools(&state, minutes, 25).await?;
-    let hot_routes = load_arbitrage_hot_routes(&state, minutes, 25).await?;
+    let (recent, hot_pools, hot_routes) = tokio::try_join!(
+        load_arbitrage_recent(&state, minutes, limit),
+        load_arbitrage_hot_pools(&state, minutes, 25),
+        load_arbitrage_hot_routes(&state, minutes, 25),
+    )?;
     Ok(Json(json!({
         "chain_id": state.default_chain_id,
         "window_minutes": minutes,
@@ -1497,9 +8333,11 @@ async fn swaps_block_range_api(
         cryptohouse_swap_txs_query(query.from_block, query.to_block, min_swaps, tx_limit);
     let pools_query =
         cryptohouse_hot_swap_pools_query(query.from_block, query.to_block, pool_limit);
-    let summary = cryptohouse_json_each_row(&state, &summary_query).await?;
-    let swap_txs = cryptohouse_json_each_row(&state, &txs_query).await?;
-    let hot_pools = cryptohouse_json_each_row(&state, &pools_query).await?;
+    let (summary, swap_txs, hot_pools) = tokio::try_join!(
+        cryptohouse_json_each_row(&state, &summary_query),
+        cryptohouse_json_each_row(&state, &txs_query),
+        cryptohouse_json_each_row(&state, &pools_query),
+    )?;
     Ok(Json(json!({
         "from_block": query.from_block,
         "to_block": query.to_block,
@@ -1664,6 +8502,128 @@ async fn load_arbitrage_recent(
             profit_amount_raw: row.get("profit_amount_raw"),
         })
         .collect())
+}
+
+async fn load_tx_candidate_context(
+    state: &WebState,
+    chain_id: u64,
+    tx_hash: &str,
+) -> Result<Option<TxCandidateContext>, WebError> {
+    let row = sqlx::query(
+        r#"
+        select c.chain_id, c.tx_hash, c.block_number, c.block_timestamp,
+               c.detection_source, c.sender_address, c.entry_contract, c.score,
+               c.swap_log_count, c.distinct_pool_count, c.route,
+               c.route_fingerprint, c.confirmation_status,
+               c.profit_token_address, c.profit_amount_raw,
+               coalesce((
+                 select array_agg(p.pool_address order by p.route_position nulls last, p.first_log_index, p.pool_address)
+                 from arbitrage_candidate_pools p
+                 where p.chain_id = c.chain_id and lower(p.tx_hash) = lower(c.tx_hash)
+               ), array[]::text[]) as pool_addresses
+        from arbitrage_candidates c
+        where c.chain_id = $1 and lower(c.tx_hash) = lower($2)
+        limit 1
+        "#,
+    )
+    .bind(chain_id as i64)
+    .bind(tx_hash.trim())
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("load tx candidate context failed: {err}")))?;
+    Ok(row.map(|row| TxCandidateContext {
+        chain_id: row.get::<i64, _>("chain_id").max(0) as u64,
+        tx_hash: row.get("tx_hash"),
+        block_number: row.get("block_number"),
+        block_timestamp: row.get("block_timestamp"),
+        detection_source: row.get("detection_source"),
+        sender_address: row.get("sender_address"),
+        entry_contract: row.get("entry_contract"),
+        score: row.get("score"),
+        swap_log_count: row.get("swap_log_count"),
+        distinct_pool_count: row.get("distinct_pool_count"),
+        route: row.get("route"),
+        route_fingerprint: row.get("route_fingerprint"),
+        confirmation_status: row.get("confirmation_status"),
+        profit_token_address: row.get("profit_token_address"),
+        profit_amount_raw: row.get("profit_amount_raw"),
+        pool_addresses: row.get("pool_addresses"),
+    }))
+}
+
+async fn prepare_tx_analysis_payload(
+    state: &WebState,
+    envelope: AnalysisEnvelope,
+) -> Result<serde_json::Value, WebError> {
+    let analysis = &envelope.analysis;
+    let recognizer_labels = analysis
+        .recognizer_results
+        .iter()
+        .map(|item| item.label.clone())
+        .collect::<Vec<_>>();
+    let scenario_kind = analysis
+        .scenario_outputs
+        .pointer("/storyline/kind")
+        .and_then(serde_json::Value::as_str);
+    let arbitrage_recognized = recognizer_labels
+        .iter()
+        .any(|label| label == "arbitrage_like_activity")
+        || scenario_kind == Some("arbitrage");
+    let assessment_status = match analysis.status {
+        crate::domain::enums::TransactionStatus::Failure => "analyzed_reverted",
+        crate::domain::enums::TransactionStatus::Pending => "analyzed_pending",
+        crate::domain::enums::TransactionStatus::Success if arbitrage_recognized => {
+            "probable_arbitrage"
+        }
+        crate::domain::enums::TransactionStatus::Success => "analyzed_multi_pool_unconfirmed",
+    };
+    let assessment = json!({
+        "method": "transaction_analysis_v1",
+        "analysis_id": analysis.analysis_id,
+        "input_digest": analysis.input_digest,
+        "analysis_status": enum_label(&analysis.analysis_status),
+        "transaction_status": enum_label(&analysis.status),
+        "recognizer_labels": recognizer_labels,
+        "scenario_kind": scenario_kind,
+        "unresolved_count": analysis.unresolved_items.len(),
+        "validation_count": analysis.validation_results.len(),
+        "reason": match assessment_status {
+            "analyzed_reverted" => "transaction did not execute successfully",
+            "analyzed_pending" => "transaction execution status is still pending",
+            "probable_arbitrage" => "transaction analysis produced an arbitrage-like signal; profit still requires complete priced net-flow and finality checks",
+            _ => "multi-pool swap signal was analyzed but no arbitrage recognizer confirmed intent",
+        }
+    });
+    sqlx::query(
+        r#"
+        update arbitrage_candidates
+        set confirmation_status = case
+              when confirmation_status like 'confirmed_%' then confirmation_status
+              else $3
+            end,
+            confirmation_metadata = confirmation_metadata || $4,
+            updated_at = now()
+        where chain_id = $1 and lower(tx_hash) = lower($2)
+        "#,
+    )
+    .bind(analysis.chain_id as i64)
+    .bind(&analysis.tx_hash)
+    .bind(assessment_status)
+    .bind(SqlJson(assessment))
+    .execute(&state.pool)
+    .await
+    .map_err(|err| WebError::internal(format!("update candidate assessment failed: {err}")))?;
+
+    let candidate = load_tx_candidate_context(state, analysis.chain_id, &analysis.tx_hash).await?;
+    let mut payload = serde_json::to_value(envelope)
+        .map_err(|err| WebError::internal(format!("analysis payload encode failed: {err}")))?;
+    if let (Some(candidate), Some(object)) = (candidate, payload.as_object_mut()) {
+        object.insert(
+            "candidate_context".to_owned(),
+            serde_json::to_value(candidate).unwrap_or_default(),
+        );
+    }
+    Ok(payload)
 }
 
 async fn load_arbitrage_hot_pools(
@@ -1883,6 +8843,31 @@ async fn indexer_api_keys_page(
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
+    if !WorkspacePlan::parse(&user.workspace_plan).allows(WorkspaceCapability::ScopedApi) {
+        let workspaces = load_execution_workspaces(
+            &state,
+            user.user_id,
+            WorkspacePlan::parse(&user.workspace_plan),
+        )
+        .await?;
+        let Some(workspace) = workspaces.first() else {
+            return Ok(Redirect::to("/app/onboarding").into_response());
+        };
+        let chain_id = workspace.chain_id.unwrap_or(state.default_chain_id);
+        let content = r#"<section class="ca-panel ei-detail-section"><div class="ei-empty-state ei-empty-wide"><strong>Enterprise API access</strong><p>Open schemas are public. Scoped access to private workspace events, Evidence Packs, reports, and operational datasets is available for Enterprise workspaces.</p><div class="button-row"><a class="ca-primary-button" href="/pilot">Discuss Enterprise Access</a><a class="ca-secondary-button" href="/app/schemas">Review Open Schemas</a></div></div></section>"#.to_owned();
+        return Ok(Html(render_private_workspace_shell(
+            &state,
+            &user,
+            "api",
+            "API",
+            chain_id,
+            &workspaces,
+            workspace,
+            WorkspaceRange::Last24Hours,
+            content,
+        ))
+        .into_response());
+    }
     render_dashboard_response(
         &state,
         user,
@@ -1911,6 +8896,210 @@ async fn indexer_api_keys_page(
     .await
 }
 
+async fn workspace_schemas_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<TodayQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let chain_id = workspace.chain_id.unwrap_or(state.default_chain_id);
+    let content = r#"<section class="ca-page-heading"><div><span class="ei-page-kicker">OPEN CONTRACTS</span><div class="ca-title-row"><h1>Schemas</h1><span>Public</span></div><p>Versioned evidence contracts can be reviewed without private API access.</p></div></section><section class="ei-report-grid"><article class="ca-panel ei-report-card"><div><span>OPEN SCHEMA</span><small>v1</small></div><h2>Evidence Pack</h2><p>Deterministic evidence, confidence, limitations, ruleset, and inputs digest.</p><footer><a class="ca-primary-button" href="/schemas/evidence-pack-v1.json">Open JSON Schema</a></footer></article><article class="ca-panel ei-report-card"><div><span>OPEN SCHEMA</span><small>v1</small></div><h2>Execution Event</h2><p>Status, severity, economic impact, participants, and evidence availability.</p><footer><a class="ca-primary-button" href="/schemas/execution-event-v1.json">Open JSON Schema</a></footer></article></section>"#.to_owned();
+    Ok(Html(render_private_workspace_shell(
+        &state,
+        &user,
+        "schemas",
+        "Schemas",
+        chain_id,
+        &workspaces,
+        workspace,
+        WorkspaceRange::parse(query.range.as_deref()),
+        content,
+    ))
+    .into_response())
+}
+
+async fn workspace_settings_page(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<TodayQuery>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    let workspaces = load_execution_workspaces(
+        &state,
+        user.user_id,
+        WorkspacePlan::parse(&user.workspace_plan),
+    )
+    .await?;
+    let Some(workspace) = selected_execution_workspace(&workspaces, query.workspace.as_deref())
+    else {
+        return Ok(Redirect::to("/app/onboarding").into_response());
+    };
+    let notifications = load_workspace_notifications(&state, workspace).await?;
+    let workspace_rows = workspaces
+        .iter()
+        .map(|item| {
+            format!(r#"<article class="ca-panel ei-monitor-card"><div><span class="ei-status {}">{}</span><small>{}</small></div><h2>{}</h2><dl><div><dt>Type</dt><dd>{}</dd></div><div><dt>Network</dt><dd>Chain {}</dd></div><div><dt>Observed objects</dt><dd>{}</dd></div><div><dt>Plan</dt><dd>{}</dd></div></dl><footer><a href="/app/overview?workspace={}">Open workspace →</a></footer></article>"#, if item.status == "active" { "verified" } else { "detected" }, escape_html(&item.status), if item.kind == WorkspaceKind::Demo { "Demo" } else { "Private" }, escape_html(&item.name), escape_html(&item.workspace_type), item.chain_id.unwrap_or_default(), item.monitored_entity_count, item.workspace_plan.label(), urlencoding::encode(&item.id))
+        })
+        .collect::<String>();
+    let notification_rows = if notifications.is_empty() {
+        r#"<div class="ei-empty-state"><strong>No notification channel connected</strong><p>Continuous observation still records changes in the workspace. Connect Telegram here when you want delivery outside LedgerFlow.</p></div>"#.to_owned()
+    } else {
+        notifications.iter().map(|channel| format!(
+            r#"<article class="ca-panel ei-destination-card"><span>{}</span><h2>{}</h2><p>{}</p><div><span class="ei-status {}">{}</span><small>Updated {}</small></div></article>"#,
+            escape_html(&channel.destination_type),
+            escape_html(&channel.display_name),
+            escape_html(channel.destination_ref.as_deref().map(|value| truncate_middle(value, 5)).as_deref().unwrap_or("Reference unavailable")),
+            if channel.operational && channel.enabled { "verified" } else { "detected" },
+            if channel.operational && channel.enabled { "Connected" } else { "Saved · unavailable" },
+            channel.updated_at.to_rfc3339(),
+        )).collect::<String>()
+    };
+    let notification_form = if WorkspacePlan::parse(&user.workspace_plan)
+        .allows(WorkspaceCapability::TelegramAlerts)
+        && workspace.kind == WorkspaceKind::Named
+    {
+        format!(
+            r#"<form class="ca-panel ei-investigation-create" method="post" action="/app/settings/notifications"><input type="hidden" name="workspace_id" value="{}"><input type="hidden" name="destination_type" value="telegram"><div class="ei-section-head compact"><div><span class="ei-section-kicker">TELEGRAM</span><h2>Connect notification channel</h2></div><span>Applied to watched objects</span></div><div class="ei-investigation-form-grid"><label><span>Display name</span><input name="display_name" value="Workspace alerts" required maxlength="160"></label><label><span>Chat or group reference</span><input name="destination_ref" placeholder="Configured Telegram chat/group reference" required></label></div><p class="panel-copy">Bot credentials stay in server configuration. This setting is reused by every object you watch in this workspace.</p><button class="ca-primary-button" type="submit">Save Telegram Channel</button></form>"#,
+            workspace_database_id(workspace)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        )
+    } else {
+        r#"<div class="notice info">Telegram delivery is available to approved Pilot and Enterprise workspaces. Email and Webhook delivery are not operational in this release.</div>"#.to_owned()
+    };
+    let notice = query
+        .notice
+        .as_deref()
+        .and_then(render_notice_message)
+        .map(|message| format!(r#"<div class="notice info">{}</div>"#, escape_html(message)))
+        .unwrap_or_default();
+    let content = format!(
+        r#"<section class="ca-page-heading"><div><span class="ei-page-kicker">ACCOUNT</span><div class="ca-title-row"><h1>Settings</h1><span>{} plan</span></div><p>Manage workspaces and notification channels. Observation starts from the object profile, not from channel configuration.</p></div><div class="ca-heading-actions"><a class="ca-primary-button" href="/app/onboarding">Create Workspace</a></div></section>{}<section class="ei-section"><div class="ei-section-head"><div><span class="ei-section-kicker">NOTIFICATION CHANNELS</span><h2>Workspace delivery</h2></div><span>Telegram operational · Email/Webhook unavailable</span></div><div class="ei-destination-grid">{}</div>{}</section><section class="ei-section"><div class="ei-section-head"><div><span class="ei-section-kicker">WORKSPACES</span><h2>Configured observation scopes</h2></div><span>{} total</span></div><div class="ei-investigation-grid">{}</div></section>"#,
+        WorkspacePlan::parse(&user.workspace_plan).label(),
+        notice,
+        notification_rows,
+        notification_form,
+        workspaces.len(),
+        workspace_rows
+    );
+    Ok(Html(render_private_workspace_shell(
+        &state,
+        &user,
+        "settings",
+        "Settings",
+        workspace.chain_id.unwrap_or(state.default_chain_id),
+        &workspaces,
+        workspace,
+        WorkspaceRange::parse(query.range.as_deref()),
+        content,
+    ))
+    .into_response())
+}
+
+async fn save_workspace_notification(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Form(form): Form<WorkspaceNotificationForm>,
+) -> Result<Response, WebError> {
+    let Some(user) = current_user(&state, &headers).await? else {
+        return Ok(Redirect::to("/auth?notice=auth-required").into_response());
+    };
+    if !WorkspacePlan::parse(&user.workspace_plan).allows(WorkspaceCapability::TelegramAlerts) {
+        return Ok(Redirect::to("/app/settings?notice=pilot-required").into_response());
+    }
+    ensure_owned_workspace(&state, user.user_id, form.workspace_id).await?;
+    if form.destination_type.trim() != "telegram" {
+        return Err(WebError::bad_request(
+            "only Telegram notifications are operational".to_owned(),
+        ));
+    }
+    let display_name = form.display_name.trim();
+    let destination_ref = form.destination_ref.trim();
+    if display_name.is_empty() || display_name.len() > 160 || destination_ref.is_empty() {
+        return Err(WebError::bad_request(
+            "notification name and Telegram reference are required".to_owned(),
+        ));
+    }
+    let mut transaction = state.pool.begin().await.map_err(|error| {
+        WebError::internal(format!("begin notification update failed: {error}"))
+    })?;
+    sqlx::query(
+        "delete from workspace_notification_destinations where workspace_id = $1 and destination_type = 'telegram'",
+    )
+    .bind(form.workspace_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("replace notification setting failed: {error}")))?;
+    sqlx::query(
+        r#"
+        insert into workspace_notification_destinations
+          (workspace_id, destination_type, display_name, destination_ref,
+           enabled, operational, metadata)
+        values ($1,'telegram',$2,$3,true,true,
+                jsonb_build_object('source','workspace_settings'))
+        "#,
+    )
+    .bind(form.workspace_id)
+    .bind(display_name)
+    .bind(destination_ref)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("save notification setting failed: {error}")))?;
+    sqlx::query(
+        r#"
+        delete from user_monitor_destinations destinations
+        using user_monitors monitors
+        where destinations.monitor_id = monitors.monitor_id
+          and monitors.user_id = $1 and monitors.workspace_id = $2
+          and destinations.destination_type = 'telegram'
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(form.workspace_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("refresh watch destinations failed: {error}")))?;
+    sqlx::query(
+        r#"
+        insert into user_monitor_destinations
+          (monitor_id, destination_type, display_name, destination_ref, enabled, metadata)
+        select monitors.monitor_id, 'telegram', $3, $4, true,
+               jsonb_build_object('source','workspace_notification_settings')
+        from user_monitors monitors
+        where monitors.user_id = $1 and monitors.workspace_id = $2
+          and monitors.status = 'active'
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(form.workspace_id)
+    .bind(display_name)
+    .bind(destination_ref)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|error| WebError::internal(format!("apply notification setting failed: {error}")))?;
+    transaction.commit().await.map_err(|error| {
+        WebError::internal(format!("commit notification setting failed: {error}"))
+    })?;
+    Ok(redirect_response(&format!(
+        "/app/settings?workspace=workspace:{}&notice=notification-saved",
+        form.workspace_id,
+    )))
+}
+
 async fn create_indexer_api_key(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -1919,6 +9108,9 @@ async fn create_indexer_api_key(
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
+    if !WorkspacePlan::parse(&user.workspace_plan).allows(WorkspaceCapability::ScopedApi) {
+        return Ok(Redirect::to("/app/api?notice=enterprise-required").into_response());
+    }
     let label = form.label.trim();
     if label.is_empty() {
         return Ok(
@@ -1951,6 +9143,9 @@ async fn revoke_indexer_api_key(
     let Some(user) = current_user(&state, &headers).await? else {
         return Ok(Redirect::to("/auth?notice=auth-required").into_response());
     };
+    if !WorkspacePlan::parse(&user.workspace_plan).allows(WorkspaceCapability::ScopedApi) {
+        return Ok(Redirect::to("/app/api?notice=enterprise-required").into_response());
+    }
     let _: IndexerApiKeyPayload = indexer_post_json(
         &state,
         state.default_chain_id,
@@ -2280,7 +9475,7 @@ async fn run_tx_analysis(
         form.tx_hash.trim(),
         form.chain_id
     );
-    let result = if mode == "reanalyze" {
+    let result: Result<AnalysisEnvelope, WebError> = if mode == "reanalyze" {
         api_post_json::<_, AnalysisEnvelope>(
             &state,
             form.chain_id,
@@ -2291,21 +9486,21 @@ async fn run_tx_analysis(
             },
         )
         .await
-        .map(|payload| serde_json::to_value(payload).unwrap_or_default())
     } else {
         match api_get_json::<AnalysisEnvelope>(&state, form.chain_id, &load_path).await {
-            Ok(payload) => Ok(serde_json::to_value(payload).unwrap_or_default()),
-            Err(_) => api_post_json::<_, AnalysisEnvelope>(
-                &state,
-                form.chain_id,
-                "/analyses/tx",
-                &AnalyzeTxRequest {
-                    chain_id: form.chain_id,
-                    tx_hash: form.tx_hash.clone(),
-                },
-            )
-            .await
-            .map(|payload| serde_json::to_value(payload).unwrap_or_default()),
+            Ok(payload) => Ok(payload),
+            Err(_) => {
+                api_post_json::<_, AnalysisEnvelope>(
+                    &state,
+                    form.chain_id,
+                    "/analyses/tx",
+                    &AnalyzeTxRequest {
+                        chain_id: form.chain_id,
+                        tx_hash: form.tx_hash.clone(),
+                    },
+                )
+                .await
+            }
         }
     };
 
@@ -2326,6 +9521,23 @@ async fn run_tx_analysis(
     };
     match result {
         Ok(payload) => {
+            let payload = match prepare_tx_analysis_payload(&state, payload).await {
+                Ok(payload) => payload,
+                Err(err) => {
+                    return render_dashboard_response(
+                        &state,
+                        user,
+                        query,
+                        None,
+                        None,
+                        Some(err.to_string()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+            };
             render_dashboard_response(
                 &state,
                 user,
@@ -2374,9 +9586,8 @@ async fn create_tx_analysis_share(
         &format!("/analyses/{}?chain_id={}", tx_hash, form.chain_id),
     )
     .await?;
-    let snapshot = serde_json::to_value(&payload)
-        .map_err(|err| WebError::internal(format!("share snapshot encode failed: {err}")))?;
     let (activity, reason, confidence) = summarize_primary_activity(&payload.analysis);
+    let snapshot = prepare_tx_analysis_payload(&state, payload).await?;
     let title = format!("{} transaction {}", activity, truncate_middle(&tx_hash, 10));
     let summary = format!("{reason} Confidence: {confidence}.");
     let share_id = Uuid::new_v4();
@@ -2421,7 +9632,7 @@ async fn public_tx_analysis_share(
         render_tx_analysis_result_with_share_url(&share.snapshot, false, Some(&share_url))
     );
     Ok(Html(render_marketing_page(
-        &format!("ChainActors share {}", share.share_id),
+        &format!("LedgerFlow share {}", share.share_id),
         user.as_ref(),
         content,
     )))
@@ -2596,6 +9807,14 @@ async fn render_dashboard_response(
     } else {
         (Vec::new(), None)
     };
+    let (graph_edges, graph_error) = if tab == DashboardTab::ClusterGraph {
+        match load_cluster_graph_edges(state, user.user_id).await {
+            Ok(edges) => (edges, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        }
+    } else {
+        (Vec::new(), None)
+    };
 
     let notice = query.notice.as_deref().and_then(render_notice_message);
     Ok(Html(render_dashboard_page(
@@ -2605,6 +9824,7 @@ async fn render_dashboard_response(
         notice,
         query.created_key.as_deref(),
         &clusters,
+        &graph_edges,
         editable_cluster,
         selected_cluster.as_ref(),
         tracking.as_ref(),
@@ -2629,7 +9849,8 @@ async fn render_dashboard_response(
             .as_deref()
             .or(cluster_error.as_deref())
             .or(indexer_error.as_deref())
-            .or(indexer_api_keys_error.as_deref()),
+            .or(indexer_api_keys_error.as_deref())
+            .or(graph_error.as_deref()),
         address_summary.as_ref(),
     ))
     .into_response())
@@ -3256,11 +10477,39 @@ fn render_notice_message(code: &str) -> Option<&'static str> {
         "alert-error" => {
             Some("Alert action failed. Refresh the cluster view and inspect server logs.")
         }
-        "indexer-key-created" => {
-            Some("Indexer API key created. Copy the full token now; the portal only shows it once.")
+        "behavior-review-saved" => Some("Behavior review decision saved with reviewer provenance."),
+        "behavior-review-error" => Some("Behavior review decision could not be saved."),
+        "watchlist-saved" => Some("Watchlist entry saved."),
+        "watchlist-deleted" => Some("Watchlist entry removed."),
+        "monitor-created" => Some(
+            "Monitor configuration saved. Delivery begins only when the configured worker consumes this workspace model.",
+        ),
+        "entity-added" => Some(
+            "Entity added. LedgerFlow is loading its evidence-backed profile; unavailable fields remain Unknown while analysis completes.",
+        ),
+        "observation-added" => Some(
+            "This object is now in your workspace. LedgerFlow is loading its Intelligence Profile; unavailable fields remain Unknown while analysis completes.",
+        ),
+        "monitoring-enabled" => Some(
+            "Continuous monitoring is enabled with evidence-backed default coverage. Configure Telegram once in Settings if you want external delivery.",
+        ),
+        "monitoring-already-enabled" => {
+            Some("Continuous monitoring is already enabled for this object.")
         }
-        "indexer-key-revoked" => Some("Indexer API key revoked."),
-        "indexer-key-label-required" => Some("Provide a label before creating an indexer API key."),
+        "notification-saved" => {
+            Some("Telegram is connected for this workspace and applied to active object watches.")
+        }
+        "workspace-configured" => Some(
+            "Workspace configured. Review the first entity profile before enabling continuous monitoring.",
+        ),
+        "demo-workspace-ready" => Some("Public-data demo workspace is ready."),
+        "investigation-created" => Some("Investigation created with its source evidence context."),
+        "investigation-updated" => Some("Investigation status and working notes updated."),
+        "indexer-key-created" => {
+            Some("API key created. Copy the full token now; the portal only shows it once.")
+        }
+        "indexer-key-revoked" => Some("API key revoked."),
+        "indexer-key-label-required" => Some("Provide a label before creating an API key."),
         "auth-required" => Some("Sign in to continue."),
         _ => None,
     }
@@ -3281,11 +10530,15 @@ fn render_marketing_page(title: &str, user: Option<&AppUser>, content: String) -
     <div class="shell">
       <header class="topbar">
         <a class="brand" href="/">{}</a>
-        <nav class="navlinks">
+        <nav class="navlinks" aria-label="Public navigation">
           <a href="/">Home</a>
-          <a href="/pricing">Pricing</a>
-          {}
+          <a href="/solutions">Solutions</a>
+          <a href="/research">Research</a>
+          <a href="/evidence">Evidence Explorer</a>
+          <a href="/api">API</a>
+          <a href="/about">About</a>
         </nav>
+        <div class="public-nav-actions"><a class="cta secondary" href="/pilot">Request Pilot</a>{}</div>
       </header>
       {}
     </div>
@@ -3295,94 +10548,343 @@ fn render_marketing_page(title: &str, user: Option<&AppUser>, content: String) -
         shared_styles(),
         brand_wordmark_html(),
         if user.is_some() {
-            "<a class=\"cta ghost\" href=\"/app/clusters\">Dashboard</a>".to_owned()
+            "<a class=\"cta ghost\" href=\"/app/overview\">Workspace</a>".to_owned()
         } else {
-            "<a class=\"cta ghost\" href=\"/auth\">Login / Register</a>".to_owned()
+            "<a class=\"cta ghost\" href=\"/auth\">Sign in</a>".to_owned()
         },
         content
     )
 }
 
-fn render_homepage_content(user: Option<&AppUser>) -> String {
-    format!(
-        r#"
-<section class="hero">
-  <div class="hero-copy">
-    <span class="eyebrow">Evidence-first onchain ops intelligence</span>
-    <h1>Track what your bots and EOAs actually spent, where it went, and which txs explain it.</h1>
-    <p>ChainActors combines indexer-fed transaction discovery with replayable transaction analysis, then turns that into operator-facing cluster summaries. It is built for address clusters, not explorer vanity metrics.</p>
+fn render_homepage_content(_user: Option<&AppUser>) -> String {
+    r#"
+<section class="public-hero">
+  <div class="public-hero-copy">
+    <span class="eyebrow">Execution Intelligence and Evidence Layer for EVM ecosystems</span>
+    <h1>Execution Intelligence and Evidence for Onchain Operations.</h1>
+    <p>LedgerFlow reconstructs economically meaningful blockchain events with deterministic evidence — from MEV and liquidations to protocol activity and execution behavior.</p>
     <div class="hero-actions">
-      <a class="cta primary" href="{}">{}</a>
-      <a class="cta secondary" href="/pricing">See pricing</a>
+      <a class="cta primary" href="/evidence">Explore Evidence</a>
+      <a class="cta secondary" href="/pilot">Request Pilot</a>
     </div>
   </div>
-  <div class="hero-card">
-    <div class="metric-card"><span>Cluster coverage</span><strong>discovered / analyzed / failed / pending</strong></div>
-    <div class="metric-card"><span>Spend attribution</span><strong>gas, external outflows, internal transfers, incoming</strong></div>
-    <div class="metric-card"><span>Debug layer</span><strong>single tx evidence pack and recognizer outputs</strong></div>
+  <aside class="public-evidence-card" aria-label="LedgerFlow evidence model">
+    <span>TRANSACTION → ECONOMIC CONTEXT</span>
+    <ol>
+      <li><b>01</b><div><strong>Reconstruct execution</strong><small>Transaction, receipt, logs, trace, exact gas</small></div></li>
+      <li><b>02</b><div><strong>Resolve economic flows</strong><small>Assets, protocols, participants, settlement</small></div></li>
+      <li><b>03</b><div><strong>Publish reproducible evidence</strong><small>Confidence, limitations, ruleset, inputs digest</small></div></li>
+    </ol>
+  </aside>
+</section>
+<section class="public-proof-strip" aria-label="Public validation artifacts">
+  <div><strong>100</strong><span>RPC-verified Base regression transactions</span></div>
+  <div><strong>LIVE</strong><span>Evidence publishing from the public Base Demo</span></div>
+  <div><strong>6</strong><span>Reviewed Base profit-accounting cases</span></div>
+  <div><strong>v1</strong><span>Versioned Evidence Pack schema</span></div>
+</section>
+<section class="public-section">
+  <header><span class="eyebrow">WHAT LEDGERFLOW DOES</span><h2>Existing tools show transactions. LedgerFlow explains execution.</h2><p>Built for chain, protocol, searcher, market-making, and infrastructure teams that need economic context with reproducible evidence.</p></header>
+  <div class="public-product-grid">
+    <article><span>01</span><h3>Reconstruct execution</h3><p>Resolve transaction, receipt, log, trace, protocol, participant, and settlement evidence into an ordered event.</p></article>
+    <article><span>02</span><h3>Measure economic impact</h3><p>Show exact asset flows, gas, and verified accounting while preserving unknown prices, intent, and ownership as unknown.</p></article>
+    <article><span>03</span><h3>Publish evidence</h3><p>Produce versioned Evidence Packs with confidence, limitations, ruleset identity, and deterministic input digests.</p></article>
+    <article><span>04</span><h3>Operate continuously</h3><p>Monitor scoped entities and deliver Telegram alerts, private investigations, and weekly reports through a Pilot.</p></article>
   </div>
 </section>
-<section class="feature-grid">
-  <article class="feature-card">
-    <h2>Homepage</h2>
-    <p>Operator-facing positioning, pricing, and auth entry instead of raw API exposure.</p>
-  </article>
-  <article class="feature-card">
-    <h2>Dashboard</h2>
-    <p>Cluster management, cluster analysis, and single-transaction analysis live in separated tabs so the product flow stays clear.</p>
-  </article>
-  <article class="feature-card">
-    <h2>Email code auth</h2>
-    <p>Passwordless login and registration by email verification code. Suitable for private beta operations without committing to a full identity stack too early.</p>
-  </article>
+<section class="public-split-section">
+  <div><span class="eyebrow">PUBLIC LAYER</span><h2>Research, evidence records, and open schemas.</h2><p>Public artifacts support grant review, developer education, and reproducible methodology without exposing customer data or internal infrastructure.</p><a href="/research">Browse technical research →</a></div>
+  <div><span class="eyebrow">PRIVATE PRODUCT</span><h2>Scoped operational intelligence through a Pilot.</h2><p>Bring 10–30 addresses or contracts. LedgerFlow configures monitoring, rules, evidence generation, Telegram delivery, investigations, and reports.</p><a href="/pilot">Request a Pilot →</a></div>
 </section>
-<section class="pricing-banner">
-  <div>
-    <span class="eyebrow">Pricing</span>
-    <h2>0.5 ETH / month</h2>
-    <p>Private beta is currently free for all invited users.</p>
-  </div>
-  <a class="cta secondary" href="/pricing">Open pricing</a>
+<section class="public-audience">
+  <span>BUILT FOR</span><div>Chains</div><div>Protocols</div><div>Searchers</div><div>Infrastructure teams</div><div>Onchain research</div>
 </section>
-"#,
-        if user.is_some() {
-            "/app/clusters"
-        } else {
-            "/auth"
-        },
-        if user.is_some() {
-            "Open dashboard"
-        } else {
-            "Request access"
-        }
+"#.to_owned()
+}
+
+fn render_public_research_content() -> String {
+    let cards = public_product::reports()
+        .iter()
+        .map(|report| {
+            format!(
+                r#"<article class="public-report-card"><div class="public-cover-placeholder"><span>{}</span><b>LedgerFlow Research</b></div><div class="public-report-card-copy"><div class="public-meta"><span>{}</span><time>{}</time><span>{} min read</span></div><h2>{}</h2><p>{}</p><footer><span>By {}</span><a href="/research/{}">Read article →</a></footer></div></article>"#,
+                escape_html(report.cover_label),
+                escape_html(report.category),
+                escape_html(report.published_date),
+                report.reading_time_minutes(),
+                escape_html(report.title),
+                escape_html(report.summary),
+                escape_html(report.author),
+                escape_html(report.slug),
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"<section class="public-page-heading"><span class="eyebrow">LEDGERFLOW RESEARCH</span><h1>Technical research on onchain execution.</h1><p>A public-good publication for MEV, liquidations, execution intelligence, and ecosystem measurement. Every article separates measured facts from detector signals and open limitations.</p></section><nav class="public-category-list" aria-label="Research categories"><span>MEV</span><span>Liquidations</span><span>Execution Intelligence</span><span>Ecosystem Reports</span></nav><section class="public-publication-note"><strong>Research is a technical publication.</strong><span>It supports grant review, developer education, and reproducible methodology; it is not product documentation.</span></section><section class="public-report-grid">{cards}</section>"#
     )
 }
 
-fn render_pricing_content() -> String {
+fn render_public_report_content(report: &public_product::PublicReport) -> String {
+    let related_events = report
+        .related_events
+        .iter()
+        .map(|tx_hash| {
+            if let Some(record) = public_product::evidence_records()
+                .iter()
+                .find(|record| record.tx_hash.eq_ignore_ascii_case(tx_hash))
+            {
+                format!(
+                    r#"<a href="/evidence/{}"><code>{}</code><span>Open evidence record →</span></a>"#,
+                    escape_html(record.slug),
+                    escape_html(&truncate_middle(tx_hash, 10)),
+                )
+            } else {
+                format!(
+                    r#"<a href="https://basescan.org/tx/{}" rel="noreferrer" target="_blank"><code>{}</code><span>Open public transaction ↗</span></a>"#,
+                    escape_html(tx_hash),
+                    escape_html(&truncate_middle(tx_hash, 10)),
+                )
+            }
+        })
+        .collect::<String>();
     format!(
-        r#"
-<section class="pricing-grid">
-  <article class="pricing-card featured">
-    <span class="eyebrow">Private beta plan</span>
-    <h1>{} ETH <small>/ month</small></h1>
-    <p>Built for a single operator or small desk that needs one place to manage address clusters, backfill historical transactions, and debug single txs.</p>
-    <ul class="flat-list">
-      <li>Cluster management dashboard</li>
-      <li>Historical backfill queue and coverage tracking</li>
-      <li>Single-tx evidence analysis</li>
-      <li>Email-based auth</li>
-    </ul>
-    <div class="price-note">Current beta status: <strong>free to use during internal testing</strong>.</div>
-    <a class="cta primary" href="/auth">Register for beta</a>
-  </article>
-  <article class="pricing-card">
-    <span class="eyebrow">Billing status</span>
-    <h2>Beta access is free right now</h2>
-    <p>Formal subscription pricing is still <strong>{} ETH / month</strong>, but enforcement is disabled during the current internal beta while workflow and recognizers continue to harden.</p>
-  </article>
+        r#"<article class="public-report-detail"><header><a class="public-back-link" href="/research">← Research</a><div class="public-meta"><span>{category}</span><time>{date}</time><span>{reading_time} min read</span><span>{author}</span></div><h1>{title}</h1><p>{summary}</p><div class="hero-actions"><a class="cta secondary" href="/research/{slug}/content.md">View Markdown</a><a class="cta ghost" href="/evidence">Explore evidence</a></div></header><div class="public-report-layout"><div class="public-markdown">{markdown}</div><aside><div class="public-cover-placeholder large"><span>{cover}</span><b>LedgerFlow Research</b></div><h2>Related public evidence</h2><div class="public-related-events">{related_events}</div><p>Related transactions are public chain references. They do not imply that every report conclusion applies to every linked transaction.</p></aside></div></article>"#,
+        category = escape_html(report.category),
+        date = escape_html(report.published_date),
+        reading_time = report.reading_time_minutes(),
+        author = escape_html(report.author),
+        title = escape_html(report.title),
+        summary = escape_html(report.summary),
+        slug = escape_html(report.slug),
+        markdown = render_public_markdown(report.markdown),
+        cover = escape_html(report.cover_label),
+    )
+}
+
+fn render_public_markdown(markdown: &str) -> String {
+    let mut options = MarkdownOptions::empty();
+    options.insert(MarkdownOptions::ENABLE_TABLES);
+    options.insert(MarkdownOptions::ENABLE_STRIKETHROUGH);
+    let parser = MarkdownParser::new_ext(markdown, options);
+    let mut rendered = String::new();
+    html::push_html(&mut rendered, parser);
+    rendered
+}
+
+fn public_filter_selected(value: Option<&str>, expected: &str) -> &'static str {
+    if value.is_some_and(|value| value.eq_ignore_ascii_case(expected)) {
+        " selected"
+    } else {
+        ""
+    }
+}
+
+fn public_evidence_matches(
+    record: &public_product::PublishedEvidenceRecord,
+    query: &PublicEvidenceQuery,
+) -> bool {
+    let matches = |value: Option<&str>, actual: &str| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none_or(|value| value.eq_ignore_ascii_case(actual))
+    };
+    let protocol_matches = query
+        .protocol
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none_or(|value| {
+            if value.eq_ignore_ascii_case("unknown") {
+                record.protocol.is_none()
+            } else {
+                record
+                    .protocol
+                    .as_deref()
+                    .is_some_and(|protocol| protocol.eq_ignore_ascii_case(value))
+            }
+        });
+    let date_matches = query
+        .date
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none_or(|value| {
+            record
+                .occurred_at
+                .as_deref()
+                .is_some_and(|occurred_at| occurred_at.starts_with(value))
+        });
+    matches(query.chain.as_deref(), &record.chain)
+        && matches(query.event_type.as_deref(), &record.event_type_key)
+        && protocol_matches
+        && matches(query.status.as_deref(), &record.status_key)
+        && date_matches
+        && matches(query.confidence.as_deref(), &record.confidence_level)
+}
+
+fn render_public_evidence_content(
+    records: &[public_product::PublishedEvidenceRecord],
+    query: &PublicEvidenceQuery,
+    source: &str,
+) -> String {
+    let rows = records
+        .iter()
+        .filter(|record| public_evidence_matches(record, query))
+        .map(|record| {
+            format!(
+                r#"<article class="public-evidence-row"><div class="public-evidence-kind"><span class="public-evidence-status {status_key}">{status}</span><strong>{event_type}</strong><small>{protocol}</small></div><div><small>CHAIN / DATE</small><strong>{chain}</strong><time>{occurred_at}</time></div><div><small>TRIGGER</small><strong>{trigger}</strong><code>{tx_hash}</code></div><div class="public-evidence-impact"><small>ECONOMIC IMPACT</small><p>{impact}</p></div><div><small>CONFIDENCE</small><strong>{confidence_level}</strong><span>{confidence}</span></div><a href="/evidence/{slug}" aria-label="Open {title}">Open evidence →</a></article>"#,
+                status_key = escape_html(&record.status_key),
+                status = escape_html(&record.status),
+                event_type = escape_html(&record.event_type),
+                protocol = escape_html(record.protocol.as_deref().unwrap_or("Protocol unresolved")),
+                chain = escape_html(&record.chain),
+                occurred_at = escape_html(record.occurred_at.as_deref().unwrap_or("Date unavailable")),
+                trigger = escape_html(&record.trigger),
+                tx_hash = escape_html(&truncate_middle(&record.tx_hash, 10)),
+                impact = escape_html(&record.economic_impact),
+                confidence_level = escape_html(&record.confidence_level),
+                confidence = escape_html(&record.confidence),
+                slug = escape_html(&record.slug),
+                title = escape_html(&record.title),
+            )
+        })
+        .collect::<String>();
+    let result_count = records
+        .iter()
+        .filter(|record| public_evidence_matches(record, query))
+        .count();
+    let rows = if rows.is_empty() {
+        r#"<div class="public-evidence-empty"><strong>No evidence records match these filters.</strong><span>Clear the filters to return to the complete public evidence set.</span><a href="/evidence">Clear filters</a></div>"#.to_owned()
+    } else {
+        rows
+    };
+    format!(
+        r#"<section class="public-page-heading"><span class="eyebrow">PUBLIC EVIDENCE EXPLORER</span><h1>Economic execution records, not marketing case studies.</h1><p>Inspect transaction-level conclusions, economic impact, participants, execution timelines, source evidence, confidence, and limitations. Verified and Detected records remain visibly distinct.</p></section>
+<form class="public-evidence-filters" method="get" action="/evidence" aria-label="Evidence filters">
+  <label><span>Chain</span><select name="chain"><option value="">All chains</option><option value="Base"{chain_base}>Base</option></select></label>
+  <label><span>Event type</span><select name="event_type"><option value="">All event types</option><option value="dex_arbitrage"{type_arbitrage}>DEX arbitrage</option><option value="liquidation"{type_liquidation}>Liquidation</option><option value="large_asset_flow"{type_flow}>Large asset flow</option><option value="high_cost_failure"{type_failure}>High-cost failure</option><option value="repeated_failed_attempts"{type_repeated}>Repeated failed attempts</option></select></label>
+  <label><span>Protocol</span><select name="protocol"><option value="">All protocols</option><option value="Uniswap Universal Router"{protocol_uniswap}>Uniswap Universal Router</option><option value="unknown"{protocol_unknown}>Unresolved / unavailable</option></select></label>
+  <label><span>Status</span><select name="status"><option value="">All statuses</option><option value="verified"{status_verified}>Verified</option><option value="detected"{status_detected}>Detected</option></select></label>
+  <label><span>Date</span><input type="date" name="date" value="{date}"></label>
+  <label><span>Confidence</span><select name="confidence"><option value="">All confidence</option><option value="High"{confidence_high}>High</option><option value="Medium"{confidence_medium}>Medium</option><option value="Low"{confidence_low}>Low</option><option value="Unknown"{confidence_unknown}>Unknown</option></select></label>
+  <button class="cta primary" type="submit">Apply filters</button><a href="/evidence">Clear</a>
+</form>
+<div class="public-evidence-list-head"><strong>{result_count} public evidence records</strong><span>Source: {source} · refreshes every 15 seconds</span></div>
+<section class="public-evidence-list">{rows}</section>"#,
+        chain_base = public_filter_selected(query.chain.as_deref(), "Base"),
+        type_arbitrage = public_filter_selected(query.event_type.as_deref(), "dex_arbitrage"),
+        type_liquidation = public_filter_selected(query.event_type.as_deref(), "liquidation"),
+        type_flow = public_filter_selected(query.event_type.as_deref(), "large_asset_flow"),
+        type_failure = public_filter_selected(query.event_type.as_deref(), "high_cost_failure"),
+        type_repeated =
+            public_filter_selected(query.event_type.as_deref(), "repeated_failed_attempts"),
+        protocol_uniswap =
+            public_filter_selected(query.protocol.as_deref(), "Uniswap Universal Router"),
+        protocol_unknown = public_filter_selected(query.protocol.as_deref(), "unknown"),
+        status_verified = public_filter_selected(query.status.as_deref(), "verified"),
+        status_detected = public_filter_selected(query.status.as_deref(), "detected"),
+        date = escape_html(query.date.as_deref().unwrap_or_default()),
+        confidence_high = public_filter_selected(query.confidence.as_deref(), "High"),
+        confidence_medium = public_filter_selected(query.confidence.as_deref(), "Medium"),
+        confidence_low = public_filter_selected(query.confidence.as_deref(), "Low"),
+        confidence_unknown = public_filter_selected(query.confidence.as_deref(), "Unknown"),
+        source = escape_html(source),
+    )
+}
+
+fn render_public_evidence_detail_content(
+    record: &public_product::PublishedEvidenceRecord,
+) -> String {
+    let list = |items: &[String]| {
+        items
+            .iter()
+            .map(|item| format!("<li>{}</li>", escape_html(item)))
+            .collect::<String>()
+    };
+    let timeline = record
+        .execution_timeline
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            format!(
+                r#"<li><b>{:02}</b><div><span>{}</span><p>{}</p></div></li>"#,
+                index + 1,
+                escape_html(&step.label),
+                escape_html(&step.detail),
+            )
+        })
+        .collect::<String>();
+    let related_entities = record
+        .related_entities
+        .iter()
+        .map(|entity| format!("<li><code>{}</code></li>", escape_html(entity)))
+        .collect::<String>();
+    let unverified = if record.status_key == "detected" {
+        r#"<div class="public-evidence-warning"><strong>Detected / Unverified</strong><span>The detector evidence is useful for review, but unresolved attribution prevents a Verified conclusion.</span></div>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<article class="public-evidence-detail"><header><a class="public-back-link" href="/evidence">← Evidence Explorer</a><div class="public-meta"><span class="public-evidence-status {status_key}">{status}</span><span>{event_type}</span><span>{chain} · chain {chain_id}</span><time>{occurred_at}</time></div><span class="eyebrow">CONCLUSION</span><h1>{title}</h1><p>{conclusion}</p><div class="public-evidence-verdict"><div><span>CONFIDENCE</span><strong>{confidence}</strong></div><div><span>PROTOCOL</span><strong>{protocol}</strong></div></div>{unverified}</header>
+<div class="public-evidence-facts"><section><span>TRANSACTION</span><code>{tx_hash}</code><a href="https://basescan.org/tx/{tx_hash}" target="_blank" rel="noreferrer">Open on public explorer ↗</a></section><section><span>ECONOMIC IMPACT</span><p>{economic_impact}</p></section></div>
+<section class="public-evidence-detail-section"><span class="eyebrow">ORDERED EXECUTION</span><h2>Execution Timeline</h2><ol class="public-execution-timeline">{timeline}</ol></section>
+<div class="public-evidence-columns"><section><h2>Participants</h2><ul>{participants}</ul></section><section><h2>Evidence</h2><ul>{evidence}</ul></section><section><h2>Related Entities</h2><ul class="public-related-entities">{related_entities}</ul></section></div>
+<section class="public-evidence-limitations"><span class="eyebrow">EVIDENCE BOUNDARY</span><h2>Limitations</h2><ul>{limitations}</ul></section></article>"#,
+        status_key = escape_html(&record.status_key),
+        status = escape_html(&record.status),
+        event_type = escape_html(&record.event_type),
+        chain = escape_html(&record.chain),
+        chain_id = record.chain_id,
+        occurred_at = escape_html(record.occurred_at.as_deref().unwrap_or("Date unavailable")),
+        title = escape_html(&record.title),
+        conclusion = escape_html(&record.conclusion),
+        confidence = escape_html(&record.confidence),
+        protocol = escape_html(record.protocol.as_deref().unwrap_or("Unresolved")),
+        unverified = unverified,
+        tx_hash = escape_html(&record.tx_hash),
+        economic_impact = escape_html(&record.economic_impact),
+        timeline = timeline,
+        participants = list(&record.participants),
+        evidence = list(&record.evidence_summary),
+        related_entities = related_entities,
+        limitations = list(&record.limitations),
+    )
+}
+
+fn render_public_solutions_content() -> String {
+    r#"<section class="public-page-heading"><span class="eyebrow">SOLUTIONS</span><h1>Execution intelligence organized around operational questions.</h1><p>LedgerFlow is not a generic analytics dashboard. It reconstructs economically meaningful events, preserves deterministic evidence, and delivers scoped operational monitoring.</p></section>
+<section class="public-solution-grid">
+  <article><span>DEX · LENDING · VAULTS</span><h2>Protocol Intelligence</h2><p>Understand how users, searchers, and liquidity interact with your protocol.</p><ul><li>MEV activity monitoring</li><li>Liquidation monitoring</li><li>Execution analysis</li><li>Treasury and economic events</li><li>Weekly reports</li></ul><a href="/pilot">Discuss a Protocol Pilot →</a></article>
+  <article><span>L2 · ECOSYSTEM TEAMS</span><h2>Chain Intelligence</h2><p>Build an evidence-backed view of execution behavior across an ecosystem.</p><ul><li>Ecosystem execution landscape</li><li>Searcher activity</li><li>Protocol activity</li><li>Economic event analysis</li></ul><a href="/pilot">Discuss a Chain Pilot →</a></article>
+  <article><span>SEARCHERS · MARKET MAKERS · FUNDS</span><h2>Searcher Intelligence</h2><p>Review execution performance and market structure from reproducible event evidence.</p><ul><li>Execution benchmarking</li><li>Competitor analysis</li><li>Failed attempts</li><li>Opportunity analysis</li></ul><a href="/pilot">Discuss a Searcher Pilot →</a></article>
+  <article><span>DEVELOPERS · INFRASTRUCTURE</span><h2>Evidence API</h2><p>Integrate stable evidence contracts into operational and research systems.</p><ul><li>Evidence Pack schema</li><li>Execution Event schema</li><li>Scoped API access</li></ul><a href="/api">Review schemas →</a></article>
 </section>
-"#,
-        DEFAULT_PRICE_ETH, DEFAULT_PRICE_ETH
+<section class="public-engagement" id="engagement-model"><header><span class="eyebrow">ACCESS MODEL</span><h2>What is public and what requires approved workspace access.</h2></header><div class="public-tier-grid"><article><span>PUBLIC · FREE</span><h3>Open evidence</h3><p>No account required.</p><ul><li>Research</li><li>Evidence Explorer</li><li>Open schemas</li></ul><a href="/evidence">Explore public evidence →</a></article><article class="featured"><span>PILOT · APPLICATION</span><h3>Operational monitoring trial</h3><p>Free to apply. Access is reviewed and released in limited evaluation cohorts.</p><ul><li>Monitored entities</li><li>Alerts and rules</li><li>Reports</li><li>Private investigations</li></ul><a href="/pilot">Apply for Pilot access →</a></article><article><span>ENTERPRISE · PRIVATE</span><h3>Operational integration</h3><p>For broader private deployments after evaluation.</p><ul><li>Scoped API</li><li>Private datasets</li><li>Operational intelligence</li></ul><a href="/pilot">Discuss scope →</a></article></div></section>
+<section class="public-product-boundary"><div><span>PUBLIC WEBSITE</span><strong>Research · Evidence Explorer · Open schemas</strong></div><div><span>PRIVATE APPLICATION</span><strong>Workspace · Monitoring · Alerts · Investigations · Reports · API</strong></div></section>"#.to_owned()
+}
+
+fn render_public_api_content() -> String {
+    r#"<section class="public-page-heading"><span class="eyebrow">API & OPEN CONTRACTS</span><h1>Evidence that can move between systems.</h1><p>LedgerFlow publishes the evidence contracts for review. Private operational API access remains scoped to Enterprise workspaces.</p></section>
+<section class="public-api-section"><header><span class="eyebrow">PUBLIC</span><h2>Open Schemas</h2><p>Versioned contracts that can be reviewed without an account.</p></header><div class="public-api-grid"><article><span>OPEN SCHEMA</span><h3>Evidence Pack v1</h3><p>Event identity, conclusion, entities, flows, cost, technical evidence, confidence, limitations, ruleset, and input digest.</p><a href="/schemas/evidence-pack-v1.json">Open Evidence Pack Schema →</a></article><article><span>OPEN SCHEMA</span><h3>Execution Event v1</h3><p>Status, severity, economic impact, participants, evidence availability, and nullable values for unresolved facts.</p><a href="/schemas/execution-event-v1.json">Open Execution Event Schema →</a></article><article><span>PUBLIC DATA</span><h3>Live Base Evidence Feed</h3><p>Continuously published, schema-validated Evidence Packs from explicitly public projects.</p><a href="/public/evidence/events.json">Open live event JSON →</a></article></div></section>
+<section class="public-api-access"><div><span class="eyebrow">ENTERPRISE</span><h2>Private API Access</h2><p>Scoped API access is available for Enterprise workspaces. The agreed scope can include project events, Evidence Packs, reports, and operational metrics.</p></div><a class="cta primary" href="/pilot">Discuss API access</a></section>
+<div class="public-boundary-note">API access never exposes private RPC URLs, credentials, internal Searcher infrastructure, or customer data outside the authorized workspace.</div>"#.to_owned()
+}
+
+fn render_public_about_content() -> String {
+    r#"<section class="public-page-heading"><span class="eyebrow">ABOUT LEDGERFLOW</span><h1>Execution Intelligence and Evidence Layer for EVM ecosystems.</h1><p>Existing tools show transactions. LedgerFlow explains execution — with a simple standard: a conclusion should never be stronger than its evidence.</p></section><section class="public-about-grid"><article><h2>Why</h2><p>Explorers expose raw execution data, while ecosystem and protocol teams still reconstruct economic context with private scripts and screenshots. LedgerFlow turns that work into a repeatable evidence system.</p></article><article><h2>How</h2><p>Deterministic extraction and accounting produce facts. Versioned rules produce event classifications. Language presents those facts without inventing missing evidence.</p></article><article><h2>Public goods</h2><p>Technical research, evidence records, open schemas, bounded datasets, and methodology make the work reviewable beyond a private dashboard.</p></article><article><h2>Commercial layer</h2><p>Private monitoring, custom intelligence, Telegram alerts, investigations, reports, API access, and service commitments fund continued operations.</p></article></section><section class="public-principles"><h2>Evidence principles</h2><div><span>01</span><p>Unknown is not zero.</p></div><div><span>02</span><p>Detected is not Verified.</p></div><div><span>03</span><p>A relationship is not ownership.</p></div><div><span>04</span><p>Language does not create facts.</p></div></section><section class="public-cta"><div><span class="eyebrow">WORK WITH LEDGERFLOW</span><h2>Need private operational monitoring?</h2><p>A Pilot is a scoped professional engagement for protocols, chains, searchers, and market makers.</p></div><a class="cta primary" href="/pilot">Request a Pilot</a></section>"#.to_owned()
+}
+
+fn render_pilot_content(submitted: bool, user: Option<&AppUser>) -> String {
+    let success = if submitted {
+        r#"<div class="public-success" role="status"><strong>Pilot request received.</strong><span>LedgerFlow will review the chain, addresses, and use case before proposing a scoped configuration.</span></div>"#
+    } else {
+        ""
+    };
+    let email = user.map(|user| user.email.as_str()).unwrap_or_default();
+    format!(
+        r#"<section class="public-page-heading pilot"><span class="eyebrow">APPLICATION-BASED PILOT ACCESS</span><h1>Apply for a LedgerFlow Pilot.</h1><p>Pilot applications are free. LedgerFlow reviews applications and periodically opens limited trial access for selected protocols, chains, searchers, and research teams. Bring 10–30 addresses or contracts to define the evaluation scope.</p></section>{success}<section class="public-pilot-audience"><span>FOR</span><strong>Protocol teams</strong><strong>Chain teams</strong><strong>Searchers and market makers</strong></section><section class="public-pilot-layout"><div><h2>What approved Pilot access includes</h2><ol><li><b>01</b><span><strong>Scope</strong>10–30 addresses or contracts with explicit roles and labels.</span></li><li><b>02</b><span><strong>Rules</strong>Material flows, execution events, failures, liquidations, and scoped economic signals.</span></li><li><b>03</b><span><strong>Delivery</strong>Telegram alerts, Evidence Packs, investigations, and weekly reports.</span></li><li><b>04</b><span><strong>Review</strong>Operator-assisted validation, known limitations, and an agreed evaluation window.</span></li></ol><p class="public-boundary-note">No payment is collected. Submitting an application does not automatically activate a production workspace; approved access is granted manually in limited evaluation cohorts.</p></div><form class="public-pilot-form" method="post" action="/pilot/submit"><label><span>Name</span><input name="name" maxlength="120" autocomplete="name" required></label><label><span>Email</span><input type="email" name="email" value="{email}" maxlength="320" autocomplete="email" required></label><label><span>Organization</span><input name="organization" maxlength="160" autocomplete="organization" required></label><label><span>Chain</span><select name="chain_id" required><option value="8453">Base</option><option value="4663">Robinhood Chain</option></select></label><label><span>Addresses / contracts</span><textarea name="addresses" rows="7" placeholder="One 0x address per line · 10–30 unique addresses" required></textarea></label><label><span>Use case</span><textarea name="use_case" rows="6" maxlength="4000" placeholder="What should LedgerFlow monitor, explain, or report?" required></textarea></label><label><span>Preferred contact</span><textarea name="contact" rows="3" maxlength="500" placeholder="Telegram, Signal, email, or another preferred contact channel" required></textarea></label><button class="cta primary" type="submit">Apply for Pilot Access</button><small>Do not submit private keys, RPC credentials, Telegram bot tokens, or confidential customer data.</small></form></section>"#,
+        email = escape_html(email),
     )
 }
 
@@ -3390,46 +10892,167 @@ fn render_auth_content(
     notice: Option<&str>,
     error: Option<String>,
     mode: &str,
-    email_delivery_mode: &str,
-    email_delivery_ready: bool,
+    method: &str,
+    email: Option<&str>,
 ) -> String {
-    format!(
+    let mode = normalize_auth_mode(Some(mode));
+    let method = normalize_login_method(Some(method));
+    let email = escape_html(email.unwrap_or_default());
+    let login_active = mode == "login";
+    let content = if mode == "signup" {
+        format!(
+            r#"<form class="auth-card auth-tab-panel" method="post" action="/auth/request-code" data-auth-code-form>
+  <div class="auth-card-heading">
+    <h2>Create account</h2>
+    <p>Set a password now, then verify your email to activate the account.</p>
+  </div>
+  <input type="hidden" name="purpose" value="signup">
+  <label>Email
+    <input type="email" name="email" value="{}" placeholder="ops@yourdesk.xyz" autocomplete="email" required>
+  </label>
+  <label>Password
+    <input type="password" name="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+  </label>
+  <label>Confirm password
+    <input type="password" name="password_confirm" minlength="8" maxlength="128" autocomplete="new-password" required>
+  </label>
+  <button class="cta primary" type="submit">Send verification code</button>
+  <p class="auth-footnote">Your account is created only after the email code is verified.</p>
+</form>"#,
+            email
+        )
+    } else {
+        let method_tabs = format!(
+            r#"<div class="auth-method-tabs" role="tablist" aria-label="Sign-in method">
+  <a class="auth-method-tab {}" role="tab" aria-selected="{}" href="/auth?mode=login&amp;method=password">Password</a>
+  <a class="auth-method-tab {}" role="tab" aria-selected="{}" href="/auth?mode=login&amp;method=code">Email code</a>
+</div>"#,
+            if method == "password" { "active" } else { "" },
+            method == "password",
+            if method == "code" { "active" } else { "" },
+            method == "code"
+        );
+        let form = if method == "code" {
+            format!(
+                r#"<form class="auth-card auth-tab-panel" method="post" action="/auth/request-code" data-auth-code-form>
+  <div class="auth-card-heading">
+    <h2>Sign in with an email code</h2>
+    <p>We will send a single-use code to your verified email.</p>
+  </div>
+  <input type="hidden" name="purpose" value="login">
+  <label>Email
+    <input type="email" name="email" value="{}" placeholder="ops@yourdesk.xyz" autocomplete="email" required>
+  </label>
+  <button class="cta primary" type="submit">Send login code</button>
+</form>"#,
+                email
+            )
+        } else {
+            format!(
+                r#"<form class="auth-card auth-tab-panel" method="post" action="/auth/password-login">
+  <div class="auth-card-heading">
+    <h2>Sign in with your password</h2>
+    <p>Use the verified email associated with your account.</p>
+  </div>
+  <label>Email
+    <input type="email" name="email" value="{}" placeholder="ops@yourdesk.xyz" autocomplete="username" required>
+  </label>
+  <label>Password
+    <input type="password" name="password" maxlength="128" autocomplete="current-password" required>
+  </label>
+  <button class="cta primary" type="submit">Sign in</button>
+  <a class="auth-inline-link" href="/auth?mode=login&amp;method=code">Use an email code instead</a>
+</form>"#,
+                email
+            )
+        };
+        format!("{method_tabs}{form}")
+    };
+
+    let page = format!(
         r#"
 <section class="auth-shell">
   <div class="auth-copy">
-    <span class="eyebrow">Access</span>
-    <h1>Login or register with a one-time email code.</h1>
-    <p>No password setup yet. Request a code, verify it, and you land in the dashboard.</p>
-    {}
+    <span class="eyebrow">Account access</span>
+    <h1>Sign in or create your account.</h1>
+    <p>Registration requires email verification. Returning users can choose a password or a one-time email code.</p>
     {}
     {}
   </div>
-  <div class="auth-grid">
-    <form class="auth-card" method="post" action="/auth/request-code">
-      <h2>Create account</h2>
-      <input type="hidden" name="purpose" value="signup">
-      <label>Email
-        <input type="email" name="email" placeholder="ops@yourdesk.xyz" required>
-      </label>
-      <button class="cta primary" type="submit">Send signup code</button>
-    </form>
-    <form class="auth-card" method="post" action="/auth/request-code">
-      <h2>Sign in</h2>
-      <input type="hidden" name="purpose" value="login">
-      <label>Email
-        <input type="email" name="email" placeholder="ops@yourdesk.xyz" required>
-      </label>
-      <button class="cta secondary" type="submit">Send login code</button>
-    </form>
+  <div class="auth-panel">
+    <div class="auth-tabs" role="tablist" aria-label="Account access">
+      <a class="auth-tab {}" role="tab" aria-selected="{}" href="/auth?mode=login">Sign in</a>
+      <a class="auth-tab {}" role="tab" aria-selected="{}" href="/auth?mode=signup">Create account</a>
+    </div>
+    {}
   </div>
-  <div class="mode-hint">Current mode: <strong>{}</strong></div>
 </section>
 "#,
-        render_email_delivery_notice(email_delivery_mode, email_delivery_ready),
         render_notice_block(notice),
         render_error_block(error.as_deref()),
-        escape_html(mode)
-    )
+        if login_active { "active" } else { "" },
+        login_active,
+        if login_active { "" } else { "active" },
+        !login_active,
+        content
+    );
+    format!("{page}{}", auth_code_request_script())
+}
+
+fn auth_code_request_script() -> &'static str {
+    r#"<script>
+(() => {
+  if (window.__ledgerflowAuthCodeBound) return;
+  window.__ledgerflowAuthCodeBound = true;
+  document.addEventListener("submit", async (event) => {
+    const form = event.target.closest?.("form[data-auth-code-form]");
+    if (!form) return;
+    event.preventDefault();
+    const button = form.querySelector("button[type=submit]");
+    const originalLabel = button?.textContent || "Send code";
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Sending…";
+    }
+    form.setAttribute("aria-busy", "true");
+    try {
+      const response = await fetch(form.action, {
+        method: "POST",
+        body: new URLSearchParams(new FormData(form)),
+        headers: { Accept: "text/html" },
+        credentials: "same-origin",
+      });
+      const html = await response.text();
+      const nextDocument = new DOMParser().parseFromString(html, "text/html");
+      const nextShell = nextDocument.querySelector(".auth-shell");
+      const currentShell = document.querySelector(".auth-shell");
+      if (!nextShell || !currentShell) {
+        window.location.assign(response.url || "/auth");
+        return;
+      }
+      currentShell.replaceWith(nextShell);
+      const nextUrl = new URL(response.url, window.location.href);
+      if (nextUrl.origin === window.location.origin && nextUrl.pathname === "/auth") {
+        window.history.replaceState({}, "", `${nextUrl.pathname}${nextUrl.search}`);
+      }
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } catch (_error) {
+      form.removeAttribute("aria-busy");
+      if (button) {
+        button.disabled = false;
+        button.textContent = originalLabel;
+      }
+      const copy = document.querySelector(".auth-copy");
+      if (copy && !copy.querySelector(".auth-network-error")) {
+        const notice = document.createElement("div");
+        notice.className = "notice error auth-network-error";
+        notice.textContent = "Unable to send the verification code. Please try again.";
+        copy.appendChild(notice);
+      }
+    }
+  });
+})();
+</script>"#
 }
 
 fn render_verify_content(
@@ -3438,58 +11061,1106 @@ fn render_verify_content(
     notice: Option<&str>,
     error: Option<String>,
 ) -> String {
+    let is_signup = purpose == "signup";
     format!(
         r#"
-<section class="verify-shell">
+<section class="auth-shell">
   <div class="auth-copy">
     <span class="eyebrow">Verify</span>
-    <h1>Enter the 6-digit code sent to {}</h1>
-    <p>This code flow is used for both signup and login. Codes expire quickly and are single-use.</p>
+    <h1>{}</h1>
+    <p>{}</p>
     {}
     {}
   </div>
-  <form class="auth-card narrow" method="post" action="/auth/verify">
-    <input type="hidden" name="email" value="{}">
-    <input type="hidden" name="purpose" value="{}">
-    <label>Verification code
-      <input type="text" name="code" placeholder="123456" inputmode="numeric" required>
-    </label>
-    <button class="cta primary" type="submit">Verify and continue</button>
-  </form>
+  <div class="auth-panel">
+    <div class="auth-tabs" role="tablist" aria-label="Account access">
+      <a class="auth-tab {}" role="tab" aria-selected="{}" href="/auth?mode=login">Sign in</a>
+      <a class="auth-tab {}" role="tab" aria-selected="{}" href="/auth?mode=signup">Create account</a>
+    </div>
+    <form class="auth-card auth-tab-panel" method="post" action="/auth/verify">
+      <input type="hidden" name="email" value="{}">
+      <input type="hidden" name="purpose" value="{}">
+      <label>Verification code
+        <input type="text" name="code" placeholder="123456" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{{6}}" maxlength="6" required autofocus>
+      </label>
+      <button class="cta primary" type="submit">{}</button>
+      <a class="auth-inline-link" href="{}">Back</a>
+    </form>
+  </div>
 </section>
 "#,
-        escape_html(email),
+        if is_signup {
+            format!("Verify {} to create your account", escape_html(email))
+        } else {
+            format!("Enter the sign-in code sent to {}", escape_html(email))
+        },
+        if is_signup {
+            "The account and password become active after this verification step."
+        } else {
+            "The code is single-use and expires shortly."
+        },
         render_notice_block(notice),
         render_error_block(error.as_deref()),
+        if is_signup { "" } else { "active" },
+        !is_signup,
+        if is_signup { "active" } else { "" },
+        is_signup,
         escape_html(email),
-        escape_html(purpose)
+        escape_html(purpose),
+        if is_signup {
+            "Verify and create account"
+        } else {
+            "Verify and sign in"
+        },
+        if is_signup {
+            "/auth?mode=signup"
+        } else {
+            "/auth?mode=login&amp;method=code"
+        }
     )
 }
 
-fn render_email_delivery_notice(email_delivery_mode: &str, email_delivery_ready: bool) -> String {
-    if email_delivery_ready {
+fn render_app_workspace_page(
+    state: &WebState,
+    user: &AppUser,
+    active: &str,
+    title: &str,
+    chain_id: u64,
+    notice: Option<&str>,
+    content: String,
+) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="LedgerFlow evidence-first on-chain intelligence.">
+    <title>{} · LedgerFlow</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
+    <style>{}</style>
+  </head>
+  <body class="dashboard-body ca-body">
+    <div class="dashboard-shell ca-shell">
+      {}
+      <div class="ca-workspace">
+        {}
+        <main class="dashboard-main">
+          <section class="dashboard-hero"><span class="eyebrow">EVIDENCE WORKBENCH</span><h1>{}</h1>{}</section>
+          {}
+        </main>
+      </div>
+    </div>
+  </body>
+</html>"#,
+        escape_html(title),
+        shared_styles(),
+        render_app_sidebar(user, active, None),
+        render_global_topbar(state, chain_id),
+        escape_html(title),
+        render_notice_block(notice),
+        content,
+    )
+}
+
+fn render_workspace_access_gate(
+    state: &WebState,
+    user: &AppUser,
+    active: &str,
+    title: &str,
+    chain_id: u64,
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+) -> String {
+    let content = format!(
+        r#"<section class="ca-page-heading"><div><span class="ei-page-kicker">PRIVATE INTELLIGENCE WORKSPACE</span><div class="ca-title-row"><h1>{}</h1><span>{} plan</span></div><p>Your workspace configuration is saved, but continuous customer intelligence is not enabled on the Free plan.</p></div></section>
+<section class="ca-panel ei-detail-section"><div class="ei-empty-state ei-empty-wide"><strong>Your workspace is configured, not activated</strong><p>LedgerFlow separates public evidence from private workspace intelligence. Approved Pilot trial access activates monitored events, Telegram alerts, investigations, and customer reports for the entities in <b>{}</b>.</p><div class="button-row"><a class="ca-primary-button" href="/pilot">Apply for Pilot Access</a><form method="post" action="/app/demo-workspace"><button class="ca-secondary-button" type="submit">Explore Demo Workspace</button></form><a class="ca-secondary-button" href="/evidence">Open Public Evidence</a></div></div></section>"#,
+        escape_html(title),
+        workspace.workspace_plan.label(),
+        escape_html(&workspace.name),
+    );
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head><body class="dashboard-body ca-body"><div class="dashboard-shell ca-shell">{sidebar}<div class="ca-workspace">{topbar}<main class="dashboard-main ca-main ei-main">{content}</main></div></div></body></html>"#,
+        title = escape_html(title),
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, active, None),
+        topbar = render_execution_topbar(
+            state,
+            chain_id,
+            workspaces,
+            workspace,
+            range,
+            "/app/overview"
+        ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_private_workspace_shell(
+    state: &WebState,
+    user: &AppUser,
+    active: &str,
+    title: &str,
+    chain_id: u64,
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    content: String,
+) -> String {
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head><body class="dashboard-body ca-body"><div class="dashboard-shell ca-shell">{sidebar}<div class="ca-workspace">{topbar}<main class="dashboard-main ca-main ei-main">{content}</main></div></div></body></html>"#,
+        title = escape_html(title),
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, active, None),
+        topbar = render_execution_topbar(
+            state,
+            chain_id,
+            workspaces,
+            workspace,
+            range,
+            match active {
+                "schemas" => "/app/schemas",
+                "settings" => "/app/settings",
+                "api" => "/app/api",
+                _ => "/app/overview",
+            },
+        ),
+    )
+}
+
+fn render_behavior_reviews_content(
+    chain_id: u64,
+    status: &str,
+    reviews: &[BehaviorReviewItem],
+    error: Option<&str>,
+) -> String {
+    let status_tabs = ["pending", "accepted", "rejected", "retracted"]
+        .iter()
+        .map(|value| {
+            format!(
+                r#"<a class="cluster-tab {}" href="/app/bots?chain_id={}&status={}">{}</a>"#,
+                if status == *value { "active" } else { "" },
+                chain_id,
+                value,
+                escape_html(value),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let rows = if reviews.is_empty() {
+        format!(
+            "<div class=\"empty-state\">There are no automation candidates with status {}. Transaction frequency alone is never used to label an address as a bot.</div>",
+            escape_html(status)
+        )
+    } else {
+        reviews
+            .iter()
+            .map(|review| {
+                let decision_form = if review.status == "pending" {
+                    format!(
+                        r#"<form class="review-decision-form" method="post" action="/app/bots/reviews/{}/decision">
+  <input type="hidden" name="chain_id" value="{}">
+  <input type="hidden" name="status" value="{}">
+  <label>Review rationale<textarea name="rationale" placeholder="Record the evidence for accepting or rejecting this candidate"></textarea></label>
+  <div class="button-row"><button class="cta secondary tiny" type="submit" name="decision" value="accept">Accept candidate</button><button class="cta ghost tiny danger" type="submit" name="decision" value="reject">Reject</button></div>
+</form>"#,
+                        review.review_id,
+                        chain_id,
+                        escape_html(status),
+                    )
+                } else {
+                    format!(
+                        "<p class=\"panel-copy\">reviewed by {} · {}</p>",
+                        escape_html(review.resolved_by.as_deref().unwrap_or("n/a")),
+                        escape_html(
+                            review
+                                .resolution_reason
+                                .as_deref()
+                                .unwrap_or("no rationale")
+                        )
+                    )
+                };
+                format!(
+                    r#"<article class="panel review-card">
+  <div class="panel-head"><div><span class="eyebrow">AUTOMATION CANDIDATE</span><h2>{}</h2></div><span class="badge">{} · {:.0}%</span></div>
+  <div class="panel-body">
+    <p class="panel-copy">Observation window #{}–#{} · method {} · expires {}</p>
+    <div class="button-row"><a class="cta ghost tiny" href="/app/address-analysis?chain_id={}&address={}">Open address analysis</a></div>
+    {}
+    {}
+  </div>
+</article>"#,
+                    render_copyable_code(&review.address, 10),
+                    escape_html(&review.status),
+                    review.confidence.clamp(0.0, 1.0) * 100.0,
+                    review
+                        .valid_from_block
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_owned()),
+                    review
+                        .valid_to_block
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "n/a".to_owned()),
+                    escape_html(&review.method_version),
+                    review
+                        .expires_at
+                        .map(|value| escape_html(&value.to_rfc3339()))
+                        .unwrap_or_else(|| "n/a".to_owned()),
+                    review.chain_id,
+                    urlencoding::encode(&review.address),
+                    render_json_details("Candidate evidence", &review.evidence, 10_000),
+                    decision_form,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    format!(
+        r#"<section class="panel"><div class="panel-head"><h2>Behavior Assertion Review Queue</h2><span class="badge">{} records</span></div><div class="panel-body"><p class="panel-copy">Automation candidates come from time-bounded statistical rules and require evidence-based human review. Acceptance creates a human-confirmed assertion.</p><div class="cluster-tabbar">{}</div>{}</div></section>{}<div class="review-list">{}</div>"#,
+        reviews.len(),
+        status_tabs,
+        render_error_block(error),
+        if status == "pending" {
+            "<div class=\"notice info\">Acceptance means the evidence supports an automation candidate. It does not confirm team identity, an MEV role, or malicious behavior.</div>"
+        } else {
+            ""
+        },
+        rows,
+    )
+}
+
+fn render_reports_page(
+    state: &WebState,
+    user: &AppUser,
+    chain_id: u64,
+    clusters: &[DashboardClusterRecord],
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    reports: &[WorkspaceReportRow],
+    object_briefs: &[(String, Option<String>, serde_json::Value)],
+    focus_entity: Option<&str>,
+) -> String {
+    let entity_context = focus_entity
+        .map(|entity| {
+            format!(
+                r#"<section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">OBSERVED OBJECT CONTEXT</span><h2>{}</h2></div><a href="/app/observations/{}?workspace={}">Return to profile →</a></div><div class="ei-empty-state"><strong>Object-scoped brief requested</strong><p>Existing generated briefs appear below. A new brief is shown only after the report worker creates an evidence-backed object snapshot; no generic summary is substituted.</p></div></section>"#,
+                escape_html(&truncate_middle(entity, 12)),
+                urlencoding::encode(entity),
+                urlencoding::encode(&workspace.id),
+            )
+        })
+        .unwrap_or_default();
+    let generated_object_briefs = object_briefs.iter().map(|(address,label,brief)| {
+        let brief_id=brief.get("id").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let brief_type=brief.get("type").and_then(serde_json::Value::as_str).unwrap_or("intelligence brief");
+        let title=brief.get("title").and_then(serde_json::Value::as_str).unwrap_or("Object Intelligence Brief");
+        let generated=brief.get("generated_at").and_then(serde_json::Value::as_str).unwrap_or("Timestamp unavailable");
+        format!(r#"<article class="ca-panel ei-report-card"><div><span>{}</span><small>Chain {}</small></div><h2>{}</h2><p>{} · <code>{}</code></p><dl><div><dt>Generated</dt><dd>{}</dd></div><div><dt>Evidence digest</dt><dd><code>{}</code></dd></div></dl><footer><a class="ca-primary-button" href="/app/observations/{}/briefs/{}?workspace={}">Open HTML</a><a class="ca-secondary-button" href="/app/observations/{}/briefs/{}?workspace={}&amp;format=md">Markdown</a></footer></article>"#,escape_html(&brief_type.replace('_'," ")),chain_id,escape_html(title),escape_html(label.as_deref().unwrap_or("Observed object")),escape_html(&truncate_middle(address,10)),escape_html(generated),escape_html(&truncate_middle(brief.get("inputs_digest").and_then(serde_json::Value::as_str).unwrap_or("Unavailable"),10)),urlencoding::encode(address),urlencoding::encode(brief_id),urlencoding::encode(&workspace.id),urlencoding::encode(address),urlencoding::encode(brief_id),urlencoding::encode(&workspace.id))
+    }).collect::<String>();
+    let legacy_workspace_reports = if reports.is_empty() && workspace.kind == WorkspaceKind::Demo {
+        r#"<article class="ca-panel ei-report-card"><div><span>DEMO WORKSPACE REPORT · PUBLIC DATA</span><small>Base</small></div><h2>Weekly Execution Report</h2><p>A real generated report from the public Base demo project. It is shown here only because this is the explicitly public Demo Workspace.</p><footer><a class="ca-primary-button" href="/demo/base-public/weekly-report">Open HTML</a><a class="ca-secondary-button" href="/demo/base-public/weekly-report.md">Markdown</a><a class="ca-secondary-button" href="/demo/base-public/events.json">Evidence JSON</a></footer></article>"#.to_owned()
+    } else if reports.is_empty() {
+        String::new()
+    } else {
+        reports.iter().map(|report| {
+            let window = match (report.window_start, report.window_end) {
+                (Some(start), Some(end)) => format!("{} → {}", start.format("%Y-%m-%d"), end.format("%Y-%m-%d")),
+                _ => report.window_key.clone(),
+            };
+            format!(r#"<article class="ca-panel ei-report-card"><div><span>WORKSPACE REPORT</span><small>Chain {}</small></div><h2>{}</h2><p>{}</p><dl><div><dt>Generated</dt><dd>{}</dd></div><div><dt>Evidence snapshot</dt><dd>{} bytes</dd></div><div><dt>Cluster ID</dt><dd>{}</dd></div></dl><footer><a class="ca-primary-button" href="/app/reports/{}/report.json">Export JSON</a><a class="ca-secondary-button" href="/app/clusters/{}">Open analysis</a></footer></article>"#, report.chain_id, escape_html(&report.cluster_name), escape_html(&window), report.generated_at.to_rfc3339(), report.report_json.to_string().len(), report.cluster_id, report.snapshot_id, report.cluster_id)
+        }).collect::<String>()
+    };
+    let workspace_reports = if generated_object_briefs.is_empty()
+        && legacy_workspace_reports.is_empty()
+    {
+        r#"<div class="ei-empty-state ei-empty-wide"><strong>Intelligence briefs are being generated</strong><p>24h, weekly, and monthly briefs appear automatically after an observed object's initial analysis completes.</p><a class="ca-secondary-button" href="/app/observations">Open Observed Objects</a></div>"#.to_owned()
+    } else {
+        format!("{generated_object_briefs}{legacy_workspace_reports}")
+    };
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Intelligence Briefs · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head><body class="dashboard-body ca-body"><div class="dashboard-shell ca-shell">{sidebar}<div class="ca-workspace">{topbar}<main class="dashboard-main ca-main ei-main"><section class="ca-page-heading"><div><span class="ei-page-kicker">OBJECT-BASED INTELLIGENCE OUTPUTS</span><div class="ca-title-row"><h1>Intelligence Briefs</h1><span>{workspace_name}</span></div><p>Automatic 24h, weekly, and monthly changes in behavior, relationships, economics, and evidence around observed objects.</p></div></section>{entity_context}<section class="ei-section"><div class="ei-section-head"><div><span class="ei-section-kicker">WORKSPACE BRIEFS</span><h2>Object intelligence briefs</h2></div><a href="/app/observations">Review observed objects →</a></div><div class="ei-report-grid">{workspace_reports}</div></section></main></div></div></body></html>"#,
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, "reports", clusters.first()),
+        topbar = render_execution_topbar(
+            state,
+            chain_id,
+            workspaces,
+            workspace,
+            range,
+            "/app/reports"
+        ),
+        workspace_reports = workspace_reports,
+        workspace_name = escape_html(&workspace.name),
+        entity_context = entity_context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_investigations_page(
+    state: &WebState,
+    user: &AppUser,
+    chain_id: u64,
+    clusters: &[DashboardClusterRecord],
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    query: &InvestigationPageQuery,
+    investigations: &[InvestigationRow],
+    source_event: Option<&ExecutionEvent>,
+) -> String {
+    let can_create = WorkspacePlan::parse(&user.workspace_plan)
+        .allows(WorkspaceCapability::PrivateInvestigations);
+    let create_form = if query.new == Some(1) && can_create {
+        let form_chain_id = source_event.map(|event| event.chain_id).unwrap_or(chain_id);
+        let title = source_event
+            .map(|event| {
+                format!(
+                    "{} · {}",
+                    event.event_type.label(),
+                    truncate_middle(&event.tx_hash, 9)
+                )
+            })
+            .unwrap_or_default();
+        let entity = query
+            .entity
+            .as_deref()
+            .or_else(|| {
+                source_event
+                    .and_then(|event| event.participants.first())
+                    .map(|entity| entity.address.as_str())
+            })
+            .unwrap_or("");
+        let conclusion = source_event
+            .map(|event| event.conclusion.as_str())
+            .unwrap_or("");
+        let event_context = source_event
+            .map(|event| {
+                format!(
+                    r#"<div class="ei-investigation-source"><span class="ei-status {}">{}</span><strong>{}</strong><small>{}</small></div>"#,
+                    event.status.key(),
+                    event.status.label(),
+                    escape_html(&event.conclusion),
+                    escape_html(&event.tx_hash),
+                )
+            })
+            .unwrap_or_else(|| r#"<div class="ei-investigation-source"><strong>No source event</strong><small>You can create an investigation from a transaction/address and add evidence later.</small></div>"#.to_owned());
+        format!(
+            r#"<section class="ca-panel ei-investigation-create"><div class="ei-section-head compact"><div><span class="ei-section-kicker">NEW INVESTIGATION</span><h2>Capture a working question</h2></div><a href="/app/investigations">Close ×</a></div><form method="post" action="/app/investigations/create"><input type="hidden" name="workspace_id" value="{workspace_id}"><input type="hidden" name="chain_id" value="{form_chain_id}"><input type="hidden" name="event_id" value="{event_id}"><div class="ei-investigation-form-grid"><label><span>Title</span><input name="title" value="{title}" placeholder="Execution anomaly near oracle update" required></label><label><span>Related entity · optional</span><input name="entity" value="{entity}" placeholder="0x..."></label><label class="wide"><span>Working conclusion</span><textarea name="working_conclusion" placeholder="What does the current evidence support?">{conclusion}</textarea></label><label><span>Open questions</span><textarea name="open_questions" placeholder="What remains unverified?"></textarea></label><label><span>Notes</span><textarea name="notes" placeholder="Investigation notes"></textarea></label></div>{event_context}<div class="ei-wizard-actions"><a class="ca-secondary-button" href="/app/investigations">Cancel</a><button class="ca-primary-button" type="submit">Create Investigation</button></div></form></section>"#,
+            workspace_id = workspace_database_id(workspace)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            event_id = escape_html(query.event_id.as_deref().unwrap_or("")),
+            title = escape_html(&title),
+            entity = escape_html(entity),
+            conclusion = escape_html(conclusion),
+        )
+    } else if query.new == Some(1) {
+        r#"<div class="notice info">Creating private investigations requires a Pilot workspace. The Demo Workspace remains read-only.</div>"#.to_owned()
+    } else {
+        String::new()
+    };
+    let status_filter = [
+        ("", "All"),
+        ("open", "Open"),
+        ("in_review", "In Review"),
+        ("resolved", "Resolved"),
+        ("archived", "Archived"),
+    ]
+    .into_iter()
+    .map(|(key, label)| {
+        let active = query.status.as_deref().unwrap_or("") == key;
+        format!(
+            r#"<a class="{}" href="/app/investigations?chain_id={chain_id}&status={key}">{label}</a>"#,
+            if active { "active" } else { "" }
+        )
+    })
+    .collect::<String>();
+    let cards = if investigations.is_empty() {
+        r#"<div class="ei-empty-state ei-empty-wide"><strong>No investigations yet</strong><p>Create an investigation from any execution event, transaction, or address.</p><div class="button-row"><a class="ca-primary-button" href="/app/events">Browse execution events</a><a class="ca-secondary-button" href="/app/investigations?new=1">Create manually</a></div></div>"#.to_owned()
+    } else {
+        investigations
+            .iter()
+            .map(|investigation| render_investigation_card(investigation, &workspace.id))
+            .collect::<String>()
+    };
+    let notice = query
+        .notice
+        .as_deref()
+        .and_then(render_notice_message)
+        .unwrap_or_default();
+    let create_action = if can_create {
+        format!(
+            r#"<a class="ca-primary-button" href="/app/investigations?new=1&chain_id={chain_id}&workspace={}">+ New Investigation</a>"#,
+            urlencoding::encode(&workspace.id)
+        )
+    } else {
+        r#"<a class="ca-primary-button" href="/pilot">Activate Investigations</a>"#.to_owned()
+    };
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Investigations · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head><body class="dashboard-body ca-body"><div class="dashboard-shell ca-shell">{sidebar}<div class="ca-workspace">{topbar}<main class="dashboard-main ca-main ei-main"><section class="ca-page-heading"><div><span class="ei-page-kicker">EVIDENCE WORKSPACE</span><div class="ca-title-row"><h1>Investigations</h1><span>{count} records</span></div><p>Move from an event signal to a working conclusion, open questions, evidence, and a resolved outcome.</p></div><div class="ca-heading-actions">{create_action}<a class="ca-secondary-button" href="/app/tx-analysis?chain_id={chain_id}">Investigate transaction</a></div></section>{notice}{create_form}<nav class="ei-view-tabs">{status_filter}</nav><section class="ei-investigation-grid">{cards}</section></main></div></div></body></html>"#,
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, "investigations", clusters.first()),
+        topbar = render_execution_topbar(
+            state,
+            chain_id,
+            workspaces,
+            workspace,
+            range,
+            "/app/investigations"
+        ),
+        count = investigations.len(),
+        notice = notice,
+        create_form = create_form,
+        status_filter = status_filter,
+        cards = cards,
+        create_action = create_action,
+    )
+}
+
+fn investigation_status_label(status: &str) -> (&'static str, &'static str) {
+    match status {
+        "in_review" => ("In Review", "investigating"),
+        "resolved" => ("Resolved", "resolved"),
+        "archived" => ("Archived", "dismissed"),
+        _ => ("Open", "detected"),
+    }
+}
+
+fn render_investigation_card(investigation: &InvestigationRow, workspace_id: &str) -> String {
+    let (status, status_class) = investigation_status_label(&investigation.status);
+    format!(
+        r#"<a class="ca-panel ei-investigation-card" href="/app/investigations/{}?workspace={}"><div><span class="ei-status {}">{}</span><small>Chain {}</small></div><h2>{}</h2><p>{}</p><dl><div><dt>Related events</dt><dd>{}</dd></div><div><dt>Related entities</dt><dd>{}</dd></div><div><dt>Open questions</dt><dd>{}</dd></div></dl><footer><span>Updated {}</span><b>Open investigation →</b></footer></a>"#,
+        investigation.investigation_id,
+        urlencoding::encode(workspace_id),
+        status_class,
+        status,
+        investigation.chain_id,
+        escape_html(&investigation.title),
+        escape_html(
+            investigation
+                .working_conclusion
+                .as_deref()
+                .unwrap_or("No working conclusion yet")
+        ),
+        investigation.related_event_ids.len(),
+        investigation.related_entities.len(),
+        if investigation.open_questions.is_some() {
+            "Recorded"
+        } else {
+            "None"
+        },
+        investigation.updated_at.to_rfc3339(),
+    )
+}
+
+fn render_investigation_detail_page(
+    state: &WebState,
+    user: &AppUser,
+    clusters: &[DashboardClusterRecord],
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    investigation: &InvestigationRow,
+    notice: Option<&str>,
+) -> String {
+    let (status, status_class) = investigation_status_label(&investigation.status);
+    let event_links = if investigation.related_event_ids.is_empty() {
+        "No related events".to_owned()
+    } else {
+        investigation
+            .related_event_ids
+            .iter()
+            .map(|event_id| {
+                format!(
+                    r#"<a href="/app/events/{}">{} →</a>"#,
+                    urlencoding::encode(event_id),
+                    escape_html(event_id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let entity_links = if investigation.related_entities.is_empty() {
+        "No related entities".to_owned()
+    } else {
+        investigation
+            .related_entities
+            .iter()
+            .map(|entity| {
+                format!(
+                    r#"<a href="/app/observations/{}?workspace={}">{}</a>"#,
+                    urlencoding::encode(entity),
+                    urlencoding::encode(&workspace.id),
+                    escape_html(&truncate_middle(entity, 9))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let raw_evidence =
+        serde_json::to_string_pretty(&investigation.evidence).unwrap_or_else(|_| "{}".to_owned());
+    let status_options = [
+        ("open", "Open"),
+        ("in_review", "In Review"),
+        ("resolved", "Resolved"),
+        ("archived", "Archived"),
+    ]
+    .into_iter()
+    .map(|(key, label)| {
+        format!(
+            r#"<option value="{key}" {}>{label}</option>"#,
+            if investigation.status == key {
+                "selected"
+            } else {
+                ""
+            }
+        )
+    })
+    .collect::<String>();
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{title} · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head><body class="dashboard-body ca-body"><div class="dashboard-shell ca-shell">{sidebar}<div class="ca-workspace">{topbar}<main class="dashboard-main ca-main ei-main"><a class="ei-back-link" href="/app/investigations">← All Investigations</a>{notice}<section class="ca-panel ei-conclusion-card"><div class="ei-event-labels"><span class="ei-status {status_class}">{status}</span><span class="ei-event-type">INVESTIGATION</span></div><span class="ei-section-kicker">WORKING CONCLUSION</span><h1>{title}</h1><p>{conclusion}</p><dl><div><dt>Network</dt><dd>Chain {chain_id}</dd></div><div><dt>Related events</dt><dd>{event_count}</dd></div><div><dt>Related entities</dt><dd>{entity_count}</dd></div><div><dt>Created</dt><dd>{created}</dd></div><div><dt>Updated</dt><dd>{updated}</dd></div><div><dt>Owner</dt><dd>Unavailable</dd></div></dl></section><section class="ei-investigation-detail-grid"><form class="ca-panel ei-investigation-editor" method="post" action="/app/investigations/{investigation_id}/update"><div class="ei-section-head compact"><div><span class="ei-section-kicker">WORKSPACE NOTES</span><h2>Update Investigation</h2></div></div><label><span>Status</span><select name="status">{status_options}</select></label><label><span>Working conclusion</span><textarea name="working_conclusion">{working_conclusion}</textarea></label><label><span>Open questions</span><textarea name="open_questions">{open_questions}</textarea></label><label><span>Notes</span><textarea name="notes">{notes}</textarea></label><button class="ca-primary-button" type="submit">Save Investigation</button></form><aside class="ei-investigation-context"><section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">RELATED EVENTS</span><h2>Execution Events</h2></div></div><div class="ei-context-links">{event_links}</div></section><section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">RELATED ENTITIES</span><h2>Entities</h2></div></div><div class="ei-context-links">{entity_links}</div></section><details class="ca-panel ei-evidence-panel"><summary><span><small>EVIDENCE SNAPSHOT</small><strong>Source evidence captured at creation</strong></span><b>Open ↓</b></summary><div class="ei-evidence-body"><pre class="json-shell">{raw_evidence}</pre></div></details></aside></section></main></div></div></body></html>"#,
+        title = escape_html(&investigation.title),
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, "investigations", clusters.first()),
+        topbar = render_execution_topbar(
+            state,
+            investigation.chain_id,
+            workspaces,
+            workspace,
+            range,
+            "/app/investigations"
+        ),
+        notice = notice.unwrap_or(""),
+        status_class = status_class,
+        status = status,
+        conclusion = escape_html(
+            investigation
+                .working_conclusion
+                .as_deref()
+                .unwrap_or("No working conclusion yet")
+        ),
+        chain_id = investigation.chain_id,
+        event_count = investigation.related_event_ids.len(),
+        entity_count = investigation.related_entities.len(),
+        created = investigation.created_at.to_rfc3339(),
+        updated = investigation.updated_at.to_rfc3339(),
+        investigation_id = investigation.investigation_id,
+        status_options = status_options,
+        working_conclusion = escape_html(investigation.working_conclusion.as_deref().unwrap_or("")),
+        open_questions = escape_html(investigation.open_questions.as_deref().unwrap_or("")),
+        notes = escape_html(investigation.notes.as_deref().unwrap_or("")),
+        event_links = event_links,
+        entity_links = entity_links,
+        raw_evidence = escape_html(&raw_evidence),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_monitors_page(
+    state: &WebState,
+    user: &AppUser,
+    chain_id: u64,
+    clusters: &[DashboardClusterRecord],
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    query: &MonitorPageQuery,
+    monitors: &[UserMonitorRow],
+    rules: &[UserMonitorRuleRow],
+    destinations: &[UserMonitorDestinationRow],
+    deliveries: &[UserMonitorDeliveryRow],
+    legacy_entries: &[WatchlistEntryRow],
+    alerts: &[GlobalAlertRow],
+) -> String {
+    let tab = match query.tab.as_deref() {
+        Some("rules") => "rules",
+        Some("destinations") => "destinations",
+        Some("delivery") => "delivery",
+        _ => "entities",
+    };
+    let tabs = [
+        ("entities", "Monitored Entities"),
+        ("rules", "Rules"),
+        ("destinations", "Destinations"),
+        ("delivery", "Delivery History"),
+    ]
+    .into_iter()
+    .map(|(key, label)| {
+        format!(
+            r#"<a class="{}" href="/app/monitors?tab={key}&chain_id={chain_id}&workspace={}">{label}</a>"#,
+            if tab == key { "active" } else { "" },
+            urlencoding::encode(&workspace.id),
+        )
+    })
+    .collect::<String>();
+    let content = match tab {
+        "rules" => render_monitor_rules(rules, query.event_type.as_deref()),
+        "destinations" => render_monitor_destinations(destinations),
+        "delivery" => render_monitor_deliveries(deliveries, alerts),
+        _ => render_monitored_entities(monitors, legacy_entries),
+    };
+    let can_manage = WorkspacePlan::parse(&user.workspace_plan)
+        .allows(WorkspaceCapability::CustomMonitoredEntities);
+    let wizard = if can_manage {
+        query
+            .step
+            .map(|step| render_monitor_wizard(state, chain_id, workspace, step.clamp(1, 4), query))
+            .unwrap_or_default()
+    } else if query.step.is_some() {
+        r#"<div class="notice info">The Demo Workspace is read-only. Creating operational monitors requires a Pilot workspace.</div>"#.to_owned()
+    } else {
+        String::new()
+    };
+    let notice = query
+        .notice
+        .as_deref()
+        .and_then(render_notice_message)
+        .unwrap_or_default();
+    let create_action = if can_manage {
+        format!(
+            r#"<a class="ca-primary-button" href="/app/monitors?step=1&chain_id={chain_id}&workspace={}">+ Create Monitor</a>"#,
+            urlencoding::encode(&workspace.id)
+        )
+    } else {
+        r#"<a class="ca-primary-button" href="/pilot">Activate Monitoring</a>"#.to_owned()
+    };
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Monitors · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head><body class="dashboard-body ca-body"><div class="dashboard-shell ca-shell">{sidebar}<div class="ca-workspace">{topbar}<main class="dashboard-main ca-main ei-main"><section class="ca-page-heading"><div><span class="ei-page-kicker">CONTINUOUS ENTITY MONITORING</span><div class="ca-title-row"><h1>All Active Monitoring Rules</h1><span>{monitor_count} configured</span></div><p>Monitoring follows entity intelligence: review an entity first, then enable behavior change, relationship, economic, protocol, or failure rules here.</p></div><div class="ca-heading-actions">{create_action}</div></section>{notice}{wizard}<nav class="ei-view-tabs" aria-label="Monitor configuration">{tabs}</nav>{content}<section class="ei-workflow-note"><strong>Delivery evidence</strong><span>A destination is considered operational only when delivery history confirms that the worker consumed it.</span></section></main></div></div></body></html>"#,
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, "monitors", clusters.first()),
+        topbar = render_execution_topbar(
+            state,
+            chain_id,
+            workspaces,
+            workspace,
+            range,
+            "/app/monitors"
+        ),
+        monitor_count = monitors.len(),
+        notice = notice,
+        wizard = wizard,
+        tabs = tabs,
+        content = content,
+        create_action = create_action,
+    )
+}
+
+fn render_monitor_wizard(
+    state: &WebState,
+    chain_id: u64,
+    workspace: &WorkspaceRef,
+    step: u8,
+    query: &MonitorPageQuery,
+) -> String {
+    let progress = (1..=4)
+        .map(|index| {
+            let label = match index {
+                1 => "Entities",
+                2 => "Roles",
+                3 => "Rules",
+                _ => "Telegram",
+            };
+            format!(
+                r#"<span class="{}"><b>{index}</b>{label}</span>"#,
+                if index == step {
+                    "active"
+                } else if index < step {
+                    "complete"
+                } else {
+                    ""
+                },
+            )
+        })
+        .collect::<String>();
+    let name = query.name.as_deref().unwrap_or("");
+    let addresses = query
+        .addresses
+        .as_deref()
+        .or(query.subject.as_deref())
+        .unwrap_or("");
+    let entity_kind = query.entity_kind.as_deref().unwrap_or("address");
+    let role = query.role.as_deref().unwrap_or("");
+    let label = query.label.as_deref().unwrap_or("");
+    let event_type = query.event_type.as_deref().unwrap_or("large_asset_flow");
+    let threshold = query.threshold.as_deref().unwrap_or("");
+    let threshold_asset = query.threshold_asset.as_deref().unwrap_or("USD");
+    let severity = query.severity.as_deref().unwrap_or("high");
+    let destination_name = query.destination_name.as_deref().unwrap_or("Telegram");
+    let destination_ref = query.destination_ref.as_deref().unwrap_or("");
+    let hidden = |name: &str, value: &str| {
+        format!(
+            r#"<input type="hidden" name="{}" value="{}">"#,
+            escape_html(name),
+            escape_html(value)
+        )
+    };
+    let chain_options = state
+        .chain_registry
+        .routes()
+        .iter()
+        .map(|route| {
+            format!(
+                r#"<option value="{}" {}>{}</option>"#,
+                route.chain_id,
+                if route.chain_id == chain_id {
+                    "selected"
+                } else {
+                    ""
+                },
+                escape_html(&route.display_name),
+            )
+        })
+        .collect::<String>();
+    let body = match step {
+        1 => format!(
+            r#"<form method="get" action="/app/monitors"><input type="hidden" name="step" value="2">{}{}{}{}{}{}{}{}<div class="ei-wizard-fields"><label><span>Monitor name</span><input name="name" value="{}" placeholder="Project Alpha Treasury" required></label><label><span>Network</span><select name="chain_id">{}</select></label><label class="wide"><span>Addresses / contracts · 1–30</span><textarea name="addresses" placeholder="One 0x address per line" required>{}</textarea></label></div><div class="ei-wizard-actions"><a class="ca-secondary-button" href="/app/monitors">Cancel</a><button class="ca-primary-button" type="submit">Continue to roles →</button></div></form>"#,
+            hidden("entity_kind", entity_kind),
+            hidden("role", role),
+            hidden("label", label),
+            hidden("event_type", event_type),
+            hidden("threshold", threshold),
+            hidden("threshold_asset", threshold_asset),
+            hidden("severity", severity),
+            hidden("destination_name", destination_name),
+            escape_html(name),
+            chain_options,
+            escape_html(addresses)
+        ),
+        2 => format!(
+            r#"<form method="get" action="/app/monitors"><input type="hidden" name="step" value="3">{}{}{}{}{}{}{}{}<div class="ei-wizard-fields"><label><span>Entity kind</span><select name="entity_kind"><option value="address" {}>Address</option><option value="contract" {}>Contract</option></select></label><label><span>Role</span><input name="role" value="{}" placeholder="Treasury / Router / Executor"></label><label><span>Label</span><input name="label" value="{}" placeholder="Project Alpha Treasury"></label></div><div class="ei-wizard-actions"><a class="ca-secondary-button" href="/app/monitors?step=1&chain_id={}&name={}&addresses={}">← Back</a><button class="ca-primary-button" type="submit">Continue to rules →</button></div></form>"#,
+            hidden("chain_id", &chain_id.to_string()),
+            hidden("name", name),
+            hidden("addresses", addresses),
+            hidden("event_type", event_type),
+            hidden("threshold", threshold),
+            hidden("threshold_asset", threshold_asset),
+            hidden("severity", severity),
+            hidden("destination_name", destination_name),
+            if entity_kind == "address" {
+                "selected"
+            } else {
+                ""
+            },
+            if entity_kind == "contract" {
+                "selected"
+            } else {
+                ""
+            },
+            escape_html(role),
+            escape_html(label),
+            chain_id,
+            urlencoding::encode(name),
+            urlencoding::encode(addresses)
+        ),
+        3 => {
+            let event_options = [
+                "large_asset_flow",
+                "treasury_movement",
+                "protocol_revenue",
+                "dex_arbitrage",
+                "backrun",
+                "liquidation",
+                "liquidation_attempt",
+                "repeated_failed_attempts",
+                "solver_execution",
+                "unknown_material_interaction",
+            ]
+            .into_iter()
+            .map(|value| {
+                format!(
+                    r#"<option value="{value}" {}>{}</option>"#,
+                    if value == event_type { "selected" } else { "" },
+                    ExecutionEventType::from_key(value).label()
+                )
+            })
+            .collect::<String>();
+            format!(
+                r#"<form method="get" action="/app/monitors"><input type="hidden" name="step" value="4">{}{}{}{}{}{}<div class="ei-wizard-fields"><label><span>Event type</span><select name="event_type">{}</select></label><label><span>Threshold · optional</span><input type="number" min="0" step="any" name="threshold" value="{}" placeholder="100000"></label><label><span>Threshold asset</span><input name="threshold_asset" value="{}" placeholder="USD / ETH / token"></label><label><span>Severity</span><select name="severity"><option value="low" {}>Low</option><option value="medium" {}>Medium</option><option value="high" {}>High</option><option value="critical" {}>Critical</option></select></label></div><div class="ei-wizard-actions"><a class="ca-secondary-button" href="/app/monitors?step=2&chain_id={}&name={}&addresses={}">← Back</a><button class="ca-primary-button" type="submit">Continue to destination →</button></div></form>"#,
+                hidden("chain_id", &chain_id.to_string()),
+                hidden("name", name),
+                hidden("addresses", addresses),
+                hidden("entity_kind", entity_kind),
+                hidden("role", role),
+                hidden("label", label),
+                event_options,
+                escape_html(threshold),
+                escape_html(threshold_asset),
+                if severity == "low" { "selected" } else { "" },
+                if severity == "medium" { "selected" } else { "" },
+                if severity == "high" { "selected" } else { "" },
+                if severity == "critical" {
+                    "selected"
+                } else {
+                    ""
+                },
+                chain_id,
+                urlencoding::encode(name),
+                urlencoding::encode(addresses)
+            )
+        }
+        _ => format!(
+            r#"<form method="post" action="/app/monitors/create">{}{}{}{}{}{}{}{}{}{}{}<div class="ei-wizard-fields"><label><span>Destination</span><select disabled><option>Telegram</option></select><input type="hidden" name="destination_name" value="{}"></label><label><span>Telegram chat / group reference</span><input name="destination_ref" value="{}" placeholder="chat ID or configured group reference" required></label><div class="ei-wizard-review"><span>Monitor</span><strong>{}</strong><small>{} entity lines · {} · severity {}</small></div></div><div class="ei-wizard-actions"><a class="ca-secondary-button" href="/app/monitors?step=3&chain_id={}&name={}&addresses={}">← Back</a><button class="ca-primary-button" type="submit">Save Monitor</button></div></form>"#,
+            hidden(
+                "workspace_id",
+                &workspace_database_id(workspace)
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            ),
+            hidden("chain_id", &chain_id.to_string()),
+            hidden("name", name),
+            hidden("addresses", addresses),
+            hidden("entity_kind", entity_kind),
+            hidden("role", role),
+            hidden("label", label),
+            hidden("event_type", event_type),
+            hidden("threshold", threshold),
+            hidden("threshold_asset", threshold_asset),
+            hidden("severity", severity),
+            escape_html(destination_name),
+            escape_html(destination_ref),
+            escape_html(name),
+            addresses
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+            escape_html(event_type),
+            escape_html(severity),
+            chain_id,
+            urlencoding::encode(name),
+            urlencoding::encode(addresses)
+        ),
+    };
+    format!(
+        r#"<section class="ca-panel ei-monitor-wizard"><div class="ei-section-head compact"><div><span class="ei-section-kicker">2-MINUTE SETUP</span><h2>Create Monitor</h2></div><a href="/app/monitors">Close ×</a></div><div class="ei-wizard-progress">{progress}</div><div class="ei-wizard-body">{body}</div></section>"#
+    )
+}
+
+fn render_monitored_entities(
+    monitors: &[UserMonitorRow],
+    legacy_entries: &[WatchlistEntryRow],
+) -> String {
+    let monitor_cards = if monitors.is_empty() {
+        r#"<div class="ei-empty-state ei-empty-wide"><strong>No monitored systems yet</strong><p>Add addresses or contracts to receive material execution alerts, transaction explanations, and weekly reports.</p><a class="ca-primary-button" href="/app/monitors?step=1">Add your first monitor</a></div>"#.to_owned()
+    } else {
+        monitors.iter().map(|monitor| format!(r#"<article class="ca-panel ei-monitor-card"><div><span class="ei-status {}">{}</span><small>Chain {}</small></div><h2>{}</h2><dl><div><dt>Entities</dt><dd>{}</dd></div><div><dt>Rules</dt><dd>{}</dd></div><div><dt>Destinations</dt><dd>{}</dd></div><div><dt>Deliveries</dt><dd>{}</dd></div></dl><footer><span>Updated {}</span><code>{}</code></footer></article>"#, if monitor.status == "active" { "verified" } else { "detected" }, escape_html(&monitor.status), monitor.chain_id, escape_html(&monitor.name), monitor.entity_count, monitor.rule_count, monitor.destination_count, monitor.delivery_count, monitor.updated_at.to_rfc3339(), monitor.monitor_id)).collect::<String>()
+    };
+    let legacy = if legacy_entries.is_empty() {
+        String::new()
+    } else {
+        let rows = legacy_entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                    escape_html(entry.label.as_deref().unwrap_or("Unlabeled")),
+                    escape_html(&entry.subject_type),
+                    escape_html(&truncate_middle(&entry.subject_key, 9)),
+                    entry.created_at.to_rfc3339()
+                )
+            })
+            .collect::<String>();
+        format!(
+            r#"<section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">LEGACY COMPATIBILITY</span><h2>Existing Watchlist Entries</h2></div><span>Preserved; migrate into a Monitor when ready</span></div><div class="table-shell ei-table"><table><thead><tr><th>Label</th><th>Type</th><th>Subject</th><th>Created</th></tr></thead><tbody>{rows}</tbody></table></div></section>"#
+        )
+    };
+    format!(r#"<section class="ei-monitor-grid">{monitor_cards}</section>{legacy}"#)
+}
+
+fn render_monitor_rules(rules: &[UserMonitorRuleRow], suggested: Option<&str>) -> String {
+    let suggestion = suggested.map(|value| format!(r#"<div class="notice info">Suggested event type from the selected event: <strong>{}</strong>. Create a Monitor to persist this rule with entities and a destination.</div>"#, escape_html(value))).unwrap_or_default();
+    if rules.is_empty() {
         return format!(
-            "<div class=\"notice success\">Verification emails are being delivered through <strong>{}</strong>.</div>",
-            escape_html(email_delivery_mode)
+            r#"{suggestion}<div class="ei-empty-state ei-empty-wide"><strong>No monitor rules</strong><p>Rules are created in context with their monitored entities and Telegram destination.</p><a class="ca-primary-button" href="/app/monitors?step=1&event_type={}">Create first rule</a></div>"#,
+            urlencoding::encode(suggested.unwrap_or("large_asset_flow"))
         );
     }
+    let rows = rules.iter().map(|rule| {
+        let threshold = match (&rule.threshold_value, &rule.threshold_asset) {
+            (Some(value), Some(asset)) => format!("{value} {asset}"),
+            (Some(value), None) => value.clone(),
+            _ => "No threshold".to_owned(),
+        };
+        format!(r#"<tr><td>{}</td><td>{}</td><td>{}</td><td><span class="ei-severity {}">{}</span></td><td>{}</td><td><code>{}</code><small>{}</small></td></tr>"#, escape_html(&rule.monitor_name), escape_html(&rule.event_type), escape_html(&threshold), escape_html(&rule.severity), escape_html(&rule.severity), if rule.enabled { "Enabled" } else { "Disabled" }, rule.rule_id, rule.monitor_id)
+    }).collect::<String>();
     format!(
-        "<div class=\"notice warning\">Verification email delivery is in <strong>{}</strong> mode. Codes will be written to server logs unless you configure `LEDGERFLOW_EMAIL_FROM` plus either `LEDGERFLOW_POSTMARK_SERVER_TOKEN` or `LEDGERFLOW_RESEND_API_KEY`, or force a real delivery mode explicitly.</div>",
-        escape_html(email_delivery_mode)
+        r#"{suggestion}<section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">EVENT POLICIES</span><h2>Rules</h2></div><a href="/app/monitors?step=1">Create rule in new Monitor →</a></div><div class="table-shell ei-table"><table><thead><tr><th>Monitor</th><th>Event type</th><th>Threshold</th><th>Severity</th><th>Status</th><th>Rule ID</th></tr></thead><tbody>{rows}</tbody></table></div></section>"#
+    )
+}
+
+fn render_monitor_destinations(destinations: &[UserMonitorDestinationRow]) -> String {
+    if destinations.is_empty() {
+        return r#"<div class="ei-empty-state ei-empty-wide"><strong>No destinations configured</strong><p>Telegram is the only enabled destination in this release. Webhook and Email are unavailable.</p><a class="ca-primary-button" href="/app/monitors?step=1">Configure Telegram with a Monitor</a></div>"#.to_owned();
+    }
+    let cards = destinations.iter().map(|destination| format!(r#"<article class="ca-panel ei-destination-card"><span>{} · {}</span><h2>{}</h2><p>{}</p><div><span class="ei-status {}">{}</span><code>{}</code></div></article>"#, escape_html(&destination.destination_type), escape_html(&destination.monitor_name), escape_html(&destination.display_name), escape_html(&destination.destination_ref.as_deref().map(|value| truncate_middle(value, 5)).unwrap_or_else(|| "Reference unavailable".to_owned())), if destination.enabled { "verified" } else { "dismissed" }, if destination.enabled { "Enabled" } else { "Disabled" }, destination.destination_id)).collect::<String>();
+    format!(
+        r#"<section class="ei-destination-grid">{cards}<article class="ca-panel ei-destination-card unavailable"><span>WEBHOOK / EMAIL</span><h2>Unavailable in v0.1</h2><p>Only Telegram is enabled by the current backend infrastructure.</p></article></section>"#
+    )
+}
+
+fn render_monitor_deliveries(
+    deliveries: &[UserMonitorDeliveryRow],
+    alerts: &[GlobalAlertRow],
+) -> String {
+    let delivery_table = if deliveries.is_empty() {
+        r#"<div class="ei-empty-state"><strong>No Monitor delivery records</strong><p>No delivery has been claimed or confirmed for the new Monitor configuration model.</p></div>"#.to_owned()
+    } else {
+        let rows = deliveries.iter().map(|delivery| format!(r#"<tr><td>{}</td><td>{}</td><td>{}</td><td><span class="ei-status {}">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td></tr>"#, escape_html(&delivery.monitor_name), escape_html(delivery.event_id.as_deref().unwrap_or("Unknown")), escape_html(delivery.destination_name.as_deref().unwrap_or("Unknown")), escape_html(&delivery.status), escape_html(&delivery.status), delivery.attempt_count, escape_html(delivery.last_error.as_deref().unwrap_or("—")), delivery.delivered_at.unwrap_or(delivery.created_at).to_rfc3339(), delivery.delivery_id)).collect::<String>();
+        format!(
+            r#"<div class="table-shell ei-table"><table><thead><tr><th>Monitor</th><th>Event</th><th>Destination</th><th>Status</th><th>Attempts</th><th>Last error</th><th>Time</th><th>Delivery ID</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+        )
+    };
+    let legacy_alerts = if alerts.is_empty() {
+        r#"<div class="ei-empty-state"><strong>No legacy cluster alerts</strong><p>Existing Cluster Alert records will remain visible here when emitted.</p></div>"#.to_owned()
+    } else {
+        render_global_alerts_content(alerts)
+    };
+    format!(
+        r#"<section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">DELIVERY STATE</span><h2>Monitor Delivery History</h2></div><span>Delivered / retrying / dead-letter are explicit states</span></div>{delivery_table}</section><section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">LEGACY COMPATIBILITY</span><h2>Existing Cluster Alerts</h2></div></div>{legacy_alerts}</section>"#
+    )
+}
+
+fn render_watchlist_content(chain_id: u64, entries: &[WatchlistEntryRow]) -> String {
+    let rows = if entries.is_empty() {
+        "<tr><td colspan=\"5\">The watchlist is empty. Add an address, transaction hash, or a cluster UUID you own.</td></tr>".to_owned()
+    } else {
+        entries
+            .iter()
+            .map(|entry| {
+                let href = match entry.subject_type.as_str() {
+                    "address" => format!(
+                        "/app/address-analysis?chain_id={}&address={}",
+                        entry.chain_id,
+                        urlencoding::encode(&entry.subject_key)
+                    ),
+                    "transaction" => tx_analysis_href(entry.chain_id, &entry.subject_key),
+                    "cluster" => format!("/app/clusters/{}", entry.subject_key),
+                    _ => "/app/watchlist".to_owned(),
+                };
+                format!(
+                    r#"<tr><td><span class="badge">{}</span></td><td><a class="evidence-link" href="{}"><code>{}</code></a></td><td>{}</td><td>{}</td><td><form method="post" action="/app/watchlist/{}/delete"><button class="cta ghost tiny danger" type="submit">Remove</button></form></td></tr>"#,
+                    escape_html(&entry.subject_type),
+                    escape_html(&href),
+                    escape_html(&truncate_middle(&entry.subject_key, 12)),
+                    escape_html(entry.label.as_deref().unwrap_or("—")),
+                    escape_html(&entry.created_at.to_rfc3339()),
+                    entry.entry_id,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    format!(
+        r#"<section class="panel"><div class="panel-head"><h2>Add Watchlist Item</h2><span class="badge">chain {}</span></div><div class="panel-body"><form class="inline-form" method="post" action="/app/watchlist/add"><input type="hidden" name="chain_id" value="{}"><label>Address / transaction / cluster UUID<input name="subject" placeholder="0x... or UUID" required></label><label>Note<input name="label" placeholder="Optional"></label><button class="cta secondary" type="submit">Add to watchlist</button></form></div></section>
+<section class="panel"><div class="panel-head"><h2>Watched Items</h2><span class="badge">{} items</span></div><div class="panel-body"><div class="table-shell"><table><thead><tr><th>Type</th><th>Subject</th><th>Note</th><th>Added</th><th></th></tr></thead><tbody>{}</tbody></table></div></div></section>"#,
+        chain_id,
+        chain_id,
+        entries.len(),
+        rows,
+    )
+}
+
+fn render_watchlist_add_button(chain_id: u64, subject: &str, return_to: &str) -> String {
+    format!(
+        r#"<form class="inline-action-form watchlist-inline-form" method="post" action="/app/watchlist/add"><input type="hidden" name="chain_id" value="{}"><input type="hidden" name="subject" value="{}"><input type="hidden" name="return_to" value="{}"><button class="cta ghost tiny" type="submit">Add to watchlist</button></form>"#,
+        chain_id,
+        escape_html(subject),
+        escape_html(return_to),
+    )
+}
+
+fn render_global_alerts_content(alerts: &[GlobalAlertRow]) -> String {
+    let unread = alerts.iter().filter(|alert| !alert.is_read).count();
+    let rows = if alerts.is_empty() {
+        "<div class=\"empty-state\">No real alerts have been generated for this user's clusters. Alerts are triggered by tracked metrics; sample records are not shown.</div>".to_owned()
+    } else {
+        alerts
+            .iter()
+            .map(|alert| {
+                format!(
+                    r#"<article class="mini-card alert-global-card {}"><div class="panel-head compact"><div><span class="eyebrow">{} · {}</span><h3>{}</h3></div><span class="badge">{}</span></div><p>{}</p><small>{} · chain {}</small><div class="button-row"><a class="cta ghost tiny" href="/app/clusters/{}">Open cluster</a>{}</div></article>"#,
+                    if alert.is_read { "read" } else { "unread" },
+                    escape_html(&alert.severity),
+                    escape_html(&alert.alert_type),
+                    escape_html(&alert.title),
+                    if alert.is_read { "read" } else { "unread" },
+                    escape_html(&alert.message),
+                    escape_html(&format!(
+                        "{} · {}",
+                        alert.cluster_name,
+                        alert.triggered_at.to_rfc3339()
+                    )),
+                    alert.chain_id,
+                    alert.cluster_id,
+                    if alert.is_read {
+                        String::new()
+                    } else {
+                        format!(
+                            r#"<form method="post" action="/app/clusters/{}/alerts/{}/read"><button class="cta secondary tiny" type="submit">Mark as read</button></form>"#,
+                            alert.cluster_id, alert.alert_id
+                        )
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    format!(
+        r#"<section class="panel"><div class="panel-head"><h2>Cross-cluster Alerts</h2><span class="badge">{} unread / {} total</span></div><div class="panel-body"><p class="panel-copy">Only real alerts generated by clusters owned by this account are shown.</p><div class="alert-global-list">{}</div></div></section>"#,
+        unread,
+        alerts.len(),
+        rows,
+    )
+}
+
+fn render_search_content(
+    chain_id: u64,
+    workspace_id: &str,
+    term: &str,
+    results: &[SearchResultRow],
+) -> String {
+    let result_rows = if term.is_empty() {
+        "<div class=\"empty-state\">Search observed addresses, contracts, names, and labels in the current workspace. A complete transaction hash can still open transaction analysis.</div>".to_owned()
+    } else if results.is_empty() {
+        "<div class=\"empty-state\">No matching database records.</div>".to_owned()
+    } else {
+        results
+            .iter()
+            .map(|result| {
+                format!(
+                    r#"<a class="ca-intel-row search-result-row" href="{}"><span class="ca-pill new">{}</span><span class="ca-intel-copy"><strong>{}</strong><small>{}</small></span><span class="ca-row-arrow">›</span></a>"#,
+                    escape_html(&result.href),
+                    escape_html(&result.result_type),
+                    escape_html(&result.title),
+                    escape_html(&result.detail),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    format!(
+        r#"<section class="panel"><div class="panel-head"><h2>Search This Workspace</h2><span class="badge">{} results</span></div><div class="panel-body"><form class="inline-form" method="get" action="/app/search"><input type="hidden" name="chain_id" value="{}"><input type="hidden" name="workspace" value="{}"><label>Search term<input type="search" name="q" value="{}" placeholder="Observed address, contract, name, or label" autofocus required></label><button class="cta secondary" type="submit">Search</button></form><div class="search-result-list">{}</div></div></section>"#,
+        results.len(),
+        chain_id,
+        escape_html(workspace_id),
+        escape_html(term),
+        result_rows,
     )
 }
 
 fn render_app_sidebar(
     user: &AppUser,
     active: &str,
-    selected_cluster: Option<&DashboardClusterRecord>,
+    _selected_cluster: Option<&DashboardClusterRecord>,
 ) -> String {
-    let team_detail_href = selected_cluster
-        .map(|cluster| format!("/app/clusters/{}", cluster.cluster_id))
-        .unwrap_or_else(|| "/app/clusters".to_owned());
-    let alert_href = selected_cluster
-        .map(|cluster| format!("/app/clusters/{}?cluster_tab=overview", cluster.cluster_id))
-        .unwrap_or_else(|| "/app/clusters".to_owned());
+    let active = match active {
+        "today" => "overview",
+        "rankings" | "events" | "watchlist" | "alerts" | "monitors" | "cases"
+        | "investigations" | "actors" | "teams" | "bots" | "graph" | "entities" => "observations",
+        "indexer-api-keys" | "api" => "api",
+        value => value,
+    };
     let email = escape_html(&user.email);
     let initial = user
         .email
@@ -3498,84 +12169,71 @@ fn render_app_sidebar(
         .unwrap_or('R')
         .to_uppercase()
         .collect::<String>();
+    let workspace_plan = WorkspacePlan::parse(&user.workspace_plan);
+    let access_summary = if workspace_plan.allows(WorkspaceCapability::ContractedSla) {
+        "Enterprise · SLA enabled"
+    } else if workspace_plan.allows(WorkspaceCapability::CustomMonitoredEntities) {
+        "Pilot · Continuous observation"
+    } else {
+        "Free · Demo access"
+    };
+    let developer_navigation = if workspace_plan.allows(WorkspaceCapability::ScopedApi) {
+        format!(
+            r#"<div class="ca-nav-divider"></div><span class="ca-nav-section">DEVELOPER</span><nav class="side-nav ca-nav ca-nav-secondary" aria-label="Developer">{}</nav>"#,
+            render_ca_nav_item("/app/api", "⌘", "API", "Developer Center", active == "api")
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"<aside class="sidebar ca-sidebar">
-  <a class="brand ca-brand" href="/app/today">{}</a>
-  <nav class="side-nav ca-nav" aria-label="Primary">
-    {}
-    {}
-    {}
-    {}
-    {}
-    {}
-  </nav>
+  <a class="brand ca-brand" href="/app/overview">{}</a>
+  <span class="ca-nav-section">WORKSPACE</span>
+  <nav class="side-nav ca-nav" aria-label="Workspace">{}{}{}</nav>
+  {developer_navigation}
   <div class="ca-nav-divider"></div>
-  <nav class="side-nav ca-nav ca-nav-secondary" aria-label="Research">
-    {}
-    {}
-    {}
-  </nav>
+  <span class="ca-nav-section">ACCOUNT</span>
+  <nav class="side-nav ca-nav ca-nav-secondary" aria-label="Account">{}</nav>
   <div class="ca-sidebar-spacer"></div>
-  <a class="ca-plan-card" href="/pricing">
-    <span class="ca-plan-icon">◆</span>
-    <span><strong>Pro Research</strong><small>完整证据与历史数据</small></span>
-    <span>›</span>
-  </a>
-  <div class="ca-usage"><span><i style="width:78%"></i></span><small>78 / 1000 API Calls</small></div>
   <div class="ca-user-row">
     <span class="ca-avatar">{}</span>
-    <span><strong>{}</strong><small>Research workspace</small></span>
+    <span><strong>{}</strong><small>{}</small></span>
     <form method="post" action="/auth/logout"><button aria-label="Sign out" title="Sign out">↗</button></form>
   </div>
 </aside>"#,
         brand_wordmark_html(),
-        render_ca_nav_item("/app/today", "⌂", "今日情报", "Today", active == "today"),
         render_ca_nav_item(
-            "/app/address-analysis",
+            "/app/overview",
+            "⌂",
+            "Overview",
+            "Workspace Overview",
+            active == "overview"
+        ),
+        render_ca_nav_item(
+            "/app/observations",
             "◎",
-            "Actors",
-            "地址与参与者",
-            active == "actors"
-        ),
-        render_ca_nav_item("/app/clusters", "◌", "Teams", "团队发现", active == "teams"),
-        render_ca_nav_item(
-            &team_detail_href,
-            "♙",
-            "Bots",
-            "机器人画像",
-            active == "bots"
+            "Observed Objects",
+            "Intelligence Profiles",
+            active == "observations"
         ),
         render_ca_nav_item(
-            "/app/arbitrage",
-            "↗",
-            "Rankings",
-            "盈利与活跃",
-            active == "rankings"
+            "/app/reports",
+            "▤",
+            "Reports",
+            "Intelligence Briefs",
+            active == "reports"
         ),
         render_ca_nav_item(
-            "/app/tx-analysis",
-            "◇",
-            "Cases",
-            "链上案例",
-            active == "cases"
-        ),
-        render_ca_nav_item(
-            &team_detail_href,
-            "♡",
-            "Watchlist",
-            "关注列表",
-            active == "watchlist"
-        ),
-        render_ca_nav_item(&alert_href, "♧", "Alerts", "监控告警", active == "alerts"),
-        render_ca_nav_item(
-            "/app/indexer/api-keys",
-            "⌘",
-            "API",
-            "开发者中心",
-            active == "api"
+            "/app/settings",
+            "⚙",
+            "Settings",
+            workspace_plan.label(),
+            active == "settings"
         ),
         escape_html(&initial),
         truncate_for_display(&email, 24),
+        access_summary,
+        developer_navigation = developer_navigation,
     )
 }
 
@@ -3590,24 +12248,34 @@ fn render_ca_nav_item(href: &str, icon: &str, label: &str, subtitle: &str, activ
     )
 }
 
+fn tx_analysis_href(chain_id: u64, tx_hash: &str) -> String {
+    format!(
+        "/app/tx-analysis?chain_id={chain_id}&tx_hash={}",
+        urlencoding::encode(tx_hash.trim())
+    )
+}
+
 fn render_global_topbar(state: &WebState, selected_chain_id: u64) -> String {
     let route = state
         .chain_registry
         .resolve(selected_chain_id)
         .or_else(|| state.chain_registry.routes().first());
-    let (chain_name, chain_id) = route
-        .map(|route| (route.display_name.as_str(), route.chain_id))
-        .unwrap_or(("No chain", selected_chain_id));
-    let chain_links = state
+    let chain_id = route
+        .map(|route| route.chain_id)
+        .unwrap_or(selected_chain_id);
+    let network_options = state
         .chain_registry
         .routes()
         .iter()
         .map(|item| {
             format!(
-                r#"<a class="{}" href="/app/today?chain_id={}"><span class="chain-dot chain-{}"></span>{}</a>"#,
-                if item.chain_id == chain_id { "active" } else { "" },
+                r#"<option value="{}" {}>{}</option>"#,
                 item.chain_id,
-                escape_html(&item.slug),
+                if item.chain_id == chain_id {
+                    "selected"
+                } else {
+                    ""
+                },
                 escape_html(&item.display_name),
             )
         })
@@ -3615,27 +12283,1194 @@ fn render_global_topbar(state: &WebState, selected_chain_id: u64) -> String {
         .join("");
     format!(
         r#"<header class="ca-topbar">
-  <details class="ca-chain-menu">
-    <summary><span class="chain-dot chain-primary"></span>{}<span class="ca-chevron">⌄</span></summary>
-    <div class="ca-chain-popover">
-      <span class="ca-menu-label">ENABLED DATA PLANES</span>
-      {}
-      <span class="ca-menu-note">更多 EVM 网络可通过控制面注册表接入</span>
-    </div>
-  </details>
-  <div class="ca-chain-rail"><span class="chain-dot chain-rh">↗</span><span>Robinhood Chain</span><small>registry</small></div>
-  <form class="ca-global-search" method="get" action="/app/address-analysis">
+  <form class="ei-context-bar" method="get" action="/app/overview">
+    <label><span>Workspace</span><select name="workspace"><option value="global" selected>Global Explorer</option></select></label>
+    <label><span>Network</span><select name="chain_id">{}</select></label>
+    <label><span>Range</span><select name="range"><option value="24h" selected>Last 24h</option><option value="7d">Last 7d</option><option value="30d">Last 30d</option></select></label>
+    <button type="submit" class="ei-context-apply">Apply</button>
+  </form>
+  <form class="ca-global-search" method="get" action="/app/search">
     <input type="hidden" name="chain_id" value="{}">
     <span>⌕</span>
-    <input type="search" name="address" aria-label="Search actors, teams, transactions or contracts" placeholder="搜索地址 / 团队 / 交易 / 合约">
+    <input type="search" name="q" aria-label="Search transaction, address, contract or protocol" placeholder="Search tx / address / contract / protocol">
     <kbd>⌘ K</kbd>
   </form>
-  <span class="ca-live"><i></i> LIVE</span>
-  <button class="ca-icon-button" type="button" aria-label="Notifications">♧<b>3</b></button>
 </header>"#,
-        escape_html(chain_name),
-        chain_links,
-        chain_id,
+        network_options, chain_id,
+    )
+}
+
+fn render_execution_topbar(
+    state: &WebState,
+    selected_chain_id: u64,
+    workspaces: &[WorkspaceRef],
+    selected_workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    action: &str,
+) -> String {
+    let workspace_options = workspaces
+        .iter()
+        .map(|workspace| {
+            let scope = match workspace.kind {
+                WorkspaceKind::Named => format!(" · {} objects", workspace.monitored_entity_count),
+                WorkspaceKind::Demo => {
+                    format!(" · Demo · {} objects", workspace.monitored_entity_count)
+                }
+            };
+            let suffix = format!("{scope} · {}", workspace.workspace_plan.label());
+            format!(
+                r#"<option value="{}" data-plan="{}" {}>{}{}</option>"#,
+                escape_html(&workspace.id),
+                workspace.workspace_plan.key(),
+                if workspace.id == selected_workspace.id {
+                    "selected"
+                } else {
+                    ""
+                },
+                escape_html(&workspace.name),
+                escape_html(&suffix),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let network_options = state
+        .chain_registry
+        .routes()
+        .iter()
+        .map(|route| {
+            format!(
+                r#"<option value="{}" {}>{}</option>"#,
+                route.chain_id,
+                if route.chain_id == selected_chain_id {
+                    "selected"
+                } else {
+                    ""
+                },
+                escape_html(&route.display_name),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let range_option = |value: WorkspaceRange| {
+        format!(
+            r#"<option value="{}" {}>{}</option>"#,
+            value.key(),
+            if value == range { "selected" } else { "" },
+            value.label(),
+        )
+    };
+    format!(
+        r#"<header class="ca-topbar">
+  <form class="ei-context-bar" method="get" action="{action}">
+    <label><span>Workspace</span><select name="workspace">{workspace_options}</select></label>
+    <label><span>Network</span><select name="chain_id">{network_options}<option value="" disabled>All · unavailable</option></select></label>
+    <label><span>Range</span><select name="range">{}{}</select></label>
+    <button type="submit" class="ei-context-apply">Apply</button>
+  </form>
+  <form class="ca-global-search" method="get" action="/app/search">
+    <input type="hidden" name="chain_id" value="{selected_chain_id}">
+    <input type="hidden" name="workspace" value="{selected_workspace_id}">
+    <span>⌕</span>
+    <input type="search" name="q" aria-label="Search transaction, address, contract or protocol" placeholder="Search tx / address / contract / protocol">
+    <kbd>⌘ K</kbd>
+  </form>
+</header>"#,
+        range_option(WorkspaceRange::Last24Hours),
+        [WorkspaceRange::Last7Days, WorkspaceRange::Last30Days]
+            .into_iter()
+            .map(range_option)
+            .collect::<String>(),
+        action = escape_html(action),
+        selected_workspace_id = escape_html(&selected_workspace.id),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_execution_overview_page(
+    state: &WebState,
+    user: &AppUser,
+    selected_chain_id: u64,
+    clusters: &[DashboardClusterRecord],
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    snapshot: &TodaySnapshot,
+    events: &[ExecutionEvent],
+    workspace_entities: &[WorkspaceEntityRow],
+    reviews: &[BehaviorReviewItem],
+    investigations: &[InvestigationRow],
+    observation_snapshots: &HashMap<String, serde_json::Value>,
+) -> String {
+    let route = state.chain_registry.resolve(selected_chain_id);
+    let network_name = route
+        .map(|route| route.display_name.as_str())
+        .unwrap_or("Unknown network");
+    let monitored_count = workspace.monitored_entity_count;
+    let attention = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.status,
+                ExecutionEventStatus::Verified
+                    | ExecutionEventStatus::Detected
+                    | ExecutionEventStatus::Investigating
+            )
+        })
+        .take(5)
+        .collect::<Vec<_>>();
+    let attention_cards = if attention.is_empty() {
+        render_overview_no_attention(monitored_count, &workspace.id)
+    } else {
+        attention
+            .iter()
+            .map(|event| render_attention_event_card(event, snapshot.captured_at, &workspace.id))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let ready_objects = observation_snapshots
+        .values()
+        .filter(|item| {
+            item.pointer("/candidate_cluster/cluster/status")
+                .or_else(|| item.pointer("/object/current_status"))
+                .and_then(serde_json::Value::as_str)
+                == Some("ready")
+        })
+        .count();
+    let active_behaviors = observation_snapshots
+        .values()
+        .flat_map(|item| overview_behavior_labels(item).into_iter())
+        .collect::<HashSet<_>>()
+        .len();
+    let object_changes = observation_snapshots
+        .values()
+        .map(|item| {
+            item.pointer("/candidate_cluster/changes")
+                .or_else(|| item.get("changes"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0)
+        })
+        .sum::<usize>();
+    let new_relationships = observation_snapshots
+        .values()
+        .flat_map(|item| {
+            item.pointer("/candidate_cluster/changes")
+                .or_else(|| item.get("changes"))
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|change| {
+                    change
+                        .get("signal_type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| value.contains("relationship"))
+                })
+        })
+        .count();
+    let economically_verified = observation_snapshots
+        .values()
+        .map(overview_verified_execution_count)
+        .sum::<i64>();
+    let baseline_available = observation_snapshots.values().any(|item| {
+        item.pointer("/candidate_cluster/windows")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|windows| {
+                windows.iter().any(|window| {
+                    window.get("window").and_then(serde_json::Value::as_str) == Some("previous_7d")
+                })
+            })
+            || item
+                .pointer("/object/metadata/baseline_available")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    });
+    let baseline_is_partial = observation_snapshots.values().any(|item| {
+        item.pointer("/object/metadata/baseline_is_partial")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
+    let analysis_pending = ready_objects < workspace_entities.len();
+    let attention_heading = if analysis_pending {
+        format!(
+            "{} objects are building intelligence",
+            workspace_entities.len().saturating_sub(ready_objects)
+        )
+    } else if !baseline_available && !workspace_entities.is_empty() {
+        "Baseline is still being built".to_owned()
+    } else {
+        format!("{} changes need attention", object_changes)
+    };
+    let behavior_metric = if analysis_pending {
+        "Building".to_owned()
+    } else {
+        format_count(active_behaviors as i64)
+    };
+    let relationship_metric = if !baseline_available {
+        "Baseline building".to_owned()
+    } else if baseline_is_partial {
+        format!("{} observed", format_count(new_relationships as i64))
+    } else {
+        format_count(new_relationships as i64)
+    };
+    let economics_metric = if analysis_pending {
+        "Building".to_owned()
+    } else {
+        format!("{} tx", economically_verified)
+    };
+    let attention_metric = if !baseline_available {
+        "Baseline building".to_owned()
+    } else if baseline_is_partial {
+        format!("{} observed", format_count(object_changes as i64))
+    } else {
+        format_count(object_changes as i64)
+    };
+    let workspace_query = urlencoding::encode(&workspace.id);
+    let metric_cards = [
+        render_execution_metric(
+            "Observed Objects",
+            &format_count(workspace_entities.len() as i64),
+            "Addresses and contracts in scope",
+            "Workspace observations",
+            &format!("/app/observations?workspace={workspace_query}"),
+            "material",
+        ),
+        render_execution_metric(
+            "Active Behaviors",
+            &behavior_metric,
+            "Evidence-backed behavior types",
+            range.label(),
+            &format!("/app/observations?workspace={workspace_query}"),
+            "value",
+        ),
+        render_execution_metric(
+            "New Relationships",
+            &relationship_metric,
+            "Observed in scoped events",
+            range.label(),
+            &format!("/app/observations?workspace={workspace_query}"),
+            "failure",
+        ),
+        render_execution_metric(
+            "Economically Verified",
+            &economics_metric,
+            "Deterministically verified executions",
+            "Token flows are not treated as profit",
+            &format!("/app/observations?workspace={workspace_query}"),
+            "actor",
+        ),
+        render_execution_metric(
+            "Attention Required",
+            &attention_metric,
+            "Object changes and material activity",
+            "Open priority queue",
+            &format!("/app/events?workspace={workspace_query}"),
+            "failure",
+        ),
+    ]
+    .join("");
+    let entity_summary =
+        render_overview_entity_summary(workspace_entities, workspace, observation_snapshots);
+    let live_events = render_live_event_rows(events, snapshot.captured_at, 8, &workspace.id);
+    let actor_reviews = render_overview_actor_reviews(reviews, workspace);
+    let recent_investigations = render_overview_investigations(investigations, &workspace.id);
+    let status =
+        render_workspace_service_status(snapshot, network_name, workspace.monitored_entity_count);
+    let data_state = if !snapshot.api_online {
+        "Limited"
+    } else if workspace.monitored_entity_count == 0 {
+        "Setup required"
+    } else {
+        "Available"
+    };
+    let freshness = snapshot
+        .metrics
+        .latest_observed_at
+        .map(|value| format_relative_time(value, snapshot.captured_at))
+        .unwrap_or_else(|| "No observation".to_owned());
+    let subtitle = match workspace.kind {
+        WorkspaceKind::Named => {
+            "Understand what changed across your tracked entities, why it matters, and where the evidence leads."
+        }
+        WorkspaceKind::Demo => {
+            "Explore a public-data entity workspace with an evidence-backed searcher, related execution, and economic context."
+        }
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="LedgerFlow Execution Intelligence workspace.">
+    <title>Workspace Overview · LedgerFlow</title>
+    <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
+    <style>{styles}</style>
+  </head>
+  <body class="dashboard-body ca-body">
+    <div class="dashboard-shell ca-shell">
+      {sidebar}
+      <div class="ca-workspace">
+        {topbar}
+        <main class="dashboard-main ca-main ei-main">
+          <section class="ca-page-heading ei-overview-heading">
+            <div><span class="ei-page-kicker">OBSERVATION WORKSPACE</span><div class="ca-title-row"><h1>What Changed?</h1><span>{workspace_name}</span></div><p>{subtitle}</p></div>
+            <div class="ca-heading-actions ei-primary-actions"><a class="ca-primary-button" href="/app/observations?workspace={workspace_id}&add=1">+ Observe</a><a class="ca-secondary-button" href="/app/observations?workspace={workspace_id}">Observed Objects</a><a class="ca-secondary-button" href="/app/reports?workspace={workspace_id}">Intelligence Briefs</a></div>
+          </section>
+
+          <section class="ei-attention-summary">
+            <div><strong>{attention_heading}</strong><span>Verified facts are prioritized; pending analysis and incomplete baselines are never rendered as zero.</span></div>
+            <dl><div><dt>Range</dt><dd>{range_label}</dd></div><div><dt>Observed</dt><dd>{monitored_count} objects</dd></div><div><dt>Updated</dt><dd>{freshness}</dd></div><div><dt>Network</dt><dd>{network_name}</dd></div><div><dt>Data</dt><dd>{data_state}</dd></div></dl>
+          </section>
+
+          <section class="ei-section" aria-labelledby="needs-attention-title">
+            <div class="ei-section-head"><div><span class="ei-section-kicker">PRIORITY QUEUE</span><h2 id="needs-attention-title">Needs Attention</h2></div><a href="/app/events?workspace={workspace_id}">Open Workspace Events →</a></div>
+            <div class="ei-attention-grid">{attention_cards}</div>
+          </section>
+
+          <section class="ei-metric-grid">{metric_cards}</section>
+
+          <section class="ei-overview-grid">
+            <div class="ei-overview-main">
+              <section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">OBSERVED OBJECTS</span><h2>Recent Changes by Object</h2></div><a href="/app/observations?workspace={workspace_id}">View all objects →</a></div>{entity_summary}</section>
+              <section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">OBJECT ACTIVITY</span><h2>Evidence-linked Changes</h2></div><span>Events stay in object context</span></div>{live_events}</section>
+            </div>
+            <aside class="ei-overview-side">
+              <section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">BEHAVIOR CHANGE</span><h2>Objects Requiring Review</h2></div><span>Evidence-backed signals</span></div>{actor_reviews}</section>
+              <section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">FOLLOW-UP</span><h2>Recent Investigations</h2></div><span>Started from an object or event</span></div>{recent_investigations}</section>
+            </aside>
+          </section>
+
+          <section class="ei-system-status"><div class="ei-section-head"><div><span class="ei-section-kicker">SERVICE AVAILABILITY</span><h2>Workspace Status</h2></div><span>Customer-visible monitoring and analysis status</span></div>{status}</section>
+        </main>
+      </div>
+    </div>
+  </body>
+</html>"#,
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, "overview", clusters.first()),
+        topbar = render_execution_topbar(
+            state,
+            selected_chain_id,
+            workspaces,
+            workspace,
+            range,
+            "/app/overview"
+        ),
+        workspace_name = escape_html(&workspace.name),
+        workspace_id = urlencoding::encode(&workspace.id),
+        subtitle = escape_html(subtitle),
+        attention_heading = escape_html(&attention_heading),
+        range_label = range.label(),
+        monitored_count = monitored_count,
+        freshness = escape_html(&freshness),
+        network_name = escape_html(network_name),
+        data_state = escape_html(data_state),
+    )
+}
+
+fn render_overview_no_attention(monitored_count: usize, workspace_id: &str) -> String {
+    if monitored_count == 0 {
+        format!(
+            r#"<div class="ei-empty-state ei-empty-wide"><strong>No observed objects yet</strong><p>Observe an address or contract to generate its Intelligence Profile, then enable continuous monitoring if it matters.</p><div class="button-row"><a class="ca-primary-button" href="/app/observations?workspace={}&amp;add=1">Observe your first object</a><a class="ca-secondary-button" href="/evidence">Explore Public Evidence</a></div></div>"#,
+            urlencoding::encode(workspace_id)
+        )
+    } else {
+        format!(
+            r#"<div class="ei-empty-state ei-empty-wide"><strong>No events need attention</strong><p>No verified material event or open detector signal is available in this range.</p><a class="ca-secondary-button" href="/app/events?workspace={}">Open Workspace Events</a></div>"#,
+            urlencoding::encode(workspace_id)
+        )
+    }
+}
+
+fn overview_behavior_labels(snapshot: &serde_json::Value) -> Vec<String> {
+    if let Some(windows) = snapshot
+        .pointer("/candidate_cluster/windows")
+        .and_then(serde_json::Value::as_array)
+    {
+        if let Some(distribution) = windows
+            .iter()
+            .find(|window| window.get("window").and_then(serde_json::Value::as_str) == Some("24h"))
+            .and_then(|window| window.get("strategy_distribution"))
+            .and_then(serde_json::Value::as_array)
+        {
+            return distribution
+                .iter()
+                .filter_map(|item| item.get("strategy").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .collect();
+        }
+    }
+    snapshot
+        .get("behaviors")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|behavior| behavior.get("label").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn overview_verified_execution_count(snapshot: &serde_json::Value) -> i64 {
+    if let Some(value) = snapshot
+        .pointer("/candidate_cluster/windows")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|windows| {
+            windows.iter().find(|window| {
+                window.get("window").and_then(serde_json::Value::as_str) == Some("24h")
+            })
+        })
+        .and_then(|window| window.get("verified_execution_count"))
+        .and_then(serde_json::Value::as_i64)
+    {
+        return value;
+    }
+    snapshot
+        .get("economics")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("window").and_then(serde_json::Value::as_str) == Some("24h"))
+        })
+        .and_then(|item| item.get("economically_verified_transaction_count"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+}
+
+fn render_overview_entity_summary(
+    entities: &[WorkspaceEntityRow],
+    workspace: &WorkspaceRef,
+    snapshots: &HashMap<String, serde_json::Value>,
+) -> String {
+    if entities.is_empty() {
+        return format!(
+            r#"<div class="ei-empty-state"><strong>No observed objects yet</strong><p>Observe an address or contract to generate its first Intelligence Profile before enabling continuous monitoring.</p><a class="ca-primary-button" href="/app/observations?workspace={}&amp;add=1">Observe your first object</a></div>"#,
+            urlencoding::encode(&workspace.id),
+        );
+    }
+    let rows = entities.iter().take(12).map(|entity| {
+        let snapshot=snapshots.get(&entity.address);
+        if let Some(cluster)=snapshot.and_then(|item|item.get("candidate_cluster")) {
+            let status=cluster.pointer("/cluster/status").and_then(serde_json::Value::as_str).unwrap_or("queued");
+            let progress=cluster.pointer("/cluster/progress/percent").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let completed=cluster.get("windows").and_then(serde_json::Value::as_array).and_then(|items|items.iter().find(|item|item.get("window").and_then(serde_json::Value::as_str)==Some("24h")));
+            let partial=cluster.get("partial_24h").unwrap_or(&serde_json::Value::Null);
+            let executions=completed.and_then(|item|item.get("executions")).or_else(||partial.get("executions")).and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let failures=completed.and_then(|item|item.get("failures")).or_else(||partial.get("failures")).and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let gas=completed.and_then(|item|item.get("gas_cost_raw")).or_else(||partial.get("gas_cost_raw")).and_then(serde_json::Value::as_str).map(format_wei_eth_raw).unwrap_or_else(||"receipt reconstruction pending".to_owned());
+            let activity_text=if executions>0 {format!("{executions} cluster executions · {failures} failed · {gas}")} else if status=="failed" {format!("Analysis failed · {}",cluster.pointer("/cluster/error").and_then(serde_json::Value::as_str).unwrap_or("Retry available"))} else {format!("{} · {}% · discovering related execution activity",status.replace('_'," "),progress)};
+            let verified=completed.and_then(|item|item.get("verified_execution_count")).or_else(||partial.get("economically_verified_count")).and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let assets=cluster_asset_catalog(cluster);
+            let economic_text=if let Some(window)=completed {
+                let gross=format_cluster_amounts(window.get("verified_gross_profit").unwrap_or(&serde_json::Value::Null),&assets);
+                let coverage=window.get("coverage_ratio").and_then(serde_json::Value::as_f64).unwrap_or(0.0)*100.0;
+                if verified>0 {format!("{gross} verified gross · {verified} tx · {coverage:.1}% coverage")} else {"No verified total; exclusions explain the evidence gaps".to_owned()}
+            } else {format!("Economic verification pending · {verified} verified so far")};
+            let behavior=completed.and_then(|item|item.get("strategy_distribution")).and_then(serde_json::Value::as_array).and_then(|items|items.first()).and_then(|item|item.get("strategy")).and_then(serde_json::Value::as_str).map(|value|value.replace('_'," ")).unwrap_or_else(||if executions>0{"Reconstructing strategies".to_owned()}else{"Pending activity".to_owned()});
+            let members=cluster.get("members").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+            let workers=members.iter().filter(|item|item.get("candidate_role").and_then(serde_json::Value::as_str)==Some("worker_candidate")&&item.get("membership_state").and_then(serde_json::Value::as_str)!=Some("excluded")).count();
+            let executors=members.iter().filter(|item|item.get("candidate_role").and_then(serde_json::Value::as_str)==Some("executor_candidate")&&item.get("membership_state").and_then(serde_json::Value::as_str)!=Some("excluded")).count();
+            let relationships=format!("{} candidates · {workers} workers · {executors} executors",members.len());
+            let latest=completed.and_then(|item|item.get("last_active")).or_else(||partial.get("last_active")).and_then(serde_json::Value::as_str).unwrap_or("No reconstructed activity yet");
+            return format!(
+                r#"<tr><td><a href="/app/observations/{}?workspace={}"><strong>{}</strong><small>{}</small></a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href="/app/observations/{}?workspace={}">Open Intelligence →</a></td></tr>"#,
+                urlencoding::encode(&entity.address),urlencoding::encode(&workspace.id),escape_html(entity.label.as_deref().or(entity.role.as_deref()).unwrap_or("Candidate Searcher System")),escape_html(&truncate_middle(&entity.address,9)),escape_html(&activity_text),escape_html(&economic_text),escape_html(&behavior),escape_html(&relationships),escape_html(latest),urlencoding::encode(&entity.address),urlencoding::encode(&workspace.id)
+            );
+        }
+        let status=snapshot.and_then(|item|item.pointer("/object/current_status")).and_then(serde_json::Value::as_str).unwrap_or(&entity.observation_status);
+        let progress=snapshot.and_then(|item|item.pointer("/object/progress/percent")).and_then(serde_json::Value::as_i64).or_else(||entity.observation_progress.get("percent").and_then(serde_json::Value::as_i64)).unwrap_or(0);
+        let activity=snapshot.and_then(|item|item.get("activity_windows")).and_then(serde_json::Value::as_array).and_then(|items|items.iter().find(|item|item.get("window").and_then(serde_json::Value::as_str)==Some("24h")));
+        let intelligence_ready=status=="ready" || snapshot.and_then(|item|item.get("briefs")).and_then(serde_json::Value::as_array).is_some_and(|items|!items.is_empty());
+        let activity_text=if intelligence_ready {
+            activity.map(|item|format!("{} tx · {} failed · {} gas{}",item.get("transaction_count").and_then(serde_json::Value::as_i64).unwrap_or(0),item.get("reverted_count").and_then(serde_json::Value::as_i64).unwrap_or(0),item.get("gas_cost_raw").and_then(serde_json::Value::as_str).map(format_wei_eth_raw).unwrap_or_else(||"unavailable".to_owned()),if status=="ready"{""}else{" · refreshing"})).unwrap_or_else(||"No 24h summary available".to_owned())
+        } else if status=="failed" { "Analysis failed · Retry".to_owned() } else { format!("{} · {}%",status.replace('_'," "),progress) };
+        let economics=snapshot.and_then(|item|item.get("economics")).and_then(serde_json::Value::as_array).and_then(|items|items.iter().find(|item|item.get("window").and_then(serde_json::Value::as_str)==Some("24h")));
+        let economic_text=economics.map(|item|{
+            let verified=item.get("economically_verified_transaction_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            if verified>0 {format!("{} verified executions · {:.1}% coverage",verified,item.get("coverage_ratio").and_then(serde_json::Value::as_f64).unwrap_or(0.0)*100.0)} else {"No deterministic total PnL; see exclusions".to_owned()}
+        }).unwrap_or_else(||if intelligence_ready{"Economic verification unavailable".to_owned()}else{"Pending analysis".to_owned()});
+        let behavior=snapshot.and_then(|item|item.get("behaviors")).and_then(serde_json::Value::as_array).and_then(|items|items.first()).and_then(|item|item.get("label")).and_then(serde_json::Value::as_str).map(|value|value.replace('_'," ")).unwrap_or_else(||if intelligence_ready{"Not classified".to_owned()}else{"Pending".to_owned()});
+        let relationships=snapshot.and_then(|item|item.get("relationships")).and_then(serde_json::Value::as_array).map(Vec::len).map(|value|value.to_string()).unwrap_or_else(||if intelligence_ready{"0 in current coverage".to_owned()}else{"Pending".to_owned()});
+        let latest=activity.and_then(|item|item.get("last_active")).and_then(serde_json::Value::as_str).unwrap_or_else(||if intelligence_ready{"No activity in the last 24 hours"}else{"Analysis in progress"});
+        format!(
+            r#"<tr><td><a href="/app/observations/{}?workspace={}"><strong>{}</strong><small>{}</small></a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href="/app/observations/{}?workspace={}">Open →</a></td></tr>"#,
+            urlencoding::encode(&entity.address), urlencoding::encode(&workspace.id),
+            escape_html(entity.label.as_deref().or(entity.role.as_deref()).unwrap_or("Observed object")),
+            escape_html(&truncate_middle(&entity.address, 9)), escape_html(&activity_text),escape_html(&economic_text),escape_html(&behavior),escape_html(&relationships),escape_html(latest), urlencoding::encode(&entity.address), urlencoding::encode(&workspace.id),
+        )
+    }).collect::<String>();
+    format!(
+        r#"<div class="table-shell ei-table"><table><thead><tr><th>Observed object</th><th>24h activity / analysis</th><th>Observed economic result</th><th>Main behavior</th><th>Relationships</th><th>Last active</th><th>Intelligence</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+    )
+}
+
+fn render_attention_event_card(
+    event: &ExecutionEvent,
+    now: DateTime<Utc>,
+    workspace_id: &str,
+) -> String {
+    let affected = if event.participants.is_empty() {
+        "Unknown".to_owned()
+    } else {
+        event
+            .participants
+            .iter()
+            .take(3)
+            .map(|entity| {
+                entity
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| truncate_middle(&entity.address, 6))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let impact = event.economic_impact.primary_value().unwrap_or("Unknown");
+    let confidence = event
+        .confidence
+        .level
+        .map(|level| level.label().to_owned())
+        .unwrap_or_else(|| "Unknown".to_owned());
+    let confidence = event
+        .confidence
+        .score
+        .map(|score| format!("{confidence} · {score}"))
+        .unwrap_or(confidence);
+    let occurred = event
+        .occurred_at
+        .map(|value| format_relative_time(value, now))
+        .unwrap_or_else(|| "Timestamp unavailable".to_owned());
+    let monitor_subject = event
+        .participants
+        .first()
+        .map(|participant| participant.address.as_str())
+        .unwrap_or("");
+    let entity_action = if monitor_subject.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<a class="ca-secondary-button" href="/app/observations/{}?workspace={}">Open Intelligence Profile</a>"#,
+            urlencoding::encode(monitor_subject),
+            urlencoding::encode(workspace_id),
+        )
+    };
+    format!(
+        r#"<article class="ei-attention-card {}"><div class="ei-event-labels"><span class="ei-severity {}">{}</span><span class="ei-event-type">{}</span><span class="ei-status {}">{}</span></div><h3>{}</h3><dl><div><dt>Affected</dt><dd>{}</dd></div><div><dt>Economic Impact</dt><dd>{}</dd></div><div><dt>Confidence</dt><dd>{}</dd></div></dl><footer><span>{}</span><div><a class="ca-primary-button" href="/app/events/{}?workspace={}">Investigate</a>{}<a class="ca-secondary-button" href="/app/monitors?step=1&workspace={}&subject={}">Monitor Entity</a></div></footer></article>"#,
+        if event.is_unverified() {
+            "unverified"
+        } else {
+            "verified"
+        },
+        event.severity.key(),
+        event.severity.label(),
+        event.event_type.label(),
+        event.status.key(),
+        event.status.label(),
+        escape_html(&event.conclusion),
+        escape_html(&affected),
+        escape_html(impact),
+        escape_html(&confidence),
+        escape_html(&occurred),
+        urlencoding::encode(&event.id),
+        urlencoding::encode(workspace_id),
+        entity_action,
+        urlencoding::encode(workspace_id),
+        urlencoding::encode(monitor_subject),
+    )
+}
+
+fn render_execution_metric(
+    title: &str,
+    value: &str,
+    detail: &str,
+    note: &str,
+    href: &str,
+    tone: &str,
+) -> String {
+    format!(
+        r#"<a class="ei-metric-card {}" href="{}"><span>{}</span><strong>{}</strong><p>{}</p><small>{}</small></a>"#,
+        escape_html(tone),
+        escape_html(href),
+        escape_html(title),
+        escape_html(value),
+        escape_html(detail),
+        escape_html(note),
+    )
+}
+
+fn render_workspace_systems(
+    workspace: &WorkspaceRef,
+    systems: &[MonitoredSystemRow],
+    events: &[ExecutionEvent],
+    now: DateTime<Utc>,
+) -> String {
+    if !systems.is_empty() {
+        return render_monitored_systems(systems, now);
+    }
+    let latest = events
+        .iter()
+        .filter_map(|event| event.occurred_at)
+        .max()
+        .map(|value| format_relative_time(value, now))
+        .unwrap_or_else(|| "No material event in range".to_owned());
+    let status = if workspace.kind == WorkspaceKind::Demo {
+        "Demo · public data"
+    } else if workspace.status == "active" {
+        "Active"
+    } else {
+        "Configured"
+    };
+    format!(
+        r#"<div class="table-shell ei-table"><table><thead><tr><th>System / Project</th><th>Health</th><th>Alerts</th><th>Latest material event</th><th>Configuration</th></tr></thead><tbody><tr><td><a href="/app/entities"><strong>{}</strong><small>chain {} · {} entities</small></a></td><td><span class="ei-status verified">{}</span></td><td>Unknown</td><td>{}</td><td>{}</td></tr></tbody></table></div>"#,
+        escape_html(&workspace.name),
+        workspace.chain_id.unwrap_or_default(),
+        workspace.monitored_entity_count,
+        escape_html(status),
+        escape_html(&latest),
+        if workspace.onboarding_complete {
+            "Complete"
+        } else {
+            "Incomplete"
+        },
+    )
+}
+
+fn render_monitored_systems(systems: &[MonitoredSystemRow], now: DateTime<Utc>) -> String {
+    if systems.is_empty() {
+        return r#"<div class="ei-empty-state"><strong>No monitored systems yet</strong><p>Create a monitor to group addresses, roles, rules, and delivery settings.</p><a class="ca-primary-button" href="/app/monitors?step=1">Add your first monitor</a></div>"#.to_owned();
+    }
+    let rows = systems
+        .iter()
+        .map(|system| {
+            let status = system
+                .tracking_status
+                .as_deref()
+                .unwrap_or("Status unavailable");
+            let latest = system
+                .latest_event_at
+                .map(|value| format_relative_time(value, now))
+                .unwrap_or_else(|| "No material event".to_owned());
+            format!(
+                r#"<tr><td><a href="/app/entities?tab=clusters&cluster_id={}"><strong>{}</strong><small>chain {} · {} entities</small></a></td><td><span class="ei-status {}">{}</span></td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                system.cluster_id,
+                escape_html(&system.name),
+                system.chain_id,
+                format_count(system.address_count),
+                if status == "enabled" { "verified" } else { "detected" },
+                escape_html(status),
+                format_count(system.alert_count),
+                escape_html(&latest),
+                escape_html(&format_relative_time(system.last_update, now)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<div class="table-shell ei-table"><table><thead><tr><th>System / Project</th><th>Health</th><th>Alerts</th><th>Latest material event</th><th>Last update</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+    )
+}
+
+fn render_live_event_rows(
+    events: &[ExecutionEvent],
+    now: DateTime<Utc>,
+    limit: usize,
+    workspace_id: &str,
+) -> String {
+    if events.is_empty() {
+        return r#"<div class="ei-empty-state"><strong>No events match the current range</strong><p>Detector and Evidence Pack records will appear here when available.</p></div>"#.to_owned();
+    }
+    let rows = events
+        .iter()
+        .take(limit)
+        .map(|event| {
+            let impact = event.economic_impact.primary_value().unwrap_or("Unknown");
+            let confidence = event
+                .confidence
+                .score
+                .map(|score| score.to_string())
+                .or_else(|| event.confidence.level.map(|level| level.label().to_owned()))
+                .unwrap_or_else(|| "Unknown".to_owned());
+            let actors = if event.participants.is_empty() {
+                "Unknown".to_owned()
+            } else {
+                event
+                    .participants
+                    .iter()
+                    .take(2)
+                    .map(|entity| {
+                        entity
+                            .label
+                            .clone()
+                            .unwrap_or_else(|| truncate_middle(&entity.address, 5))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            format!(
+                r#"<a class="ei-event-row" href="/app/events/{}?workspace={}"><time>{}</time><span class="ei-status {}">{}</span><span class="ei-severity {}">{}</span><span class="ei-event-summary"><strong>{}</strong><small>{}</small></span><span class="ei-event-impact" title="{}">{}</span><span class="ei-event-actors">{}</span><span class="ei-event-confidence">{}</span><b>→</b></a>"#,
+                urlencoding::encode(&event.id),
+                urlencoding::encode(workspace_id),
+                event
+                    .occurred_at
+                    .map(|value| format_relative_time(value, now))
+                    .unwrap_or_else(|| "Unknown".to_owned()),
+                event.status.key(),
+                event.status.label(),
+                event.severity.key(),
+                event.severity.label(),
+                event.event_type.label(),
+                escape_html(&event.conclusion),
+                escape_html(impact),
+                escape_html(impact),
+                escape_html(&actors),
+                escape_html(&confidence),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    format!(
+        r#"<div class="ei-event-list"><div class="ei-event-list-head"><span>Time</span><span>Status</span><span>Severity</span><span>Entity Event / Conclusion</span><span>Impact</span><span>Related Entities</span><span>Confidence</span><span></span></div>{rows}</div>"#
+    )
+}
+
+fn render_overview_actor_reviews(
+    reviews: &[BehaviorReviewItem],
+    workspace: &WorkspaceRef,
+) -> String {
+    if reviews.is_empty() {
+        return r#"<div class="ei-empty-state"><strong>No actors require review</strong><p>Only evidence-backed behavior changes appear here; high volume alone is not enough.</p></div>"#.to_owned();
+    }
+    reviews
+        .iter()
+        .take(5)
+        .map(|review| {
+            format!(
+                r#"<a class="ei-review-actor" href="/app/observations/{}?workspace={}"><span class="ei-actor-mark">◎</span><span><strong>{}</strong><small>Changed automated behavior · evidence review required</small></span><b>{:.0}%</b></a>"#,
+                urlencoding::encode(&review.address),
+                urlencoding::encode(&workspace.id),
+                escape_html(&truncate_middle(&review.address, 7)),
+                review.confidence.clamp(0.0, 1.0) * 100.0,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_overview_investigations(
+    investigations: &[InvestigationRow],
+    workspace_id: &str,
+) -> String {
+    if investigations.is_empty() {
+        return r#"<div class="ei-empty-state"><strong>No investigations yet</strong><p>Create an investigation from any execution event.</p><a class="ca-secondary-button" href="/app/events">Browse events</a></div>"#.to_owned();
+    }
+    investigations
+        .iter()
+        .take(5)
+        .map(|investigation| {
+            let (status, status_class) = investigation_status_label(&investigation.status);
+            format!(
+                r#"<a class="ei-review-actor" href="/app/investigations/{}?workspace={}"><span class="ei-actor-mark">◇</span><span><strong>{}</strong><small>{} related events · updated {}</small></span><span class="ei-status {}">{}</span></a>"#,
+                investigation.investigation_id,
+                urlencoding::encode(workspace_id),
+                escape_html(&investigation.title),
+                investigation.related_event_ids.len(),
+                investigation.updated_at.format("%Y-%m-%d %H:%M UTC"),
+                status_class,
+                status,
+            )
+        })
+        .collect::<String>()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_live_events_page(
+    state: &WebState,
+    user: &AppUser,
+    selected_chain_id: u64,
+    clusters: &[DashboardClusterRecord],
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    query: &ExecutionUiQuery,
+    events: &[&ExecutionEvent],
+) -> String {
+    let queue_is_review = query.queue.as_deref() == Some("review");
+    let selected = |current: Option<&str>, value: &str| {
+        if current == Some(value) {
+            "selected"
+        } else {
+            ""
+        }
+    };
+    let status_options = [
+        ExecutionEventStatus::Detected,
+        ExecutionEventStatus::Verified,
+        ExecutionEventStatus::Investigating,
+        ExecutionEventStatus::Resolved,
+        ExecutionEventStatus::Dismissed,
+    ]
+    .into_iter()
+    .map(|status| {
+        format!(
+            r#"<option value="{}" {}>{}</option>"#,
+            status.key(),
+            selected(query.status.as_deref(), status.key()),
+            status.label(),
+        )
+    })
+    .collect::<String>();
+    let severity_options = [
+        EventSeverity::Critical,
+        EventSeverity::High,
+        EventSeverity::Medium,
+        EventSeverity::Low,
+    ]
+    .into_iter()
+    .map(|severity| {
+        format!(
+            r#"<option value="{}" {}>{}</option>"#,
+            severity.key(),
+            selected(query.severity.as_deref(), severity.key()),
+            severity.label(),
+        )
+    })
+    .collect::<String>();
+    let event_type_options = [
+        ExecutionEventType::DexArbitrage,
+        ExecutionEventType::Backrun,
+        ExecutionEventType::Liquidation,
+        ExecutionEventType::LiquidationAttempt,
+        ExecutionEventType::RepeatedFailedAttempts,
+        ExecutionEventType::LargeAssetFlow,
+        ExecutionEventType::ProtocolRevenue,
+        ExecutionEventType::TreasuryMovement,
+        ExecutionEventType::SolverExecution,
+        ExecutionEventType::UnknownMaterialInteraction,
+    ]
+    .into_iter()
+    .map(|event_type| {
+        format!(
+            r#"<option value="{}" {}>{}</option>"#,
+            event_type.key(),
+            selected(query.event_type.as_deref(), event_type.key()),
+            event_type.label(),
+        )
+    })
+    .collect::<String>();
+    let event_refs = events
+        .iter()
+        .map(|event| (*event).clone())
+        .collect::<Vec<_>>();
+    let rows = render_live_event_rows(&event_refs, Utc::now(), usize::MAX, &workspace.id);
+    let empty = if events.is_empty() {
+        r#"<div class="ei-empty-state ei-empty-wide"><strong>No events match the current filters.</strong><p>Remove one or more filters, change the time range, or return to all events.</p><a class="ca-secondary-button" href="/app/events">Clear filters</a></div>"#.to_owned()
+    } else {
+        rows
+    };
+    let notice = query
+        .notice
+        .as_deref()
+        .and_then(render_notice_message)
+        .unwrap_or_default();
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Workspace Events · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head>
+  <body class="dashboard-body ca-body"><div class="dashboard-shell ca-shell">{sidebar}<div class="ca-workspace">{topbar}<main class="dashboard-main ca-main ei-main">
+    <section class="ca-page-heading"><div><span class="ei-page-kicker">ENTITY-RELATED ACTIVITY</span><div class="ca-title-row"><h1>Entity Events</h1><span>{count} matching</span></div><p>Events are scoped to tracked entities in {workspace_name} and preserve related entities and evidence state. Global verified records remain in the public Evidence Explorer.</p></div><div class="ca-heading-actions"><a class="ca-secondary-button" href="/app/events?queue=review&workspace={workspace_id}">Open Review Queue</a></div></section>
+    {notice}
+    <nav class="ei-view-tabs" aria-label="Event views"><a class="{all_active}" href="/app/events?workspace={workspace_id}&chain_id={chain_id}&range={range_key}">All Events</a><a class="{review_active}" href="/app/events?queue=review&workspace={workspace_id}&chain_id={chain_id}&range={range_key}">Review Queue</a></nav>
+    <section class="ca-panel ei-filter-panel"><form class="ei-filter-grid" method="get" action="/app/events"><input type="hidden" name="workspace" value="{workspace_id}"><input type="hidden" name="range" value="{range_key}">{queue_field}<label><span>Status</span><select name="status"><option value="">All statuses</option>{status_options}</select></label><label><span>Severity</span><select name="severity"><option value="">All severities</option>{severity_options}</select></label><label><span>Event type</span><select name="event_type"><option value="">All event types</option>{event_type_options}</select></label><label><span>Network</span><select name="chain_id"><option value="{chain_id}" selected>{network}</option></select></label><label><span>Protocol</span><input name="protocol" value="{protocol}" placeholder="Protocol name"></label><label><span>Entity</span><input name="entity" value="{entity}" placeholder="0x address or label"></label><label><span>Confidence</span><select name="confidence"><option value="">Any confidence</option><option value="High" {confidence_high}>High</option><option value="Medium" {confidence_medium}>Medium</option><option value="Low" {confidence_low}>Low</option></select></label><button class="ca-primary-button" type="submit">Apply filters</button></form></section>
+    <section class="ca-panel ei-panel ei-events-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">{queue_kicker}</span><h2>{queue_title}</h2></div><span>Candidate signals never inherit verified styling</span></div><div class="ei-events-scroll">{empty}</div></section>
+  </main></div></div></body></html>"#,
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, "events", clusters.first()),
+        topbar = render_execution_topbar(
+            state,
+            selected_chain_id,
+            workspaces,
+            workspace,
+            range,
+            "/app/events"
+        ),
+        count = events.len(),
+        workspace_name = escape_html(&workspace.name),
+        notice = notice,
+        all_active = if queue_is_review { "" } else { "active" },
+        review_active = if queue_is_review { "active" } else { "" },
+        workspace_id = urlencoding::encode(&workspace.id),
+        chain_id = selected_chain_id,
+        range_key = range.key(),
+        queue_field = if queue_is_review {
+            r#"<input type="hidden" name="queue" value="review">"#
+        } else {
+            ""
+        },
+        status_options = status_options,
+        severity_options = severity_options,
+        event_type_options = event_type_options,
+        network = escape_html(
+            state
+                .chain_registry
+                .resolve(selected_chain_id)
+                .map(|route| route.display_name.as_str())
+                .unwrap_or("Unknown network")
+        ),
+        protocol = escape_html(query.protocol.as_deref().unwrap_or("")),
+        entity = escape_html(query.entity.as_deref().unwrap_or("")),
+        confidence_high = selected(query.confidence.as_deref(), "High"),
+        confidence_medium = selected(query.confidence.as_deref(), "Medium"),
+        confidence_low = selected(query.confidence.as_deref(), "Low"),
+        queue_kicker = if queue_is_review {
+            "REVIEW QUEUE"
+        } else {
+            "EVENT STREAM"
+        },
+        queue_title = if queue_is_review {
+            "Detected / Low-confidence / Missing-evidence events"
+        } else {
+            "All Execution Events"
+        },
+        empty = empty,
+    )
+}
+
+fn render_execution_event_page(
+    state: &WebState,
+    user: &AppUser,
+    clusters: &[DashboardClusterRecord],
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    event: &ExecutionEvent,
+    related_event_count: usize,
+) -> String {
+    let network = state
+        .chain_registry
+        .resolve(event.chain_id)
+        .map(|route| route.display_name.as_str())
+        .unwrap_or("Unknown network");
+    let confidence = event
+        .confidence
+        .level
+        .map(|level| level.label().to_owned())
+        .unwrap_or_else(|| "Unknown".to_owned());
+    let confidence = event
+        .confidence
+        .score
+        .map(|score| format!("{confidence} · {score}"))
+        .unwrap_or(confidence);
+    let occurred_at = event
+        .occurred_at
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| "Unknown".to_owned());
+    let impact = [
+        (
+            "Trigger size",
+            event.economic_impact.trigger_size.as_deref(),
+        ),
+        (
+            "Price impact",
+            event.economic_impact.price_impact.as_deref(),
+        ),
+        (
+            "Gross value captured",
+            event.economic_impact.gross_value_captured.as_deref(),
+        ),
+        ("Gas cost", event.economic_impact.gas_cost.as_deref()),
+        (
+            "Net searcher profit",
+            event.economic_impact.net_profit.as_deref(),
+        ),
+        (
+            "Protocol fees",
+            event.economic_impact.protocol_fees.as_deref(),
+        ),
+        (
+            "Rebate / profit share",
+            event.economic_impact.rebate.as_deref(),
+        ),
+        ("Asset moved", event.economic_impact.asset_moved.as_deref()),
+    ]
+    .into_iter()
+    .map(|(label, value)| {
+        format!(
+            r#"<div class="{}"><span>{}</span><strong>{}</strong></div>"#,
+            if value.is_some() {
+                "available"
+            } else {
+                "unknown"
+            },
+            label,
+            escape_html(value.unwrap_or("Unknown")),
+        )
+    })
+    .collect::<String>();
+    let timeline = if event.timeline.is_empty() {
+        r#"<div class="ei-empty-state"><strong>Execution timeline unavailable</strong><p>No deterministic ordered steps are present in this event's evidence.</p></div>"#.to_owned()
+    } else {
+        event
+            .timeline
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                let time = step
+                    .occurred_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "Time unavailable".to_owned());
+                format!(
+                    r#"<article class="ei-timeline-step"><span>{}</span><div><small>{} · {}</small><strong>{}</strong><p>{}</p>{}</div></article>"#,
+                    index + 1,
+                    escape_html(&step.label),
+                    escape_html(&time),
+                    escape_html(&step.title),
+                    escape_html(&step.detail),
+                    step.status.as_deref().map(|status| format!(r#"<em>{}</em>"#, escape_html(status))).unwrap_or_default(),
+                )
+            })
+            .collect::<String>()
+    };
+    let participants = if event.participants.is_empty() {
+        r#"<div class="ei-empty-state"><strong>Participants unavailable</strong><p>The current evidence does not provide attributable participant addresses.</p></div>"#.to_owned()
+    } else {
+        event
+            .participants
+            .iter()
+            .map(|entity| {
+                format!(
+                    r#"<a class="ei-participant" href="/app/observations/{}?workspace={}"><span>{}</span><strong>{}</strong><small>{}</small><b>→</b></a>"#,
+                    urlencoding::encode(&entity.address),
+                    urlencoding::encode(&workspace.id),
+                    escape_html(&entity.role),
+                    escape_html(entity.label.as_deref().unwrap_or("Unlabeled entity")),
+                    escape_html(&entity.address),
+                )
+            })
+            .collect::<String>()
+    };
+    let protocol_list = if event.protocols.is_empty() {
+        "Unknown".to_owned()
+    } else {
+        event.protocols.join(" · ")
+    };
+    let evidence_flags = [
+        ("Receipt", event.evidence.receipt_available),
+        ("Logs", event.evidence.logs_available),
+        ("Trace", event.evidence.trace_available),
+        ("Token balance delta", event.evidence.token_deltas_available),
+    ]
+    .into_iter()
+    .map(|(label, available)| {
+        format!(
+            r#"<div><span>{}</span><strong class="{}">{}</strong></div>"#,
+            label,
+            if available { "available" } else { "unknown" },
+            if available {
+                "Available"
+            } else {
+                "Unavailable"
+            },
+        )
+    })
+    .collect::<String>();
+    let limitations = if event.evidence.limitations.is_empty() {
+        "No explicit limitations recorded.".to_owned()
+    } else {
+        format!(
+            "<ul>{}</ul>",
+            event
+                .evidence
+                .limitations
+                .iter()
+                .map(|item| format!("<li>{}</li>", escape_html(item)))
+                .collect::<String>()
+        )
+    };
+    let raw_evidence = event
+        .evidence
+        .raw
+        .as_ref()
+        .and_then(|raw| serde_json::to_string_pretty(raw).ok())
+        .map(|raw| format!(r#"<pre class="json-shell">{}</pre>"#, escape_html(&raw)))
+        .unwrap_or_else(|| "<p>Raw evidence unavailable.</p>".to_owned());
+    let monitor_subject = event
+        .participants
+        .first()
+        .map(|entity| entity.address.as_str())
+        .unwrap_or("");
+    let recommendation = if event.is_unverified() {
+        "Review the recorded limitations and missing evidence before escalating or creating an operational rule."
+    } else if related_event_count > 1 {
+        "Compare the recurring events and participants, then create a scoped rule if the pattern is operationally material."
+    } else {
+        "Review the affected entity and monitor the participant if this verified event is relevant to your operating threshold."
+    };
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Execution Event · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head><body class="dashboard-body ca-body"><div class="dashboard-shell ca-shell">{sidebar}<div class="ca-workspace">{topbar}<main class="dashboard-main ca-main ei-main ei-event-detail">
+        <a class="ei-back-link" href="/app/events?workspace={workspace_id}">← Back to Workspace Events</a>
+        <section class="ca-panel ei-conclusion-card"><div class="ei-event-labels"><span class="ei-severity {severity_key}">{severity}</span><span class="ei-event-type">{event_type}</span><span class="ei-status {status_key}">{status}</span></div><span class="ei-section-kicker">CONCLUSION</span><h1>Execution Event</h1><p>{conclusion}</p><dl><div><dt>Confidence</dt><dd>{confidence}</dd></div><div><dt>Network</dt><dd>{network}</dd></div><div><dt>Timestamp</dt><dd>{occurred_at}</dd></div><div><dt>Tx hash</dt><dd><code>{tx_hash}</code></dd></div><div><dt>Block</dt><dd>{block}</dd></div><div><dt>Protocol</dt><dd>{protocols}</dd></div></dl>{unverified_note}</section>
+        <section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">WORKSPACE CONTEXT</span><h2>{workspace_name}</h2></div><span>{workspace_entities} monitored entities</span></div><div class="ei-impact-grid"><div class="available"><span>Similar events · 30d</span><strong>{related_event_count}</strong></div><div class="available"><span>Related entities</span><strong>{participant_count}</strong></div><div class="available"><span>Operational next step</span><strong>{recommendation}</strong></div></div></section>
+        <section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">CONFIRMED VALUES ONLY</span><h2>Economic Impact</h2></div><span>Unknown is never coerced to zero</span></div><div class="ei-impact-grid">{impact}</div></section>
+        <section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">ORDERED EVIDENCE</span><h2>Execution Timeline</h2></div></div><div class="ei-timeline">{timeline}</div></section>
+        <section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">ATTRIBUTED ADDRESSES</span><h2>Participants</h2></div></div><div class="ei-participants">{participants}</div></section>
+        <details class="ca-panel ei-evidence-panel"><summary><span><small>EVIDENCE</small><strong>Technical evidence and limitations</strong></span><b>Open evidence ↓</b></summary><div class="ei-evidence-body"><div class="ei-evidence-flags">{evidence_flags}</div><dl class="ei-evidence-identifiers"><div><dt>Route fingerprint</dt><dd>{route_fingerprint}</dd></div><div><dt>Ruleset ID</dt><dd>{ruleset}</dd></div><div><dt>Inputs digest</dt><dd>{inputs_digest}</dd></div></dl><section><h3>Limitations</h3>{limitations}</section><details class="raw-json-shell"><summary>Raw persisted evidence</summary>{raw_evidence}</details></div></details>
+        <section class="ca-panel ei-detail-actions"><div><span class="ei-section-kicker">NEXT ACTION</span><h2>Actions</h2><p>Continue from this event without losing its evidence context.</p></div><div><a class="ca-primary-button" href="/app/investigations?new=1&workspace={workspace_id}&event_id={event_id}">Add to Investigation</a><a class="ca-secondary-button" href="/app/monitors?step=1&workspace={workspace_id}&subject={monitor_subject}">Track This Entity</a><a class="ca-secondary-button" href="/app/monitors?tab=rules&workspace={workspace_id}&event_type={event_type_key}">Create a Rule for Similar Events</a><a class="ca-secondary-button" href="/app/events/{event_id}/evidence.json">Export JSON</a><a class="ca-secondary-button" href="{analysis_href}">Create Shareable Transaction Explanation</a><button class="ca-secondary-button" type="button" onclick="navigator.clipboard.writeText(window.location.href)">Copy Transaction Link</button><button class="ca-disabled-button" type="button" disabled title="Public Evidence Pack sharing is not available for authenticated workspace records.">Share Evidence Pack · unavailable</button></div></section>
+      </main></div></div></body></html>"#,
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, "events", clusters.first()),
+        topbar = render_execution_topbar(
+            state,
+            event.chain_id,
+            workspaces,
+            workspace,
+            range,
+            "/app/events"
+        ),
+        severity_key = event.severity.key(),
+        severity = event.severity.label(),
+        event_type = event.event_type.label(),
+        event_type_key = event.event_type.key(),
+        status_key = event.status.key(),
+        status = event.status.label(),
+        conclusion = escape_html(&event.conclusion),
+        confidence = escape_html(&confidence),
+        network = escape_html(network),
+        occurred_at = escape_html(&occurred_at),
+        tx_hash = escape_html(&event.tx_hash),
+        block = event
+            .block_number
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "Unknown".to_owned()),
+        protocols = escape_html(&protocol_list),
+        unverified_note = if event.is_unverified() {
+            r#"<div class="ei-unverified-note"><strong>Detected / Unverified</strong><span>This detector signal is not a confirmed arbitrage conclusion. Economic profit and intent remain unknown until deterministic verification succeeds.</span></div>"#
+        } else {
+            ""
+        },
+        impact = impact,
+        workspace_name = escape_html(&workspace.name),
+        workspace_entities = workspace.monitored_entity_count,
+        related_event_count = related_event_count,
+        participant_count = event.participants.len(),
+        recommendation = escape_html(recommendation),
+        timeline = timeline,
+        participants = participants,
+        evidence_flags = evidence_flags,
+        route_fingerprint = escape_html(
+            event
+                .evidence
+                .route_fingerprint
+                .as_deref()
+                .unwrap_or("Unknown")
+        ),
+        ruleset = escape_html(event.evidence.ruleset_id.as_deref().unwrap_or("Unknown")),
+        inputs_digest = escape_html(event.evidence.inputs_digest.as_deref().unwrap_or("Unknown")),
+        limitations = limitations,
+        raw_evidence = raw_evidence,
+        event_id = urlencoding::encode(&event.id),
+        workspace_id = urlencoding::encode(&workspace.id),
+        monitor_subject = urlencoding::encode(monitor_subject),
+        analysis_href = tx_analysis_href(event.chain_id, &event.tx_hash),
     )
 }
 
@@ -3644,6 +13479,7 @@ fn render_today_page(
     user: &AppUser,
     selected_chain_id: u64,
     clusters: &[DashboardClusterRecord],
+    snapshot: &TodaySnapshot,
 ) -> String {
     let chain = state
         .chain_registry
@@ -3653,304 +13489,335 @@ fn render_today_page(
         .map(|route| route.display_name.as_str())
         .unwrap_or("Selected chain");
     let chain_slug = chain.map(|route| route.slug.as_str()).unwrap_or("chain");
-    let today = Utc::now().format("%Y年%m月%d日").to_string();
+    let today = snapshot.captured_at.format("%B %d, %Y").to_string();
+    let weekday = english_weekday(snapshot.captured_at.weekday());
     let known_teams = clusters
         .iter()
         .filter(|cluster| cluster.chain_id == selected_chain_id)
-        .count();
+        .count() as i64;
     let known_addresses = clusters
         .iter()
         .filter(|cluster| cluster.chain_id == selected_chain_id)
-        .map(|cluster| cluster.address_count as usize)
-        .sum::<usize>();
-    let first_team_href = clusters
-        .iter()
-        .find(|cluster| cluster.chain_id == selected_chain_id)
-        .map(|cluster| format!("/app/clusters/{}", cluster.cluster_id))
-        .unwrap_or_else(|| "/app/clusters".to_owned());
-    let og_image_url = escape_html(&format!(
-        "{}/assets/chainactors-og.png",
-        state.web_base_url.trim_end_matches('/')
-    ));
+        .map(|cluster| cluster.address_count as i64)
+        .sum::<i64>();
     let sidebar = render_app_sidebar(user, "today", clusters.first());
     let topbar = render_global_topbar(state, selected_chain_id);
+    let hero = render_today_hero(chain_name, chain_slug, selected_chain_id, snapshot);
+    let latest_intelligence = render_today_intelligence_rows(selected_chain_id, snapshot);
+    let actor_rows = render_today_actor_rows(selected_chain_id, snapshot);
+    let hot_list = render_today_hot_list(selected_chain_id, snapshot);
+    let hourly_activity = render_today_hourly_activity(snapshot);
+    let plane_status = render_today_plane_status(
+        snapshot,
+        selected_chain_id,
+        chain_name,
+        chain.map(|route| route.config_version).unwrap_or(1),
+    );
+    let supported_data_planes =
+        render_today_supported_data_planes(state, selected_chain_id, snapshot);
+    let updated_label = snapshot
+        .metrics
+        .latest_observed_at
+        .map(|value| {
+            format!(
+                "Latest observation {} · {}",
+                value.format("%H:%M:%S UTC"),
+                format_relative_time(value, snapshot.captured_at)
+            )
+        })
+        .unwrap_or_else(|| "No onchain observations yet".to_owned());
+    let freshness_tone = today_freshness_tone(snapshot);
+    let metrics = &snapshot.metrics;
+
+    let signal_cards = [
+        render_signal_card(
+            "new",
+            "Arbitrage Candidates",
+            &format_count(metrics.arbitrage_24h),
+            &format!(
+                "{} confirmed",
+                format_count(metrics.confirmed_arbitrage_24h)
+            ),
+            &format_window_comparison(metrics.arbitrage_24h, metrics.arbitrage_previous_24h),
+            "ARBITRAGE",
+            "↗",
+            "/app/arbitrage",
+        ),
+        render_signal_card(
+            "bot",
+            "Multi-pool Swaps",
+            &format_count(metrics.multi_swap_24h),
+            "24h signals persisted by the trace monitor",
+            &format_window_comparison(metrics.multi_swap_24h, metrics.multi_swap_previous_24h),
+            "MULTI-SWAP",
+            "♙",
+            "/app/arbitrage",
+        ),
+        render_signal_card(
+            "winner",
+            "Analyzed Transactions",
+            &format_count(metrics.analyzed_transactions_24h),
+            &format!(
+                "{} failed or reverted",
+                format_count(metrics.failed_transactions_24h)
+            ),
+            &format_window_comparison(
+                metrics.analyzed_transactions_24h,
+                metrics.analyzed_transactions_previous_24h,
+            ),
+            "ANALYSES",
+            "◇",
+            "/app/tx-analysis",
+        ),
+        render_signal_card(
+            "change",
+            "Label Updates",
+            &format_count(metrics.labels_updated_24h),
+            &format!(
+                "{} label records in the database",
+                format_count(metrics.effective_labels)
+            ),
+            &format_window_comparison(
+                metrics.labels_updated_24h,
+                metrics.labels_updated_previous_24h,
+            ),
+            "LABELS",
+            "◎",
+            "/app/address-analysis",
+        ),
+        render_signal_card(
+            "failure",
+            "Ready Metadata",
+            &format_count(metrics.ready_token_metadata),
+            &format!(
+                "{} active protocol deployments",
+                format_count(metrics.active_protocol_deployments)
+            ),
+            "Cumulative database value",
+            "TOKENS",
+            "⌘",
+            "/app/address-analysis",
+        ),
+    ]
+    .join("");
+
     format!(
         r#"<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="ChainActors — 识别链上行为，追踪地址关系，看懂链上参与者。">
-    <meta property="og:title" content="ChainActors · Today’s On-chain Intelligence">
+    <meta name="description" content="LedgerFlow — identify onchain behavior, trace address relationships, and understand execution actors.">
+    <meta property="og:title" content="LedgerFlow · Today’s On-chain Intelligence">
     <meta property="og:description" content="Know the actors behind the blockchain.">
-    <meta property="og:image" content="{og_image_url}">
-    <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:image" content="{og_image_url}">
-    <title>今日链上情报 · ChainActors</title>
+    <meta name="twitter:card" content="summary">
+    <title>Today's Onchain Intelligence · LedgerFlow</title>
     <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
-    <style>{}</style>
+    <style>{styles}</style>
   </head>
   <body class="dashboard-body ca-body">
     <div class="dashboard-shell ca-shell">
-      {}
+      {sidebar}
       <div class="ca-workspace">
-        {}
+        {topbar}
         <main class="dashboard-main ca-main">
           <section class="ca-page-heading">
             <div>
-              <div class="ca-title-row"><h1>今日链上情报</h1><span>{} · 星期一</span></div>
-              <p>聚焦值得研究的参与者、团队与机器人变化，并给出可追溯证据。</p>
+              <div class="ca-title-row"><h1>Today's Onchain Intelligence</h1><span>{today} · {weekday}</span></div>
+              <p>Data shown here is observed by PostgreSQL, the indexer, and the local RPC. Unverified signals are explicitly labeled.</p>
             </div>
             <div class="ca-heading-actions">
-              <span class="ca-updated"><i></i> 数据更新于 48 秒前</span>
-              <a class="ca-primary-button" href="/app/clusters">查看研究空间</a>
+              <span class="ca-updated {freshness_tone}"><i></i>{updated_label}</span>
+              <a class="ca-primary-button" href="/app/clusters">Open Research Workspace</a>
             </div>
           </section>
 
-          <section class="ca-intel-hero">
-            <div class="ca-hero-copy">
-              <div class="ca-kicker"><span class="ca-pill intelligence">HIGH PRIORITY</span><span class="ca-chain-badge {}">{}</span><span>首次发现于 2 小时前</span></div>
-              <h2>一个新的 {} 套利团队正在快速扩张</h2>
-              <p>系统检测到 8 个疑似关联地址、3 个执行合约和一个共同资金来源。该团队主要活跃于 Uniswap V3 与 Aerodrome。</p>
-              <div class="ca-hero-metrics">
-                <div><span>估算 7D 盈利</span><strong>42.8 ETH</strong><small class="positive">+28.4%</small></div>
-                <div><span>关联地址</span><strong>8</strong><small>新增 4 个</small></div>
-                <div><span>关系置信度</span><strong>87%</strong><small class="verified">12 条证据</small></div>
-              </div>
-              <div class="ca-evidence-row"><span>判断依据</span><b>共同资金源</b><b>调用序列相似</b><b>利润归集</b><b>时间行为</b></div>
-              <div class="ca-hero-actions">
-                <a class="ca-primary-button" href="{}">查看完整分析 <span>→</span></a>
-                <a class="ca-secondary-button" href="/app/tx-analysis">检查交易证据</a>
-              </div>
-            </div>
-            <div class="ca-relation-card" aria-label="Simplified relationship graph">
-              <div class="ca-chart-head"><span>关系证据图</span><small>8 wallets · 3 contracts</small></div>
-              <div class="ca-relation-graph">
-                <span class="ca-link l1"></span><span class="ca-link l2"></span><span class="ca-link l3"></span><span class="ca-link l4"></span>
-                <i class="node funding">F</i><i class="node core">T</i><i class="node n1">01</i><i class="node n2">02</i><i class="node n3">03</i><i class="node n4">04</i><i class="node contract">C</i>
-              </div>
-              <div class="ca-graph-legend"><span><i class="funding"></i>资金源</span><span><i class="wallet"></i>执行地址</span><span><i class="contract"></i>合约</span></div>
-            </div>
-          </section>
+          {hero}
 
-          <section class="ca-signal-grid" aria-label="Core intelligence signals">
-            {}
-            {}
-            {}
-            {}
-            {}
+          <section class="ca-signal-grid" aria-label="Real intelligence signals">
+            {signal_cards}
           </section>
 
           <section class="ca-content-grid">
             <div class="ca-main-column">
               <section class="ca-panel">
-                <div class="ca-panel-head"><div><h3>最新发现</h3><p>Latest Intelligence</p></div><a href="/app/clusters">查看全部 <span>→</span></a></div>
-                <div class="ca-intel-list">
-                  {}
-                  {}
-                  {}
-                  {}
-                  {}
-                </div>
+                <div class="ca-panel-head"><div><h3>Latest Observations</h3><p>Latest database records</p></div><a href="/app/arbitrage">View All <span>→</span></a></div>
+                <div class="ca-intel-list">{latest_intelligence}</div>
               </section>
               <section class="ca-panel ca-overview-panel">
-                <div class="ca-panel-head"><div><h3>活跃概览</h3><p>Network Overview · 24H</p></div><span class="ca-sample-label">ILLUSTRATIVE DATA</span></div>
+                <div class="ca-panel-head"><div><h3>Activity Overview</h3><p>Observed data · 24H</p></div><span class="ca-sample-label">POSTGRESQL SNAPSHOT</span></div>
                 <div class="ca-overview-grid">
-                  <div><span>活跃 Bots</span><strong>{}</strong><small class="positive">+11.3%</small></div>
-                  <div><span>跟踪 Actors</span><strong>{}</strong><small class="positive">+9.8%</small></div>
-                  <div><span>已识别 Teams</span><strong>{}</strong><small class="positive">+2 今日</small></div>
-                  <div><span>24h 交易</span><strong>3.2M</strong><small class="base">+15.7%</small></div>
-                  <div><span>估算总盈利</span><strong>$1.48B</strong><small class="purple">+21.6%</small></div>
+                  <div><span>Active Candidate Senders</span><strong>{active_senders}</strong><small class="positive">24h unique</small></div>
+                  <div><span>Tracked Actors</span><strong>{tracked_actors}</strong><small>{tracked_eoas} EOA · {tracked_contracts} contracts</small></div>
+                  <div><span>My Entity Clusters</span><strong>{known_teams}</strong><small>{known_addresses} addresses</small></div>
+                  <div><span>Analyzed Transactions</span><strong>{analyzed_transactions}</strong><small>{failed_transactions} failed/reverted</small></div>
+                  <div><span>Confirmed Arbitrage</span><strong>{confirmed_arbitrage}</strong><small>Candidate profit is not presented as confirmed</small></div>
                 </div>
-                <div class="ca-activity-chart">
-                  <div class="ca-chart-scale"><span>10K</span><span>8K</span><span>6K</span><span>4K</span><span>2K</span></div>
-                  <div class="ca-chart-canvas"><span class="grid g1"></span><span class="grid g2"></span><span class="grid g3"></span><span class="grid g4"></span><div class="area blue"></div><div class="area green"></div></div>
-                </div>
-                <div class="ca-chart-footer"><span><i class="blue"></i>{}</span><span><i class="green"></i>Cross-chain actors</span><small>缓存快照 · 不在页面加载时扇出查询</small></div>
+                {hourly_activity}
               </section>
             </div>
 
             <aside class="ca-side-column">
               <section class="ca-panel">
-                <div class="ca-panel-head"><div><h3>热门地址</h3><p>Trending Actors · 24H</p></div><a href="/app/address-analysis">更多 <span>→</span></a></div>
-                <div class="ca-ranking-list">
-                  {}
-                  {}
-                  {}
-                  {}
-                  {}
-                </div>
+                <div class="ca-panel-head"><div><h3>Notable Addresses</h3><p>Candidate senders · 24H</p></div><a href="/app/address-analysis">More <span>→</span></a></div>
+                <div class="ca-ranking-list">{actor_rows}</div>
               </section>
               <section class="ca-panel">
-                <div class="ca-panel-head"><div><h3>链上热榜</h3><p>Signals worth watching</p></div><a href="/app/arbitrage">更多 <span>→</span></a></div>
-                <div class="ca-hot-list">
-                  <a href="/app/arbitrage"><span class="hot">●</span><span><b>最活跃 Protocol</b><small>Uniswap V3</small></span><strong>1.2M 交易</strong></a>
-                  <a href="/app/arbitrage"><span class="hot">●</span><span><b>最活跃 Pool</b><small>WETH / USDC</small></span><strong>$45.2M</strong></a>
-                  <a href="/app/address-analysis?address=0x7c2a...a1b2"><span class="hot">●</span><span><b>最赚钱机器人</b><small>0x7c2a...a1b2</small></span><strong>2,341 ETH</strong></a>
-                  <a href="/app/clusters"><span class="hot">●</span><span><b>最高置信团队</b><small>Team A-042</small></span><strong>91%</strong></a>
-                </div>
+                <div class="ca-panel-head"><div><h3>Onchain Activity</h3><p>Observed pools, routes and deployments</p></div><a href="/app/arbitrage">More <span>→</span></a></div>
+                <div class="ca-hot-list">{hot_list}</div>
               </section>
-              <section class="ca-panel ca-plane-status">
-                <div class="ca-panel-head"><div><h3>数据平面</h3><p>Control-plane registry</p></div><span class="ca-live"><i></i> LIVE</span></div>
-                <div class="ca-plane-row"><span class="chain-dot chain-primary"></span><span><strong>{}</strong><small>独立 API · 独立存储 · config v{}</small></span><b>Healthy</b></div>
-              </section>
+              {plane_status}
             </aside>
           </section>
 
           <section class="ca-supported">
-            <div><span class="ca-eyebrow">SUPPORTED DATA PLANES</span><h3>每条链独立运行，统一由控制面聚合</h3><p>链数据、索引器与 RPC 压力相互隔离；任何单链故障都不会阻塞其他网络的情报页面。</p></div>
-            <div class="ca-supported-cards">
-              <article><span class="chain-logo base">B</span><div><strong>{}</strong><small>已启用 · Chain ID {}</small></div><span><b>5s</b><small>读取预算</small></span></article>
-              <article><span class="chain-logo rh">↗</span><div><strong>Robinhood Chain</strong><small>通过注册表独立接入</small></div><span><b>v1</b><small>统一契约</small></span></article>
-              <article class="muted"><span class="chain-logo more">＋</span><div><strong>更多 EVM 网络</strong><small>Arbitrum · Optimism · Ethereum</small></div><span><b>∞</b><small>可扩展</small></span></article>
-            </div>
+            <div><span class="ca-eyebrow">ENABLED DATA PLANES</span><h3>Networks Enabled in the Control Plane</h3><p>Only enabled routes in the registry are shown. Networks that are not connected are omitted.</p></div>
+            <div class="ca-supported-cards">{supported_data_planes}</div>
           </section>
         </main>
       </div>
     </div>
   </body>
 </html>"#,
-        shared_styles(),
-        sidebar,
-        topbar,
-        today,
+        styles = shared_styles(),
+        active_senders = format_count(metrics.active_candidate_senders_24h),
+        tracked_actors = format_count(metrics.tracked_actors),
+        tracked_eoas = format_count(metrics.tracked_eoas),
+        tracked_contracts = format_count(metrics.tracked_contracts),
+        known_teams = format_count(known_teams),
+        known_addresses = format_count(known_addresses),
+        analyzed_transactions = format_count(metrics.analyzed_transactions_24h),
+        failed_transactions = format_count(metrics.failed_transactions_24h),
+        confirmed_arbitrage = format_count(metrics.confirmed_arbitrage_24h),
+    )
+}
+
+fn render_today_hero(
+    chain_name: &str,
+    chain_slug: &str,
+    selected_chain_id: u64,
+    snapshot: &TodaySnapshot,
+) -> String {
+    let Some(candidate) = snapshot.candidates.first() else {
+        let monitor_detail = snapshot
+            .monitor
+            .as_ref()
+            .map(|monitor| {
+                format!(
+                    "The trace monitor has processed block #{}, but the database has no arbitrage candidates yet.",
+                    format_count(monitor.last_processed_block)
+                )
+            })
+            .unwrap_or_else(|| "The trace monitor has not persisted progress yet.".to_owned());
+        return format!(
+            r#"<section class="ca-intel-hero ca-empty-hero">
+  <div class="ca-hero-copy">
+    <div class="ca-kicker"><span class="ca-pill system">REAL DATA</span><span class="ca-chain-badge {}">{}</span></div>
+    <h2>No Real-time Arbitrage Candidates Yet</h2>
+    <p>{}</p>
+    <div class="ca-hero-actions">
+      <a class="ca-primary-button" href="/app/arbitrage">View Collection Status <span>→</span></a>
+      <a class="ca-secondary-button" href="/app/indexer/progress">Check Indexer Progress</a>
+    </div>
+  </div>
+  <div class="ca-relation-card">
+    <div class="ca-chart-head"><span>Data Evidence</span><small>Chain ID {}</small></div>
+    <div class="empty-state">An empty state is shown when no records exist; fallback numbers and sample addresses are never used.</div>
+  </div>
+</section>"#,
+            escape_html(chain_slug),
+            escape_html(chain_name),
+            escape_html(&monitor_detail),
+            selected_chain_id,
+        );
+    };
+
+    let sender = candidate
+        .sender_address
+        .as_deref()
+        .map(|value| truncate_middle(value, 7))
+        .unwrap_or_else(|| "Sender not recorded".to_owned());
+    let sender_href = candidate
+        .sender_address
+        .as_deref()
+        .map(|value| {
+            format!(
+                "/app/address-analysis?chain_id={selected_chain_id}&address={}",
+                urlencoding::encode(value)
+            )
+        })
+        .unwrap_or_else(|| "/app/arbitrage".to_owned());
+    let tx_href = tx_analysis_href(selected_chain_id, &candidate.tx_hash);
+    let route_summary = today_route_summary(&candidate.route, 4);
+    let observed = candidate
+        .block_timestamp
+        .map(|value| format_relative_time(value, snapshot.captured_at))
+        .unwrap_or_else(|| "Timestamp not recorded".to_owned());
+    let status = today_candidate_status(&candidate.confirmation_status);
+    let entry_contract = candidate
+        .entry_contract
+        .as_deref()
+        .map(|value| truncate_middle(value, 7))
+        .unwrap_or_else(|| "Not recorded".to_owned());
+    let fingerprint = if candidate.route_fingerprint.is_empty() {
+        "Not recorded".to_owned()
+    } else {
+        truncate_middle(&candidate.route_fingerprint, 7)
+    };
+
+    format!(
+        r#"<section class="ca-intel-hero">
+  <div class="ca-hero-copy">
+    <div class="ca-kicker"><span class="ca-pill intelligence">REAL-TIME CANDIDATE</span><span class="ca-chain-badge {}">{}</span><span>Observed {}</span></div>
+    <h2>Arbitrage Candidate Detected Across {} Pools</h2>
+    <p>Transaction {} was sent by {} and contains {} recorded swaps. Current verification status: "{}". Route: {}.</p>
+    <div class="ca-hero-metrics">
+      <div><span>Block</span><strong>#{}</strong><small>RPC logs</small></div>
+      <div><span>Swaps / Pools</span><strong>{} / {}</strong><small>Actual detector counts</small></div>
+      <div><span>Detection Score</span><strong>{}</strong><small class="verified">{}</small></div>
+    </div>
+    <div class="ca-evidence-row"><span>Evidence Fields</span><b>{}</b><b>route fingerprint</b><b>{}</b></div>
+    <div class="ca-hero-actions">
+      <a class="ca-primary-button" href="{}">Analyze Transaction <span>→</span></a>
+      <a class="ca-secondary-button" href="{}">View Sender</a>
+    </div>
+  </div>
+  <div class="ca-relation-card" aria-label="Candidate evidence record">
+    <div class="ca-chart-head"><span>Data Evidence</span><small>PostgreSQL row</small></div>
+    <dl class="ca-source-facts">
+      <div><dt>Transaction Hash</dt><dd><code title="{}">{}</code></dd></div>
+      <div><dt>Sender</dt><dd><code>{}</code></dd></div>
+      <div><dt>Entry Contract</dt><dd><code>{}</code></dd></div>
+      <div><dt>Route Fingerprint</dt><dd><code>{}</code></dd></div>
+      <div><dt>Detection Source</dt><dd>{}</dd></div>
+    </dl>
+    <div class="ca-graph-legend"><span><i class="funding"></i>Candidate ≠ Verified</span><span><i class="contract"></i>Raw evidence retained</span></div>
+  </div>
+</section>"#,
         escape_html(chain_slug),
         escape_html(chain_name),
-        escape_html(chain_name),
-        escape_html(&first_team_href),
-        render_signal_card(
-            "new",
-            "新团队发现",
-            "3",
-            "个新团队被发现",
-            "+50%",
-            "NEW TEAM",
-            "↗"
-        ),
-        render_signal_card(
-            "bot",
-            "机器人画像",
-            "27",
-            "活跃机器人",
-            "+12%",
-            "BOT PROFILE",
-            "♙"
-        ),
-        render_signal_card(
-            "winner",
-            "盈利排行榜",
-            "Top 10",
-            "最高估算盈利 1,248 ETH",
-            "+23.5%",
-            "WINNERS",
-            "↗"
-        ),
-        render_signal_card(
-            "failure",
-            "失败案例",
-            "5",
-            "重大失败交易",
-            "↑25%",
-            "FAILURES",
-            "↘"
-        ),
-        render_signal_card(
-            "change",
-            "重大变化",
-            "12",
-            "关键行为变化",
-            "+33%",
-            "BEHAVIOR",
-            "◇"
-        ),
-        render_intel_row(
-            "new",
-            "新团队",
-            "疑似新套利团队 “0x8f3...c9d1” 被发现",
-            "8 地址 · 3 合约 · 共同资金源",
-            "2 小时前",
-            "87%"
-        ),
-        render_intel_row(
-            "bot",
-            "高频人",
-            "高频套利机器人 “0x7c2...a1b2” 利润激增",
-            "过去 7 天盈利增长 340% · 主要活跃于 Uniswap V3",
-            "4 小时前",
-            "92%"
-        ),
-        render_intel_row(
-            "failure",
-            "失败案例",
-            "今日最大失败套利：损失 17.3 ETH",
-            "Builder 延迟导致竞赛失败 · 6 笔交易证据",
-            "6 小时前",
-            "Verified"
-        ),
-        render_intel_row(
-            "change",
-            "行为变化",
-            "鲸鱼地址 “0x9a1...e3f4” 停止做市",
-            "在 Aerodrome 的活动发生显著下降",
-            "8 小时前",
-            "81%"
-        ),
-        render_intel_row(
-            "system",
-            "追踪更新",
-            "Searcher 排行已更新",
-            "Top 1 Searcher 过去 30 天盈利 1,248 ETH",
-            "10 小时前",
-            "Updated"
-        ),
-        known_addresses.max(702),
-        (known_addresses + 545).max(1_247),
-        known_teams.max(27),
-        escape_html(chain_name),
-        render_rank_row(
-            1,
-            "0x7c2...a1b2",
-            "Arbitrage bot",
-            "2,341 ETH",
-            "+45.2%",
-            "purple"
-        ),
-        render_rank_row(
-            2,
-            "0x8f3...c9d1",
-            "Team executor",
-            "1,982 ETH",
-            "+32.1%",
-            "gold"
-        ),
-        render_rank_row(
-            3,
-            "0x9a1...e3f4",
-            "Market maker",
-            "1,247 ETH",
-            "+28.5%",
-            "dark"
-        ),
-        render_rank_row(
-            4,
-            "0x1b2...d4e5",
-            "Liquidator",
-            "987 ETH",
-            "+18.7%",
-            "silver"
-        ),
-        render_rank_row(
-            5,
-            "0x5d6...f7a8",
-            "Rising actor",
-            "765 ETH",
-            "+12.3%",
-            "orange"
-        ),
-        escape_html(chain_name),
-        chain.map(|route| route.config_version).unwrap_or(1),
-        escape_html(chain_name),
-        selected_chain_id,
+        escape_html(&observed),
+        candidate.distinct_pool_count,
+        escape_html(&truncate_middle(&candidate.tx_hash, 8)),
+        escape_html(&sender),
+        candidate.swap_log_count,
+        escape_html(status),
+        escape_html(&route_summary),
+        format_count(candidate.block_number),
+        candidate.swap_log_count,
+        candidate.distinct_pool_count,
+        candidate.score,
+        escape_html(status),
+        escape_html(&candidate.detection_source),
+        escape_html(status),
+        escape_html(&tx_href),
+        escape_html(&sender_href),
+        escape_html(&candidate.tx_hash),
+        escape_html(&truncate_middle(&candidate.tx_hash, 10)),
+        escape_html(&sender),
+        escape_html(&entry_contract),
+        escape_html(&fingerprint),
+        escape_html(&candidate.detection_source),
     )
 }
 
@@ -3959,59 +13826,605 @@ fn render_signal_card(
     title: &str,
     value: &str,
     detail: &str,
-    change: &str,
+    comparison: &str,
     label: &str,
     icon: &str,
+    href: &str,
 ) -> String {
     format!(
-        r#"<a class="ca-signal-card {}" href="/app/clusters"><div><span>{}</span><b>{}</b></div><strong>{}</strong><p><b>{}</b> · {}</p><small>较昨日 <em>{}</em></small></a>"#,
+        r#"<a class="ca-signal-card {}" href="{}"><div><span>{}</span><b>{}</b></div><strong>{}</strong><p><b>{}</b> · {}</p><small>{}</small></a>"#,
         escape_html(tone),
+        escape_html(href),
         escape_html(label),
         escape_html(icon),
         escape_html(value),
         escape_html(title),
         escape_html(detail),
-        escape_html(change),
+        escape_html(comparison),
     )
 }
 
-fn render_intel_row(
-    tone: &str,
-    label: &str,
-    title: &str,
-    description: &str,
-    time: &str,
-    confidence: &str,
+fn render_today_intelligence_rows(chain_id: u64, snapshot: &TodaySnapshot) -> String {
+    if snapshot.candidates.is_empty() {
+        return "<div class=\"empty-state\">There are no candidate records in the database. They will appear after collection begins; sample intelligence is never shown.</div>"
+            .to_owned();
+    }
+    snapshot
+        .candidates
+        .iter()
+        .map(|candidate| render_today_intelligence_row(chain_id, candidate, snapshot.captured_at))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_today_intelligence_row(
+    chain_id: u64,
+    candidate: &TodayCandidateRow,
+    captured_at: DateTime<Utc>,
 ) -> String {
+    let href = tx_analysis_href(chain_id, &candidate.tx_hash);
+    let sender = candidate
+        .sender_address
+        .as_deref()
+        .map(|value| truncate_middle(value, 6))
+        .unwrap_or_else(|| "Sender not recorded".to_owned());
+    let time = candidate
+        .block_timestamp
+        .map(|value| format_relative_time(value, captured_at))
+        .unwrap_or_else(|| "Timestamp unavailable".to_owned());
     format!(
-        r#"<a class="ca-intel-row" href="/app/clusters"><span class="ca-pill {}">{}</span><span class="ca-intel-copy"><strong>{}</strong><small>{}</small></span><span class="ca-intel-meta"><small>{}</small><b>{}</b></span><span class="ca-row-arrow">›</span></a>"#,
-        escape_html(tone),
-        escape_html(label),
+        r#"<a class="ca-intel-row" href="{}"><span class="ca-pill new">Multi-pool Candidate</span><span class="ca-intel-copy"><strong>{}</strong><small>{} · {} swaps · {} pools · block #{}</small></span><span class="ca-intel-meta"><small>{}</small><b>Score {} · {}</b></span><span class="ca-row-arrow">›</span></a>"#,
+        escape_html(&href),
+        escape_html(&truncate_middle(&candidate.tx_hash, 10)),
+        escape_html(&sender),
+        candidate.swap_log_count,
+        candidate.distinct_pool_count,
+        format_count(candidate.block_number),
+        escape_html(&time),
+        candidate.score,
+        escape_html(today_candidate_status(&candidate.confirmation_status)),
+    )
+}
+
+fn render_today_actor_rows(chain_id: u64, snapshot: &TodaySnapshot) -> String {
+    if snapshot.actors.is_empty() {
+        return "<div class=\"empty-state\">No candidate senders were available for ranking in the last 24 hours.</div>".to_owned();
+    }
+    const AVATARS: [&str; 5] = ["purple", "gold", "dark", "silver", "orange"];
+    snapshot
+        .actors
+        .iter()
+        .enumerate()
+        .map(|(index, actor)| {
+            let label = actor.label.as_deref().unwrap_or("Unlabeled address");
+            let last_seen = actor
+                .last_seen
+                .map(|value| format_relative_time(value, snapshot.captured_at))
+                .unwrap_or_else(|| "Timestamp unavailable".to_owned());
+            format!(
+                r#"<a href="/app/address-analysis?chain_id={}&address={}"><span class="ca-rank">{}</span><span class="ca-actor-avatar {}"></span><span class="ca-rank-copy"><code>{}</code><small>{} · {}</small></span><strong>{} candidates</strong><em>{} swaps</em></a>"#,
+                chain_id,
+                urlencoding::encode(&actor.address),
+                index + 1,
+                AVATARS[index % AVATARS.len()],
+                escape_html(&truncate_middle(&actor.address, 6)),
+                escape_html(label),
+                escape_html(&last_seen),
+                format_count(actor.candidate_count),
+                format_count(actor.swap_count),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn render_today_hot_list(chain_id: u64, snapshot: &TodaySnapshot) -> String {
+    let mut items = Vec::new();
+    for pool in snapshot.hot_pools.iter().take(2) {
+        items.push(render_today_hot_item(
+            "Active Candidate Pool",
+            &format!(
+                "{} · {} senders",
+                truncate_middle(&pool.pool_address, 6),
+                format_count(pool.unique_senders)
+            ),
+            &format!(
+                "{} candidates · {} swaps",
+                format_count(pool.tx_count),
+                format_count(pool.swap_log_count)
+            ),
+            &format!(
+                "/app/address-analysis?chain_id={chain_id}&address={}",
+                urlencoding::encode(&pool.pool_address)
+            ),
+        ));
+    }
+    if let Some(route) = snapshot.hot_routes.first() {
+        items.push(render_today_hot_item(
+            "Repeated Route",
+            &format!(
+                "{} · {} senders",
+                today_route_summary(&route.route, 3),
+                format_count(route.unique_senders)
+            ),
+            &format!("{} candidates", format_count(route.tx_count)),
+            "/app/arbitrage",
+        ));
+    }
+    for protocol in &snapshot.protocols {
+        if items.len() >= 4 {
+            break;
+        }
+        let last_seen = protocol
+            .last_seen
+            .map(|value| format_relative_time(value, snapshot.captured_at))
+            .unwrap_or_else(|| "Time not recorded".to_owned());
+        items.push(render_today_hot_item(
+            "Protocol Deployment",
+            &format!(
+                "{} · {} · {}",
+                protocol.display_name, protocol.protocol_family, last_seen
+            ),
+            &format!("{} contracts", format_count(protocol.deployment_count)),
+            "/app/address-analysis",
+        ));
+    }
+    if items.len() < 4 && snapshot.metrics.ready_token_metadata > 0 {
+        items.push(render_today_hot_item(
+            "Token Metadata",
+            "Onchain calls successfully returned symbol / name / decimals",
+            &format!(
+                "{} tokens",
+                format_count(snapshot.metrics.ready_token_metadata)
+            ),
+            "/app/address-analysis",
+        ));
+    }
+    if items.is_empty() {
+        "<div class=\"empty-state\">No active pools, repeated routes, or protocol deployments were recorded in the last 24 hours.</div>".to_owned()
+    } else {
+        items.join("")
+    }
+}
+
+fn render_today_hot_item(title: &str, detail: &str, value: &str, href: &str) -> String {
+    format!(
+        r#"<a href="{}"><span class="hot">●</span><span><b>{}</b><small>{}</small></span><strong>{}</strong></a>"#,
+        escape_html(href),
         escape_html(title),
-        escape_html(description),
-        escape_html(time),
-        escape_html(confidence),
+        escape_html(detail),
+        escape_html(value),
     )
 }
 
-fn render_rank_row(
-    rank: usize,
-    address: &str,
-    label: &str,
-    profit: &str,
-    change: &str,
-    avatar: &str,
-) -> String {
+fn render_today_hourly_activity(snapshot: &TodaySnapshot) -> String {
+    let total = snapshot
+        .hourly_activity
+        .iter()
+        .map(|point| point.candidate_count)
+        .sum::<i64>();
+    if total == 0 {
+        return "<div class=\"ca-hourly-empty\"><div class=\"empty-state\">No arbitrage candidates were recorded in the last 24 hours, so the hourly chart remains empty.</div></div>"
+            .to_owned();
+    }
+    let max_count = snapshot
+        .hourly_activity
+        .iter()
+        .map(|point| point.candidate_count)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let bars = snapshot
+        .hourly_activity
+        .iter()
+        .map(|point| {
+            let height = if point.candidate_count == 0 {
+                0
+            } else {
+                ((point.candidate_count * 100) / max_count).max(5)
+            };
+            format!(
+                r#"<span class="ca-hour-bar" title="{} — {} candidates"><b>{}</b><i style="height:{}%"></i><small>{}</small></span>"#,
+                point.bucket.format("%Y-%m-%d %H:00 UTC"),
+                point.candidate_count,
+                point.candidate_count,
+                height,
+                point.bucket.format("%H"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
     format!(
-        r#"<a href="/app/address-analysis?address={}"><span class="ca-rank">{}</span><span class="ca-actor-avatar {}"></span><span class="ca-rank-copy"><code>{}</code><small>{}</small></span><strong>{}</strong><em>{}</em></a>"#,
-        urlencoding::encode(address),
-        rank,
-        escape_html(avatar),
-        escape_html(address),
-        escape_html(label),
-        escape_html(profit),
-        escape_html(change),
+        r#"<div class="ca-hourly-chart" aria-label="Actual hourly arbitrage candidate counts"><div class="ca-hourly-bars">{}</div><div class="ca-chart-footer"><span><i class="blue"></i>Arbitrage candidates / hour</span><small>24h total {} · queried at {}</small></div></div>"#,
+        bars,
+        format_count(total),
+        snapshot.captured_at.format("%H:%M:%S UTC"),
     )
+}
+
+fn render_today_plane_status(
+    snapshot: &TodaySnapshot,
+    chain_id: u64,
+    chain_name: &str,
+    config_version: u64,
+) -> String {
+    let (overall_label, overall_tone) = today_plane_state(snapshot, chain_id);
+    let latest = snapshot
+        .metrics
+        .latest_observed_at
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "No observations".to_owned());
+    let postgres = render_today_plane_row(
+        "PostgreSQL",
+        &format!("{} · latest observation {}", chain_name, latest),
+        "Connected",
+        "healthy",
+    );
+    let api = render_today_plane_row(
+        "Analysis API",
+        &format!(
+            "Control plane config v{} · Chain ID {}",
+            config_version, chain_id
+        ),
+        if snapshot.api_online {
+            "Online"
+        } else {
+            "Unavailable"
+        },
+        if snapshot.api_online {
+            "healthy"
+        } else {
+            "unavailable"
+        },
+    );
+    let rpc_ok = snapshot.rpc_chain_id == Some(chain_id) && snapshot.rpc_head_block.is_some();
+    let rpc_detail = match (snapshot.rpc_chain_id, snapshot.rpc_head_block) {
+        (Some(actual_chain_id), Some(head)) if actual_chain_id == chain_id => {
+            format!(
+                "eth_chainId {} · head #{}",
+                actual_chain_id,
+                format_count(head as i64)
+            )
+        }
+        (Some(actual_chain_id), Some(head)) => format!(
+            "Chain ID mismatch: {} · head #{}",
+            actual_chain_id,
+            format_count(head as i64)
+        ),
+        _ => "The local RPC gateway did not return a valid result".to_owned(),
+    };
+    let rpc = render_today_plane_row(
+        "Local RPC",
+        &rpc_detail,
+        if rpc_ok { "Connected" } else { "Unavailable" },
+        if rpc_ok { "healthy" } else { "unavailable" },
+    );
+    let monitor = snapshot
+        .monitor
+        .as_ref()
+        .map(|monitor| {
+            let fresh = today_monitor_is_fresh(snapshot);
+            let observed = monitor
+                .last_processed_at
+                .map(|value| format_relative_time(value, snapshot.captured_at))
+                .unwrap_or_else(|| "Timestamp unavailable".to_owned());
+            render_today_plane_row(
+                "Trace monitor",
+                &format!(
+                    "{} · block #{} · {}",
+                    monitor.worker_id,
+                    format_count(monitor.last_processed_block),
+                    observed
+                ),
+                if fresh { "Fresh" } else { "Lagging" },
+                if fresh { "healthy" } else { "degraded" },
+            )
+        })
+        .unwrap_or_else(|| {
+            render_today_plane_row(
+                "Trace monitor",
+                "No worker progress is recorded in the database",
+                "No progress",
+                "unavailable",
+            )
+        });
+    let indexer = snapshot
+        .indexer_progress
+        .as_ref()
+        .map(|progress| {
+            let stored = progress.max_stored_indexed_block.unwrap_or(0);
+            let has_live_worker = progress
+                .workers
+                .iter()
+                .any(|worker| worker.worker_kind == "live");
+            let mode = if has_live_worker { "live" } else { "lazy" };
+            let lag = progress.live_lag_blocks.unwrap_or_else(|| {
+                progress
+                    .rpc_head_block
+                    .unwrap_or(progress.last_indexed_block)
+                    .saturating_sub(progress.last_indexed_block)
+            });
+            let fresh = has_live_worker && lag <= 5;
+            render_today_plane_row(
+                "ClickHouse indexer",
+                &format!(
+                    "{} · head #{} · cursor #{} · lag {} · raw tx {} · stored #{}",
+                    mode,
+                    format_count(
+                        progress
+                            .rpc_head_block
+                            .unwrap_or(progress.last_indexed_block) as i64
+                    ),
+                    format_count(progress.last_indexed_block as i64),
+                    format_count(lag as i64),
+                    format_count(progress.raw_transaction_count as i64),
+                    format_count(stored as i64),
+                ),
+                if fresh { "Fresh" } else { "Catching up" },
+                if fresh { "healthy" } else { "degraded" },
+            )
+        })
+        .unwrap_or_else(|| {
+            render_today_plane_row(
+                "ClickHouse indexer",
+                "Progress endpoint unavailable",
+                "Unavailable",
+                "unavailable",
+            )
+        });
+    format!(
+        r#"<section class="ca-panel ca-plane-status">
+  <div class="ca-panel-head"><div><h3>Data Plane</h3><p>Live health checks and persisted cursors</p></div><span class="ca-plane-badge {}">{}</span></div>
+  {}{}{}{}{}
+</section>"#,
+        overall_tone, overall_label, postgres, api, rpc, monitor, indexer,
+    )
+}
+
+fn render_workspace_service_status(
+    snapshot: &TodaySnapshot,
+    network_name: &str,
+    monitored_entity_count: usize,
+) -> String {
+    let latest_event = snapshot
+        .metrics
+        .latest_observed_at
+        .map(|value| format_relative_time(value, snapshot.captured_at))
+        .unwrap_or_else(|| "No recent material event".to_owned());
+    let availability = if snapshot.api_online {
+        ("Available", "healthy")
+    } else {
+        ("Limited", "degraded")
+    };
+    let data_row = render_today_plane_row(
+        "Network data",
+        &format!("{} · {}", network_name, latest_event),
+        availability.0,
+        availability.1,
+    );
+    let analysis_row = render_today_plane_row(
+        "Execution analysis",
+        "Transaction explanations and deterministic evidence",
+        availability.0,
+        availability.1,
+    );
+    let monitoring_row = render_today_plane_row(
+        "Workspace monitoring",
+        &format!("{} configured entities", monitored_entity_count),
+        if monitored_entity_count > 0 {
+            "Configured"
+        } else {
+            "Setup required"
+        },
+        if monitored_entity_count > 0 {
+            "healthy"
+        } else {
+            "degraded"
+        },
+    );
+    let (overall_label, overall_tone) = if !snapshot.api_online {
+        ("Limited", "degraded")
+    } else if monitored_entity_count == 0 {
+        ("Setup required", "degraded")
+    } else {
+        ("Available", "healthy")
+    };
+    format!(
+        r#"<section class="ca-panel ca-plane-status">
+  <div class="ca-panel-head"><div><h3>Workspace services</h3><p>Monitoring coverage and analysis availability</p></div><span class="ca-plane-badge {}">{}</span></div>
+  {}{}{}
+</section>"#,
+        overall_tone, overall_label, data_row, analysis_row, monitoring_row,
+    )
+}
+
+fn render_today_plane_row(name: &str, detail: &str, status: &str, tone: &str) -> String {
+    format!(
+        r#"<div class="ca-plane-row"><span class="ca-plane-dot {}"></span><span><strong>{}</strong><small>{}</small></span><b class="{}">{}</b></div>"#,
+        escape_html(tone),
+        escape_html(name),
+        escape_html(detail),
+        escape_html(tone),
+        escape_html(status),
+    )
+}
+
+fn render_today_supported_data_planes(
+    state: &WebState,
+    selected_chain_id: u64,
+    snapshot: &TodaySnapshot,
+) -> String {
+    let (selected_status, selected_tone) = today_plane_state(snapshot, selected_chain_id);
+    state
+        .chain_registry
+        .routes()
+        .iter()
+        .map(|route| {
+            let selected = route.chain_id == selected_chain_id;
+            let status = if selected {
+                selected_status
+            } else {
+                "Registered"
+            };
+            let tone = if selected { selected_tone } else { "registered" };
+            let logo = if route.chain_id == 4663 {
+                "↗".to_owned()
+            } else {
+                route
+                    .display_name
+                    .chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_string()
+            };
+            format!(
+                r#"<article><span class="chain-logo {}">{}</span><div><strong>{}</strong><small>Chain ID {} · {}</small></div><span class="ca-plane-card-status {}"><b>{}</b><small>config v{}</small></span></article>"#,
+                escape_html(&route.slug),
+                escape_html(&logo),
+                escape_html(&route.display_name),
+                route.chain_id,
+                escape_html(&route.native_symbol),
+                escape_html(tone),
+                escape_html(status),
+                route.config_version,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn today_plane_state(snapshot: &TodaySnapshot, chain_id: u64) -> (&'static str, &'static str) {
+    let rpc_ok = snapshot.rpc_chain_id == Some(chain_id) && snapshot.rpc_head_block.is_some();
+    let monitor_ok = today_monitor_is_fresh(snapshot);
+    let indexer_ok = snapshot.indexer_progress.is_some();
+    if snapshot.api_online && rpc_ok && monitor_ok && indexer_ok {
+        ("Healthy", "healthy")
+    } else if snapshot.api_online || rpc_ok || monitor_ok || indexer_ok {
+        ("Degraded", "degraded")
+    } else {
+        ("Database only", "unavailable")
+    }
+}
+
+fn today_monitor_is_fresh(snapshot: &TodaySnapshot) -> bool {
+    snapshot
+        .monitor
+        .as_ref()
+        .and_then(|monitor| monitor.last_processed_at)
+        .map(|observed_at| {
+            let age = snapshot.captured_at.signed_duration_since(observed_at);
+            age >= ChronoDuration::seconds(-30) && age <= ChronoDuration::minutes(2)
+        })
+        .unwrap_or(false)
+}
+
+fn today_freshness_tone(snapshot: &TodaySnapshot) -> &'static str {
+    snapshot
+        .metrics
+        .latest_observed_at
+        .map(|observed_at| {
+            let age = snapshot.captured_at.signed_duration_since(observed_at);
+            if age <= ChronoDuration::minutes(2) {
+                "fresh"
+            } else if age <= ChronoDuration::minutes(15) {
+                "stale"
+            } else {
+                "outdated"
+            }
+        })
+        .unwrap_or("empty")
+}
+
+fn today_candidate_status(status: &str) -> &str {
+    match status {
+        "candidate" => "Detected / Unverified",
+        "analyzed_multi_pool_unconfirmed" => "Analyzed, arbitrage unverified",
+        "probable_arbitrage" => "Probable arbitrage, profit unverified",
+        "analyzed_reverted" => "Execution failed",
+        "analyzed_pending" => "Transaction status pending",
+        "confirmed_stable_surplus_to_sender" => "Stable-asset surplus confirmed",
+        "confirmed_surplus_to_sender" => "Asset surplus confirmed",
+        value if value.is_empty() => "Status not recorded",
+        value => value,
+    }
+}
+
+fn today_route_summary(route: &str, limit: usize) -> String {
+    let pools = route
+        .split('>')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if pools.is_empty() {
+        return "Route not recorded".to_owned();
+    }
+    let mut values = pools
+        .iter()
+        .take(limit)
+        .map(|value| truncate_middle(value, 5))
+        .collect::<Vec<_>>();
+    if pools.len() > limit {
+        values.push(format!("+{}", pools.len() - limit));
+    }
+    values.join(" → ")
+}
+
+fn format_relative_time(observed_at: DateTime<Utc>, captured_at: DateTime<Utc>) -> String {
+    let seconds = captured_at
+        .signed_duration_since(observed_at)
+        .num_seconds()
+        .max(0);
+    if seconds < 10 {
+        "Just now".to_owned()
+    } else if seconds < 60 {
+        format!("{} seconds ago", seconds)
+    } else if seconds < 3_600 {
+        format!("{} minutes ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{} hours ago", seconds / 3_600)
+    } else {
+        format!("{} days ago", seconds / 86_400)
+    }
+}
+
+fn format_window_comparison(current: i64, previous: i64) -> String {
+    if previous == 0 {
+        return if current == 0 {
+            "Previous 24h window was also 0".to_owned()
+        } else {
+            "Previous 24h window was 0".to_owned()
+        };
+    }
+    let change = ((current - previous) as f64 / previous as f64) * 100.0;
+    format!("{change:+.1}% vs previous 24h")
+}
+
+fn format_count(value: i64) -> String {
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let mut output = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            output.push(',');
+        }
+        output.push(character);
+    }
+    if negative {
+        output.insert(0, '-');
+    }
+    output
+}
+
+fn english_weekday(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Mon => "Monday",
+        Weekday::Tue => "Tuesday",
+        Weekday::Wed => "Wednesday",
+        Weekday::Thu => "Thursday",
+        Weekday::Fri => "Friday",
+        Weekday::Sat => "Saturday",
+        Weekday::Sun => "Sunday",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4022,6 +14435,7 @@ fn render_dashboard_page(
     notice: Option<&str>,
     created_key: Option<&str>,
     clusters: &[DashboardClusterRecord],
+    graph_edges: &[ClusterGraphEdgeRow],
     editable_cluster: Option<&AddressCluster>,
     selected_cluster: Option<&DashboardClusterRecord>,
     tracking: Option<&ClusterTrackingState>,
@@ -4263,7 +14677,7 @@ fn render_dashboard_page(
   <div class="tx-workbench-head">
     <div>
       <h1>Tx Analysis</h1>
-      <p>Enter a transaction hash. ChainActors loads a saved result when available; use Reanalyze only when you need fresh evidence.</p>
+      <p>Enter a transaction hash. LedgerFlow loads a saved result when available; use Reanalyze only when you need fresh evidence.</p>
     </div>
     <span class="readonly-pill">{}</span>
   </div>
@@ -4286,10 +14700,10 @@ fn render_dashboard_page(
         tx_result
             .map(render_tx_analysis_result)
             .unwrap_or_else(|| {
-                "<div class=\"empty-state\">Enter one tx hash to load the saved result if it already exists. Use Reanalyze when you want ChainActors to fetch evidence again and rerun the recognizers.</div>".to_owned()
+                "<div class=\"empty-state\">Enter one tx hash to load the saved result if it already exists. Use Reanalyze when you want LedgerFlow to fetch evidence again and rerun the recognizers.</div>".to_owned()
             })
     );
-    let graph_panel = render_cluster_graph_panel(clusters);
+    let graph_panel = render_cluster_graph_panel(clusters, graph_edges);
     let address_analysis_panel = render_address_analysis_panel(address_summary, state);
     let indexer_progress_panel = render_indexer_progress_panel(indexer_progress);
     let indexer_lookup_panel = render_indexer_lookup_panel(indexer_lookup, indexer_query);
@@ -4338,9 +14752,8 @@ fn render_dashboard_page(
     };
 
     let active_nav = match tab {
-        DashboardTab::Clusters | DashboardTab::ClusterAnalysis | DashboardTab::ClusterGraph => {
-            "teams"
-        }
+        DashboardTab::Clusters | DashboardTab::ClusterAnalysis => "teams",
+        DashboardTab::ClusterGraph => "graph",
         DashboardTab::AddressAnalysis => "actors",
         DashboardTab::TxAnalysis => "cases",
         DashboardTab::IndexerProgress
@@ -4360,12 +14773,12 @@ fn render_dashboard_page(
         render_cluster_autorefresh_script(selected_cluster, start, end, cluster_analysis_tab);
     format!(
         r#"<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="description" content="ChainActors evidence-first on-chain participant intelligence.">
-    <title>{title} · ChainActors</title>
+    <meta name="description" content="LedgerFlow evidence-first on-chain participant intelligence.">
+    <title>{title} · LedgerFlow</title>
     <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
     <style>{styles}</style>
   </head>
@@ -4378,7 +14791,7 @@ fn render_dashboard_page(
           <section class="dashboard-hero">
             <span class="eyebrow">EVIDENCE WORKBENCH</span>
             <h1>{title}</h1>
-            <p>从研究结论逐层下钻到指标、时间线、关系与原始交易证据。</p>
+            <p>Move from research conclusions into metrics, timelines, relationships, and raw transaction evidence.</p>
             {notice_html}
             {error_html}
           </section>
@@ -4417,7 +14830,7 @@ fn render_arbitrage_page(
   <td>{}</td>
   <td>{}</td>
 </tr>"#,
-                render_copyable_code(&item.tx_hash, 10),
+                render_tx_hash_action(&item.tx_hash, state.default_chain_id),
                 item.block_number,
                 item.block_timestamp
                     .map(|value| value.format("%H:%M:%S").to_string())
@@ -4510,11 +14923,11 @@ fn render_arbitrage_page(
     );
     format!(
         r#"<!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>套利排行 · ChainActors</title>
+    <title>Multi-pool Transaction Candidates · LedgerFlow</title>
     <link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg">
     <style>{styles}</style>
   </head>
@@ -4525,26 +14938,26 @@ fn render_arbitrage_page(
         {topbar}
         <main class="dashboard-main">
           <section class="dashboard-hero">
-            <span class="eyebrow">LIVE RANKING</span>
-            <h1>套利参与者与热门路径</h1>
-            <p>按已确认交易、活跃池和重复路由查看当前竞争格局。所有利润均为估算值。</p>
+            <span class="eyebrow">LIVE CANDIDATES</span>
+            <h1>Multi-pool Candidates and Active Routes</h1>
+            <p>These are real candidates with Swap logs across multiple pools in one transaction. A candidate is not proof of arbitrage or profit. Open transaction analysis to review asset flows, gas, and verification evidence.</p>
             <form class="inline-form" method="get" action="/app/arbitrage">
-              <label>时间窗口（分钟）<input type="number" min="1" max="1440" name="minutes" value="{minutes}"></label>
-              <label>候选数量<input type="number" min="10" max="200" name="limit" value="{limit}"></label>
-              <button class="cta secondary" type="submit">刷新</button>
+              <label>Time window (minutes)<input type="number" min="1" max="1440" name="minutes" value="{minutes}"></label>
+              <label>Candidate limit<input type="number" min="10" max="200" name="limit" value="{limit}"></label>
+              <button class="cta secondary" type="submit">Refresh</button>
             </form>
           </section>
           <section class="arbitrage-table-stack">
             <section class="panel">
-              <div class="panel-head"><h2>近期套利候选</h2><span class="badge">{recent_count}</span></div>
+              <div class="panel-head"><h2>Recent Multi-pool Candidates</h2><span class="badge">{recent_count}</span></div>
               <div class="panel-body">{recent_table}</div>
             </section>
             <section class="panel">
-              <div class="panel-head"><h2>热门池</h2><span class="badge">{pool_count}</span></div>
+              <div class="panel-head"><h2>Active Pools</h2><span class="badge">{pool_count}</span></div>
               <div class="panel-body">{pools_table}</div>
             </section>
             <section class="panel">
-              <div class="panel-head"><h2>热门路由</h2><span class="badge">{route_count}</span></div>
+              <div class="panel-head"><h2>Active Routes</h2><span class="badge">{route_count}</span></div>
               <div class="panel-body">{routes_table}</div>
             </section>
           </section>
@@ -4585,7 +14998,12 @@ fn render_route_compact(route: &str, limit: usize) -> String {
 fn render_arbitrage_status(status: &str) -> String {
     let label = match status {
         "confirmed_stable_surplus_to_sender" => "confirmed stable",
-        "candidate" => "candidate",
+        "confirmed_surplus_to_sender" => "confirmed surplus",
+        "candidate" => "detected only",
+        "analyzed_multi_pool_unconfirmed" => "analyzed · unconfirmed",
+        "probable_arbitrage" => "probable · profit unconfirmed",
+        "analyzed_reverted" => "reverted",
+        "analyzed_pending" => "pending finality",
         other => other,
     };
     format!("<span class=\"badge\">{}</span>", escape_html(label))
@@ -4679,7 +15097,7 @@ fn render_cluster_management_panel(
       <label>Cluster name<input type="text" name="name" value="{}" placeholder="liquidation_operator" required></label>
       <label><span class="label-row">Description<span class="optional-icon" title="Optional field" aria-label="Optional field">i</span></span><input type="text" name="description" value="{}" placeholder="seed collector wallets; worker expands related addresses automatically"></label>
       <label>Seed addresses<textarea name="addresses" placeholder="0x111...,collector,collector&#10;0x222...,seed-2,collector" required>{}</textarea></label>
-      <div class="field-hint">One seed per line. Format: <code>address,label,role</code>. For collector wallets you can paste only <code>0xabc...</code>; ChainActors marks it as a seed, the worker finds related addresses, stores suggestions, auto-adds high-confidence candidates, then runs analysis.</div>
+      <div class="field-hint">One seed per line. Format: <code>address,label,role</code>. For collector wallets you can paste only <code>0xabc...</code>; LedgerFlow marks it as a seed, the worker finds related addresses, stores suggestions, auto-adds high-confidence candidates, then runs analysis.</div>
       <div class="button-row">
         <button class="cta primary" type="submit">{}</button>
         {}
@@ -4696,7 +15114,7 @@ fn render_cluster_management_panel(
         if is_editing {
             "Update the cluster definition in place. Existing analyses stay in the database, while future tracking and backfill runs use the edited address set."
         } else {
-            "Create a cluster from one or more seed addresses. As soon as creation succeeds, ChainActors queues worker onboarding: related address discovery, candidate classification, high-confidence auto-add, historical backfill, and report refresh."
+            "Create a cluster from one or more seed addresses. As soon as creation succeeds, LedgerFlow queues worker onboarding: related address discovery, candidate classification, high-confidence auto-add, historical backfill, and report refresh."
         },
         action,
         chain_field,
@@ -4714,6 +15132,1798 @@ fn render_cluster_management_panel(
         } else {
             String::new()
         }
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_entities_page(
+    state: &WebState,
+    user: &AppUser,
+    chain_id: u64,
+    clusters: &[DashboardClusterRecord],
+    workspaces: &[WorkspaceRef],
+    workspace: &WorkspaceRef,
+    range: WorkspaceRange,
+    tab: &str,
+    query: &EntityPageQuery,
+    summary: Option<&AddressSummaryEnvelope>,
+    address_error: Option<&str>,
+    reviews: &[BehaviorReviewItem],
+    graph_edges: &[ClusterGraphEdgeRow],
+    events: &[ExecutionEvent],
+    _protocols: &[TodayProtocolRow],
+    workspace_entities: &[WorkspaceEntityRow],
+) -> String {
+    let content = match tab {
+        "addresses" | "contracts" if summary.is_some() || address_error.is_some() => {
+            let workspace_entity = summary.and_then(|summary| {
+                workspace_entities
+                    .iter()
+                    .find(|entity| entity.address.eq_ignore_ascii_case(&summary.address))
+            });
+            render_entity_address_content(
+                state,
+                chain_id,
+                tab,
+                workspace,
+                workspace_entity,
+                summary,
+                address_error,
+                graph_edges,
+                events,
+            )
+        }
+        "addresses" | "contracts" | "searchers" | "protocols" => {
+            render_workspace_entity_directory(chain_id, workspace, tab, workspace_entities, reviews)
+        }
+        "clusters" => {
+            render_entity_clusters_content(clusters, graph_edges, query.cluster_id.as_deref())
+        }
+        _ => unreachable!(),
+    };
+    let notice = query
+        .notice
+        .as_deref()
+        .and_then(render_notice_message)
+        .unwrap_or_default();
+    let add_form = if query.add == Some(1)
+        && WorkspacePlan::parse(&user.workspace_plan)
+            .allows(WorkspaceCapability::CustomMonitoredEntities)
+    {
+        format!(
+            r#"<section class="ca-panel ei-investigation-create"><div class="ei-section-head compact"><div><span class="ei-section-kicker">OBSERVE</span><h2>What address do you want LedgerFlow to understand?</h2></div><a href="/app/observations?workspace={}">Close ×</a></div><form method="post" action="/app/observations/add"><input type="hidden" name="workspace_id" value="{}"><input type="hidden" name="chain_id" value="{}"><input type="hidden" name="entity_kind" value="address"><div class="ei-investigation-form-grid"><label class="wide"><span>Address or contract</span><input name="address" placeholder="0x..." autocomplete="off" required></label><label><span>Optional name</span><input name="label" placeholder="Searcher A / Executor"></label></div><p class="panel-copy">LedgerFlow resolves the address type, starts historical analysis, and enables continuous observation automatically.</p><div class="ei-wizard-actions"><a class="ca-secondary-button" href="/app/observations?workspace={}">Cancel</a><button class="ca-primary-button" type="submit">Observe</button></div></form></section>"#,
+            urlencoding::encode(&workspace.id),
+            workspace_database_id(workspace)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            chain_id,
+            urlencoding::encode(&workspace.id),
+        )
+    } else if query.add == Some(1) {
+        r#"<div class="notice info">Adding private intelligence targets requires an approved Pilot workspace. You can inspect the public-data Demo Workspace without changing its entities.</div>"#.to_owned()
+    } else {
+        String::new()
+    };
+    format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Observed Objects · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{styles}</style></head><body class="dashboard-body ca-body"><div class="dashboard-shell ca-shell">{sidebar}<div class="ca-workspace">{topbar}<main class="dashboard-main ca-main ei-main"><section class="ca-page-heading"><div><span class="ei-page-kicker">CONTINUOUS ONCHAIN INTELLIGENCE</span><div class="ca-title-row"><h1>Observed Objects</h1><span>{workspace_name}</span></div><p>Watch important addresses and contracts. LedgerFlow builds their intelligence profiles, explains historical behavior, and tracks meaningful changes.</p></div><div class="ca-heading-actions"><a class="ca-primary-button" href="/app/observations?workspace={workspace_query}&amp;add=1">+ Observe</a></div></section>{notice}{add_form}{content}</main></div></div></body></html>"#,
+        styles = shared_styles(),
+        sidebar = render_app_sidebar(user, "observations", clusters.first()),
+        topbar = render_execution_topbar(
+            state,
+            chain_id,
+            workspaces,
+            workspace,
+            range,
+            "/app/observations"
+        ),
+        notice = notice,
+        add_form = add_form,
+        content = content,
+        workspace_name = escape_html(&workspace.name),
+        workspace_query = urlencoding::encode(&workspace.id),
+    )
+}
+
+fn render_workspace_entity_directory(
+    chain_id: u64,
+    workspace: &WorkspaceRef,
+    tab: &str,
+    entities: &[WorkspaceEntityRow],
+    reviews: &[BehaviorReviewItem],
+) -> String {
+    let selected = entities
+        .iter()
+        .filter(|entity| match tab {
+            "contracts" => matches!(entity.entity_kind.as_str(), "contract" | "pool"),
+            "protocols" => entity.entity_kind == "protocol",
+            "searchers" => {
+                let role = entity.role.as_deref().unwrap_or("").to_ascii_lowercase();
+                role.contains("searcher")
+                    || role.contains("executor")
+                    || role.contains("arbitrage")
+                    || reviews
+                        .iter()
+                        .any(|review| review.address.eq_ignore_ascii_case(&entity.address))
+            }
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+    let cards = if selected.is_empty() {
+        format!(
+            r#"<div class="ei-empty-state ei-empty-wide"><strong>No observed objects yet</strong><p>Add an address or contract. LedgerFlow will show available intelligence before asking you to enable continuous monitoring.</p><a class="ca-primary-button" href="/app/observations?workspace={}&amp;add=1">Observe your first object</a></div>"#,
+            urlencoding::encode(&workspace.id),
+        )
+    } else {
+        selected
+            .iter()
+            .map(|entity| {
+                let label = entity
+                    .label
+                    .as_deref()
+                    .or(entity.role.as_deref())
+                    .unwrap_or("Observed object");
+                let evidence_state = reviews
+                    .iter()
+                    .find(|review| review.address.eq_ignore_ascii_case(&entity.address))
+                    .map(|review| format!("{} · {:.0}%", review.status, review.confidence * 100.0))
+                    .unwrap_or_else(|| "Identity unverified".to_owned());
+                let progress_percent = entity
+                    .observation_progress
+                    .get("percent")
+                    .and_then(serde_json::Value::as_i64)
+                    .unwrap_or(0);
+                let (status_class, status_label, footer_state) = match entity.observation_status.as_str() {
+                    "ready" => ("verified", "Watching", evidence_state),
+                    "failed" => ("critical", "Analysis failed", entity.observation_error.clone().unwrap_or_else(|| "Retry available".to_owned())),
+                    status => ("detected", "Analyzing", format!("{} · {}%", status.replace('_', " "), progress_percent)),
+                };
+                format!(
+                    r#"<a class="ca-panel ei-investigation-card" href="/app/observations/{}?chain_id={}&amp;workspace={}"><div><span class="ei-status {}">{}</span><small>{}</small></div><h2>{}</h2><p><code>{}</code></p><footer><span>{}</span><b>Open Intelligence Profile →</b></footer></a>"#,
+                    urlencoding::encode(&entity.address),
+                    chain_id,
+                    urlencoding::encode(&workspace.id),
+                    status_class,
+                    status_label,
+                    escape_html(&entity.entity_kind),
+                    escape_html(label),
+                    escape_html(&truncate_middle(&entity.address, 10)),
+                    escape_html(&footer_state),
+                )
+            })
+            .collect::<String>()
+    };
+    format!(
+        r#"<section class="ei-section"><div class="ei-section-head"><div><span class="ei-section-kicker">WORKSPACE OBSERVATIONS</span><h2>Objects you care about</h2></div><span>{} objects in {}</span></div><div class="ei-investigation-grid">{}</div></section>"#,
+        selected.len(),
+        escape_html(&workspace.name),
+        cards,
+    )
+}
+
+fn render_searcher_cluster_intelligence_v1(
+    chain_id: u64,
+    workspace: &WorkspaceRef,
+    entity: &WorkspaceEntityRow,
+    snapshot: &serde_json::Value,
+    activity_filter: Option<&str>,
+) -> String {
+    let seed = snapshot
+        .pointer("/seed/seed_address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&entity.address);
+    let seed_role = snapshot
+        .pointer("/seed/seed_role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unverified");
+    let role_confidence = snapshot
+        .pointer("/seed/seed_role_confidence")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0)
+        * 100.0;
+    let cluster = snapshot.get("cluster").unwrap_or(&serde_json::Value::Null);
+    let status = cluster
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("queued");
+    let progress = cluster
+        .pointer("/progress/percent")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        .clamp(0, 100);
+    let progress_message = cluster
+        .pointer("/progress/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Preparing candidate execution cluster");
+    let members = snapshot
+        .get("members")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let member_count = members.len();
+    let count_role = |role: &str| {
+        members
+            .iter()
+            .filter(|member| {
+                member
+                    .get("candidate_role")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(role)
+                    && member
+                        .get("membership_state")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("excluded")
+            })
+            .count()
+    };
+    let worker_count = count_role("worker_candidate");
+    let executor_count = count_role("executor_candidate");
+    let settlement_count =
+        count_role("settlement_recipient_candidate") + count_role("profit_recipient_candidate");
+    let unresolved_count = count_role("unresolved");
+
+    let source = snapshot
+        .get("data_source")
+        .unwrap_or(&serde_json::Value::Null);
+    let source_available = source
+        .get("available")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !source_available {
+        let limitation = source
+            .get("limitation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("The selected live data source is unavailable.");
+        return format!(
+            r#"<div class="ei-back-link"><a href="/app/observations?workspace={}">← Observed Objects</a></div><div class="notice error"><strong>Live chain intelligence unavailable.</strong> {}</div>"#,
+            urlencoding::encode(&workspace.id),
+            escape_html(limitation)
+        );
+    }
+    let source_name = source
+        .get("data_source")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("live indexer and RPC");
+    let indexed_from = source
+        .get("indexed_from_block")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "Unavailable".to_owned());
+    let indexed_to = source
+        .get("indexed_to_block")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "Unavailable".to_owned());
+    let lag = source
+        .get("ingestion_lag")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| format!("{value} blocks"))
+        .unwrap_or_else(|| "Unavailable".to_owned());
+
+    let windows = snapshot
+        .get("windows")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let window = |key: &str| {
+        windows
+            .iter()
+            .find(|item| item.get("window").and_then(serde_json::Value::as_str) == Some(key))
+    };
+    let partial_24h = snapshot
+        .get("partial_24h")
+        .unwrap_or(&serde_json::Value::Null);
+    let window_24h = window("24h");
+    let executions_24h = window_24h
+        .and_then(|item| item.get("executions"))
+        .or_else(|| partial_24h.get("executions"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let successes_24h = window_24h
+        .and_then(|item| item.get("successes"))
+        .or_else(|| partial_24h.get("successes"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let failures_24h = window_24h
+        .and_then(|item| item.get("failures"))
+        .or_else(|| partial_24h.get("failures"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let gas_24h = window_24h
+        .and_then(|item| item.get("gas_cost_raw"))
+        .or_else(|| partial_24h.get("gas_cost_raw"))
+        .and_then(serde_json::Value::as_str)
+        .map(format_wei_eth_raw)
+        .unwrap_or_else(|| "Pending receipt reconstruction".to_owned());
+    let last_active = window_24h
+        .and_then(|item| item.get("last_active"))
+        .or_else(|| partial_24h.get("last_active"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("No cluster execution in the reconstructed scope");
+    let verified_count = window_24h
+        .and_then(|item| item.get("verified_execution_count"))
+        .or_else(|| partial_24h.get("economically_verified_count"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let excluded_count = window_24h
+        .and_then(|item| item.get("excluded_transactions"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let candidate_economic_count = verified_count + excluded_count;
+    let coverage_ratio = window_24h
+        .and_then(|item| item.get("coverage_ratio"))
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| value * 100.0)
+        .unwrap_or_else(|| {
+            if candidate_economic_count > 0 {
+                verified_count as f64 * 100.0 / candidate_economic_count as f64
+            } else {
+                0.0
+            }
+        });
+
+    let asset_catalog = cluster_asset_catalog(snapshot);
+    let gross = window_24h
+        .and_then(|item| item.get("verified_gross_profit"))
+        .map(|value| format_cluster_amounts(value, &asset_catalog))
+        .unwrap_or_else(|| "Economic verification is still running".to_owned());
+    let net = window_24h
+        .and_then(|item| item.get("verified_net_result"))
+        .map(|value| format_cluster_amounts(value, &asset_catalog))
+        .unwrap_or_else(|| "Not available until unlike-asset gas can be reconciled".to_owned());
+    let failed_gas = window_24h
+        .and_then(|item| item.get("failed_gas_cost_raw"))
+        .and_then(serde_json::Value::as_str)
+        .map(format_wei_eth_raw)
+        .unwrap_or_else(|| "Pending".to_owned());
+    let settlement = window_24h
+        .and_then(|item| item.get("observed_settlement_inflows"))
+        .map(|value| format_cluster_amounts(value, &asset_catalog))
+        .unwrap_or_else(|| "Pending window aggregation".to_owned());
+    let limitations = snapshot
+        .get("economic_limitations")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let economic_reasons = if limitations.is_empty() {
+        if status == "ready" && verified_count == 0 {
+            "<li>No candidate execution passed deterministic balance, receipt, trace, and gas reconciliation.</li>".to_owned()
+        } else {
+            "<li>Verification coverage is still being built; funding and settlement remain outside profit.</li>".to_owned()
+        }
+    } else {
+        limitations
+            .iter()
+            .take(6)
+            .map(|item| {
+                format!(
+                    "<li>{} · {} transactions</li>",
+                    escape_html(
+                        item.get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Unresolved economic scope")
+                    ),
+                    item.get("transaction_count")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0)
+                )
+            })
+            .collect::<String>()
+    };
+
+    let member_rows = members
+        .iter()
+        .filter(|member| member.get("candidate_role").and_then(serde_json::Value::as_str) != Some("seed"))
+        .map(|member| {
+            let address=member.get("address").and_then(serde_json::Value::as_str).unwrap_or("Unavailable");
+            let role=member.get("candidate_role").and_then(serde_json::Value::as_str).unwrap_or("unresolved");
+            let membership=member.get("membership_state").and_then(serde_json::Value::as_str).unwrap_or("candidate");
+            let confidence=member.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.0)*100.0;
+            let interactions=member.pointer("/evidence/interaction_count").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let reasons=member.pointer("/evidence/reasons").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+            let reason=reasons.first().and_then(serde_json::Value::as_str).unwrap_or("Candidate relationship supported by repeated execution evidence.");
+            let hashes=member.get("supporting_transactions").and_then(serde_json::Value::as_array).map(Vec::len).unwrap_or(0);
+            format!(r#"<tr><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td><td>{:.0}%</td><td>{}<small>{} supporting transactions</small></td><td><form method="post" action="/app/observations/{}/cluster/members/{}"><input type="hidden" name="workspace_id" value="{}"><input type="hidden" name="chain_id" value="{}"><select name="action" aria-label="Membership action"><option value="keep_candidate">Keep candidate</option><option value="include">Include</option><option value="exclude">Exclude</option><option value="mark_role">Mark role</option></select><select name="role" aria-label="Candidate role"><option value="{}">Current role</option><option value="worker_candidate">Worker candidate</option><option value="executor_candidate">Executor candidate</option><option value="settlement_recipient_candidate">Settlement candidate</option><option value="unresolved">Unresolved</option></select><button class="ca-secondary-button" type="submit">Apply</button></form></td></tr>"#,
+                escape_html(&truncate_middle(address,10)),escape_html(&role.replace('_'," ")),escape_html(membership),interactions,confidence,escape_html(reason),hashes,urlencoding::encode(seed),urlencoding::encode(address),workspace_database_id(workspace).map(|value|value.to_string()).unwrap_or_default(),chain_id,escape_html(role))
+        })
+        .collect::<String>();
+
+    let relationships = snapshot
+        .get("relationships")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let relationship_rows = relationships
+        .iter()
+        .take(40)
+        .map(|relation| {
+            let source=relation.get("source_address").and_then(serde_json::Value::as_str).unwrap_or(seed);
+            let related=relation.get("related_address").and_then(serde_json::Value::as_str).unwrap_or("Unavailable");
+            let kind=relation.get("relationship_type").and_then(serde_json::Value::as_str).unwrap_or("observed_interaction");
+            let count=relation.get("interaction_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let confidence=relation.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.0)*100.0;
+            let reason=relation.get("evidence_reason").and_then(serde_json::Value::as_str).unwrap_or("Observed interaction; control is not asserted.");
+            let tx=relation.get("supporting_transactions").and_then(serde_json::Value::as_array).and_then(|items|items.first()).and_then(serde_json::Value::as_str);
+            let evidence=tx.map(|hash|format!(r#"<a href="{}">Evidence →</a>"#,tx_analysis_href(chain_id,hash))).unwrap_or_else(||"Unavailable".to_owned());
+            format!(r#"<tr><td><code>{}</code> → <code>{}</code></td><td>{}</td><td>{}</td><td>{:.0}%</td><td>{}</td><td>{}</td></tr>"#,escape_html(&truncate_middle(source,8)),escape_html(&truncate_middle(related,8)),escape_html(&kind.replace('_'," ")),count,confidence,escape_html(reason),evidence)
+        })
+        .collect::<String>();
+
+    let executions = snapshot
+        .get("executions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let selected_filter = activity_filter.unwrap_or("all");
+    let filtered = executions
+        .iter()
+        .filter(|execution| match selected_filter {
+            "successful" => {
+                execution.get("status").and_then(serde_json::Value::as_str) == Some("success")
+            }
+            "failed" => {
+                execution.get("status").and_then(serde_json::Value::as_str) == Some("failure")
+            }
+            "arbitrage" => execution
+                .get("execution_type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("arbitrage")),
+            "verified" => {
+                execution
+                    .get("economic_verification_status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("verified")
+            }
+            "excluded" => {
+                execution
+                    .get("economic_verification_status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("excluded")
+            }
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+    let timeline_rows = filtered.iter().take(250).map(|execution| {
+        let tx=execution.get("tx_hash").and_then(serde_json::Value::as_str).unwrap_or("Unavailable");
+        let worker=execution.get("worker").and_then(serde_json::Value::as_str).unwrap_or("Unavailable");
+        let executor=execution.get("executor").and_then(serde_json::Value::as_str).unwrap_or("Unavailable");
+        let gas=execution.get("gas_cost_raw").and_then(serde_json::Value::as_str).map(format_wei_eth_raw).unwrap_or_else(||"Pending".to_owned());
+        let result=if execution.get("economic_verification_status").and_then(serde_json::Value::as_str)==Some("verified") { format_cluster_amounts(execution.get("verified_gross_profit").unwrap_or(&serde_json::Value::Null),&asset_catalog) } else { execution.get("economic_verification_status").and_then(serde_json::Value::as_str).unwrap_or("unknown").to_owned() };
+        format!(r#"<tr><td>{}</td><td>{}</td><td><span class="ei-status {}">{}</span></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td><a href="{}">Evidence →</a></td></tr>"#,escape_html(execution.get("timestamp").and_then(serde_json::Value::as_str).unwrap_or("Pending")),escape_html(execution.get("execution_type").and_then(serde_json::Value::as_str).unwrap_or("unknown_interaction").replace('_'," ").as_str()),if execution.get("status").and_then(serde_json::Value::as_str)==Some("success"){"verified"}else{"detected"},escape_html(execution.get("status").and_then(serde_json::Value::as_str).unwrap_or("pending")),escape_html(&truncate_middle(worker,8)),escape_html(&truncate_middle(executor,8)),escape_html(&gas),escape_html(&result),tx_analysis_href(chain_id,tx))
+    }).collect::<String>();
+    let filter_links=[("all","All"),("successful","Successful"),("failed","Failed"),("arbitrage","Arbitrage"),("verified","Economically verified"),("excluded","Excluded")].iter().map(|(key,label)|format!(r#"<a class="{}" href="/app/observations/{}?workspace={}&amp;activity_filter={}">{}</a>"#,if selected_filter==*key{"active"}else{""},urlencoding::encode(seed),urlencoding::encode(&workspace.id),key,label)).collect::<String>();
+
+    let strategy_value = window_24h.and_then(|value| value.get("strategy_distribution"));
+    let strategy_rows = strategy_value
+        .and_then(serde_json::Value::as_array)
+        .filter(|items| !items.is_empty())
+        .map(|items| items.iter().map(|item|format!(r#"<div><span><strong>{}</strong><small>Evidence-backed cluster executions</small></span><b>{} tx</b></div>"#,escape_html(item.get("strategy").and_then(serde_json::Value::as_str).unwrap_or("unknown").replace('_'," ").as_str()),item.get("count").and_then(serde_json::Value::as_u64).unwrap_or(0))).collect::<String>())
+        .unwrap_or_else(|| {
+            let mut counts=BTreeMap::<String,u64>::new();
+            for execution in &executions { let label=execution.get("execution_type").and_then(serde_json::Value::as_str).unwrap_or("unknown_interaction").to_owned(); *counts.entry(label).or_default()+=1; }
+            counts.into_iter().map(|(label,count)|format!(r#"<div><span><strong>{}</strong><small>Current reconstructed sample</small></span><b>{} tx</b></div>"#,escape_html(&label.replace('_'," ")),count)).collect::<String>()
+        });
+    let changes = snapshot
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let changes_html = if changes.is_empty() {
+        if status == "ready" {
+            r#"<div class="ei-empty-state"><strong>No material change met the deterministic threshold</strong><p>This means no qualifying change was found, not that the cluster had no activity.</p></div>"#.to_owned()
+        } else {
+            r#"<div class="ei-empty-state"><strong>Building historical baseline</strong><p>7-day comparison appears only after execution reconstruction and baseline materialization complete.</p></div>"#.to_owned()
+        }
+    } else {
+        changes.iter().map(|item|format!(r#"<article class="ei-attention-card"><strong>{}</strong><p>{}</p><small>{:.0}% confidence · transaction-backed</small></article>"#,escape_html(item.get("signal_type").and_then(serde_json::Value::as_str).unwrap_or("change").replace('_'," ").as_str()),escape_html(item.get("conclusion").and_then(serde_json::Value::as_str).unwrap_or("Evidence-backed change detected")),item.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.0)*100.0)).collect::<String>()
+    };
+
+    let progress_notice = if status == "ready" {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="notice info"><strong>{} · {}%</strong> {} Partial transaction and relationship results below are real and continue updating.</div>"#,
+            escape_html(&status.replace('_', " ")),
+            progress,
+            escape_html(progress_message)
+        )
+    };
+    let back = format!(
+        r#"<div class="ei-back-link"><a href="/app/observations?workspace={}">← Observed Objects</a></div>"#,
+        urlencoding::encode(&workspace.id)
+    );
+    format!(
+        r#"{back}<section class="ca-panel ei-entity-hero"><div class="ei-event-labels"><span class="ei-status {}">{}</span><span class="ei-event-type">Candidate Searcher System</span></div><div class="ei-entity-title"><div><h1>Candidate Searcher System</h1><code>{}</code></div><div class="ei-entity-actions"><span class="ca-primary-button ei-button-disabled">Watching: On</span><a class="ca-secondary-button" href="/app/settings?workspace={}">Notification Settings</a></div></div><dl class="ei-entity-facts"><div><dt>Seed role</dt><dd>{} · {:.0}% candidate confidence</dd></div><div><dt>Candidate cluster</dt><dd>{} members</dd></div><div><dt>Composition</dt><dd>{} workers · {} executors · {} settlement · {} unresolved</dd></div><div><dt>Last active</dt><dd>{}</dd></div><div><dt>Network</dt><dd>Chain {}</dd></div><div><dt>Analysis</dt><dd>{}%</dd></div></dl><p class="ei-observation-state">Observed and candidate relationships do not assert ownership, same-team control, or confirmed profit attribution.</p></section>{progress_notice}<div class="notice info"><strong>Data source:</strong> {} · chain {} · indexed blocks {} → {} · ingestion lag {} · updated {}</div><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">VERIFIED ECONOMIC ACCOUNTING</span><h2>Is it making money?</h2></div><span>{} of {} candidate executions verified · {:.1}% coverage</span></div><div class="ei-impact-grid"><div class="available"><span>Verified gross profit</span><strong>{}</strong></div><div class="available"><span>Verified observed net</span><strong>{}</strong></div><div class="available"><span>Failed execution gas</span><strong>{}</strong></div><div class="unknown"><span>Observed settlement inflow</span><strong>{}</strong><small>Not necessarily profit</small></div></div><h3>Why total PnL may be unavailable</h3><ul>{}</ul><p class="panel-copy">Funding, inventory transfers, and settlement inflows are never merged into profit. Unlike-asset gas is shown separately unless a deterministic conversion is available.</p></section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">LAST 24 HOURS</span><h2>What did it do?</h2></div><span>Cluster executions, not seed transfers</span></div><div class="ei-impact-grid"><div class="available"><span>Executions</span><strong>{}</strong></div><div class="available"><span>Successful</span><strong>{}</strong></div><div class="available"><span>Failed</span><strong>{}</strong></div><div class="available"><span>Worker gas spent</span><strong>{}</strong></div></div><div class="ei-behavior-list">{}</div></section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">CANDIDATE CONTROL CLUSTER</span><h2>Who is related?</h2></div><span>Every member is evidence-scored and correctable</span></div><div class="table-shell"><table><thead><tr><th>Address</th><th>Candidate role</th><th>State</th><th>Interactions</th><th>Confidence</th><th>Evidence reason</th><th>Correction</th></tr></thead><tbody>{}</tbody></table></div><h3>Relationship evidence</h3><div class="table-shell"><table><thead><tr><th>Path</th><th>Type</th><th>Interactions</th><th>Confidence</th><th>Reason</th><th>Evidence</th></tr></thead><tbody>{}</tbody></table></div></section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">MONEY MOVEMENT</span><h2>How does money move?</h2></div><span>Observed path; ownership is not asserted</span></div><div class="ei-flow-strip"><span>Candidate funding / worker</span><b>→</b><span>Worker EOA</span><b>→</b><span>Executor contract</span><b>→</b><span>DEX pools</span><b>→</b><span>Candidate settlement recipient</span></div><p class="panel-copy">The exact supporting transfers and calls are listed above. Settlement inflow remains separate from verified execution surplus.</p></section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">BASELINE COMPARISON</span><h2>What changed?</h2></div><span>Current 7 days vs previous 7 days</span></div>{}</section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">CLUSTER EXECUTION TIMELINE</span><h2>Activity Timeline</h2></div><span>{} reconstructed records</span></div><nav class="ei-view-tabs">{}</nav><div class="table-shell"><table><thead><tr><th>Time</th><th>Execution</th><th>Status</th><th>Worker</th><th>Executor</th><th>Gas</th><th>Economic result</th><th>Evidence</th></tr></thead><tbody>{}</tbody></table></div></section>"#,
+        if status == "ready" {
+            "verified"
+        } else if status == "failed" {
+            "critical"
+        } else {
+            "detected"
+        },
+        escape_html(status),
+        escape_html(seed),
+        urlencoding::encode(&workspace.id),
+        escape_html(&seed_role.replace('_', " ")),
+        role_confidence,
+        member_count,
+        worker_count,
+        executor_count,
+        settlement_count,
+        unresolved_count,
+        escape_html(last_active),
+        chain_id,
+        progress,
+        escape_html(source_name),
+        chain_id,
+        indexed_from,
+        indexed_to,
+        escape_html(&lag),
+        escape_html(
+            source
+                .get("last_updated_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Unavailable")
+        ),
+        verified_count,
+        candidate_economic_count,
+        coverage_ratio,
+        escape_html(&gross),
+        escape_html(&net),
+        escape_html(&failed_gas),
+        escape_html(&settlement),
+        economic_reasons,
+        executions_24h,
+        successes_24h,
+        failures_24h,
+        escape_html(&gas_24h),
+        strategy_rows,
+        member_rows,
+        relationship_rows,
+        changes_html,
+        executions.len(),
+        filter_links,
+        timeline_rows
+    )
+}
+
+fn cluster_asset_catalog(snapshot: &serde_json::Value) -> HashMap<String, (String, i32)> {
+    snapshot
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|asset| {
+            let address = asset.get("address")?.as_str()?.to_ascii_lowercase();
+            let symbol = asset
+                .get("symbol")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Token")
+                .to_owned();
+            let decimals = asset
+                .get("decimals")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0) as i32;
+            Some((address, (symbol, decimals)))
+        })
+        .collect()
+}
+
+fn format_cluster_amounts(
+    value: &serde_json::Value,
+    assets: &HashMap<String, (String, i32)>,
+) -> String {
+    let Some(items) = value.as_array() else {
+        return "Unavailable".to_owned();
+    };
+    if items.is_empty() {
+        return "No deterministic same-asset total".to_owned();
+    }
+    items
+        .iter()
+        .take(3)
+        .map(|item| {
+            let asset = item
+                .get("asset")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_ascii_lowercase();
+            let raw = item
+                .get("amount_raw")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("0");
+            let (label, decimals) = assets
+                .get(&asset)
+                .cloned()
+                .unwrap_or_else(|| (truncate_middle(&asset, 8), 0));
+            format!("{} {}", format_raw_token_units(raw, decimals), label)
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn format_raw_token_units(raw: &str, decimals: i32) -> String {
+    if decimals <= 0 {
+        return format!("{raw} raw");
+    }
+    let negative = raw.starts_with('-');
+    let digits = raw.trim_start_matches('-').trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let decimals = decimals as usize;
+    let formatted = if digits.len() <= decimals {
+        format!("0.{:0>width$}", digits, width = decimals)
+    } else {
+        let split = digits.len() - decimals;
+        format!("{}.{}", &digits[..split], &digits[split..])
+    };
+    let formatted = formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned();
+    if negative {
+        format!("-{formatted}")
+    } else {
+        formatted
+    }
+}
+
+fn render_observation_intelligence_v1(
+    chain_id: u64,
+    workspace: &WorkspaceRef,
+    entity: &WorkspaceEntityRow,
+    snapshot: &serde_json::Value,
+    activity_filter: Option<&str>,
+) -> String {
+    let object = snapshot.get("object").unwrap_or(&serde_json::Value::Null);
+    let status = object
+        .get("current_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("queued");
+    let progress = object.get("progress").unwrap_or(&serde_json::Value::Null);
+    let percent = progress
+        .get("percent")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        .clamp(0, 100);
+    let progress_message = progress
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Preparing deterministic address analysis");
+    let has_materialized_intelligence = snapshot
+        .get("briefs")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+        && snapshot
+            .get("economics")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+    let address = object
+        .get("address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&entity.address);
+    let label = entity
+        .label
+        .as_deref()
+        .or(entity.role.as_deref())
+        .unwrap_or("Observed Address");
+    let back = format!(
+        r#"<div class="ei-back-link"><a href="/app/observations?workspace={}">← Observed Objects</a></div>"#,
+        urlencoding::encode(&workspace.id)
+    );
+    let header = format!(
+        r#"<section class="ca-panel ei-entity-hero"><div class="ei-event-labels"><span class="ei-status {}">{}</span><span class="ei-event-type">{}</span></div><div class="ei-entity-title"><div><h1>{}</h1><code>{}</code></div><div class="ei-entity-actions"><span class="ca-primary-button ei-button-disabled">Watching: On</span><a class="ca-secondary-button" href="/app/settings?workspace={}">Advanced Settings</a></div></div><dl class="ei-entity-facts"><div><dt>Network</dt><dd>Chain {}</dd></div><div><dt>Analysis</dt><dd>{}%</dd></div><div><dt>Observed since</dt><dd>{}</dd></div><div><dt>Last update</dt><dd>{}</dd></div></dl></section>"#,
+        if status == "ready" {
+            "verified"
+        } else if status == "failed" {
+            "critical"
+        } else {
+            "detected"
+        },
+        escape_html(status),
+        escape_html(
+            object
+                .get("object_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&entity.entity_kind)
+        ),
+        escape_html(label),
+        escape_html(address),
+        urlencoding::encode(&workspace.id),
+        chain_id,
+        percent,
+        entity.created_at.to_rfc3339(),
+        escape_html(
+            object
+                .get("last_incremental_update")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Analysis in progress")
+        ),
+    );
+    if status != "ready" && !has_materialized_intelligence {
+        let error = object
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .or(entity.observation_error.as_deref());
+        let discovered = progress
+            .get("transactions_discovered")
+            .and_then(serde_json::Value::as_i64);
+        let analyzed = progress
+            .get("transactions_analyzed")
+            .and_then(serde_json::Value::as_i64);
+        let counters = [
+            discovered.map(|value| format!("Transactions discovered: {value}")),
+            analyzed.map(|value| format!("Transactions analyzed: {value}")),
+            progress
+                .get("receipts_processed")
+                .and_then(serde_json::Value::as_i64)
+                .map(|value| format!("Receipts processed: {value}")),
+            progress
+                .get("economic_verified")
+                .and_then(serde_json::Value::as_i64)
+                .map(|value| format!("Economically verified: {value}")),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|value| format!("<li>{}</li>", escape_html(&value)))
+        .collect::<String>();
+        let retry = if status == "failed" {
+            format!(
+                r#"<form method="post" action="/app/observations/{}/retry"><input type="hidden" name="workspace_id" value="{}"><input type="hidden" name="chain_id" value="{}"><p class="notice error">{}</p><button class="ca-primary-button" type="submit">Retry analysis</button></form>"#,
+                urlencoding::encode(address),
+                workspace_database_id(workspace)
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                chain_id,
+                escape_html(
+                    error.unwrap_or("Analysis failed. Retry will preserve its checkpoint.")
+                ),
+            )
+        } else {
+            String::new()
+        };
+        return format!(
+            r#"{back}{header}<section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">HISTORICAL ANALYSIS</span><h2>{}</h2></div><strong>{percent}%</strong></div><div class="observation-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent}"><span style="width:{percent}%"></span></div><p class="panel-copy">{}</p><ul>{counters}</ul>{retry}<p class="panel-copy">Activity, behavior, relationships, economics, and change cards remain hidden until their evidence stage is complete; pending work is not rendered as zero.</p></section>"#,
+            escape_html(&status.replace('_', " ")),
+            escape_html(progress_message),
+        );
+    }
+
+    let refresh_notice = if status == "ready" {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="notice info"><strong>Refreshing observed activity · {}%</strong> The last completed intelligence profile remains visible while new blocks are processed.</div>"#,
+            percent
+        )
+    };
+
+    let windows = snapshot
+        .get("activity_windows")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let window = |key: &str| {
+        windows
+            .iter()
+            .find(|item| item.get("window").and_then(serde_json::Value::as_str) == Some(key))
+    };
+    let summary_card = |key: &str| {
+        let Some(item) = window(key) else {
+            return format!(
+                r#"<article><span>{}</span><strong>Unavailable</strong><small>The window has not been materialized.</small></article>"#,
+                escape_html(key)
+            );
+        };
+        let txs = item
+            .get("transaction_count")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let success = item
+            .get("success_count")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let failed = item
+            .get("reverted_count")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let gas = item
+            .get("gas_cost_raw")
+            .and_then(serde_json::Value::as_str)
+            .map(format_wei_eth_raw)
+            .unwrap_or_else(|| "Unavailable".to_owned());
+        format!(
+            r#"<article><span>{}</span><strong>{} transactions</strong><small>{} successful · {} reverted · {} sender gas</small></article>"#,
+            escape_html(key),
+            txs,
+            success,
+            failed,
+            escape_html(&gas)
+        )
+    };
+    let activity_24h = window("24h");
+    let txs_24h = activity_24h
+        .and_then(|item| item.get("transaction_count"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let success_24h = activity_24h
+        .and_then(|item| item.get("success_count"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let failed_24h = activity_24h
+        .and_then(|item| item.get("reverted_count"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let protocols_24h = activity_24h
+        .and_then(|item| item.get("protocol_count"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let counterparties_24h = activity_24h
+        .and_then(|item| item.get("counterparty_count"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let gas_24h = activity_24h
+        .and_then(|item| item.get("gas_cost_raw"))
+        .and_then(serde_json::Value::as_str)
+        .map(format_wei_eth_raw)
+        .unwrap_or_else(|| "No verified sender gas in this window".to_owned());
+    let last_active = activity_24h
+        .and_then(|item| item.get("last_active"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("No activity in the last 24 hours");
+    let partial = object
+        .get("coverage_is_partial")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let coverage = if partial {
+        r#"<div class="notice info"><strong>Partial top-level history coverage.</strong> Token-transfer history was scanned directly; direct calls include existing indexed and cached coverage. No whole-range block backfill was scheduled.</div>"#.to_owned()
+    } else {
+        r#"<div class="notice success">The requested historical scope is fully covered by deterministic activity sources.</div>"#.to_owned()
+    };
+
+    let behaviors = snapshot
+        .get("behaviors")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let behavior_rows = if behaviors.is_empty() {
+        r#"<div class="ei-empty-state"><strong>No behavior classification established</strong><p>Activity remains available as deterministic transactions and transfers; LedgerFlow will not invent a strategy label.</p></div>"#.to_owned()
+    } else {
+        behaviors.iter().map(|item| {
+            let label=item.get("label").and_then(serde_json::Value::as_str).unwrap_or("unknown_contract_interaction");
+            let count=item.get("supporting_transaction_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let confidence=item.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.0)*100.0;
+            let evidence=item.get("evidence_coverage").and_then(serde_json::Value::as_f64).unwrap_or(0.0)*100.0;
+            format!(r#"<div><span><strong>{}</strong><small>{} supporting transactions · {:.0}% evidence share</small></span><b>{:.0}% confidence</b></div>"#,escape_html(&label.replace('_'," ")),count,evidence,confidence)
+        }).collect::<String>()
+    };
+    let main_behavior = behaviors
+        .first()
+        .and_then(|item| item.get("label"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.replace('_', " "))
+        .unwrap_or_else(|| "Not classified".to_owned());
+
+    let relationships = snapshot
+        .get("relationships")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let relationship_rows = if relationships.is_empty() {
+        r#"<tr><td colspan="8">No evidence-backed relationships are available in the analyzed scope.</td></tr>"#.to_owned()
+    } else {
+        relationships.iter().take(50).map(|item| {
+            let related=item.get("related_address").and_then(serde_json::Value::as_str).unwrap_or("Unavailable");
+            let kind=item.get("relationship_type").and_then(serde_json::Value::as_str).unwrap_or("observed_interaction");
+            let state=item.get("evidence_state").and_then(serde_json::Value::as_str).unwrap_or("possible");
+            let count=item.get("interaction_count").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let confidence=item.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.0)*100.0;
+            let hashes=item.get("supporting_transactions").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+            let evidence=hashes.first().and_then(serde_json::Value::as_str).map(|hash|format!(r#"<a href="{}">{} tx · Evidence →</a>"#,tx_analysis_href(chain_id,hash),hashes.len())).unwrap_or_else(||"Unavailable".to_owned());
+            let first=item.get("first_seen").and_then(serde_json::Value::as_str).unwrap_or("Unavailable");
+            let last=item.get("last_seen").and_then(serde_json::Value::as_str).unwrap_or("Unavailable");
+            format!(r#"<tr><td><a href="/app/observations/{}?workspace={}"><code>{}</code></a></td><td>{}</td><td>{}</td><td>{}</td><td>{:.0}%</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,urlencoding::encode(related),urlencoding::encode(&workspace.id),escape_html(&truncate_middle(related,10)),escape_html(&kind.replace('_'," ")),escape_html(state),count,confidence,escape_html(first),escape_html(last),evidence)
+        }).collect::<String>()
+    };
+
+    let economics = snapshot
+        .get("economics")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("window").and_then(serde_json::Value::as_str) == Some("24h"))
+        });
+    let economics_html = if let Some(item) = economics {
+        let status = item
+            .get("result_status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let verified = item
+            .get("economically_verified_transaction_count")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let excluded = item
+            .get("excluded_transaction_count")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        let coverage_ratio = item
+            .get("coverage_ratio")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+            * 100.0;
+        let gas = item
+            .get("verified_gas_cost_raw")
+            .and_then(serde_json::Value::as_str)
+            .map(format_wei_eth_raw)
+            .unwrap_or_else(|| "Unavailable".to_owned());
+        let gross = item
+            .get("verified_gross_surplus")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let gross_rows = if gross.is_empty() {
+            "<li>No deterministic realized surplus is available.</li>".to_owned()
+        } else {
+            gross
+                .iter()
+                .map(|value| {
+                    format!(
+                        "<li><strong>{}</strong> raw units in <code>{}</code></li>",
+                        escape_html(
+                            value
+                                .get("amount_raw")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("Unavailable")
+                        ),
+                        escape_html(
+                            value
+                                .get("asset")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("Unknown asset")
+                        )
+                    )
+                })
+                .collect::<String>()
+        };
+        format!(
+            r#"<div class="ei-impact-grid"><div class="{}"><span>Result state</span><strong>{}</strong></div><div class="available"><span>Verified executions</span><strong>{}</strong></div><div class="available"><span>Verified sender gas</span><strong>{}</strong></div><div class="available"><span>Economic coverage</span><strong>{:.1}%</strong><small>{} excluded</small></div></div><h3>Verified gross surplus</h3><ul>{}</ul><p class="panel-copy">No deterministic cross-asset total PnL is shown. Funding, inventory and settlement scope are excluded unless proven.</p>"#,
+            if status == "verified" {
+                "verified"
+            } else {
+                "unknown"
+            },
+            escape_html(status),
+            verified,
+            escape_html(&gas),
+            coverage_ratio,
+            excluded,
+            gross_rows
+        )
+    } else {
+        r#"<div class="ei-empty-state"><strong>No deterministic total PnL is available</strong><p>Economic verification has no completed 24-hour summary. Observed token flows remain visible in Activity and are not interpreted as profit.</p></div>"#.to_owned()
+    };
+
+    let baseline_available = object
+        .pointer("/metadata/baseline_available")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let baseline_is_partial = object
+        .pointer("/metadata/baseline_is_partial")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let changes = snapshot
+        .get("changes")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let changes_html = if !baseline_available {
+        r#"<div class="ei-empty-state"><strong>Building historical baseline</strong><p>Change analysis will be available after an evidence-complete comparison window exists. LedgerFlow does not render this as 0 changes.</p></div>"#.to_owned()
+    } else if changes.is_empty() && baseline_is_partial {
+        r#"<div class="ei-empty-state"><strong>No material change in the observed subset</strong><p>This is a partial baseline because discovery reached the stated transaction limit. It is not a claim about complete address activity.</p></div>"#.to_owned()
+    } else if changes.is_empty() {
+        r#"<div class="ei-empty-state"><strong>No material change crossed the current threshold</strong><p>The baseline exists and the comparison completed.</p></div>"#.to_owned()
+    } else {
+        let scope_notice = if baseline_is_partial {
+            r#"<div class="ei-empty-state"><strong>Partial observed baseline</strong><p>Comparisons below apply only to the explicitly reported discovered and analyzed coverage.</p></div>"#
+        } else {
+            ""
+        };
+        format!("{}{}", scope_notice, changes.iter().map(|item|format!(r#"<article class="ca-intel-row"><span class="ca-pill new">{}</span><span class="ca-intel-copy"><strong>{}</strong><small>{:.0}% confidence</small></span></article>"#,escape_html(item.get("signal_type").and_then(serde_json::Value::as_str).unwrap_or("change")),escape_html(item.get("conclusion").and_then(serde_json::Value::as_str).unwrap_or("Evidence-backed change detected")),item.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.0)*100.0)).collect::<String>())
+    };
+
+    let selected_filter = activity_filter.unwrap_or("all");
+    let timeline = snapshot
+        .get("timeline")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let filtered = timeline
+        .iter()
+        .filter(|item| match selected_filter {
+            "successful" => {
+                item.get("status").and_then(serde_json::Value::as_str) == Some("success")
+            }
+            "failed" => item.get("status").and_then(serde_json::Value::as_str) == Some("failure"),
+            "arbitrage" => item
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("arbitrage")),
+            "swap" => item
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| value.contains("swap")),
+            "transfer" => {
+                item.get("action").and_then(serde_json::Value::as_str) == Some("asset_transfer")
+            }
+            "unknown" => {
+                item.get("action").and_then(serde_json::Value::as_str)
+                    == Some("unknown_contract_interaction")
+            }
+            "profitable" => {
+                item.get("economic_status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("verified")
+            }
+            "unverified" => {
+                item.get("economic_status")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("verified")
+            }
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+    let filter_links=[("all","All"),("successful","Successful"),("failed","Failed"),("arbitrage","Arbitrage"),("swap","Swap"),("transfer","Transfer"),("unknown","Unknown"),("profitable","Profitable"),("unverified","Unverified")].iter().map(|(key,label)|format!(r#"<a class="{}" href="/app/observations/{}?workspace={}&amp;activity_filter={}">{}</a>"#,if selected_filter==*key{"active"}else{""},urlencoding::encode(address),urlencoding::encode(&workspace.id),key,label)).collect::<String>();
+    let timeline_rows = if filtered.is_empty() {
+        r#"<tr><td colspan="8">No activity matches this filter.</td></tr>"#.to_owned()
+    } else {
+        filtered.into_iter().map(|item|{
+        let tx=item.get("tx_hash").and_then(serde_json::Value::as_str).unwrap_or("Unavailable");
+        let inflows=item.get("token_inflows").and_then(serde_json::Value::as_array).map(Vec::len).unwrap_or(0);
+        let outflows=item.get("token_outflows").and_then(serde_json::Value::as_array).map(Vec::len).unwrap_or(0);
+        let gas=item.get("gas_cost_raw").and_then(serde_json::Value::as_str).map(format_wei_eth_raw).unwrap_or_else(||"—".to_owned());
+        format!(r#"<tr><td>{}</td><td>{}</td><td><span class="ei-status {}">{}</span></td><td>{}</td><td><code>{}</code></td><td>{} in · {} out</td><td>{}</td><td><a href="{}">Evidence →</a></td></tr>"#,escape_html(item.get("timestamp").and_then(serde_json::Value::as_str).unwrap_or("Pending timestamp")),escape_html(item.get("action").and_then(serde_json::Value::as_str).unwrap_or("analysis_pending")),if item.get("status").and_then(serde_json::Value::as_str)==Some("success"){"verified"}else{"detected"},escape_html(item.get("status").and_then(serde_json::Value::as_str).unwrap_or("pending")),escape_html(item.get("protocol").and_then(serde_json::Value::as_str).unwrap_or("Unavailable")),escape_html(&truncate_middle(item.get("counterparty").and_then(serde_json::Value::as_str).unwrap_or("Unavailable"),8)),inflows,outflows,escape_html(&gas),tx_analysis_href(chain_id,tx))
+    }).collect::<String>()
+    };
+
+    format!(
+        r#"{back}{header}{refresh_notice}{coverage}<section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">WHAT HAPPENED?</span><h2>24h Activity</h2></div><span>Last active: {}</span></div><div class="ei-impact-grid"><div class="available"><span>Transactions</span><strong>{}</strong></div><div class="available"><span>Successful / Reverted</span><strong>{} / {}</strong></div><div class="available"><span>Protocols</span><strong>{}</strong></div><div class="available"><span>Counterparties</span><strong>{}</strong></div><div class="available"><span>Verified sender gas</span><strong>{}</strong></div></div><p class="panel-copy">Primary observed behavior: <strong>{}</strong>.</p><div class="observation-window-grid">{}{}{}</div></section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">OBSERVED ECONOMIC RESULT</span><h2>Is it making money?</h2></div><span>Verified ≠ estimated ≠ unknown</span></div>{}</section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">OBSERVED BEHAVIORS</span><h2>What does it do?</h2></div><span>Transaction-backed classifications</span></div><div class="ei-behavior-list">{}</div></section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">RELATIONSHIPS</span><h2>Who is it related to?</h2></div><span>Interaction evidence does not prove ownership</span></div><div class="table-shell"><table><thead><tr><th>Related address</th><th>Relationship</th><th>Evidence state</th><th>Interactions</th><th>Confidence</th><th>First seen</th><th>Last seen</th><th>Supporting transactions</th></tr></thead><tbody>{}</tbody></table></div></section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">CHANGE DETECTION</span><h2>What changed?</h2></div></div>{}</section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">ALL DISCOVERED ACTIVITY</span><h2>Activity Timeline</h2></div><span>{} rows</span></div><nav class="ei-view-tabs">{}</nav><div class="table-shell"><table><thead><tr><th>Time</th><th>Action</th><th>Status</th><th>Protocol</th><th>Counterparty</th><th>Token flow</th><th>Gas</th><th>Evidence</th></tr></thead><tbody>{}</tbody></table></div></section>"#,
+        escape_html(last_active),
+        txs_24h,
+        success_24h,
+        failed_24h,
+        protocols_24h,
+        counterparties_24h,
+        escape_html(&gas_24h),
+        escape_html(&main_behavior),
+        summary_card("24h"),
+        summary_card("7d"),
+        summary_card("30d"),
+        economics_html,
+        behavior_rows,
+        relationship_rows,
+        changes_html,
+        timeline.len(),
+        filter_links,
+        timeline_rows
+    )
+}
+
+fn render_entity_address_content(
+    _state: &WebState,
+    chain_id: u64,
+    _tab: &str,
+    workspace: &WorkspaceRef,
+    workspace_entity: Option<&WorkspaceEntityRow>,
+    summary: Option<&AddressSummaryEnvelope>,
+    address_error: Option<&str>,
+    graph_edges: &[ClusterGraphEdgeRow],
+    events: &[ExecutionEvent],
+) -> String {
+    let search = format!(
+        r#"<div class="ei-back-link"><a href="/app/observations?chain_id={}&amp;workspace={}">← Observed Objects</a></div>"#,
+        chain_id,
+        urlencoding::encode(&workspace.id),
+    );
+    if address_error.is_some() && summary.is_none() {
+        return format!(
+            "{search}<div class=\"notice error\">{}</div>",
+            escape_html(address_error.unwrap_or("Object intelligence is unavailable."))
+        );
+    }
+    let Some(summary) = summary else {
+        return format!(
+            r#"{search}<div class="ei-empty-state ei-empty-wide"><strong>No observed object selected</strong><p>Choose an object from this workspace. Fields without backend evidence stay Unknown.</p></div>"#
+        );
+    };
+    let partial_notice = address_error
+        .map(|error| format!(r#"<div class="notice info">{}</div>"#, escape_html(error)))
+        .unwrap_or_default();
+    let search = format!("{search}{partial_notice}");
+    let profile = adapt_entity_profile(summary, workspace_entity, graph_edges, events);
+    let monitoring_state = if workspace_entity.is_some_and(|object| object.monitoring_enabled) {
+        ObservationMonitoringState::Enabled
+    } else if workspace
+        .workspace_plan
+        .allows(WorkspaceCapability::CustomMonitoredEntities)
+    {
+        ObservationMonitoringState::Available
+    } else {
+        ObservationMonitoringState::Unavailable
+    };
+    let observed_object = ObservedObject {
+        id: workspace_entity
+            .map(|object| object.workspace_entity_id.to_string())
+            .unwrap_or_else(|| summary.address.clone()),
+        target: summary.address.clone(),
+        object_type: profile.entity_type.clone(),
+        workspace_id: workspace.id.clone(),
+        observed_since: workspace_entity
+            .map(|object| object.created_at)
+            .unwrap_or_else(Utc::now),
+        monitoring_state,
+        intelligence_profile: profile,
+    };
+    let profile = &observed_object.intelligence_profile;
+    let workspace_id = urlencoding::encode(&workspace.id);
+    let encoded_address = urlencoding::encode(&summary.address);
+    let title = workspace_entity
+        .and_then(|entity| entity.label.as_deref())
+        .or_else(|| profile.labels.first().map(|claim| claim.value.as_str()))
+        .unwrap_or("Observed Object");
+    let confidence = profile
+        .confidence
+        .map(|value| {
+            format!("High · {value}%").replace(
+                "High",
+                if value >= 85 {
+                    "High"
+                } else if value >= 60 {
+                    "Medium"
+                } else {
+                    "Low"
+                },
+            )
+        })
+        .unwrap_or_else(|| "Unknown".to_owned());
+    let roles = render_entity_claims(
+        &profile.roles,
+        "No role has been established from available evidence.",
+    );
+    let labels = render_entity_claims(&profile.labels, "No evidence-backed labels are available.");
+    let behavior = render_entity_behaviors(&profile.behaviors);
+    let protocols = if profile.protocols.is_empty() {
+        r#"<div class="ei-empty-state"><strong>Protocols unavailable</strong><p>No protocol path is recorded in this entity's scoped execution events.</p></div>"#.to_owned()
+    } else {
+        format!(
+            r#"<div class="ei-chip-list">{}</div>"#,
+            profile
+                .protocols
+                .iter()
+                .map(|protocol| format!(r#"<span>{}</span>"#, escape_html(protocol)))
+                .collect::<String>()
+        )
+    };
+    let relationship_graph = render_entity_relationship_graph(profile, workspace);
+    let relationships = render_entity_relationships(&profile.relationships, workspace);
+    let economics = render_entity_economics(&profile.economics);
+    let timeline = render_entity_timeline(&profile.timeline, workspace);
+    let limitations = if profile.limitations.is_empty() {
+        "No additional limitations recorded.".to_owned()
+    } else {
+        profile
+            .limitations
+            .iter()
+            .map(|item| format!("<li>{}</li>", escape_html(item)))
+            .collect::<String>()
+    };
+    let evidence_action = profile.timeline.iter().find_map(|item| item.event_id.as_deref()).map(|event_id| {
+        format!(r#"<a class="ca-secondary-button" href="/app/events/{}/evidence.json">Export Evidence</a>"#, urlencoding::encode(event_id))
+    }).unwrap_or_default();
+    let monitoring_action = match observed_object.monitoring_state {
+        ObservationMonitoringState::Enabled => format!(
+            r#"<span class="ca-primary-button ei-button-disabled" aria-label="Monitoring enabled">Watching</span><a class="ca-secondary-button" href="/app/settings?workspace={}">Notification Settings</a>"#,
+            workspace_id,
+        ),
+        ObservationMonitoringState::Available => format!(
+            r#"<form method="post" action="/app/observations/{}/monitoring"><input type="hidden" name="workspace_id" value="{}"><input type="hidden" name="chain_id" value="{}"><button class="ca-primary-button" type="submit">Enable Monitoring</button></form>"#,
+            encoded_address,
+            workspace_database_id(workspace)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            chain_id,
+        ),
+        ObservationMonitoringState::Unavailable => {
+            r#"<a class="ca-primary-button" href="/pilot">Request Monitoring Access</a>"#.to_owned()
+        }
+    };
+    format!(
+        r##"{search}<section class="ca-panel ei-entity-hero"><div class="ei-event-labels"><span class="ei-status {monitoring_key}">{monitoring_label}</span><span class="ei-event-type">{entity_type}</span></div><div class="ei-entity-title"><div><h1>{title}</h1><code>{entity_address}</code></div><div class="ei-entity-actions">{monitoring_action}<a class="ca-secondary-button" href="/app/investigations?new=1&amp;workspace={workspace_id}&amp;entity={encoded_address}">Investigate</a><a class="ca-secondary-button" href="/app/reports?workspace={workspace_id}&amp;entity={encoded_address}">Create Brief</a>{evidence_action}</div></div><dl class="ei-entity-facts"><div><dt>Object type</dt><dd>{entity_type}</dd></div><div><dt>Confidence</dt><dd>{confidence}</dd></div><div><dt>Observed since</dt><dd>{observed_since}</dd></div><div><dt>First seen onchain</dt><dd>{first_seen}</dd></div><div><dt>Last active</dt><dd>{last_seen}</dd></div><div><dt>Network</dt><dd>Chain {chain_id}</dd></div></dl><p class="ei-observation-state">This object is in your workspace observation scope. Continuous alerts are controlled separately through <strong>{monitoring_label}</strong>.</p></section><nav class="ei-context-tabs"><a href="#identity">Overview</a><a href="#behavior">Behavior</a><a href="#relationships">Relationships</a><a href="#economics">Economic Intelligence</a><a href="#timeline">Timeline</a><a href="#monitoring">Monitoring</a></nav><section id="identity" class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">OVERVIEW</span><h2>What is this object?</h2></div><span>Ownership is never inferred from interaction alone</span></div><div class="ei-two-column"><div><h3>Observed and inferred roles</h3>{roles}</div><div><h3>Current labels</h3>{labels}</div></div></section><section id="behavior" class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">BEHAVIOR</span><h2>What does this object do?</h2></div><span>Completed analysis samples only</span></div><div class="ei-two-column"><div><h3>Observed strategies and execution patterns</h3><div class="ei-behavior-list">{behavior}</div></div><div><h3>Observed protocols</h3>{protocols}</div></div></section><section id="relationships" class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">RELATIONSHIPS</span><h2>Who is it connected to?</h2></div><span>Associated with ≠ owned by</span></div>{relationship_graph}{relationships}</section><section id="economics" class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">ECONOMIC INTELLIGENCE</span><h2>Does this object create or capture value?</h2></div><span>Estimated total profit is never presented as fact</span></div>{economics}</section><section id="timeline" class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">HISTORICAL ACTIVITY</span><h2>Activity Timeline</h2></div></div>{timeline}</section><section id="monitoring" class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">CONTINUOUS OBSERVATION</span><h2>Watch this object</h2></div><span>{monitoring_label}</span></div><p class="panel-copy">Default observation covers material asset flow, execution behavior, liquidations, repeated failures, and previously unknown material interactions. Notification channels are managed once in Settings.</p><div class="ei-entity-actions">{monitoring_action}</div></section><details class="ca-panel ei-evidence-panel"><summary><span><small>LIMITATIONS</small><strong>Evidence boundary</strong></span><b>Open ↓</b></summary><div class="ei-evidence-body"><ul>{limitations}</ul></div></details>"##,
+        title = escape_html(title),
+        entity_address = escape_html(&summary.address),
+        encoded_address = urlencoding::encode(&summary.address),
+        entity_type = escape_html(&profile.entity_type),
+        monitoring_key = observed_object.monitoring_state.key(),
+        monitoring_label = observed_object.monitoring_state.label(),
+        monitoring_action = monitoring_action,
+        observed_since = observed_object.observed_since.to_rfc3339(),
+        confidence = escape_html(&confidence),
+        first_seen = profile
+            .first_seen_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "Unknown".to_owned()),
+        last_seen = profile
+            .last_seen_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "Unknown".to_owned()),
+    )
+}
+
+fn adapt_entity_profile(
+    summary: &AddressSummaryEnvelope,
+    workspace_entity: Option<&WorkspaceEntityRow>,
+    graph_edges: &[ClusterGraphEdgeRow],
+    events: &[ExecutionEvent],
+) -> EntityProfile {
+    let address = summary.address.to_ascii_lowercase();
+    let profile = summary.profile.as_ref();
+    let total_behavior_transactions = summary
+        .behavior_rows
+        .iter()
+        .map(|row| row.tx_count)
+        .sum::<u64>();
+    let mut behaviors = summary
+        .behavior_rows
+        .iter()
+        .map(|row| EntityBehavior {
+            name: row.behavior.clone(),
+            transaction_count: row.tx_count,
+            share_percent: (total_behavior_transactions > 0)
+                .then(|| row.tx_count as f64 * 100.0 / total_behavior_transactions as f64),
+            gas_cost: Some(format_wei_eth_raw(&row.gas_spent_raw)),
+            evidence_state: EntityEvidenceState::Observed,
+        })
+        .collect::<Vec<_>>();
+    let observed_transaction_count = summary
+        .observed_txs
+        .iter()
+        .map(|item| item.tx_hash.to_ascii_lowercase())
+        .collect::<HashSet<_>>()
+        .len() as u64;
+    if observed_transaction_count > 0 {
+        behaviors.push(EntityBehavior {
+            name: "Indexed address activity".to_owned(),
+            transaction_count: observed_transaction_count,
+            share_percent: None,
+            gas_cost: None,
+            evidence_state: EntityEvidenceState::Observed,
+        });
+    }
+    let roles = workspace_entity
+        .and_then(|entity| entity.role.as_ref())
+        .map(|role| {
+            vec![EntityIdentityClaim {
+                value: role.clone(),
+                confidence: None,
+                evidence_state: EntityEvidenceState::Unverified,
+                source: Some("Workspace configuration".to_owned()),
+            }]
+        })
+        .unwrap_or_default();
+    let labels = summary
+        .labels
+        .iter()
+        .map(|label| {
+            let observed = label.source.to_ascii_lowercase().contains("registry")
+                || label.source.to_ascii_lowercase().contains("human");
+            EntityIdentityClaim {
+                value: label.label.clone(),
+                confidence: Some((label.confidence.clamp(0.0, 1.0) * 100.0).round() as u8),
+                evidence_state: if observed {
+                    EntityEvidenceState::Observed
+                } else {
+                    EntityEvidenceState::Inferred
+                },
+                source: Some(label.source.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+    let related_events = events
+        .iter()
+        .filter(|event| {
+            event
+                .participants
+                .iter()
+                .any(|participant| participant.address.eq_ignore_ascii_case(&address))
+        })
+        .collect::<Vec<_>>();
+    let mut protocols = related_events
+        .iter()
+        .flat_map(|event| event.protocols.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    protocols.sort();
+    let mut relationship_keys = HashSet::new();
+    let mut relationships = Vec::new();
+    for event in &related_events {
+        for participant in event
+            .participants
+            .iter()
+            .filter(|participant| !participant.address.eq_ignore_ascii_case(&address))
+        {
+            let role = participant.role.to_ascii_lowercase();
+            let kind = if role.contains("fund") {
+                EntityRelationshipKind::Funding
+            } else if role.contains("recipient")
+                || role.contains("settlement")
+                || role.contains("surplus")
+            {
+                EntityRelationshipKind::Settlement
+            } else if role.contains("protocol") || role.contains("pool") || role.contains("router")
+            {
+                EntityRelationshipKind::Protocol
+            } else {
+                EntityRelationshipKind::Execution
+            };
+            let key = format!(
+                "{}:{}",
+                kind.label(),
+                participant.address.to_ascii_lowercase()
+            );
+            if relationship_keys.insert(key) {
+                relationships.push(EntityRelationship {
+                    kind,
+                    counterparty: participant.clone(),
+                    evidence_state: if matches!(
+                        event.status,
+                        ExecutionEventStatus::Verified | ExecutionEventStatus::Resolved
+                    ) {
+                        EntityEvidenceState::Observed
+                    } else {
+                        EntityEvidenceState::Inferred
+                    },
+                    observation_count: None,
+                    last_seen_at: event.occurred_at,
+                    evidence_href: Some(format!("/app/events/{}", urlencoding::encode(&event.id))),
+                });
+            }
+        }
+    }
+    for edge in graph_edges.iter().filter(|edge| {
+        edge.source_address.eq_ignore_ascii_case(&address)
+            || edge.counterparty_address.eq_ignore_ascii_case(&address)
+    }) {
+        let counterparty = if edge.source_address.eq_ignore_ascii_case(&address) {
+            &edge.counterparty_address
+        } else {
+            &edge.source_address
+        };
+        let key = format!("observed:{}", counterparty.to_ascii_lowercase());
+        if relationship_keys.insert(key) {
+            relationships.push(EntityRelationship {
+                kind: EntityRelationshipKind::ObservedInteraction,
+                counterparty: EntityReference {
+                    role: "Asset-flow counterparty".to_owned(),
+                    address: counterparty.clone(),
+                    label: None,
+                },
+                evidence_state: EntityEvidenceState::Observed,
+                observation_count: Some(edge.tx_count.max(0) as u64),
+                last_seen_at: edge.last_seen_at,
+                evidence_href: Some(tx_analysis_href(edge.chain_id, &edge.sample_tx_hash)),
+            });
+        }
+    }
+    let mut observed_counterparties = BTreeMap::<String, (String, u64, u64, String)>::new();
+    for reference in &summary.observed_txs {
+        let (role, counterparty) = match reference.direction {
+            AddressHitDirection::To => ("Observed sender", reference.from_address.as_deref()),
+            AddressHitDirection::From => ("Observed recipient", reference.to_address.as_deref()),
+        };
+        let Some(counterparty) = counterparty
+            .map(str::to_ascii_lowercase)
+            .filter(|value| value != &address && is_evm_hex_value(value, 40))
+        else {
+            continue;
+        };
+        let entry = observed_counterparties
+            .entry(counterparty)
+            .or_insert_with(|| {
+                (
+                    role.to_owned(),
+                    0,
+                    reference.block_number,
+                    reference.tx_hash.clone(),
+                )
+            });
+        entry.1 += 1;
+        if reference.block_number > entry.2 {
+            entry.2 = reference.block_number;
+            entry.3.clone_from(&reference.tx_hash);
+        }
+        if entry.0 != role {
+            entry.0 = "Observed transaction / transfer counterparty".to_owned();
+        }
+    }
+    for (counterparty, (role, count, _last_block, sample_tx_hash)) in observed_counterparties {
+        let key = format!("observed:{}", counterparty.to_ascii_lowercase());
+        if relationship_keys.insert(key) {
+            relationships.push(EntityRelationship {
+                kind: EntityRelationshipKind::ObservedInteraction,
+                counterparty: EntityReference {
+                    role,
+                    address: counterparty,
+                    label: None,
+                },
+                evidence_state: EntityEvidenceState::Observed,
+                observation_count: Some(count),
+                last_seen_at: None,
+                evidence_href: Some(tx_analysis_href(summary.chain_id, &sample_tx_hash)),
+            });
+        }
+    }
+    let verified_events = related_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.status,
+                ExecutionEventStatus::Verified | ExecutionEventStatus::Resolved
+            )
+        })
+        .collect::<Vec<_>>();
+    let verified_usd_values = verified_events
+        .iter()
+        .filter_map(|event| event.economic_impact.usd_value)
+        .collect::<Vec<_>>();
+    let economics = EntityEconomicIntelligence {
+        observed_execution_count: related_events.len() as u64,
+        verified_profitable_execution_count: verified_events
+            .iter()
+            .filter(|event| event.economic_impact.net_profit.is_some())
+            .count() as u64,
+        verified_usd_impact: (!verified_usd_values.is_empty())
+            .then(|| verified_usd_values.iter().sum()),
+        analyzed_gas_cost: (summary.analyzed_tx_count > 0)
+            .then(|| format_wei_eth_raw(&summary.gas_spent_raw)),
+        coverage: format!(
+            "{} verified events; {} analyzed transaction samples; {} indexed recent transactions",
+            verified_events.len(),
+            summary.analyzed_tx_count,
+            observed_transaction_count,
+        ),
+    };
+    let mut timeline = related_events
+        .iter()
+        .take(30)
+        .map(|event| EntityTimelineItem {
+            occurred_at: event.occurred_at,
+            title: event.event_type.label().to_owned(),
+            detail: event.conclusion.clone(),
+            impact: event.economic_impact.primary_value().map(str::to_owned),
+            evidence_state: if matches!(
+                event.status,
+                ExecutionEventStatus::Verified | ExecutionEventStatus::Resolved
+            ) {
+                EntityEvidenceState::Observed
+            } else {
+                EntityEvidenceState::Inferred
+            },
+            event_id: Some(event.id.clone()),
+        })
+        .collect::<Vec<_>>();
+    let mut timeline_tx_hashes = HashSet::new();
+    for reference in summary
+        .observed_txs
+        .iter()
+        .filter(|reference| timeline_tx_hashes.insert(reference.tx_hash.to_ascii_lowercase()))
+        .take(20)
+    {
+        let (title, counterparty) = match reference.direction {
+            AddressHitDirection::To => (
+                "Incoming indexed activity",
+                reference.from_address.as_deref(),
+            ),
+            AddressHitDirection::From => {
+                ("Outgoing indexed activity", reference.to_address.as_deref())
+            }
+        };
+        let detail = match counterparty {
+            Some(counterparty) => format!(
+                "Observed in block #{} with counterparty {} (transaction {}).",
+                reference.block_number,
+                truncate_middle(counterparty, 8),
+                truncate_middle(&reference.tx_hash, 8),
+            ),
+            None => format!(
+                "Observed in block #{} (transaction {}).",
+                reference.block_number,
+                truncate_middle(&reference.tx_hash, 8),
+            ),
+        };
+        timeline.push(EntityTimelineItem {
+            occurred_at: None,
+            title: title.to_owned(),
+            detail,
+            impact: None,
+            evidence_state: EntityEvidenceState::Observed,
+            event_id: None,
+        });
+    }
+    let existing_timeline_hashes = timeline_tx_hashes;
+    for transaction in summary.recent_txs.iter().filter(|transaction| {
+        !existing_timeline_hashes.contains(&transaction.tx_hash.to_ascii_lowercase())
+    }) {
+        timeline.push(EntityTimelineItem {
+            occurred_at: transaction
+                .block_timestamp
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc)),
+            title: transaction.behavior.clone(),
+            detail: format!(
+                "Completed deterministic analysis for transaction {}.",
+                truncate_middle(&transaction.tx_hash, 8),
+            ),
+            impact: None,
+            evidence_state: EntityEvidenceState::Observed,
+            event_id: None,
+        });
+    }
+    let mut limitations = related_events
+        .iter()
+        .flat_map(|event| event.evidence.limitations.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    limitations.insert("Relationships show recorded interactions or evidence roles; they do not establish common ownership.".to_owned());
+    if profile.is_none() {
+        limitations.insert(
+            "Address-level profile and behavior samples are not available yet; workspace configuration and related event evidence are shown independently."
+                .to_owned(),
+        );
+    }
+    limitations.insert(format!(
+        "Recent activity is bounded to at most {} live-indexed blocks and {} returned references; it is not a claim of complete address history.",
+        OBSERVATION_RECENT_BLOCK_LOOKBACK,
+        OBSERVATION_RECENT_TX_LIMIT,
+    ));
+    limitations.insert(
+        "Indexed address activity includes direct transaction endpoints and ERC-20 Transfer log participants; relationship labels describe observed interaction only."
+            .to_owned(),
+    );
+    if economics.verified_usd_impact.is_none() {
+        limitations.insert(
+            "No deterministic USD-denominated impact is available for aggregation.".to_owned(),
+        );
+    }
+    EntityProfile {
+        id: address,
+        chain_id: summary.chain_id,
+        entity_type: profile
+            .map(|value| value.address_type.clone())
+            .or_else(|| workspace_entity.map(|value| value.entity_kind.clone()))
+            .unwrap_or_else(|| "Unknown".to_owned()),
+        roles,
+        labels,
+        confidence: profile.map(|value| (value.confidence.clamp(0.0, 1.0) * 100.0).round() as u8),
+        first_seen_at: profile.map(|value| value.first_seen_at),
+        last_seen_at: profile.map(|value| value.last_seen_at),
+        behaviors,
+        protocols,
+        relationships,
+        economics,
+        timeline,
+        limitations: limitations.into_iter().collect(),
+    }
+}
+
+fn render_entity_claims(claims: &[EntityIdentityClaim], empty: &str) -> String {
+    if claims.is_empty() {
+        return format!(
+            r#"<div class="ei-empty-state"><p>{}</p></div>"#,
+            escape_html(empty)
+        );
+    }
+    claims.iter().map(|claim| format!(
+        r#"<div class="ei-claim"><span class="ei-evidence-state {}">{}</span><strong>{}</strong><small>{}{}</small></div>"#,
+        claim.evidence_state.key(), claim.evidence_state.label(), escape_html(&claim.value),
+        claim.source.as_deref().map(escape_html).unwrap_or_else(|| "Source unavailable".to_owned()),
+        claim.confidence.map(|value| format!(" · {value}%")).unwrap_or_default(),
+    )).collect()
+}
+
+fn render_entity_behaviors(behaviors: &[EntityBehavior]) -> String {
+    if behaviors.is_empty() {
+        return r#"<div class="ei-empty-state"><strong>Behavior unavailable</strong><p>No completed transaction-analysis sample exists for this entity.</p></div>"#.to_owned();
+    }
+    behaviors.iter().map(|behavior| format!(
+        r#"<div class="ei-behavior-row"><span>{}<small>{}</small></span><strong>{}</strong><small>{} · Gas {}</small></div>"#,
+        escape_html(&behavior.name), behavior.evidence_state.label(),
+        behavior.share_percent.map(|value| format!("{value:.1}%")).unwrap_or_else(|| "Unknown".to_owned()),
+        format_count(behavior.transaction_count as i64),
+        escape_html(behavior.gas_cost.as_deref().unwrap_or("Unknown")),
+    )).collect()
+}
+
+fn render_entity_relationship_graph(profile: &EntityProfile, workspace: &WorkspaceRef) -> String {
+    if profile.relationships.is_empty() {
+        return r#"<div class="ei-empty-state"><strong>No recorded relationships</strong><p>No Evidence Pack participant or persisted asset-flow edge connects this entity to another entity yet.</p></div>"#.to_owned();
+    }
+    let nodes = profile.relationships.iter().take(6).map(|relationship| format!(
+        r#"<a href="/app/observations/{}?workspace={}"><span>{}</span><strong>{}</strong><small>{}</small></a>"#,
+        urlencoding::encode(&relationship.counterparty.address), urlencoding::encode(&workspace.id),
+        relationship.kind.label(),
+        escape_html(relationship.counterparty.label.as_deref().unwrap_or(&truncate_middle(&relationship.counterparty.address, 7))),
+        relationship.evidence_state.label(),
+    )).collect::<String>();
+    format!(
+        r#"<div class="ei-relationship-graph"><div class="ei-relationship-center"><span>OBSERVED OBJECT</span><strong>{}</strong></div><div class="ei-relationship-nodes">{}</div></div>"#,
+        escape_html(&truncate_middle(&profile.id, 9)),
+        nodes
+    )
+}
+
+fn render_entity_relationships(
+    relationships: &[EntityRelationship],
+    workspace: &WorkspaceRef,
+) -> String {
+    if relationships.is_empty() {
+        return String::new();
+    }
+    let categories = [
+        EntityRelationshipKind::Funding,
+        EntityRelationshipKind::Execution,
+        EntityRelationshipKind::Settlement,
+        EntityRelationshipKind::Protocol,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let count = relationships
+            .iter()
+            .filter(|relationship| relationship.kind == kind)
+            .count();
+        format!(
+            r#"<div><span>{}</span><strong>{}</strong><small>{}</small></div>"#,
+            kind.label(),
+            count,
+            if count == 0 {
+                "No evidence recorded"
+            } else {
+                "Evidence-linked counterparties"
+            }
+        )
+    })
+    .collect::<String>();
+    let rows = relationships.iter().map(|relationship| format!(
+        r#"<tr><td>{}</td><td><a href="/app/observations/{}?workspace={}">{}</a><small>{}</small></td><td><span class="ei-evidence-state {}">{}</span></td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+        relationship.kind.label(), urlencoding::encode(&relationship.counterparty.address), urlencoding::encode(&workspace.id),
+        escape_html(relationship.counterparty.label.as_deref().unwrap_or(&truncate_middle(&relationship.counterparty.address, 8))),
+        escape_html(&relationship.counterparty.role), relationship.evidence_state.key(), relationship.evidence_state.label(),
+        relationship.observation_count.map(|value| value.to_string()).unwrap_or_else(|| "Event evidence".to_owned()),
+        relationship.last_seen_at.map(|value| value.to_rfc3339()).unwrap_or_else(|| "Unknown".to_owned()),
+        relationship.evidence_href.as_deref().map(|href| format!(r#"<a href="{}">Open evidence →</a>"#, escape_html(href))).unwrap_or_else(|| "Unavailable".to_owned()),
+    )).collect::<String>();
+    format!(
+        r#"<div class="ei-relationship-categories">{categories}</div><div class="table-shell ei-table"><table><thead><tr><th>Relationship</th><th>Counterparty</th><th>Evidence state</th><th>Observations</th><th>Last observed</th><th>Evidence</th></tr></thead><tbody>{rows}</tbody></table></div>"#
+    )
+}
+
+fn render_entity_economics(economics: &EntityEconomicIntelligence) -> String {
+    let verified_impact = economics
+        .verified_usd_impact
+        .map(|value| format!("${value:.2}"))
+        .unwrap_or_else(|| "Unknown".to_owned());
+    format!(
+        r#"<div class="ei-economic-grid"><div><span>Observed executions</span><strong>{}</strong><small>Scoped event records</small></div><div><span>Verified profitable executions</span><strong>{}</strong><small>Net profit field required</small></div><div><span>Verified economic impact</span><strong>{}</strong><small>Verified USD values only</small></div><div><span>Analyzed gas cost</span><strong>{}</strong><small>Completed samples only</small></div></div><p class="ei-coverage-note"><strong>Coverage:</strong> {}</p>"#,
+        format_count(economics.observed_execution_count as i64),
+        format_count(economics.verified_profitable_execution_count as i64),
+        escape_html(&verified_impact),
+        escape_html(economics.analyzed_gas_cost.as_deref().unwrap_or("Unknown")),
+        escape_html(&economics.coverage),
+    )
+}
+
+fn render_entity_timeline(timeline: &[EntityTimelineItem], workspace: &WorkspaceRef) -> String {
+    if timeline.is_empty() {
+        return r#"<div class="ei-empty-state"><strong>No entity timeline yet</strong><p>Related execution events will appear here when deterministic evidence connects them to this entity.</p></div>"#.to_owned();
+    }
+    timeline.iter().map(|item| format!(
+        r#"<article class="ei-timeline-item"><time>{}</time><div><span class="ei-evidence-state {}">{}</span><h3>{}</h3><p>{}</p><small>Impact: {}</small></div>{}</article>"#,
+        item.occurred_at.map(|value| value.format("%b %d · %H:%M UTC").to_string()).unwrap_or_else(|| "Time unavailable".to_owned()),
+        item.evidence_state.key(), item.evidence_state.label(), escape_html(&item.title), escape_html(&item.detail),
+        escape_html(item.impact.as_deref().unwrap_or("Unknown")),
+        item.event_id.as_deref().map(|id| format!(r#"<a href="/app/events/{}?workspace={}">Open event →</a>"#, urlencoding::encode(id), urlencoding::encode(&workspace.id))).unwrap_or_default(),
+    )).collect()
+}
+
+fn render_entity_searchers_content(chain_id: u64, reviews: &[BehaviorReviewItem]) -> String {
+    if reviews.is_empty() {
+        return r#"<div class="ei-empty-state ei-empty-wide"><strong>No Searchers / Automated Actors require review</strong><p>Only evidence-backed behavior assertions are shown here. High transaction volume alone does not create an entity.</p></div>"#.to_owned();
+    }
+    let cards = reviews
+        .iter()
+        .map(|review| {
+            format!(
+                r#"<article class="ca-panel ei-searcher-card"><div class="ei-event-labels"><span class="ei-status detected">Review required</span><span class="ei-event-type">{}</span></div><h2><a href="/app/entities?tab=addresses&chain_id={chain_id}&address={}">{}</a></h2><dl><div><dt>Confidence</dt><dd>{:.0}%</dd></div><div><dt>Priority</dt><dd>{}</dd></div><div><dt>Method</dt><dd>{}</dd></div><div><dt>Valid block range</dt><dd>{} → {}</dd></div></dl><details class="raw-json-shell"><summary>Evidence</summary><pre class="json-shell">{}</pre></details></article>"#,
+                escape_html(&review.label),
+                urlencoding::encode(&review.address),
+                escape_html(&truncate_middle(&review.address, 10)),
+                review.confidence.clamp(0.0, 1.0) * 100.0,
+                review.priority,
+                escape_html(&review.method_version),
+                review.valid_from_block.map(|value| value.to_string()).unwrap_or_else(|| "Unknown".to_owned()),
+                review.valid_to_block.map(|value| value.to_string()).unwrap_or_else(|| "Unknown".to_owned()),
+                escape_html(&serde_json::to_string_pretty(&review.evidence).unwrap_or_else(|_| "{}".to_owned())),
+            )
+        })
+        .collect::<String>();
+    format!(r#"<section class="ei-searcher-grid">{cards}</section>"#)
+}
+
+fn render_entity_clusters_content(
+    clusters: &[DashboardClusterRecord],
+    graph_edges: &[ClusterGraphEdgeRow],
+    selected_cluster: Option<&str>,
+) -> String {
+    if let Some(selected_cluster) = selected_cluster {
+        if let Some(cluster) = clusters
+            .iter()
+            .find(|cluster| cluster.cluster_id.to_string() == selected_cluster)
+        {
+            let edges = graph_edges
+                .iter()
+                .filter(|edge| edge.cluster_id == cluster.cluster_id)
+                .collect::<Vec<_>>();
+            let rows = if edges.is_empty() {
+                r#"<tr><td colspan="5">No persisted flow relationships for this cluster.</td></tr>"#
+                    .to_owned()
+            } else {
+                edges
+                    .iter()
+                    .take(100)
+                    .map(|edge| {
+                        format!(r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href="{}">open evidence →</a></td></tr>"#, escape_html(&truncate_middle(&edge.source_address, 8)), escape_html(&truncate_middle(&edge.counterparty_address, 8)), edge.tx_count, edge.token_count, tx_analysis_href(edge.chain_id, &edge.sample_tx_hash))
+                    })
+                    .collect::<String>()
+            };
+            return format!(
+                r#"<a class="ei-back-link" href="/app/entities?tab=clusters">← All Entity Clusters</a><section class="ca-panel ei-conclusion-card"><span class="ei-section-kicker">ENTITY CLUSTER</span><h1>{}</h1><p>{}</p><dl><div><dt>Cluster ID</dt><dd>{}</dd></div><div><dt>Network</dt><dd>Chain {}</dd></div><div><dt>Addresses</dt><dd>{}</dd></div><div><dt>Confidence</dt><dd>Unknown</dd></div><div><dt>Created</dt><dd>{}</dd></div><div><dt>External team identity</dt><dd>Not asserted</dd></div></dl></section><section class="ca-panel ei-detail-section"><div class="ei-section-head compact"><div><span class="ei-section-kicker">RELATIONSHIPS</span><h2>Persisted flow graph</h2></div><a href="/app/clusters/{}">Open legacy analysis →</a></div><div class="table-shell ei-table"><table><thead><tr><th>Source</th><th>Counterparty</th><th>Transactions</th><th>Assets</th><th>Evidence</th></tr></thead><tbody>{}</tbody></table></div></section>"#,
+                escape_html(&cluster.name),
+                escape_html(cluster.description.as_deref().unwrap_or("No description")),
+                cluster.cluster_id,
+                cluster.chain_id,
+                cluster.address_count,
+                cluster.created_at.to_rfc3339(),
+                cluster.cluster_id,
+                rows
+            );
+        }
+    }
+    if clusters.is_empty() {
+        return r#"<div class="ei-empty-state ei-empty-wide"><strong>No Entity Clusters</strong><p>Entity Clusters group addresses by explicit workspace configuration; they do not imply that addresses belong to a real-world team.</p><a class="ca-primary-button" href="/app/monitors?step=1">Create a monitored system</a></div>"#.to_owned();
+    }
+    let cards = clusters.iter().map(|cluster| format!(r#"<a class="ca-panel ei-cluster-card" href="/app/entities?tab=clusters&cluster_id={}"><span>ENTITY CLUSTER · chain {}</span><h2>{}</h2><p>{}</p><dl><div><dt>Addresses</dt><dd>{}</dd></div><div><dt>Created</dt><dd>{}</dd></div><div><dt>Real-world team</dt><dd>Not asserted</dd></div></dl><b>Open profile & relationships →</b></a>"#, cluster.cluster_id, cluster.chain_id, escape_html(&cluster.name), escape_html(cluster.description.as_deref().unwrap_or("No description")), cluster.address_count, cluster.created_at.format("%Y-%m-%d"))).collect::<String>();
+    format!(r#"<section class="ei-cluster-grid">{cards}</section>"#)
+}
+
+fn render_entity_protocols_content(protocols: &[TodayProtocolRow]) -> String {
+    if protocols.is_empty() {
+        return r#"<div class="ei-empty-state ei-empty-wide"><strong>No active protocols found</strong><p>Protocol entities appear only from registered active deployments; LedgerFlow does not guess protocol identity from transaction shape.</p></div>"#.to_owned();
+    }
+    let rows = protocols
+        .iter()
+        .map(|protocol| {
+            format!(
+                r#"<tr><td><strong>{}</strong></td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                escape_html(&protocol.display_name),
+                escape_html(&protocol.protocol_family),
+                protocol.deployment_count,
+                protocol
+                    .last_seen
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "Unknown".to_owned())
+            )
+        })
+        .collect::<String>();
+    format!(
+        r#"<section class="ca-panel ei-panel"><div class="ei-section-head compact"><div><span class="ei-section-kicker">REGISTERED DEPLOYMENTS</span><h2>Protocols</h2></div><span>No inferred identities</span></div><div class="table-shell ei-table"><table><thead><tr><th>Protocol</th><th>Family</th><th>Active deployments</th><th>Last observed</th></tr></thead><tbody>{rows}</tbody></table></div></section>"#
     )
 }
 
@@ -4746,140 +16956,22 @@ fn render_address_analysis_panel(
         .collect::<Vec<_>>()
         .join("");
     let body = summary
-        .map(|summary| {
-            let profile = summary
-                .profile
-                .as_ref()
-                .map(|profile| {
-                    let portfolio = profile
-                        .metadata
-                        .pointer("/portfolio_estimate/estimated_usd")
-                        .and_then(serde_json::Value::as_f64)
-                        .map(|estimated_usd| {
-                            let classification = if profile
-                                .metadata
-                                .pointer("/portfolio_estimate/is_whale")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(false)
-                            {
-                                "whale"
-                            } else {
-                                "below threshold / partial"
-                            };
-                            format!(
-                                r#"<div class="stat"><span>Observed portfolio value</span><strong>${:.2}</strong><small>{}</small></div>"#,
-                                estimated_usd,
-                                escape_html(classification)
-                            )
-                        })
-                        .unwrap_or_default();
-                    format!(
-                        r#"<div class="stat"><span>Type</span><strong>{}</strong></div>
-<div class="stat"><span>Code bytes</span><strong>{}</strong></div>{}"#,
-                        escape_html(&profile.address_type),
-                        profile.bytecode_length.unwrap_or_default(),
-                        portfolio
-                    )
-                })
-                .unwrap_or_else(|| {
-                    "<div class=\"stat\"><span>Type</span><strong>pending</strong></div><div class=\"stat\"><span>Code bytes</span><strong>n/a</strong></div>".to_owned()
-                });
-            let labels = if summary.labels.is_empty() {
-                "<span class=\"muted\">No labels yet. Worker has been queued if this address was not analyzed.</span>".to_owned()
-            } else {
-                summary
-                    .labels
-                    .iter()
-                    .map(|label| {
-                        format!(
-                            r#"<span class="address-label-chip">{} · {}</span>"#,
-                            escape_html(&label.label),
-                            escape_html(&label.source)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("")
-            };
-            let behavior_rows = if summary.behavior_rows.is_empty() {
-                "<tr><td colspan=\"3\">No analyzed transactions for this address yet.</td></tr>".to_owned()
-            } else {
-                summary
-                    .behavior_rows
-                    .iter()
-                    .map(|row| {
-                        format!(
-                            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                            escape_html(&row.behavior),
-                            row.tx_count,
-                            render_amount_stack(&format_wei_eth_raw(&row.gas_spent_raw), &row.gas_spent_raw)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("")
-            };
-            let recent_rows = if summary.recent_txs.is_empty() {
-                "<tr><td colspan=\"4\">No recent analyzed txs found.</td></tr>".to_owned()
-            } else {
-                summary
-                    .recent_txs
-                    .iter()
-                    .map(|tx| {
-                        format!(
-                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                            render_copyable_code(&tx.tx_hash, 8),
-                            escape_html(tx.block_timestamp.as_deref().unwrap_or("n/a")),
-                            escape_html(&tx.behavior),
-                            render_amount_stack(&format_wei_eth_raw(&tx.gas_raw), &tx.gas_raw)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("")
-            };
-            let queued = if summary.queued {
-                "<div class=\"notice info\">Address profile job is queued. Keep the address worker running and refresh later.</div>"
-            } else {
-                ""
-            };
-            format!(
-                r#"{}
-<div class="stats-grid">
-  <div class="stat"><span>Address</span><strong>{}</strong></div>
-  <div class="stat"><span>Native balance</span><strong>{}</strong></div>
-  <div class="stat"><span>Analyzed txs</span><strong>{}</strong></div>
-  <div class="stat"><span>Gas spent</span><strong>{}</strong></div>
-  {}
-</div>
-<section class="mini-card"><strong>Known labels</strong><div>{}</div></section>
-<div class="split-panels">
-  <div class="table-shell"><table><thead><tr><th>Behavior</th><th>Tx count</th><th>Gas spent</th></tr></thead><tbody>{}</tbody></table></div>
-  <div class="table-shell"><table><thead><tr><th>Tx</th><th>Time</th><th>Behavior</th><th>Gas</th></tr></thead><tbody>{}</tbody></table></div>
-</div>"#,
-                queued,
-                render_copyable_code(&summary.address, 10),
-                summary.native_balance_raw.as_deref().map(format_wei_eth_raw).unwrap_or_else(|| "n/a".to_owned()),
-                summary.analyzed_tx_count,
-                format_wei_eth_raw(&summary.gas_spent_raw),
-                profile,
-                labels,
-                behavior_rows,
-                recent_rows
-            )
-        })
+        .map(render_address_summary_body)
         .unwrap_or_else(|| {
-            "<div class=\"empty-state\">Enter an address to inspect known labels, native balance, previously analyzed txs, behavior breakdown, and gas spend.</div>".to_owned()
+            "<div class=\"empty-state\">Enter an address to view its onchain balance, profile, labels, indexer-observed transactions, completed analyses, behavior statistics, and coverage status.</div>".to_owned()
         });
     format!(
         r#"<section class="panel">
-  <div class="panel-head"><h2>Address analysis</h2><span class="badge">address intelligence</span></div>
+  <div class="panel-head"><h2>Address Analysis</h2><span class="badge">Real onchain and database data</span></div>
   <div class="panel-body">
-    <p class="panel-copy">This page reads the accumulated address intelligence layer. If the address is new, it is queued for the background address worker.</p>
+    <p class="panel-copy">Address profiles and behavior statistics come from persisted analyses. Observed transactions come directly from the local indexer. New addresses enter the background analysis queue, and this page shows the actual job status.</p>
     <form class="stack-form" method="get" action="/app/address-analysis">
       <div class="split-fields">
         <label>Address<input type="text" name="address" value="{}" placeholder="0x..." required></label>
         <label>Network<select name="chain_id">{}</select></label>
       </div>
       <div class="button-row">
-        <button class="cta secondary" type="submit">Analyze address</button>
+        <button class="cta secondary" type="submit">Analyze Address</button>
       </div>
     </form>
     {}
@@ -4888,6 +16980,370 @@ fn render_address_analysis_panel(
         escape_html(address),
         chain_options,
         body
+    )
+}
+
+fn render_address_summary_body(summary: &AddressSummaryEnvelope) -> String {
+    let profile_stats = summary
+        .profile
+        .as_ref()
+        .map(|profile| {
+            format!(
+                r#"<div class="stat"><span>Address Type</span><strong>{}</strong><small>Confidence {:.0}%</small></div>
+<div class="stat"><span>Contract Code</span><strong>{} bytes</strong><small>{}</small></div>
+<div class="stat"><span>First / Last Observed</span><strong>{}</strong><small>{}</small></div>
+<div class="stat"><span>Latest Profile Analysis</span><strong>{}</strong><small>profile updated {}</small></div>"#,
+                escape_html(&profile.address_type),
+                profile.confidence.clamp(0.0, 1.0) * 100.0,
+                profile.bytecode_length.unwrap_or_default(),
+                profile
+                    .code_hash
+                    .as_deref()
+                    .map(|value| escape_html(&truncate_middle(value, 8)))
+                    .unwrap_or_else(|| "EOA / code hash not recorded".to_owned()),
+                escape_html(&profile.first_seen_at.to_rfc3339()),
+                escape_html(&profile.last_seen_at.to_rfc3339()),
+                profile
+                    .last_analyzed_at
+                    .map(|value| escape_html(&value.to_rfc3339()))
+                    .unwrap_or_else(|| "Not completed".to_owned()),
+                escape_html(&profile.updated_at.to_rfc3339()),
+            )
+        })
+        .unwrap_or_else(|| {
+            r#"<div class="stat"><span>Address Type</span><strong>Awaiting analysis</strong></div>
+<div class="stat"><span>Contract Code</span><strong>n/a</strong></div>"#
+                .to_owned()
+        });
+    let behavior_rows = if summary.behavior_rows.is_empty() {
+        "<tr><td colspan=\"3\">There are no related transactions with completed analysis.</td></tr>"
+            .to_owned()
+    } else {
+        summary
+            .behavior_rows
+            .iter()
+            .map(|row| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape_html(&row.behavior),
+                    row.tx_count,
+                    render_amount_stack(
+                        &format_wei_eth_raw(&row.gas_spent_raw),
+                        &row.gas_spent_raw
+                    )
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let analyzed_rows = if summary.recent_txs.is_empty() {
+        "<tr><td colspan=\"4\">There are no related transactions with completed analysis.</td></tr>"
+            .to_owned()
+    } else {
+        summary
+            .recent_txs
+            .iter()
+            .map(|tx| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    render_tx_hash_action(&tx.tx_hash, summary.chain_id),
+                    escape_html(tx.block_timestamp.as_deref().unwrap_or("n/a")),
+                    escape_html(&tx.behavior),
+                    render_amount_stack(&format_wei_eth_raw(&tx.gas_raw), &tx.gas_raw)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    format!(
+        r#"{}
+{}
+<div class="stats-grid">
+  <div class="stat"><span>Address</span><strong>{}</strong></div>
+  <div class="stat"><span>Native Asset Balance</span><strong>{}</strong><small>Queried from the local RPC when the page loads</small></div>
+  <div class="stat"><span>Analyzed Transactions</span><strong>{}</strong><small>Used for the behavior statistics below</small></div>
+  <div class="stat"><span>Analyzed Transaction Gas</span><strong>{}</strong><small>Completed analysis samples only</small></div>
+  {}
+</div>
+{}
+{}
+{}
+<div class="split-panels">
+  <section class="address-data-section"><div class="panel-head compact"><h3>Behavior Statistics</h3><span class="badge">Analyzed samples</span></div><div class="table-shell"><table><thead><tr><th>Behavior</th><th>Transactions</th><th>Gas</th></tr></thead><tbody>{}</tbody></table></div></section>
+  <section class="address-data-section"><div class="panel-head compact"><h3>Recent Analyzed Transactions</h3><span class="badge">Open details</span></div><div class="table-shell"><table><thead><tr><th>Transaction</th><th>Time</th><th>Behavior</th><th>Gas</th></tr></thead><tbody>{}</tbody></table></div></section>
+</div>"#,
+        render_address_job_status(summary),
+        render_watchlist_add_button(
+            summary.chain_id,
+            &summary.address,
+            &format!(
+                "/app/address-analysis?chain_id={}&address={}",
+                summary.chain_id,
+                urlencoding::encode(&summary.address)
+            ),
+        ),
+        render_copyable_code(&summary.address, 10),
+        summary
+            .native_balance_raw
+            .as_deref()
+            .map(format_wei_eth_raw)
+            .unwrap_or_else(|| "RPC query failed / n/a".to_owned()),
+        summary.analyzed_tx_count,
+        format_wei_eth_raw(&summary.gas_spent_raw),
+        profile_stats,
+        render_address_labels(summary),
+        render_address_portfolio(summary.profile.as_ref()),
+        render_address_observed_transactions(summary),
+        behavior_rows,
+        analyzed_rows,
+    )
+}
+
+fn render_address_job_status(summary: &AddressSummaryEnvelope) -> String {
+    let Some(job) = summary.job.as_ref() else {
+        return if summary.queued {
+            "<div class=\"notice info\">The address analysis job has been queued. Refresh this page to see its current status.</div>"
+                .to_owned()
+        } else {
+            String::new()
+        };
+    };
+    let (tone, label) = match job.status.as_str() {
+        "pending" => ("info", "Queued"),
+        "running" => ("info", "Analyzing"),
+        "completed" => ("success", "Completed"),
+        "failed" => ("error", "Failed, awaiting retry"),
+        other => ("warning", other),
+    };
+    let timestamp = job
+        .completed_at
+        .or(job.claimed_at)
+        .or(job.updated_at)
+        .or(job.available_at)
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| "n/a".to_owned());
+    let error = job
+        .last_error
+        .as_deref()
+        .map(|value| format!(" · {}", escape_html(value)))
+        .unwrap_or_default();
+    format!(
+        r#"<div class="notice {}"><strong>Background job: {}</strong> · attempts {} · priority {} · {}{}</div>"#,
+        tone,
+        escape_html(label),
+        job.attempts,
+        job.priority,
+        escape_html(&timestamp),
+        error,
+    )
+}
+
+fn render_address_labels(summary: &AddressSummaryEnvelope) -> String {
+    let labels = if summary.labels.is_empty() {
+        "<div class=\"empty-state compact-empty\">No effective labels yet. Labels are generated from traceable assertions after the background job completes.</div>".to_owned()
+    } else {
+        summary
+            .labels
+            .iter()
+            .map(|label| {
+                format!(
+                    r#"<details class="mini-card address-label-card"><summary><strong>{}</strong><span class="confidence-pill">{:.0}%</span></summary><small>source: {} · updated {}</small>{}</details>"#,
+                    escape_html(&label.label),
+                    label.confidence.clamp(0.0, 1.0) * 100.0,
+                    escape_html(&label.source),
+                    escape_html(&label.updated_at.to_rfc3339()),
+                    render_json_details("Label evidence", &label.evidence_json, 5_000),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    format!(
+        r#"<section class="address-data-section"><div class="panel-head compact"><h3>Address Labels</h3><span class="badge">{} labels</span></div><div class="address-label-grid">{}</div></section>"#,
+        summary.labels.len(),
+        labels,
+    )
+}
+
+fn render_address_portfolio(profile: Option<&AddressProfile>) -> String {
+    let Some(portfolio) = profile.and_then(|profile| profile.metadata.get("portfolio_estimate"))
+    else {
+        return r#"<section class="address-data-section"><div class="panel-head compact"><h3>Asset Valuation</h3><span class="badge">No data yet</span></div><div class="empty-state compact-empty">Only assets discovered in analyzed transactions can be valued. The background job has not produced a valuation yet, or this address type is not applicable.</div></section>"#.to_owned();
+    };
+    let estimated = portfolio
+        .get("estimated_usd")
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| format!("${value:.2}"))
+        .unwrap_or_else(|| "n/a".to_owned());
+    let threshold = portfolio
+        .get("threshold_usd")
+        .and_then(serde_json::Value::as_f64)
+        .map(|value| format!("${value:.2}"))
+        .unwrap_or_else(|| "n/a".to_owned());
+    let assets = portfolio
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let asset_rows = if assets.is_empty() {
+        "<tr><td colspan=\"5\">No non-zero assets with price data.</td></tr>".to_owned()
+    } else {
+        assets
+            .iter()
+            .map(|asset| {
+                let token = asset
+                    .get("token_address")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("native");
+                format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    escape_html(
+                        asset
+                            .get("symbol")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                    ),
+                    escape_html(&truncate_middle(token, 7)),
+                    escape_html(
+                        asset
+                            .get("amount_decimal")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("n/a")
+                    ),
+                    escape_html(
+                        asset
+                            .get("estimated_usd")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("n/a")
+                    ),
+                    escape_html(
+                        asset
+                            .get("price_source")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("n/a")
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let missing = portfolio
+        .get("missing_prices")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(|value| escape_html(&truncate_middle(value, 7)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "None".to_owned());
+    format!(
+        r#"<section class="address-data-section"><div class="panel-head compact"><h3>Asset Valuation Lower Bound</h3><span class="badge">Not a complete wallet balance</span></div>
+<div class="stats-grid compact-stats-grid"><div class="stat"><span>Total Priced Assets</span><strong>{}</strong></div><div class="stat"><span>Whale Threshold</span><strong>{}</strong></div><div class="stat"><span>Missing Prices</span><strong>{}</strong></div></div>
+<p class="panel-copy">This valuation includes only assets discovered in analyzed transactions that currently have a non-zero balance and available price data. It is a lower bound, not a complete portfolio.</p>
+<div class="table-shell"><table><thead><tr><th>Asset</th><th>Token</th><th>Amount</th><th>Estimated USD</th><th>Price Source</th></tr></thead><tbody>{}</tbody></table></div></section>"#,
+        escape_html(&estimated),
+        escape_html(&threshold),
+        missing,
+        asset_rows,
+    )
+}
+
+fn render_address_observed_transactions(summary: &AddressSummaryEnvelope) -> String {
+    let rows = if summary.observed_txs.is_empty() {
+        "<tr><td colspan=\"4\">The indexer returned no transaction references for this address.</td></tr>".to_owned()
+    } else {
+        summary
+            .observed_txs
+            .iter()
+            .map(|tx| {
+                format!(
+                    "<tr><td>{}</td><td>#{}</td><td>{}</td><td>{}</td></tr>",
+                    render_tx_hash_action(&tx.tx_hash, tx.chain_id),
+                    tx.block_number,
+                    tx.tx_index,
+                    escape_html(&enum_label(&tx.direction)),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let observed_range = summary
+        .observed_txs
+        .iter()
+        .map(|tx| tx.block_number)
+        .fold(None::<(u64, u64)>, |range, block| {
+            Some(match range {
+                Some((min, max)) => (min.min(block), max.max(block)),
+                None => (block, block),
+            })
+        })
+        .map(|(min, max)| format!("#{} – #{}", min, max))
+        .unwrap_or_else(|| "No returned records".to_owned());
+    let history_marker = summary
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.metadata.get("address_history_backfilled_at"))
+        .map(|value| {
+            format!(
+                "The address worker marked historical analysis complete at {}",
+                escape_html(&value.to_string())
+            )
+        })
+        .unwrap_or_else(|| "No address history completion marker exists yet".to_owned());
+    let bounded_coverage = summary
+        .observed_coverage
+        .as_ref()
+        .map(|coverage| {
+            format!(
+                "Requested range #{}–#{}: {}/{} blocks, {}",
+                coverage.from_block,
+                coverage.to_block,
+                coverage.indexed_block_count,
+                coverage.requested_block_count,
+                if coverage.complete {
+                    "complete"
+                } else {
+                    "indexing"
+                }
+            )
+        })
+        .unwrap_or_else(|| {
+            "This query uses indexed data and does not claim complete historical coverage"
+                .to_owned()
+        });
+    let indexer_error = summary
+        .indexer_error
+        .as_deref()
+        .map(|error| {
+            format!(
+                "<div class=\"notice warning\">Indexer query failed: {}</div>",
+                escape_html(error)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<section class="address-data-section"><div class="panel-head compact"><h3>Indexer-observed Transactions</h3><span class="badge">Latest {} references</span></div>
+{}
+<div class="stats-grid compact-stats-grid"><div class="stat"><span>Returned Block Range</span><strong>{}</strong></div><div class="stat"><span>Highest Stored Indexer Block</span><strong>{}</strong></div><div class="stat"><span>RPC Head</span><strong>{}</strong></div><div class="stat"><span>Coverage</span><strong>{}</strong><small>{}</small></div></div>
+<div class="table-shell"><table><thead><tr><th>Transaction</th><th>Block</th><th>Transaction Index</th><th>Direction</th></tr></thead><tbody>{}</tbody></table></div></section>"#,
+        summary.observed_txs.len(),
+        indexer_error,
+        escape_html(&observed_range),
+        summary
+            .indexer_last_indexed_block
+            .map(|value| format!("#{value}"))
+            .unwrap_or_else(|| "n/a".to_owned()),
+        summary
+            .indexer_head_block
+            .map(|value| format!("#{value}"))
+            .unwrap_or_else(|| "n/a".to_owned()),
+        escape_html(&bounded_coverage),
+        history_marker,
+        rows,
     )
 }
 
@@ -5035,6 +17491,9 @@ fn render_tx_analysis_result_with_share_url(
     let (primary_activity, primary_activity_reason, primary_confidence) =
         summarize_primary_activity(analysis);
     let storyline_panel = render_tx_storyline_panel(analysis, &address_book);
+    let candidate_panel = render_tx_candidate_context(envelope.candidate_context.as_ref());
+    let recognizer_panel = render_recognizer_evidence_panel(analysis);
+    let evidence_pack_panel = render_evidence_pack_panel(&envelope.evidence_pack, analysis);
     let report_hero = render_tx_report_hero(
         analysis,
         &primary_activity,
@@ -5053,17 +17512,396 @@ fn render_tx_analysis_result_with_share_url(
   {}
   {}
   {}
+  {}
+  {}
+  {}
 </div>"#,
         meta_strip,
         report_hero,
+        candidate_panel,
         storyline_panel,
         gas_profile,
+        recognizer_panel,
+        evidence_pack_panel,
         render_storyline_gap_explanation(&analysis.scenario_outputs)
             .map(|message| format!(
                 r#"<div class="notice info">{}</div>"#,
                 escape_html(&message)
             ))
             .unwrap_or_default(),
+    )
+}
+
+fn render_tx_candidate_context(context: Option<&TxCandidateContext>) -> String {
+    let Some(context) = context else {
+        return String::new();
+    };
+    let (status_label, status_note) = match context.confirmation_status.as_str() {
+        "candidate" => (
+            "Multi-pool Transaction Detected",
+            "Multiple swap logs across several pools were observed in one transaction. This is only a candidate condition and does not prove arbitrage or profit.",
+        ),
+        "analyzed_multi_pool_unconfirmed" => (
+            "Analyzed, Arbitrage Unverified",
+            "Transaction analysis is complete, but the recognizers did not produce an arbitrage signal or the evidence is insufficient to confirm arbitrage intent.",
+        ),
+        "probable_arbitrage" => (
+            "Probable Arbitrage, Profit Unverified",
+            "The recognizer found an arbitrage-like asset cycle. Complete net flows, pricing, and block finality evidence are still required to confirm profit.",
+        ),
+        "analyzed_reverted" => (
+            "Transaction Execution Failed",
+            "This candidate transaction did not execute successfully and therefore cannot have realized arbitrage profit.",
+        ),
+        "analyzed_pending" => (
+            "Transaction Status Pending",
+            "The transaction execution status is not final. The current analysis cannot confirm arbitrage or realized profit.",
+        ),
+        "confirmed_stable_surplus_to_sender" => (
+            "Stable-asset Surplus Confirmed",
+            "The detector recorded a net stable-asset surplus received by the sender. Review the Evidence Pack for the supporting details.",
+        ),
+        "confirmed_surplus_to_sender" => (
+            "Asset Surplus Confirmed",
+            "The detector recorded a net asset surplus received by the sender. Review the Evidence Pack for the supporting details.",
+        ),
+        other => (
+            other,
+            "This is the raw verification status persisted by the detector.",
+        ),
+    };
+    let sender = context
+        .sender_address
+        .as_deref()
+        .map(|address| render_address_analysis_link(context.chain_id, address, 9))
+        .unwrap_or_else(|| "n/a".to_owned());
+    let entry = context
+        .entry_contract
+        .as_deref()
+        .map(|address| render_address_analysis_link(context.chain_id, address, 9))
+        .unwrap_or_else(|| "n/a".to_owned());
+    let pools = if context.pool_addresses.is_empty() {
+        "<div class=\"empty-state\">The detection record does not contain pool addresses.</div>"
+            .to_owned()
+    } else {
+        context
+            .pool_addresses
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                format!(
+                    r#"<div class="mini-card"><span>Route position {}</span><strong>{}</strong></div>"#,
+                    index + 1,
+                    render_address_analysis_link(context.chain_id, address, 9),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let profit = match (
+        context.profit_amount_raw.as_deref(),
+        context.profit_token_address.as_deref(),
+    ) {
+        (Some(amount), Some(token)) => format!(
+            "{} · {}",
+            escape_html(amount),
+            render_address_analysis_link(context.chain_id, token, 7)
+        ),
+        _ => "Unverified".to_owned(),
+    };
+    format!(
+        r#"<details class="tx-section-card candidate-evidence-panel" open>
+  <summary class="tx-section-title">
+    <span class="tx-section-index"></span>
+    <h2>Multi-pool Transaction Candidate Evidence</h2>
+    <span class="badge">{}</span>
+  </summary>
+  <div class="notice info">{}</div>
+  <div class="stats-grid compact-stats-grid">
+    <div class="stat"><span>Swap logs</span><strong>{}</strong></div>
+    <div class="stat"><span>Distinct pools</span><strong>{}</strong></div>
+    <div class="stat"><span>Detection score</span><strong>{}</strong></div>
+    <div class="stat"><span>Confirmed profit</span><strong>{}</strong></div>
+  </div>
+  <div class="basic-info-grid candidate-basic-grid">
+    <div><span>Detection source</span><strong>{}</strong></div>
+    <div><span>Block</span><strong>#{}</strong></div>
+    <div><span>Sender</span><strong>{}</strong></div>
+    <div><span>Entry contract</span><strong>{}</strong></div>
+    <div class="wide"><span>Route fingerprint</span><strong><code>{}</code></strong></div>
+    <div class="wide"><span>Raw route</span><strong>{}</strong></div>
+  </div>
+  <h3 class="subsection-title">Observed pools</h3>
+  <div class="candidate-pool-grid">{}</div>
+</details>"#,
+        escape_html(status_label),
+        escape_html(status_note),
+        context.swap_log_count,
+        context.distinct_pool_count,
+        context.score,
+        profit,
+        escape_html(&context.detection_source),
+        context.block_number,
+        sender,
+        entry,
+        escape_html(&context.route_fingerprint),
+        render_route_compact(&context.route, 8),
+        pools,
+    )
+}
+
+fn render_recognizer_evidence_panel(analysis: &TransactionAnalysis) -> String {
+    let recognizers = if analysis.recognizer_results.is_empty() {
+        "<div class=\"empty-state\">No recognizer produced a result for this transaction.</div>"
+            .to_owned()
+    } else {
+        analysis
+            .recognizer_results
+            .iter()
+            .map(|result| {
+                let warnings = if result.warnings.is_empty() {
+                    "none".to_owned()
+                } else {
+                    result
+                        .warnings
+                        .iter()
+                        .map(|warning| escape_html(warning))
+                        .collect::<Vec<_>>()
+                        .join("<br>")
+                };
+                let unresolved = if result.unresolved_points.is_empty() {
+                    "none".to_owned()
+                } else {
+                    result
+                        .unresolved_points
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "<strong>{}</strong>: {}",
+                                escape_html(&item.code),
+                                escape_html(&item.message)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("<br>")
+                };
+                format!(
+                    r#"<details class="mini-card recognizer-card" open>
+  <summary><strong>{}</strong><span class="confidence-pill">{:.0}%</span></summary>
+  <div class="basic-info-grid recognizer-grid">
+    <div><span>Recognizer</span><strong>{} · {}</strong></div>
+    <div><span>Evidence refs</span><strong>{}</strong></div>
+    <div><span>Warnings</span><strong>{}</strong></div>
+    <div><span>Unresolved</span><strong>{}</strong></div>
+  </div>
+  {}
+  {}
+</details>"#,
+                    escape_html(&result.label),
+                    (result.confidence.clamp(0.0, 1.0) * 100.0),
+                    escape_html(&result.recognizer_id),
+                    escape_html(&result.recognizer_version),
+                    result.evidence_refs.len(),
+                    warnings,
+                    unresolved,
+                    render_evidence_refs(&result.evidence_refs),
+                    render_json_details("Recognizer attributes", &result.attributes, 8_000),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let validation_rows = if analysis.validation_results.is_empty() {
+        "<tr><td colspan=\"4\">No validation messages.</td></tr>".to_owned()
+    } else {
+        analysis
+            .validation_results
+            .iter()
+            .map(|message| {
+                format!(
+                    r#"<tr><td><code>{}</code></td><td><span class="badge">{}</span></td><td>{}</td><td>{}</td></tr>"#,
+                    escape_html(&message.validator_id),
+                    escape_html(&enum_label(&message.status)),
+                    escape_html(&message.message),
+                    message.evidence_refs.len(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let unresolved = if analysis.unresolved_items.is_empty() {
+        "<div class=\"notice success\">No unresolved analysis items were recorded.</div>".to_owned()
+    } else {
+        format!(
+            r#"<div class="notice warning"><strong>{} unresolved item(s)</strong><br>{}</div>"#,
+            analysis.unresolved_items.len(),
+            analysis
+                .unresolved_items
+                .iter()
+                .map(|item| format!(
+                    "{}: {}",
+                    escape_html(&item.code),
+                    escape_html(&item.message)
+                ))
+                .collect::<Vec<_>>()
+                .join("<br>")
+        )
+    };
+    format!(
+        r#"<details class="tx-section-card recognizer-evidence-panel" open>
+  <summary class="tx-section-title">
+    <span class="tx-section-index"></span>
+    <h2>Recognizer and Validation Results</h2>
+    <span class="badge">{} recognizers</span>
+  </summary>
+  <div class="recognizer-list">{}</div>
+  {}
+  <div class="table-shell compact-table-shell"><table class="compact-table"><thead><tr><th>Validator</th><th>Status</th><th>Message</th><th>Refs</th></tr></thead><tbody>{}</tbody></table></div>
+</details>"#,
+        analysis.recognizer_results.len(),
+        recognizers,
+        unresolved,
+        validation_rows,
+    )
+}
+
+fn render_evidence_pack_panel(pack: &EvidencePack, analysis: &TransactionAnalysis) -> String {
+    let versions = if pack.recognizer_set_versions.is_empty() {
+        "none".to_owned()
+    } else {
+        pack.recognizer_set_versions
+            .iter()
+            .map(|(name, version)| format!("{}={}", escape_html(name), escape_html(version)))
+            .collect::<Vec<_>>()
+            .join("<br>")
+    };
+    format!(
+        r#"<details class="tx-section-card evidence-pack-panel">
+  <summary class="tx-section-title">
+    <span class="tx-section-index"></span>
+    <h2>Evidence Pack</h2>
+    <span class="badge">reproducible evidence</span>
+  </summary>
+  <p class="panel-copy">The Evidence Pack preserves the facts, ruleset versions, flows, and validation results used in this analysis so the conclusion can be reproduced. It is not, by itself, an arbitrage confirmation.</p>
+  <div class="stats-grid compact-stats-grid">
+    <div class="stat"><span>Pack ID</span><strong><code>{}</code></strong></div>
+    <div class="stat"><span>Ruleset</span><strong>{}</strong></div>
+    <div class="stat"><span>Flows</span><strong>{}</strong></div>
+    <div class="stat"><span>Raw evidence refs</span><strong>{}</strong></div>
+    <div class="stat"><span>Pack validations</span><strong>{}</strong></div>
+    <div class="stat"><span>Pack unresolved</span><strong>{}</strong></div>
+  </div>
+  <div class="basic-info-grid evidence-pack-grid">
+    <div class="wide"><span>Input digest</span><strong><code>{}</code></strong></div>
+    <div><span>Created</span><strong>{}</strong></div>
+    <div><span>Recognizer versions</span><strong>{}</strong></div>
+  </div>
+  {}
+  {}
+  {}
+  {}
+  {}
+  {}
+</details>"#,
+        pack.pack_id,
+        escape_html(&pack.ruleset_id),
+        pack.flows.len(),
+        analysis.raw_evidence_refs.len(),
+        pack.validation_results.len(),
+        pack.unresolved.len(),
+        escape_html(&pack.input_digest),
+        escape_html(&pack.created_at.to_rfc3339()),
+        versions,
+        render_evidence_refs(&analysis.raw_evidence_refs),
+        render_json_details("Facts", &pack.facts, 12_000),
+        render_json_details(
+            "Labels",
+            &serde_json::Value::Array(pack.labels.clone()),
+            8_000
+        ),
+        render_json_details(
+            "Flows",
+            &serde_json::Value::Array(pack.flows.clone()),
+            12_000
+        ),
+        render_json_details(
+            "Pack validation results",
+            &serde_json::Value::Array(pack.validation_results.clone()),
+            8_000,
+        ),
+        render_json_details(
+            "Pack metadata and unresolved",
+            &json!({
+                "metadata": pack.metadata,
+                "unresolved": pack.unresolved,
+            }),
+            8_000
+        ),
+    )
+}
+
+fn render_address_analysis_link(chain_id: u64, address: &str, keep: usize) -> String {
+    format!(
+        r#"<a class="evidence-link" href="/app/address-analysis?chain_id={}&address={}" title="{}"><code>{}</code></a>"#,
+        chain_id,
+        urlencoding::encode(address),
+        escape_html(address),
+        escape_html(&truncate_middle(address, keep)),
+    )
+}
+
+fn render_evidence_refs(refs: &[crate::domain::value_objects::EvidenceRef]) -> String {
+    if refs.is_empty() {
+        return "<div class=\"empty-state compact-empty\">No evidence references attached.</div>"
+            .to_owned();
+    }
+    let rows = refs
+        .iter()
+        .take(20)
+        .map(|item| {
+            format!(
+                r#"<tr><td><span class="badge">{}</span></td><td><code>{}</code></td><td>{}</td></tr>"#,
+                escape_html(&enum_label(&item.kind)),
+                escape_html(&item.reference),
+                item.tx_hash
+                    .as_deref()
+                    .map(|hash| escape_html(&truncate_middle(hash, 8)))
+                    .unwrap_or_else(|| "n/a".to_owned()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let remainder = refs.len().saturating_sub(20);
+    format!(
+        r#"<details class="evidence-ref-details"><summary>Evidence references ({})</summary><div class="table-shell compact-table-shell"><table class="compact-table"><thead><tr><th>Kind</th><th>Reference</th><th>Tx</th></tr></thead><tbody>{}</tbody></table></div>{}</details>"#,
+        refs.len(),
+        rows,
+        if remainder > 0 {
+            format!(
+                "<p class=\"panel-copy\">{} additional reference(s) omitted from this compact view.</p>",
+                remainder
+            )
+        } else {
+            String::new()
+        }
+    )
+}
+
+fn render_json_details(label: &str, value: &serde_json::Value, limit: usize) -> String {
+    let raw = serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_owned());
+    let truncated = raw.chars().count() > limit;
+    let preview = if truncated {
+        format!(
+            "{}\n… output truncated in this view",
+            truncate_for_display(&raw, limit)
+        )
+    } else {
+        raw
+    };
+    format!(
+        r#"<details class="raw-json-shell"><summary>{}</summary><pre class="json-shell">{}</pre></details>"#,
+        escape_html(label),
+        escape_html(&preview),
     )
 }
 
@@ -5089,7 +17927,7 @@ fn render_storyline_gap_explanation(scenario_outputs: &serde_json::Value) -> Opt
         return None;
     }
     Some(
-        "ChainActors matched the protocol or method pattern, but the current flow reconstruction did not confidently attach concrete funding, repay, reward, or settlement legs yet. In practice this means the protocol match is ahead of the asset-leg attribution."
+        "LedgerFlow matched the protocol or method pattern, but the current flow reconstruction did not confidently attach concrete funding, repay, reward, or settlement legs yet. In practice this means the protocol match is ahead of the asset-leg attribution."
             .to_owned(),
     )
 }
@@ -5103,6 +17941,7 @@ fn render_tx_report_meta_strip(
     let network = match analysis.chain_id {
         1 => "Ethereum",
         8453 => "Base",
+        4663 => "Robinhood Chain",
         10 => "Optimism",
         42161 => "Arbitrum",
         _ => "EVM chain",
@@ -5147,10 +17986,10 @@ fn render_tx_report_meta_strip(
             "Status",
             &format!(
                 r#"<strong class="status-chip status-{}">{}</strong>"#,
-                if analysis.status == crate::domain::enums::TransactionStatus::Success {
-                    "success"
-                } else {
-                    "failure"
+                match analysis.status {
+                    crate::domain::enums::TransactionStatus::Success => "success",
+                    crate::domain::enums::TransactionStatus::Failure => "failure",
+                    crate::domain::enums::TransactionStatus::Pending => "pending",
                 },
                 escape_html(&enum_label(&analysis.status))
             ),
@@ -5251,17 +18090,26 @@ fn render_tx_report_meta_strip(
             render_copyable_code(&analysis.input_data, 14)
         ),
     ));
+    let watchlist_action = if public_share {
+        String::new()
+    } else {
+        render_watchlist_add_button(
+            analysis.chain_id,
+            &analysis.tx_hash,
+            &tx_analysis_href(analysis.chain_id, &analysis.tx_hash),
+        )
+    };
     let share_top_action = if let Some(url) = share_url {
         format!(
             r#"<div class="tx-report-share-action">{}</div>"#,
             render_copyable_code(url, 16)
         )
     } else if share_action.is_empty() {
-        String::new()
+        watchlist_action
     } else {
         format!(
-            r#"<div class="tx-report-share-action">{}</div>"#,
-            share_action
+            r#"<div class="tx-report-share-action">{}{}</div>"#,
+            share_action, watchlist_action
         )
     };
     format!(
@@ -5696,7 +18544,6 @@ fn token_is_eth_equivalent(token: Option<&serde_json::Value>) -> bool {
         .unwrap_or("");
     symbol.eq_ignore_ascii_case("ETH")
         || symbol.eq_ignore_ascii_case("WETH")
-        || address.eq_ignore_ascii_case("0x4200000000000000000000000000000000000006")
         || address.eq_ignore_ascii_case("native")
 }
 
@@ -6100,16 +18947,11 @@ fn flow_token_descriptor(flow: &crate::domain::value_objects::AssetFlow) -> serd
         }),
         crate::domain::enums::AssetType::Erc20 => {
             let address = flow.token_address.as_deref().unwrap_or_default();
-            let (symbol, name, decimals) = match address.to_ascii_lowercase().as_str() {
-                "0x4200000000000000000000000000000000000006" => ("WETH", "Wrapped Ether", Some(18)),
-                "0x091a5abe6616e26268e5eecff256c2212fce2707" => ("BondETH", "Bond ETH", Some(18)),
-                _ => ("ERC20", "Unlabeled token", None),
-            };
             serde_json::json!({
-                "symbol": symbol,
-                "name": name,
+                "symbol": "ERC20",
+                "name": "Unlabeled token",
                 "address": address,
-                "decimals": decimals,
+                "decimals": null,
             })
         }
     }
@@ -6831,30 +19673,30 @@ fn price_for_token_usd(token: &serde_json::Value, analysis: &TransactionAnalysis
         .get("symbol")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    if matches_ignore_ascii_case(symbol, &["USDC", "USDT", "USDBC"])
-        || matches_ignore_ascii_case(
-            &address,
-            &[
-                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
-                "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
-                "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
-            ],
-        )
-    {
+    if matches_ignore_ascii_case(
+        symbol,
+        &[
+            "USDC", "USDT", "USDBC", "DAI", "USDS", "PYUSD", "FRAX", "LUSD", "GHO", "USD0", "USDG",
+            "USDE",
+        ],
+    ) {
         return Some(1.0);
     }
-    let pricing_address = if address == "native" || symbol.eq_ignore_ascii_case("ETH") {
-        "0x4200000000000000000000000000000000000006"
-    } else {
-        address.as_str()
-    };
+    let native_asset = address == "native" || symbol.eq_ignore_ascii_case("ETH");
     for flow in &analysis.derived_flows {
         let flow_address = flow
             .token_address
             .as_deref()
             .unwrap_or("")
             .to_ascii_lowercase();
-        if flow_address != pricing_address {
+        let flow_symbol = flow
+            .metadata
+            .pointer("/token/symbol")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if (native_asset && !flow_symbol.eq_ignore_ascii_case("WETH"))
+            || (!native_asset && flow_address != address)
+        {
             continue;
         }
         if let Some(price) = flow
@@ -6878,7 +19720,21 @@ fn price_for_token_usd(token: &serde_json::Value, analysis: &TransactionAnalysis
                     .get("token_address")
                     .and_then(|value| value.as_str())?
                     .to_ascii_lowercase();
-                if quote_address != pricing_address {
+                let quote_matches = if native_asset {
+                    analysis.derived_flows.iter().any(|flow| {
+                        flow.token_address
+                            .as_deref()
+                            .is_some_and(|value| value.eq_ignore_ascii_case(&quote_address))
+                            && flow
+                                .metadata
+                                .pointer("/token/symbol")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|value| value.eq_ignore_ascii_case("WETH"))
+                    })
+                } else {
+                    quote_address == address
+                };
+                if !quote_matches {
                     return None;
                 }
                 quote
@@ -7454,51 +20310,121 @@ fn render_storyline_roles(
     tags.join("")
 }
 
-fn render_cluster_graph_panel(clusters: &[DashboardClusterRecord]) -> String {
-    let cluster_links = if clusters.is_empty() {
-        "<div class=\"empty-state\">No clusters yet. Create a cluster first so graph planning has a subject.</div>"
-            .to_owned()
+fn render_cluster_graph_panel(
+    clusters: &[DashboardClusterRecord],
+    edges: &[ClusterGraphEdgeRow],
+) -> String {
+    let visible_edges = edges.iter().take(40).collect::<Vec<_>>();
+    let mut sources = std::collections::BTreeMap::<String, usize>::new();
+    let mut counterparties = std::collections::BTreeMap::<String, usize>::new();
+    for edge in &visible_edges {
+        let next_source = sources.len();
+        sources
+            .entry(edge.source_address.clone())
+            .or_insert(next_source);
+        let next_counterparty = counterparties.len();
+        counterparties
+            .entry(edge.counterparty_address.clone())
+            .or_insert(next_counterparty);
+    }
+    let row_count = sources.len().max(counterparties.len()).max(3);
+    let graph_height = row_count * 58 + 50;
+    let source_y = |index: usize| 45 + index * 58;
+    let counterparty_y = |index: usize| 45 + index * 58;
+    let edge_lines = visible_edges
+        .iter()
+        .filter_map(|edge| {
+            let left = sources.get(&edge.source_address)?;
+            let right = counterparties.get(&edge.counterparty_address)?;
+            let width = (1.0 + (edge.tx_count.max(1) as f64).log10()).min(6.0);
+            Some(format!(
+                r##"<line x1="230" y1="{}" x2="570" y2="{}" stroke="#8ba3bf" stroke-width="{:.2}" opacity="0.55"><title>{} tx · {} flows</title></line>"##,
+                source_y(*left),
+                counterparty_y(*right),
+                width,
+                edge.tx_count,
+                edge.flow_count,
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let source_nodes = sources
+        .iter()
+        .map(|(address, index)| {
+            format!(
+                r##"<g><circle cx="220" cy="{}" r="8" fill="#5b4cff"/><text x="204" y="{}" text-anchor="end">{}</text></g>"##,
+                source_y(*index),
+                source_y(*index) + 4,
+                escape_html(&truncate_middle(address, 7)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let counterparty_nodes = counterparties
+        .iter()
+        .map(|(address, index)| {
+            format!(
+                r##"<g><circle cx="580" cy="{}" r="8" fill="#0d6e63"/><text x="596" y="{}">{}</text></g>"##,
+                counterparty_y(*index),
+                counterparty_y(*index) + 4,
+                escape_html(&truncate_middle(address, 7)),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let graph = if visible_edges.is_empty() {
+        "<div class=\"empty-state\">Analyzed flows for the current clusters have not formed relationship edges yet. Once historical analysis completes, this view reads actual asset flows directly.</div>".to_owned()
     } else {
-        clusters
+        format!(
+            r#"<div class="relationship-graph-scroll"><svg class="relationship-graph" viewBox="0 0 800 {}" role="img" aria-label="Cluster addresses and observed flow counterparties"><text x="220" y="20" text-anchor="middle" class="graph-column-title">Cluster address</text><text x="580" y="20" text-anchor="middle" class="graph-column-title">Observed counterparty</text>{}{}{}</svg></div>"#,
+            graph_height, edge_lines, source_nodes, counterparty_nodes,
+        )
+    };
+    let edge_rows = if edges.is_empty() {
+        "<tr><td colspan=\"7\">No analyzed flow edges.</td></tr>".to_owned()
+    } else {
+        edges
             .iter()
-            .map(|cluster| {
+            .take(100)
+            .map(|edge| {
                 format!(
-                    "<a class=\"cluster-card\" href=\"/app/clusters/{}\"><strong>{}</strong><span>{} addresses</span><small>graph work will begin from historical cluster transactions</small></a>",
-                    cluster.cluster_id,
-                    escape_html(&cluster.name),
-                    cluster.address_count
+                    r#"<tr><td><a href="/app/clusters/{}">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                    edge.cluster_id,
+                    escape_html(&edge.cluster_name),
+                    render_address_analysis_link(edge.chain_id, &edge.source_address, 7),
+                    render_address_analysis_link(edge.chain_id, &edge.counterparty_address, 7),
+                    edge.tx_count,
+                    edge.flow_count,
+                    edge.token_count,
+                    render_tx_hash_action(&edge.sample_tx_hash, edge.chain_id),
                 )
             })
             .collect::<Vec<_>>()
             .join("")
     };
-
+    let total_flow_count = edges.iter().map(|edge| edge.flow_count).sum::<i64>();
+    let last_seen = edges
+        .iter()
+        .filter_map(|edge| edge.last_seen_at)
+        .max()
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| "n/a".to_owned());
     format!(
-        r#"
-<section class="panel">
-  <div class="panel-head"><h2>Cluster relationship graph</h2><span class="badge">planned</span></div>
+        r#"<section class="panel">
+  <div class="panel-head"><h2>Cluster Funding Relationships</h2><span class="badge">database flows</span></div>
   <div class="panel-body">
-    <p class="panel-copy">This page will evolve into the dedicated graph workspace: cluster-level relationship inference, historical flow clustering, and eventually a high-performance 3D view. The first milestone is not rendering. It is building stable graph data extraction and storage.</p>
-    <div class="feature-grid">
-      <article class="feature-card">
-        <h2>Phase 1</h2>
-        <p>Build graph-ready exports from analyzed cluster history: counterparties, internal transfers, repeated router/protocol touchpoints, and address co-occurrence motifs.</p>
-      </article>
-      <article class="feature-card">
-        <h2>Phase 2</h2>
-        <p>Add server-side graph aggregation, edge scoring, and time-window filtering so graph queries stay fast before any 3D rendering work starts.</p>
-      </article>
-      <article class="feature-card">
-        <h2>Phase 3</h2>
-        <p>Ship a 2D operator graph first, then move to a GPU-backed 3D scene only after the graph data model and interaction patterns are stable.</p>
-      </article>
-    </div>
-    <div class="panel-copy">Current cluster entry points for that roadmap:</div>
-    <div class="cluster-list">{}</div>
+    <p class="panel-copy">Each edge comes from a persisted asset flow. Addresses in this account's clusters appear on the left and observed counterparties on the right. Line width scales with related transaction count; no identity is inferred.</p>
+    <div class="stats-grid compact-stats-grid"><div class="stat"><span>Clusters</span><strong>{}</strong></div><div class="stat"><span>Edges</span><strong>{}</strong></div><div class="stat"><span>Flow rows</span><strong>{}</strong></div><div class="stat"><span>Last analyzed edge</span><strong>{}</strong></div></div>
+    {}
+    <div class="table-shell"><table><thead><tr><th>Cluster</th><th>Address</th><th>Counterparty</th><th>Tx</th><th>Flows</th><th>Assets</th><th>Evidence Transaction</th></tr></thead><tbody>{}</tbody></table></div>
   </div>
-</section>
-"#,
-        cluster_links
+</section>"#,
+        clusters.len(),
+        edges.len(),
+        total_flow_count,
+        escape_html(&last_seen),
+        graph,
+        edge_rows,
     )
 }
 
@@ -8573,29 +21499,75 @@ fn format_wei_compact(raw: &str) -> String {
 fn render_indexer_progress_panel(progress: Option<&IndexerProgressPayload>) -> String {
     let body = progress
         .map(|progress| {
+            let worker_summary = if progress.workers.is_empty() {
+                "No worker cursor has been committed yet.".to_owned()
+            } else {
+                progress
+                    .workers
+                    .iter()
+                    .map(|worker| {
+                        let detail = if worker.last_error.is_empty() {
+                            worker
+                                .last_success_at
+                                .as_deref()
+                                .map(|value| format!("last success {}", escape_html(value)))
+                                .unwrap_or_else(|| "waiting for first commit".to_owned())
+                        } else {
+                            format!("error: {}", escape_html(&worker.last_error))
+                        };
+                        format!(
+                            "{} / {} · block #{} · lag {} · retries {} · {}",
+                            escape_html(&worker.worker_id),
+                            escape_html(&worker.worker_kind),
+                            worker.last_indexed_block,
+                            worker.lag_blocks.unwrap_or(0),
+                            worker.retry_count,
+                            detail
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("<br>")
+            };
             format!(
                 r#"<div class="stats-grid">
   <div class="stat"><span>Chain ID</span><strong>{}</strong></div>
   <div class="stat"><span>Worker ID</span><strong>{}</strong></div>
+  <div class="stat"><span>RPC head</span><strong>{}</strong></div>
+  <div class="stat"><span>Live cursor</span><strong>{}</strong><small>lag {} blocks</small></div>
   <div class="stat"><span>Query target block</span><strong>{}</strong></div>
   <div class="stat"><span>Max stored block</span><strong>{}</strong></div>
-  <div class="stat"><span>Contiguous through</span><strong>{}</strong></div>
+  <div class="stat"><span>Canonical blocks</span><strong>{}</strong><small>{} orphaned · {} reorgs</small></div>
+  <div class="stat"><span>Raw transactions</span><strong>{}</strong></div>
+  <div class="stat"><span>Raw logs</span><strong>{}</strong></div>
+  <div class="stat"><span>Selected traces</span><strong>{}</strong></div>
   <div class="stat"><span>Lazy queue</span><strong>{}</strong><small>{} pending</small></div>
   <div class="stat"><span>Pending from/to backfill rows</span><strong>{}</strong></div>
 </div>
-<div class="panel-copy">This portal keeps indexer and analysis separate. The indexer discovers address-level transaction references; the analysis stack consumes those references for cluster backfill, tx interpretation, and spend attribution.</div>
+<div class="panel-copy"><strong>Persisted workers</strong><p>{}</p></div>
+<div class="panel-copy">Canonical blocks, transactions and receipt logs are read from the local chain node. Lazy address lookup runs on a separately throttled worker.</div>
 <div class="button-row">
   <a class="cta secondary" href="/app/indexer/address-lookup">Open address lookup</a>
   <a class="cta ghost" href="/app/clusters">Open clusters</a>
 </div>"#,
                 progress.chain_id,
                 escape_html(&progress.worker_id),
+                progress.rpc_head_block.unwrap_or(0),
                 progress.last_indexed_block,
+                progress.live_lag_blocks.unwrap_or(0),
+                progress
+                    .query_target_block
+                    .unwrap_or(progress.last_indexed_block),
                 progress.max_stored_indexed_block.unwrap_or(0),
-                progress.contiguous_indexed_through_block.unwrap_or(0),
+                progress.canonical_block_count,
+                progress.orphaned_block_count,
+                progress.reorg_count,
+                progress.raw_transaction_count,
+                progress.raw_log_count,
+                progress.raw_trace_count,
                 if progress.lazy_enabled { "enabled" } else { "disabled" },
                 progress.pending_indexing_requests,
-                progress.endpoint_backfill_pending_rows.unwrap_or(0)
+                progress.endpoint_backfill_pending_rows.unwrap_or(0),
+                worker_summary,
             )
         })
         .unwrap_or_else(|| {
@@ -8622,7 +21594,7 @@ fn render_indexer_api_keys_panel(
         .map(|value| {
             format!(
                 r#"<div class="panel-copy success-copy">
-  <strong>New indexer API key</strong>
+  <strong>New API key</strong>
   <p>Copy this token now. It will not be shown again.</p>
   <code class="inline-code-block">{}</code>
 </div>"#,
@@ -8632,7 +21604,7 @@ fn render_indexer_api_keys_panel(
         .unwrap_or_default();
 
     let list_body = if indexer_api_keys.is_empty() {
-        "<div class=\"empty-state\">No external indexer API keys yet. Create one for scripts, dashboards, or client integrations that should call the indexer directly.</div>".to_owned()
+        "<div class=\"empty-state\">No Workspace API keys yet. Create one for an approved script, dashboard, or integration.</div>".to_owned()
     } else {
         format!(
             r#"<div class="table-shell">
@@ -8692,11 +21664,11 @@ fn render_indexer_api_keys_panel(
 
     format!(
         r#"<section class="panel">
-  <div class="panel-head"><h2>Indexer API keys</h2><span class="badge">external access</span></div>
+  <div class="panel-head"><h2>Workspace API access</h2><span class="badge">scoped credentials</span></div>
   <div class="panel-body">
     <div class="panel-copy">
-      <p>These keys are for external clients that call the indexer API directly. The signed-in portal keeps using the internal service token and does not consume these keys.</p>
-      <p>Public indexer endpoints accept either <code>Authorization: Bearer &lt;api_key&gt;</code> or <code>x-api-key: &lt;api_key&gt;</code>.</p>
+      <p>Create scoped credentials for approved LedgerFlow API integrations. Availability and accessible datasets follow the current Workspace plan.</p>
+      <p>API clients can authenticate with <code>Authorization: Bearer &lt;api_key&gt;</code> or <code>x-api-key: &lt;api_key&gt;</code>.</p>
       <p>Owner: <strong>{}</strong></p>
     </div>
     {}
@@ -9417,17 +22389,16 @@ fn render_error_block(message: Option<&str>) -> String {
 
 fn brand_wordmark_html() -> String {
     format!(
-        r#"<span class="brand-lockup"><span class="brand-mark">{}</span><span class="brand-text">ChainActors</span><small class="brand-beta">BETA</small></span>"#,
+        r#"<span class="brand-lockup"><span class="brand-mark">{}</span><span class="brand-text">LedgerFlow</span></span>"#,
         brand_mark_svg_source()
     )
 }
 
 fn brand_mark_svg_source() -> &'static str {
     r##"<svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" role="img">
-  <circle cx="32" cy="32" r="26" fill="#5B4CFF"/>
-  <path d="M15 32H49" stroke="#A99FFF" stroke-width="2"/>
-  <path d="M32 14C26 20 24 26 24 32C24 38 26 44 32 50" stroke="#0C1220" stroke-width="3" fill="none"/>
-  <circle cx="43" cy="22" r="4" fill="#55D176"/>
+  <rect x="6" y="6" width="52" height="52" rx="12" fill="#111"/>
+  <path d="M20 19H44V26H28V31H42V38H28V45H20V19Z" fill="#fff"/>
+  <path d="M32 19H44V26H40V45H32V19Z" fill="#f60"/>
 </svg>"##
 }
 
@@ -9487,7 +22458,9 @@ fn render_copy_only_button(value: &str) -> String {
 }
 
 fn shared_styles() -> &'static str {
-    r#"
+    static STYLES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        enforce_minimum_ui_font_size(
+            r#"
 :root {
   --bg: #f7f7f7;
   --panel: #ffffff;
@@ -9517,7 +22490,7 @@ a { color: inherit; text-decoration: none; }
 .cta.ghost { background: transparent; border-color: var(--line); }
 .cta.danger { color: var(--accent-2); border-color: rgba(197,95,12,.28); }
 .hero { display: grid; grid-template-columns: 1.4fr 1fr; gap: 18px; padding: 18px 0 28px; align-items: center; }
-.hero h1, .pricing-card h1, .auth-copy h1, .verify-shell h1, .dashboard-hero h1 { font-size: clamp(1.9rem, 3vw, 3rem); line-height: 1.06; margin: 0 0 10px; letter-spacing: -.02em; }
+.hero h1, .pricing-card h1, .auth-copy h1, .dashboard-hero h1 { font-size: clamp(1.9rem, 3vw, 3rem); line-height: 1.06; margin: 0 0 10px; letter-spacing: -.02em; }
 .hero p, .auth-copy p, .panel-copy, .dashboard-hero p { color: var(--muted); line-height: 1.55; }
 .hero-card, .feature-card, .pricing-card, .auth-card, .panel, .cluster-card, .price-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
 .hero-card { padding: 14px; display: grid; gap: 10px; }
@@ -9525,13 +22498,27 @@ a { color: inherit; text-decoration: none; }
 .metric-card span, .eyebrow { color: var(--accent); text-transform: uppercase; letter-spacing: .12em; font-size: .7rem; font-weight: 700; }
 .metric-card strong { display: block; margin-top: 8px; line-height: 1.3; font-size: 1.03rem; }
 .hero-actions, .button-row { display: flex; gap: 12px; flex-wrap: wrap; }
-.feature-grid, .pricing-grid, .auth-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.feature-grid, .pricing-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .feature-card, .pricing-card, .auth-card { padding: 16px; }
 .auth-card { display: grid; gap: 14px; align-content: start; }
 .pricing-banner { margin: 18px 0 28px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: #f8fbff; display: flex; justify-content: space-between; gap: 16px; align-items: center; }
-.auth-shell, .verify-shell { display: grid; gap: 18px; padding: 24px 0; }
+.auth-shell { display: grid; gap: 18px; width: min(640px, 100%); margin: 0 auto; padding: 24px 0; }
+.auth-copy { text-align: center; }
+.auth-panel { width: min(520px, 100%); margin: 0 auto; }
+.auth-tabs, .auth-method-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 8px; background: #f2f2f2; }
+.auth-tabs { margin-bottom: 12px; }
+.auth-method-tabs { margin-bottom: 8px; background: #fff; }
+.auth-tab, .auth-method-tab { padding: 9px 12px; border-radius: 6px; color: var(--muted); text-align: center; font-weight: 700; }
+.auth-tab.active { background: #111; color: #fff; }
+.auth-method-tab.active { background: var(--accent); color: #fff; }
+.auth-card-heading { display: grid; gap: 5px; }
+.auth-card-heading h2, .auth-card-heading p { margin: 0; }
+.auth-card-heading p, .auth-footnote { color: var(--muted); line-height: 1.5; }
+.auth-footnote { margin: 0; font-size: .82rem; }
+.auth-inline-link { color: var(--accent); text-align: center; font-weight: 700; }
+.auth-tab-panel > .cta { width: 100%; }
 .auth-card.narrow { max-width: 420px; }
-.mode-hint, .price-note { margin-top: 16px; color: var(--muted); }
+.price-note { margin-top: 16px; color: var(--muted); }
 .flat-list { padding-left: 18px; color: var(--muted); line-height: 1.7; }
 .notice { margin: 12px 0; padding: 10px 12px; border-radius: 8px; font-size: .92rem; }
 .notice.info { background: rgba(255,102,0,.08); color: var(--accent); }
@@ -9595,6 +22582,23 @@ textarea { min-height: 140px; resize: vertical; }
 .json-shell { margin: 0; padding: 14px; border-radius: 8px; background: #0f172a; color: #f8fafc; overflow: auto; font-size: 12px; line-height: 1.55; }
 .mini-card { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; min-width: 0; }
 .mini-card span, .mini-card small { color: var(--muted); line-height: 1.45; }
+.address-data-section { display: grid; gap: 10px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); min-width: 0; }
+.panel-head.compact { padding: 0; }
+.panel-head.compact h3 { margin: 0; font-size: 1rem; }
+.address-label-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.address-label-card > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; cursor: pointer; }
+.address-label-card .raw-json-shell { margin-top: 8px; }
+.review-list, .alert-global-list, .search-result-list { display: grid; gap: 12px; }
+.review-card h2, .alert-global-card h3 { margin: 4px 0 0; }
+.review-decision-form { display: grid; gap: 10px; margin-top: 12px; }
+.review-decision-form textarea { min-height: 76px; }
+.alert-global-card.unread { border-left: 3px solid var(--accent); }
+.alert-global-card.read { opacity: .78; }
+.relationship-graph-scroll { margin: 12px 0; border: 1px solid var(--line); border-radius: 10px; background: #fbfdff; overflow: auto; }
+.relationship-graph { display: block; width: 100%; min-width: 720px; min-height: 220px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; fill: var(--ink); }
+.relationship-graph .graph-column-title { fill: var(--muted); font-family: inherit; font-weight: 700; text-transform: uppercase; }
+.watchlist-inline-form { margin: 10px 0; }
+.ca-data-source { padding-top: 8px; border-top: 1px solid rgba(255,255,255,.08); }
 .tx-workbench { overflow: hidden; }
 .tx-workbench-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 18px 10px; }
 .tx-workbench-head h1 { margin: 0; font-size: clamp(1.8rem, 2.4vw, 2.5rem); letter-spacing: -.03em; }
@@ -9615,6 +22619,17 @@ textarea { min-height: 140px; resize: vertical; }
 .tx-section-title .badge, .tx-section-title .confidence-pill { margin-left: auto; }
 .tx-section-index { width: 26px; height: 26px; border-radius: 999px; display: inline-grid; place-items: center; background: #2563eb; color: #fff; font-size: 0; font-weight: 800; flex: 0 0 auto; }
 .tx-section-index::before { counter-increment: tx-section; content: counter(tx-section); font-size: .9rem; }
+.candidate-pool-grid, .recognizer-list { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.candidate-pool-grid .mini-card strong { overflow-wrap: anywhere; }
+.subsection-title { margin: 16px 0 10px; font-size: .92rem; color: var(--muted); }
+.recognizer-card > summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; cursor: pointer; }
+.recognizer-card > summary::marker { color: var(--muted); }
+.recognizer-grid, .candidate-basic-grid, .evidence-pack-grid { margin-top: 12px; }
+.recognizer-card .raw-json-shell, .recognizer-card .evidence-ref-details { margin-top: 10px; }
+.evidence-ref-details { margin-top: 12px; }
+.evidence-ref-details > summary, .raw-json-shell > summary { cursor: pointer; color: var(--muted); font-weight: 700; padding: 8px 0; }
+.evidence-link { color: var(--accent); overflow-wrap: anywhere; }
+.compact-empty { padding: 8px; margin-top: 8px; }
 .tx-report-top { display: grid; gap: 14px; padding: 2px 0 0; }
 .tx-report-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
 .tx-report-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
@@ -9637,6 +22652,7 @@ textarea { min-height: 140px; resize: vertical; }
 .status-chip { display: inline-flex; width: fit-content; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); font-size: .8rem; }
 .status-success { color: #047857; border-color: rgba(4,120,87,.25); background: #ecfdf5; }
 .status-failure { color: #b91c1c; border-color: rgba(185,28,28,.25); background: #fef2f2; }
+.status-pending { color: #92400e; border-color: rgba(146,64,14,.25); background: #fffbeb; }
 .gas-profile-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .gas-profile-summary div { display: grid; gap: 5px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; }
 .gas-profile-summary span { color: var(--muted); font-size: .78rem; }
@@ -9809,7 +22825,7 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line
 .brand-text { font-weight: 800; }
 .topbar { padding: 10px 0 8px; border-bottom: 1px solid var(--line); }
 .hero { padding: 14px 0 20px; }
-.hero h1, .pricing-card h1, .auth-copy h1, .verify-shell h1, .dashboard-hero h1 { font-size: clamp(1.45rem, 2vw, 2.25rem); letter-spacing: 0; }
+.hero h1, .pricing-card h1, .auth-copy h1, .dashboard-hero h1 { font-size: clamp(1.45rem, 2vw, 2.25rem); letter-spacing: 0; }
 .hero p, .auth-copy p, .panel-copy, .dashboard-hero p { line-height: 1.45; }
 .cta { border-radius: 6px; padding: 7px 10px; font-size: .82rem; font-weight: 700; }
 .cta.tiny { padding: 5px 8px; font-size: .76rem; }
@@ -9851,7 +22867,7 @@ th { background: #fafafa; color: #555; font-size: .68rem; text-transform: upperc
 td { color: #222; }
 code, .copy-button { font-size: .72rem; }
 .copy-button { border-radius: 4px; padding: 2px 5px; }
-.json-shell { border-radius: 6px; background: #111; color: #fff; font-size: 11px; }
+.json-shell { border-radius: 6px; background: #111; color: #fff; font-size: 12px; }
 .cluster-tab { border-radius: 6px; padding: 6px 9px; font-size: .78rem; }
 .cluster-tab.active { background: #111; border-color: #111; color: #fff; }
 .tx-section-card, .basic-info-card, .tx-meta-strip, .storyline-summary-card, .timeline-list, .trace-timeline-list { border-radius: 6px; box-shadow: none; }
@@ -9859,7 +22875,7 @@ code, .copy-button { font-size: .72rem; }
 .meter span, .gas-profile-bar span { background: var(--accent); }
 .cta::before { content: ""; width: 6px; height: 6px; margin-right: 7px; border-radius: 2px; background: currentColor; opacity: .8; }
 .cta.primary::before, .cta.secondary::before { background: #fff; }
-.status-success, .status-failure, .activity-pill, .verdict-pill, .confidence-pill { color: #111; border-color: var(--line); background: #fff; }
+.status-success, .status-failure, .status-pending, .activity-pill, .verdict-pill, .confidence-pill { color: #111; border-color: var(--line); background: #fff; }
 .verdict-profit, .verdict-loss, .verdict-mixed, .verdict-unknown, .profit-number, .tx-report-loss .profit-number { color: #111; }
 .tx-report-profit, .tx-report-loss, .tx-report-mixed, .tx-report-unknown { border-left-color: var(--accent); }
 .table-badge.gained, .table-badge.spent, .table-badge.gas, .address-type-pill, .story-chip-badge { color: var(--accent); border-color: rgba(255,102,0,.28); background: rgba(255,102,0,.06); }
@@ -9896,7 +22912,7 @@ code, .copy-button { font-size: .72rem; }
   .timeline-head { border-bottom: 1px solid var(--line); }
 }
 
-/* ChainActors intelligence terminal */
+/* LedgerFlow intelligence terminal */
 :root {
   --bg: #050a11;
   --panel: #0a111b;
@@ -9929,7 +22945,6 @@ code, kbd { font-family: "SFMono-Regular", "Roboto Mono", Consolas, monospace; }
 .brand-lockup { gap: 9px; }
 .brand-mark, .brand-mark svg { width: 30px; height: 30px; }
 .brand-text { color: var(--ink); font-size: .98rem; letter-spacing: -.015em; }
-.brand-beta { padding: 2px 5px; border: 1px solid var(--line-strong); border-radius: 4px; color: #a7b3c2; font-size: .52rem; letter-spacing: .06em; }
 .dashboard-shell { background: transparent; }
 .sidebar { background: #070d15; border-color: var(--line); }
 .dashboard-main { color: var(--ink); }
@@ -9982,6 +22997,7 @@ tr:hover td { background: rgba(255,255,255,.018); }
 .empty-state { background: #080f18; border-color: var(--line-strong); color: var(--muted); }
 .status-success { background: rgba(85,209,118,.08); border-color: rgba(85,209,118,.25); color: #73d98d; }
 .status-failure { background: rgba(255,111,69,.08); border-color: rgba(255,111,69,.25); color: #ff8765; }
+.status-pending { background: rgba(255,193,7,.08); border-color: rgba(255,193,7,.25); color: #e6bd4c; }
 .meter, .gas-profile-bar { background: #111c29; border-color: var(--line); }
 .meter span, .gas-profile-bar span { background: var(--accent); }
 
@@ -10002,6 +23018,7 @@ tr:hover td { background: rgba(255,255,255,.018); }
 }
 .ca-brand { display: flex; padding: 0 8px 14px !important; min-height: 42px; align-items: center; }
 .ca-nav { display: grid; gap: 3px; }
+.ca-nav-section { padding: 0 9px; color: #4f5e70; font-size: .53rem; font-weight: 700; letter-spacing: .12em; }
 .ca-nav a {
   min-height: 43px;
   padding: 7px 9px;
@@ -10076,13 +23093,17 @@ tr:hover td { background: rgba(255,255,255,.018); }
   min-height: 64px;
   padding: 0 22px;
   display: grid;
-  grid-template-columns: auto auto minmax(280px, 1fr) auto auto;
+  grid-template-columns: minmax(480px, auto) minmax(280px, 1fr);
   gap: 12px;
   align-items: center;
   border-bottom: 1px solid var(--line);
   background: rgba(5, 10, 17, .91);
   backdrop-filter: blur(14px);
 }
+.ei-context-bar { display: grid; grid-template-columns: 1.25fr 1fr .9fr auto; gap: 7px; align-items: end; }
+.ei-context-bar label { gap: 3px; color: #617084; font-size: .52rem; letter-spacing: .06em; text-transform: uppercase; }
+.ei-context-bar select { min-width: 0; height: 34px; padding: 6px 26px 6px 9px; color: #c3cdd8; font-size: .65rem; }
+.ei-context-apply { height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; background: #111a27; color: #aeb9c6; cursor: pointer; }
 .ca-chain-menu { position: relative; }
 .ca-chain-menu summary {
   min-width: 120px;
@@ -10141,6 +23162,9 @@ tr:hover td { background: rgba(255,255,255,.018); }
 .ca-global-search kbd { padding: 2px 5px; border: 1px solid var(--line); border-radius: 4px; color: #5c6979; font-size: .56rem; }
 .ca-live { display: inline-flex; gap: 6px; align-items: center; color: #6c7b8d; font-size: .58rem; letter-spacing: .08em; }
 .ca-live i, .ca-updated i { width: 6px; height: 6px; border-radius: 50%; background: var(--positive); box-shadow: 0 0 0 4px rgba(85,209,118,.08); }
+.ca-registry-count { color: #667587; font-size: .56rem; letter-spacing: .08em; white-space: nowrap; }
+.ca-updated.stale i { background: var(--warning); box-shadow: 0 0 0 4px rgba(227,182,76,.08); }
+.ca-updated.outdated i, .ca-updated.empty i { background: #ff7651; box-shadow: 0 0 0 4px rgba(255,118,81,.08); }
 .ca-icon-button { position: relative; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 50%; background: #0a121d; color: #8b99aa; }
 .ca-icon-button b { position: absolute; top: -3px; right: -1px; min-width: 15px; height: 15px; display: grid; place-items: center; border-radius: 8px; background: #6c5cf4; color: #fff; font-size: .5rem; }
 .ca-main { width: min(1480px, 100%); margin: 0 auto; padding: 22px 24px 40px; gap: 14px; }
@@ -10199,6 +23223,12 @@ tr:hover td { background: rgba(255,255,255,.018); }
 .ca-relation-card { padding: 18px; display: grid; grid-template-rows: auto 1fr auto; gap: 10px; border-left: 1px solid var(--line); background: rgba(5,12,20,.44); }
 .ca-chart-head { display: flex; justify-content: space-between; gap: 10px; color: #8695a7; font-size: .65rem; }
 .ca-chart-head small { color: #546273; font-size: .56rem; }
+.ca-source-facts { margin: 0; display: grid; align-content: center; }
+.ca-source-facts > div { padding: 10px 0; display: grid; gap: 4px; border-bottom: 1px solid var(--line); }
+.ca-source-facts > div:last-child { border-bottom: 0; }
+.ca-source-facts dt { color: #59687a; font-size: .54rem; }
+.ca-source-facts dd { min-width: 0; margin: 0; overflow: hidden; color: #aab6c3; font-size: .61rem; text-overflow: ellipsis; white-space: nowrap; }
+.ca-source-facts code { color: #aab6c3; font-size: .59rem; }
 .ca-relation-graph { position: relative; min-height: 220px; }
 .ca-relation-graph .node { position: absolute; z-index: 2; width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid rgba(111,99,255,.45); border-radius: 50%; background: #171d3a; color: #aaa4ff; box-shadow: 0 0 0 6px rgba(111,99,255,.04); font-size: .58rem; font-style: normal; }
 .ca-relation-graph .node.funding { left: 4%; top: 43%; background: #2b2516; border-color: rgba(227,182,76,.4); color: #dfbb64; }
@@ -10277,6 +23307,14 @@ tr:hover td { background: rgba(255,255,255,.018); }
 .ca-chart-footer i { width: 7px; height: 2px; background: var(--base); }
 .ca-chart-footer i.green { background: var(--positive); }
 .ca-chart-footer small { margin-left: auto; color: #4d5a6a; }
+.ca-hourly-chart { padding: 16px 16px 6px; }
+.ca-hourly-bars { height: 156px; display: grid; grid-template-columns: repeat(24,minmax(0,1fr)); gap: 4px; align-items: end; border-bottom: 1px solid var(--line-strong); }
+.ca-hour-bar { height: 100%; min-width: 0; display: grid; grid-template-rows: 18px minmax(0,1fr) 18px; align-items: end; justify-items: center; }
+.ca-hour-bar b { color: #536173; font-size: .47rem; font-weight: 500; }
+.ca-hour-bar i { width: min(14px,75%); min-height: 0; border-radius: 3px 3px 0 0; background: linear-gradient(to top,#477cff,rgba(71,124,255,.35)); }
+.ca-hour-bar small { color: #4d5a6a; font-size: .44rem; }
+.ca-hourly-chart .ca-chart-footer { padding: 9px 0 2px; }
+.ca-hourly-empty { padding: 16px; }
 .ca-ranking-list { display: grid; }
 .ca-ranking-list > a { min-height: 59px; padding: 9px 12px; display: grid; grid-template-columns: 18px 26px minmax(0,1fr) auto auto; gap: 8px; align-items: center; border-bottom: 1px solid var(--line); }
 .ca-ranking-list > a:last-child { border-bottom: 0; }
@@ -10301,26 +23339,668 @@ tr:hover td { background: rgba(255,255,255,.018); }
 .ca-hot-list b { color: #9aa7b6; font-size: .56rem; }
 .ca-hot-list small { color: #596778; font-size: .52rem; }
 .ca-hot-list strong { color: #a7b2bf; font-size: .56rem; font-weight: 500; white-space: nowrap; }
-.ca-plane-row { min-height: 66px; padding: 12px 14px; display: grid; grid-template-columns: 20px minmax(0,1fr) auto; gap: 9px; align-items: center; }
+.ca-plane-row { min-height: 66px; padding: 12px 14px; display: grid; grid-template-columns: 20px minmax(0,1fr) auto; gap: 9px; align-items: center; border-bottom: 1px solid var(--line); }
+.ca-plane-row:last-child { border-bottom: 0; }
 .ca-plane-row > span:nth-child(2) { display: grid; gap: 3px; }
 .ca-plane-row strong { color: #abb7c4; font-size: .62rem; }
 .ca-plane-row small { color: #566475; font-size: .52rem; }
 .ca-plane-row > b { color: var(--positive); font-size: .54rem; }
+.ca-plane-row > b.degraded, .ca-plane-badge.degraded { color: var(--warning); }
+.ca-plane-row > b.unavailable, .ca-plane-badge.unavailable { color: #ff7651; }
+.ca-plane-dot { width: 8px; height: 8px; justify-self: center; border-radius: 50%; background: var(--positive); box-shadow: 0 0 0 4px rgba(85,209,118,.06); }
+.ca-plane-dot.degraded { background: var(--warning); box-shadow: 0 0 0 4px rgba(227,182,76,.06); }
+.ca-plane-dot.unavailable { background: #ff7651; box-shadow: 0 0 0 4px rgba(255,118,81,.06); }
+.ca-plane-badge { padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; color: var(--positive); font-size: .52rem; }
 .ca-supported { padding: 18px 20px; display: grid; grid-template-columns: minmax(250px,.55fr) minmax(0,1.45fr); gap: 26px; align-items: center; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
 .ca-eyebrow { color: #8f86ff; font-size: .54rem; letter-spacing: .11em; }
 .ca-supported h3 { margin: 6px 0; color: #dce4ed; font-size: .9rem; }
 .ca-supported p { margin: 0; color: #667587; font-size: .6rem; line-height: 1.55; }
-.ca-supported-cards { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 9px; }
+.ca-supported-cards { display: grid; grid-template-columns: repeat(auto-fit,minmax(190px,1fr)); gap: 9px; }
 .ca-supported-cards article { min-height: 68px; padding: 10px; display: grid; grid-template-columns: 32px minmax(0,1fr) auto; gap: 9px; align-items: center; border: 1px solid var(--line); border-radius: 8px; background: #0b131e; }
 .chain-logo { width: 31px; height: 31px; display: grid; place-items: center; border-radius: 50%; background: var(--base); color: #fff; font-size: .72rem; font-weight: 800; }
 .chain-logo.rh { background: #123320; color: #56d77a; }
+.chain-logo.robinhood, .chain-logo.robinhood-mainnet { background: #123320; color: #56d77a; }
 .chain-logo.more { background: #171425; color: #9d94ee; }
 .ca-supported-cards article > div { display: grid; gap: 2px; }
 .ca-supported-cards strong { color: #b4bfcc; font-size: .62rem; }
 .ca-supported-cards small { color: #576577; font-size: .51rem; }
 .ca-supported-cards article > span:last-child { display: grid; gap: 1px; justify-items: end; }
 .ca-supported-cards article > span:last-child b { color: #8896a7; font-size: .58rem; }
+.ca-plane-card-status.healthy b { color: var(--positive) !important; }
+.ca-plane-card-status.degraded b { color: var(--warning) !important; }
+.ca-plane-card-status.unavailable b { color: #ff7651 !important; }
 .ca-supported-cards article.muted { opacity: .73; }
+
+/* Execution Intelligence task surfaces */
+.ei-main { gap: 18px; padding-top: 20px; }
+.ei-page-kicker, .ei-section-kicker { color: #8f86ff; font-size: .56rem; font-weight: 800; letter-spacing: .13em; }
+.ei-overview-heading { min-height: 70px; }
+.ei-overview-heading h1 { color: #eef3f8; }
+.ei-overview-heading p { max-width: 760px; }
+.ei-primary-actions { gap: 8px; }
+.ei-attention-summary { display: grid; grid-template-columns: minmax(250px,.75fr) minmax(0,1.25fr); gap: 18px; align-items: center; padding: 15px 18px; border: 1px solid rgba(111,99,255,.32); border-left: 3px solid var(--accent); border-radius: 9px; background: #0b1320; }
+.ei-attention-summary > div { display: grid; gap: 4px; }
+.ei-attention-summary strong { color: #f2f5f8; font-size: 1.08rem; }
+.ei-attention-summary > div span { color: #77879a; font-size: .65rem; }
+.ei-attention-summary dl { margin: 0; display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); }
+.ei-attention-summary dl div { min-width: 0; padding: 2px 12px; border-left: 1px solid var(--line); }
+.ei-attention-summary dt { color: #647386; font-size: .53rem; text-transform: uppercase; letter-spacing: .07em; }
+.ei-attention-summary dd { margin: 5px 0 0; color: #b7c2cd; font-size: .62rem; overflow-wrap: anywhere; }
+.ei-section { display: grid; gap: 10px; }
+.ei-section-head { display: flex; align-items: end; justify-content: space-between; gap: 14px; }
+.ei-section-head h2 { margin: 3px 0 0; color: #dce4ec; font-size: .94rem; }
+.ei-section-head > a, .ei-section-head > span { color: #748398; font-size: .58rem; }
+.ei-section-head > a:hover { color: #a69fff; }
+.ei-section-head.compact { align-items: center; padding: 13px 15px 11px; border-bottom: 1px solid var(--line); }
+.ei-attention-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(310px,1fr)); gap: 10px; }
+.ei-attention-card { display: grid; gap: 14px; min-width: 0; padding: 15px; border: 1px solid rgba(85,209,118,.25); border-top: 2px solid var(--positive); border-radius: 9px; background: var(--panel); }
+.ei-attention-card.unverified { border-color: rgba(227,182,76,.24); border-top-color: var(--warning); }
+.ei-attention-card h3 { margin: 0; color: #dce4ec; font-size: .82rem; line-height: 1.55; }
+.ei-event-labels { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.ei-severity, .ei-status, .ei-event-type { display: inline-flex; align-items: center; width: fit-content; padding: 4px 7px; border: 1px solid var(--line); border-radius: 5px; color: #9aa7b6; background: #0d1723; font-size: .5rem; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.ei-severity.critical { color: #ff8b73; border-color: rgba(255,111,69,.38); }
+.ei-severity.high { color: #f0c35c; border-color: rgba(227,182,76,.35); }
+.ei-severity.medium { color: #8dc7e5; border-color: rgba(73,185,198,.3); }
+.ei-severity.low { color: #8b9aac; }
+.ei-status.verified, .ei-status.resolved { color: var(--positive); border-color: rgba(85,209,118,.3); }
+.ei-status.enabled { color: var(--positive); border-color: rgba(85,209,118,.3); }
+.ei-status.available { color: var(--accent-2); border-color: rgba(142,134,232,.35); }
+.ei-status.unavailable { color: var(--muted); border-color: var(--line); }
+.ei-status.detected { color: var(--warning); border-color: rgba(227,182,76,.3); }
+.ei-status.investigating { color: #9c94ff; border-color: rgba(111,99,255,.34); }
+.ei-status.dismissed { color: #738194; text-decoration: line-through; }
+.ei-event-type { color: #aaa3ff; border-color: rgba(111,99,255,.25); }
+.ei-attention-card dl { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; margin: 0; }
+.ei-attention-card dl div { min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 6px; background: #08101a; }
+.ei-attention-card dt { color: #627184; font-size: .5rem; text-transform: uppercase; }
+.ei-attention-card dd { margin: 5px 0 0; color: #aeb9c6; font-size: .62rem; overflow-wrap: anywhere; }
+.ei-attention-card footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.ei-attention-card footer > span { color: #627184; font-size: .55rem; }
+.ei-attention-card footer > div { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.ei-metric-grid { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 9px; }
+.ei-metric-card { min-height: 126px; display: grid; align-content: start; gap: 6px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.ei-metric-card:hover { border-color: rgba(111,99,255,.34); background: #0c1521; }
+.ei-metric-card > span { color: #77869a; font-size: .54rem; text-transform: uppercase; letter-spacing: .08em; }
+.ei-metric-card > strong { margin-top: 7px; color: #e5ebf1; font-size: 1.42rem; font-variant-numeric: tabular-nums; }
+.ei-metric-card > p, .ei-metric-card > small { margin: 0; color: #78879a; font-size: .58rem; }
+.ei-metric-card > small { margin-top: auto; color: #596779; }
+.ei-metric-card.material { box-shadow: inset 0 2px var(--positive); }
+.ei-metric-card.value { box-shadow: inset 0 2px var(--accent); }
+.ei-metric-card.failure { box-shadow: inset 0 2px var(--warning); }
+.ei-metric-card.actor { box-shadow: inset 0 2px var(--cyan); }
+.ei-overview-grid { display: grid; grid-template-columns: minmax(0,1.45fr) minmax(290px,.55fr); gap: 10px; align-items: start; }
+.ei-overview-main, .ei-overview-side { display: grid; gap: 10px; min-width: 0; }
+.ei-panel { overflow: hidden; }
+.ei-empty-state { display: grid; justify-items: start; gap: 7px; min-height: 112px; align-content: center; padding: 20px; color: #768599; }
+.ei-empty-state strong { color: #b6c1cd; font-size: .7rem; }
+.ei-empty-state p { margin: 0; max-width: 600px; font-size: .59rem; line-height: 1.55; }
+.ei-empty-wide { min-height: 170px; border: 1px dashed var(--line-strong); border-radius: 8px; }
+.ei-table { border: 0; border-radius: 0; background: transparent; }
+.ei-table table { background: transparent; }
+.ei-table th { background: #09111c; color: #5d6b7e; }
+.ei-table td { color: #9eabb9; border-color: var(--line); }
+.ei-table td a { display: grid; gap: 2px; }
+.ei-table td small { color: #5e6d80; font-size: .52rem; }
+.ei-event-list { min-width: 1100px; }
+.ei-event-list-head, .ei-event-row { display: grid; grid-template-columns: 78px 188px 92px minmax(260px,1fr) 140px 140px 90px 14px; gap: 8px; align-items: center; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+.ei-event-list-head > *, .ei-event-row > * { min-width: 0; }
+.ei-event-list-head { background: #09111c; color: #5d6b7e; font-size: .51rem; font-weight: 800; text-transform: uppercase; }
+.ei-event-row { color: #8391a2; font-size: .57rem; }
+.ei-event-row:hover { background: rgba(255,255,255,.018); }
+.ei-event-row time { color: #617084; }
+.ei-event-row > .ei-status, .ei-event-row > .ei-severity { white-space: nowrap; }
+.ei-event-summary { display: grid; gap: 3px; }
+.ei-event-summary strong { color: #aeb9c5; font-size: .58rem; }
+.ei-event-summary small, .ei-event-impact, .ei-event-actors, .ei-event-confidence { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ei-event-summary small { color: #657386; }
+.ei-event-impact { color: #aeb9c5; font-variant-numeric: tabular-nums; }
+.ei-event-actors { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.ei-review-actor { display: grid; grid-template-columns: 30px minmax(0,1fr) auto; gap: 9px; align-items: center; padding: 11px 13px; border-bottom: 1px solid var(--line); }
+.ei-review-actor:hover { background: rgba(255,255,255,.018); }
+.ei-review-actor > span:nth-child(2) { display: grid; gap: 3px; min-width: 0; }
+.ei-review-actor strong { color: #aab6c3; font-size: .61rem; }
+.ei-review-actor small { color: #617084; font-size: .51rem; }
+.ei-review-actor b { color: var(--warning); font-size: .55rem; }
+.ei-actor-mark { width: 28px; height: 28px; display: grid; place-items: center; border: 1px solid rgba(111,99,255,.28); border-radius: 50%; color: #9d95ff; background: rgba(111,99,255,.07); }
+.ei-system-status { display: grid; gap: 9px; padding-top: 8px; opacity: .86; }
+.ei-system-status .ca-plane-row { background: var(--panel); }
+.ei-view-tabs { display: flex; gap: 5px; padding-bottom: 1px; border-bottom: 1px solid var(--line); }
+.ei-view-tabs a { padding: 8px 11px; border-bottom: 2px solid transparent; color: #718094; font-size: .6rem; font-weight: 800; }
+.ei-view-tabs a.active { border-color: var(--accent); color: #b4aefe; }
+.ei-filter-panel { padding: 12px; }
+.ei-filter-grid { display: grid; grid-template-columns: repeat(7,minmax(100px,1fr)) auto; gap: 8px; align-items: end; }
+.ei-filter-grid label { color: #69788b; font-size: .52rem; text-transform: uppercase; letter-spacing: .05em; }
+.ei-filter-grid input, .ei-filter-grid select { min-height: 34px; color: #aab5c2; background: #08101a; border-color: var(--line); font-size: .58rem; }
+.ei-events-panel { min-width: 0; }
+.ei-events-scroll { overflow-x: auto; }
+.ei-back-link { width: fit-content; color: #7c8ba0; font-size: .6rem; }
+.ei-back-link:hover { color: #a9a2ff; }
+.ei-conclusion-card { display: grid; gap: 12px; padding: 21px; border-top: 2px solid var(--accent); }
+.ei-conclusion-card h1 { margin: 0; color: #eef3f8; font-size: clamp(1.55rem,2.3vw,2.2rem); }
+.ei-conclusion-card > p { max-width: 920px; margin: 0; color: #c0cad4; font-size: .85rem; line-height: 1.65; }
+.ei-conclusion-card dl { display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap: 0; margin: 8px 0 0; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.ei-conclusion-card dl div { min-width: 0; padding: 11px; border-right: 1px solid var(--line); background: #08101a; }
+.ei-conclusion-card dl div:last-child { border-right: 0; }
+.ei-conclusion-card dt, .ei-evidence-identifiers dt { color: #607084; font-size: .5rem; text-transform: uppercase; letter-spacing: .05em; }
+.ei-conclusion-card dd, .ei-evidence-identifiers dd { margin: 5px 0 0; color: #aab6c3; font-size: .59rem; overflow-wrap: anywhere; }
+.ei-conclusion-card code { color: #a69fff; font-size: .56rem; }
+.ei-unverified-note { display: flex; gap: 10px; align-items: center; padding: 10px 12px; border: 1px solid rgba(227,182,76,.26); border-radius: 6px; background: rgba(227,182,76,.05); }
+.ei-unverified-note strong { color: var(--warning); font-size: .58rem; white-space: nowrap; }
+.ei-unverified-note span { color: #8a7f66; font-size: .56rem; }
+.ei-detail-section { overflow: hidden; }
+.ei-impact-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); }
+.ei-impact-grid > div { min-height: 82px; display: grid; align-content: center; gap: 7px; padding: 14px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.ei-impact-grid > div:nth-child(4n) { border-right: 0; }
+.ei-impact-grid > div:nth-last-child(-n+4) { border-bottom: 0; }
+.ei-impact-grid span { color: #68778a; font-size: .52rem; text-transform: uppercase; }
+.ei-impact-grid strong { color: #b8c3ce; font-size: .72rem; overflow-wrap: anywhere; }
+.ei-impact-grid .unknown strong { color: #596779; font-weight: 500; }
+.observation-progress { height: 9px; margin: 16px; overflow: hidden; border: 1px solid var(--line); border-radius: 999px; background: #08101a; }
+.observation-progress span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.observation-window-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); border-top: 1px solid var(--line); }
+.observation-window-grid article { min-width: 0; padding: 14px; display: grid; gap: 6px; border-right: 1px solid var(--line); }
+.observation-window-grid article:last-child { border-right: 0; }
+.observation-window-grid span, .observation-window-grid small { color: #718095; }
+.observation-window-grid strong { color: #dce4ec; overflow-wrap: anywhere; }
+.ei-timeline { display: grid; padding: 16px; }
+.ei-timeline-step { position: relative; display: grid; grid-template-columns: 34px minmax(0,1fr); gap: 12px; padding-bottom: 17px; }
+.ei-timeline-step:last-child { padding-bottom: 0; }
+.ei-timeline-step::after { content: ""; position: absolute; left: 16px; top: 32px; bottom: 0; width: 1px; background: var(--line-strong); }
+.ei-timeline-step:last-child::after { display: none; }
+.ei-timeline-step > span { z-index: 1; width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid rgba(111,99,255,.4); border-radius: 50%; color: #a59eff; background: #0a111b; font-size: .58rem; font-weight: 800; }
+.ei-timeline-step > div { display: grid; gap: 5px; padding: 8px 11px; border: 1px solid var(--line); border-radius: 7px; background: #08101a; }
+.ei-timeline-step small { color: #67768a; font-size: .51rem; }
+.ei-timeline-step strong { color: #b4bfca; font-size: .67rem; }
+.ei-timeline-step p { margin: 0; color: #758397; font-size: .58rem; line-height: 1.5; }
+.ei-timeline-step em { width: fit-content; color: #9991f5; font-size: .5rem; font-style: normal; }
+.ei-participants { display: grid; grid-template-columns: repeat(auto-fit,minmax(250px,1fr)); }
+.ei-participant { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 3px 8px; padding: 13px 15px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.ei-participant:hover { background: rgba(255,255,255,.017); }
+.ei-participant span { grid-column: 1/-1; color: #6c7b8f; font-size: .51rem; text-transform: uppercase; }
+.ei-participant strong { color: #adb9c5; font-size: .64rem; }
+.ei-participant small { grid-column: 1/2; color: #637286; font-family: ui-monospace,SFMono-Regular,Menlo,monospace; font-size: .51rem; overflow-wrap: anywhere; }
+.ei-participant b { grid-column: 2; grid-row: 2/4; align-self: center; color: #8e86e8; }
+.ei-evidence-panel { overflow: hidden; }
+.ei-evidence-panel > summary { cursor: pointer; list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 15px; }
+.ei-evidence-panel > summary::-webkit-details-marker { display: none; }
+.ei-evidence-panel > summary span { display: grid; gap: 4px; }
+.ei-evidence-panel > summary small { color: #8e86eb; font-size: .52rem; letter-spacing: .1em; }
+.ei-evidence-panel > summary strong { color: #b4bfca; font-size: .7rem; }
+.ei-evidence-panel > summary b { color: #6e7d90; font-size: .55rem; }
+.ei-evidence-body { display: grid; gap: 14px; padding: 0 15px 15px; border-top: 1px solid var(--line); }
+.ei-evidence-flags { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); margin-top: 14px; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.ei-evidence-flags div { display: grid; gap: 5px; padding: 10px; border-right: 1px solid var(--line); }
+.ei-evidence-flags div:last-child { border-right: 0; }
+.ei-evidence-flags span { color: #68778a; font-size: .51rem; }
+.ei-evidence-flags strong { color: var(--positive); font-size: .57rem; }
+.ei-evidence-flags strong.unknown { color: #596779; }
+.ei-evidence-identifiers { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); margin: 0; }
+.ei-evidence-identifiers div { min-width: 0; padding: 8px 12px; border-left: 1px solid var(--line); }
+.ei-evidence-identifiers div:first-child { border-left: 0; }
+.ei-evidence-body h3 { color: #9eabb8; font-size: .65rem; }
+.ei-evidence-body li, .ei-evidence-body p { color: #718095; font-size: .57rem; line-height: 1.5; }
+.ei-detail-actions { display: grid; grid-template-columns: minmax(190px,.4fr) minmax(0,1.6fr); gap: 20px; align-items: center; padding: 17px; }
+.ei-detail-actions h2 { margin: 4px 0; color: #c2ccd6; font-size: .85rem; }
+.ei-detail-actions p { margin: 0; color: #6e7d90; font-size: .56rem; }
+.ei-detail-actions > div:last-child { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+.ca-disabled-button { display: inline-flex; align-items: center; padding: 7px 10px; border: 1px dashed var(--line-strong); border-radius: 5px; color: #536174; background: transparent; font: inherit; font-size: .56rem; cursor: not-allowed; }
+.ei-entity-tabs { overflow-x: auto; }
+.ei-entity-tabs a { white-space: nowrap; }
+.ei-entity-search { padding: 12px; }
+.ei-entity-search form { display: grid; grid-template-columns: minmax(280px,1fr) minmax(150px,.35fr) auto; gap: 9px; align-items: end; }
+.ei-entity-search label { color: #6d7c8f; font-size: .54rem; }
+.ei-entity-search input, .ei-entity-search select { color: #aeb9c5; background: #08101a; border-color: var(--line); }
+.ei-context-tabs { position: sticky; top: 58px; z-index: 4; display: flex; gap: 5px; padding: 7px; border: 1px solid var(--line); border-radius: 7px; background: rgba(8,16,26,.94); backdrop-filter: blur(12px); }
+.ei-context-tabs a { padding: 6px 9px; border-radius: 5px; color: #7a899c; font-size: .56rem; font-weight: 800; }
+.ei-context-tabs a:hover { color: #b6b0ff; background: rgba(111,99,255,.08); }
+.ei-entity-hero { display: grid; gap: 17px; padding: 21px; border-top: 2px solid var(--accent); }
+.ei-observation-state { margin: 0; padding: 11px 13px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: rgba(255,255,255,.015); }
+.ei-button-disabled { cursor: default; opacity: .82; }
+.ei-entity-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 22px; }
+.ei-entity-title h1 { margin: 0 0 7px; color: #eef3f8; font-size: clamp(1.45rem,2.2vw,2.05rem); }
+.ei-entity-title code { color: #8f9daf; overflow-wrap: anywhere; }
+.ei-entity-actions { display: flex; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+.ei-entity-facts { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); margin: 0; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.ei-entity-facts div { min-width: 0; padding: 12px; border-right: 1px solid var(--line); background: #08101a; }
+.ei-entity-facts div:last-child { border-right: 0; }
+.ei-entity-facts dt { color: #68778a; font-size: .55rem; text-transform: uppercase; }
+.ei-entity-facts dd { margin: 6px 0 0; color: #b2bdc8; font-size: .66rem; overflow-wrap: anywhere; }
+.ei-two-column { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); }
+.ei-two-column > div { min-width: 0; padding: 16px; border-right: 1px solid var(--line); }
+.ei-two-column > div:last-child { border-right: 0; }
+.ei-two-column h3 { margin: 0 0 12px; color: #9eabb8; font-size: .72rem; }
+.ei-claim { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 4px 9px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.ei-claim:last-child { border-bottom: 0; }
+.ei-claim strong { color: #b6c1cb; }
+.ei-claim small { grid-column: 2; color: #718095; }
+.ei-evidence-state { width: fit-content; display: inline-flex; align-items: center; padding: 3px 6px; border: 1px solid var(--line-strong); border-radius: 999px; color: #8b99aa; font-size: .53rem; }
+.ei-evidence-state.observed { color: #68d98a; border-color: rgba(85,209,118,.3); }
+.ei-evidence-state.inferred { color: #e3b64c; border-color: rgba(227,182,76,.3); }
+.ei-evidence-state.unverified { color: #9b91fb; border-color: rgba(111,99,255,.35); }
+.ei-chip-list { display: flex; gap: 7px; flex-wrap: wrap; }
+.ei-chip-list span { padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; color: #aeb9c5; background: #08101a; }
+.ei-relationship-graph { display: grid; grid-template-columns: minmax(150px,.35fr) minmax(0,1.65fr); gap: 18px; align-items: center; padding: 18px; border-bottom: 1px solid var(--line); background: #090f19; }
+.ei-relationship-center { display: grid; gap: 5px; padding: 16px; border: 1px solid rgba(111,99,255,.45); border-radius: 8px; background: #0c1120; }
+.ei-relationship-center span, .ei-relationship-nodes span { color: #8e86e8; font-size: .52rem; text-transform: uppercase; }
+.ei-relationship-center strong { color: #d3dae1; }
+.ei-relationship-nodes { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 8px; }
+.ei-relationship-nodes a { position: relative; display: grid; gap: 4px; padding: 11px; border: 1px solid var(--line); border-radius: 7px; background: #08101a; }
+.ei-relationship-nodes a::before { content: "→"; position: absolute; left: -15px; top: 50%; color: #5d568e; }
+.ei-relationship-nodes strong { color: #aeb9c5; overflow-wrap: anywhere; }
+.ei-relationship-nodes small { color: #6f7e91; }
+.ei-relationship-categories { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); border-bottom: 1px solid var(--line); }
+.ei-relationship-categories > div { display: grid; gap: 5px; padding: 13px 16px; border-right: 1px solid var(--line); }
+.ei-relationship-categories > div:last-child { border-right: 0; }
+.ei-relationship-categories span { color: #6d7c90; text-transform: uppercase; }
+.ei-relationship-categories strong { color: #b9c4ce; font-size: .85rem; }
+.ei-relationship-categories small { color: #667589; }
+.ei-economic-grid { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); }
+.ei-economic-grid > div { display: grid; gap: 7px; min-width: 0; padding: 16px; border-right: 1px solid var(--line); }
+.ei-economic-grid > div:last-child { border-right: 0; }
+.ei-economic-grid span { color: #68778a; text-transform: uppercase; }
+.ei-economic-grid strong { color: #c0cad4; font-size: .9rem; overflow-wrap: anywhere; }
+.ei-economic-grid small { color: #718095; }
+.ei-coverage-note { margin: 0; padding: 12px 16px; border-top: 1px solid var(--line); color: #77869a; }
+.ei-timeline-item { display: grid; grid-template-columns: 150px minmax(0,1fr) auto; gap: 16px; padding: 15px 17px; border-bottom: 1px solid var(--line); }
+.ei-timeline-item:last-child { border-bottom: 0; }
+.ei-timeline-item time { color: #728196; }
+.ei-timeline-item > div { display: grid; gap: 6px; }
+.ei-timeline-item h3, .ei-timeline-item p { margin: 0; }
+.ei-timeline-item h3 { color: #b8c3ce; }
+.ei-timeline-item p, .ei-timeline-item small { color: #718095; line-height: 1.5; }
+.ei-timeline-item > a { align-self: center; color: #9991f5; }
+.ei-profile-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); }
+.ei-profile-grid > div { min-width: 0; display: grid; gap: 7px; padding: 14px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.ei-profile-grid > div:nth-child(3n) { border-right: 0; }
+.ei-profile-grid > div:nth-last-child(-n+3) { border-bottom: 0; }
+.ei-profile-grid span { color: #68778a; font-size: .51rem; text-transform: uppercase; }
+.ei-profile-grid strong { color: #acb8c4; font-size: .63rem; line-height: 1.45; overflow-wrap: anywhere; }
+.ei-behavior-list { display: grid; grid-template-columns: repeat(auto-fit,minmax(230px,1fr)); }
+.ei-behavior-row { display: grid; gap: 6px; padding: 14px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.ei-behavior-row span { color: #958ef1; font-size: .53rem; text-transform: uppercase; }
+.ei-behavior-row strong { color: #afbac6; font-size: .65rem; }
+.ei-behavior-row small { color: #69788b; font-size: .53rem; }
+.ei-searcher-grid, .ei-cluster-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(310px,1fr)); gap: 10px; }
+.ei-searcher-card { display: grid; gap: 11px; padding: 15px; }
+.ei-searcher-card h2 { margin: 0; color: #bbc5cf; font-size: .8rem; }
+.ei-searcher-card dl, .ei-cluster-card dl { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 7px; margin: 0; }
+.ei-searcher-card dl div, .ei-cluster-card dl div { min-width: 0; padding: 8px; border: 1px solid var(--line); border-radius: 5px; }
+.ei-searcher-card dt, .ei-cluster-card dt { color: #657488; font-size: .49rem; text-transform: uppercase; }
+.ei-searcher-card dd, .ei-cluster-card dd { margin: 4px 0 0; color: #a8b4c0; font-size: .57rem; overflow-wrap: anywhere; }
+.ei-cluster-card { display: grid; gap: 10px; padding: 15px; }
+.ei-cluster-card:hover { border-color: rgba(111,99,255,.34); }
+.ei-cluster-card > span { color: #8d86e8; font-size: .51rem; letter-spacing: .07em; }
+.ei-cluster-card h2 { margin: 0; color: #bdc7d1; font-size: .79rem; }
+.ei-cluster-card p { margin: 0; color: #6e7d91; font-size: .56rem; }
+.ei-cluster-card > b { color: #8e86e8; font-size: .55rem; }
+.ei-monitor-wizard { border-color: rgba(111,99,255,.32); }
+.ei-wizard-progress { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); border-bottom: 1px solid var(--line); }
+.ei-wizard-progress span { position: relative; display: flex; align-items: center; gap: 8px; padding: 12px 15px; color: #627185; font-size: .55rem; }
+.ei-wizard-progress span::after { content: ""; position: absolute; right: 0; top: 50%; width: 1px; height: 24px; transform: translateY(-50%); background: var(--line); }
+.ei-wizard-progress span:last-child::after { display: none; }
+.ei-wizard-progress b { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 50%; color: #77869a; }
+.ei-wizard-progress .active { color: #b3adff; }
+.ei-wizard-progress .active b { border-color: var(--accent); color: #fff; background: var(--accent); }
+.ei-wizard-progress .complete { color: #7ba88b; }
+.ei-wizard-progress .complete b { color: var(--positive); border-color: rgba(85,209,118,.35); }
+.ei-wizard-body { padding: 16px; }
+.ei-wizard-body form { display: grid; gap: 15px; }
+.ei-wizard-fields { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 11px; }
+.ei-wizard-fields label { color: #718095; font-size: .55rem; }
+.ei-wizard-fields .wide { grid-column: 1/-1; }
+.ei-wizard-fields input, .ei-wizard-fields textarea, .ei-wizard-fields select { color: #aeb9c5; background: #08101a; border-color: var(--line); }
+.ei-wizard-fields textarea { min-height: 110px; font-family: ui-monospace,SFMono-Regular,Menlo,monospace; }
+.ei-wizard-actions { display: flex; justify-content: space-between; gap: 9px; }
+.ei-wizard-review { display: grid; gap: 5px; align-content: center; padding: 11px; border: 1px solid var(--line); border-radius: 6px; background: #08101a; }
+.ei-wizard-review span { color: #657488; font-size: .5rem; text-transform: uppercase; }
+.ei-wizard-review strong { color: #b3bec9; font-size: .68rem; }
+.ei-wizard-review small { color: #6c7b8f; font-size: .53rem; }
+.ei-monitor-grid, .ei-destination-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(280px,1fr)); gap: 10px; }
+.ei-monitor-card { display: grid; gap: 11px; padding: 15px; }
+.ei-monitor-card > div:first-child { display: flex; justify-content: space-between; align-items: center; }
+.ei-monitor-card > div:first-child small { color: #657488; font-size: .52rem; }
+.ei-monitor-card h2 { margin: 0; color: #bdc7d1; font-size: .8rem; }
+.ei-monitor-card dl { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 6px; margin: 0; }
+.ei-monitor-card dl div { padding: 8px; border: 1px solid var(--line); border-radius: 5px; }
+.ei-monitor-card dt { color: #617084; font-size: .48rem; text-transform: uppercase; }
+.ei-monitor-card dd { margin: 4px 0 0; color: #a9b5c1; font-size: .66rem; }
+.ei-monitor-card footer { display: flex; justify-content: space-between; gap: 10px; color: #617084; font-size: .51rem; }
+.ei-monitor-card footer code { color: #827be0; font-size: .49rem; }
+.ei-destination-card { display: grid; gap: 9px; padding: 15px; }
+.ei-destination-card > span { color: #8e86e8; font-size: .5rem; letter-spacing: .08em; }
+.ei-destination-card h2 { margin: 0; color: #b9c4ce; font-size: .76rem; }
+.ei-destination-card p { margin: 0; color: #718095; font-size: .56rem; }
+.ei-destination-card > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.ei-destination-card code { color: #6d7c90; font-size: .5rem; }
+.ei-destination-card.unavailable { opacity: .6; border-style: dashed; }
+.ei-workflow-note { display: flex; gap: 9px; align-items: center; padding: 9px 12px; border: 1px dashed var(--line-strong); border-radius: 6px; color: #657488; font-size: .54rem; }
+.ei-workflow-note strong { color: var(--warning); white-space: nowrap; }
+.ei-investigation-create { border-color: rgba(111,99,255,.3); }
+.ei-investigation-create form { display: grid; gap: 13px; padding: 15px; }
+.ei-investigation-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.ei-investigation-form-grid .wide { grid-column: 1/-1; }
+.ei-investigation-form-grid label, .ei-investigation-editor label { color: #718095; font-size: .54rem; }
+.ei-investigation-form-grid input, .ei-investigation-form-grid textarea, .ei-investigation-editor textarea, .ei-investigation-editor select { color: #aeb9c5; background: #08101a; border-color: var(--line); }
+.ei-investigation-form-grid textarea { min-height: 86px; }
+.ei-investigation-source { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 5px 10px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: #08101a; }
+.ei-investigation-source strong { color: #aeb9c5; font-size: .6rem; }
+.ei-investigation-source small { grid-column: 2; color: #657488; font-size: .51rem; }
+.ei-investigation-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(320px,1fr)); gap: 10px; }
+.ei-investigation-card { display: grid; gap: 11px; padding: 15px; }
+.ei-investigation-card:hover { border-color: rgba(111,99,255,.34); }
+.ei-investigation-card > div:first-child { display: flex; justify-content: space-between; align-items: center; }
+.ei-investigation-card > div:first-child small { color: #657488; font-size: .51rem; }
+.ei-investigation-card h2 { margin: 0; color: #bdc7d1; font-size: .78rem; }
+.ei-investigation-card p { margin: 0; min-height: 38px; color: #78879a; font-size: .57rem; line-height: 1.55; }
+.ei-investigation-card dl { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 6px; margin: 0; }
+.ei-investigation-card dl div { padding: 7px; border: 1px solid var(--line); border-radius: 5px; }
+.ei-investigation-card dt { color: #647386; font-size: .48rem; }
+.ei-investigation-card dd { margin: 4px 0 0; color: #a4b0bd; font-size: .57rem; }
+.ei-investigation-card footer { display: flex; justify-content: space-between; gap: 10px; color: #617084; font-size: .51rem; }
+.ei-investigation-card footer b { color: #8e86e8; }
+.ei-investigation-detail-grid { display: grid; grid-template-columns: minmax(0,1.2fr) minmax(300px,.8fr); gap: 10px; align-items: start; }
+.ei-investigation-editor { display: grid; gap: 11px; padding-bottom: 15px; }
+.ei-investigation-editor > label, .ei-investigation-editor > button { margin: 0 15px; }
+.ei-investigation-editor textarea { min-height: 120px; }
+.ei-investigation-context { display: grid; gap: 10px; }
+.ei-context-links { display: grid; gap: 7px; padding: 13px; color: #77869a; font-size: .56rem; }
+.ei-context-links a { padding: 8px; border: 1px solid var(--line); border-radius: 5px; color: #9b94f5; overflow-wrap: anywhere; }
+.ei-report-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(310px,1fr)); gap: 10px; }
+.ei-report-card { display: grid; gap: 11px; padding: 15px; }
+.ei-report-card > div:first-child { display: flex; justify-content: space-between; gap: 10px; }
+.ei-report-card > div:first-child span { color: #8f87ed; font-size: .5rem; letter-spacing: .08em; }
+.ei-report-card > div:first-child small { color: #657488; font-size: .5rem; }
+.ei-report-card h2 { margin: 0; color: #bdc7d1; font-size: .79rem; }
+.ei-report-card p { margin: 0; color: #748397; font-size: .57rem; line-height: 1.55; }
+.ei-report-card dl { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 6px; margin: 0; }
+.ei-report-card dl div { min-width: 0; padding: 8px; border: 1px solid var(--line); border-radius: 5px; }
+.ei-report-card dt { color: #617084; font-size: .47rem; }
+.ei-report-card dd { margin: 4px 0 0; color: #9eabb8; font-size: .52rem; overflow-wrap: anywhere; }
+.ei-report-card footer { display: flex; flex-wrap: wrap; gap: 7px; margin-top: auto; }
+.ei-report-card.public { border-top: 2px solid var(--positive); }
+.ei-report-card.unavailable { opacity: .65; border-style: dashed; }
+
+/* Public product surface: restrained presentation with evidence ahead of decoration. */
+.marketing { background: #f5f4f1; color: #171719; }
+.marketing .shell { width: min(1220px, calc(100vw - 48px)); }
+.marketing .topbar { min-height: 78px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 30px; border-bottom: 1px solid #d9d7d1; }
+.marketing .brand-mark { width: 32px; height: 32px; }
+.marketing .brand-mark svg { width: 32px; height: 32px; }
+.marketing .brand-text { letter-spacing: -.02em; }
+.marketing .navlinks { justify-content: center; gap: 5px; }
+.marketing .navlinks a { padding: 9px 11px; border-radius: 6px; color: #5e5c58; font-size: 12px; font-weight: 650; }
+.marketing .navlinks a:hover, .marketing .navlinks a:focus-visible { background: #eae8e2; color: #171719; outline: none; }
+.public-nav-actions { display: flex; align-items: center; gap: 7px; }
+.marketing .cta { border-radius: 6px; font-size: 12px; }
+.marketing .cta.primary { background: #111214; color: #fff; }
+.marketing .cta.primary:hover { background: #2a2b2f; }
+.marketing .cta.secondary { background: #ebe8ff; color: #4e46a5; }
+.marketing .cta.ghost { border-color: #cfcdc7; color: #343438; }
+.public-hero { min-height: 560px; display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(360px, .8fr); gap: 70px; align-items: center; padding: 80px 0 68px; }
+.public-hero-copy { display: grid; gap: 20px; }
+.public-hero .eyebrow, .public-section .eyebrow, .public-page-heading .eyebrow, .public-split-section .eyebrow, .public-cta .eyebrow { width: fit-content; color: #5e55c9; font-size: 12px; letter-spacing: .12em; }
+.public-hero h1 { max-width: 760px; margin: 0; font-size: clamp(42px, 5.3vw, 72px); line-height: .99; letter-spacing: -.055em; }
+.public-hero-copy > p { max-width: 720px; margin: 0; color: #5d5b57; font-size: 17px; line-height: 1.65; }
+.public-evidence-card { padding: 22px; border: 1px solid #d5d2ca; border-radius: 10px; background: #15161a; color: #fff; box-shadow: 12px 12px 0 #dedbd3; }
+.public-evidence-card > span { color: #a9a2ff; font-size: 12px; font-weight: 750; letter-spacing: .11em; }
+.public-evidence-card ol { display: grid; gap: 0; margin: 20px 0 0; padding: 0; list-style: none; }
+.public-evidence-card li { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 12px; padding: 17px 0; border-top: 1px solid #32333a; }
+.public-evidence-card li b { color: #8379f2; font-size: 12px; }
+.public-evidence-card li div { display: grid; gap: 6px; }
+.public-evidence-card li strong { font-size: 14px; }
+.public-evidence-card li small { color: #9c9da5; font-size: 12px; line-height: 1.5; }
+.public-proof-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid #d8d5cd; border-width: 1px 0; }
+.public-proof-strip div { min-width: 0; display: grid; gap: 5px; padding: 25px 22px; border-right: 1px solid #d8d5cd; }
+.public-proof-strip div:last-child { border-right: 0; }
+.public-proof-strip strong { font-size: 30px; letter-spacing: -.04em; }
+.public-proof-strip span { color: #66635e; font-size: 12px; line-height: 1.45; }
+.public-section { padding: 88px 0; }
+.public-section > header { max-width: 760px; display: grid; gap: 11px; margin-bottom: 32px; }
+.public-section h2, .public-split-section h2, .public-cta h2 { margin: 0; font-size: clamp(28px, 3vw, 42px); line-height: 1.08; letter-spacing: -.04em; }
+.public-section header p, .public-split-section p, .public-cta p { margin: 0; color: #65625d; font-size: 14px; line-height: 1.65; }
+.public-product-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid #d8d5cd; background: #fff; }
+.public-product-grid article { min-height: 250px; display: grid; align-content: start; gap: 14px; padding: 25px; border-right: 1px solid #d8d5cd; }
+.public-product-grid article:last-child { border-right: 0; }
+.public-product-grid article > span, .public-product-detail-grid article > span { color: #5e55c9; font-size: 12px; font-weight: 750; }
+.public-product-grid h3 { margin: 30px 0 0; font-size: 18px; }
+.public-product-grid p { margin: 0; color: #65625d; font-size: 13px; line-height: 1.65; }
+.public-split-section { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid #d8d5cd; }
+.public-split-section > div { min-height: 330px; display: grid; align-content: start; gap: 17px; padding: 38px; }
+.public-split-section > div:first-child { border-right: 1px solid #d8d5cd; background: #fff; }
+.public-split-section > div:last-child { background: #ebe8ff; }
+.public-split-section a, .public-report-card a, .public-case-card > a, .public-api-grid a { width: fit-content; margin-top: auto; color: #5147b7; font-size: 13px; font-weight: 750; }
+.public-audience { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); margin: 80px 0 40px; border: 1px solid #d8d5cd; }
+.public-audience > * { min-height: 72px; display: grid; place-items: center; padding: 14px; border-right: 1px solid #d8d5cd; font-size: 12px; text-align: center; }
+.public-audience > *:last-child { border-right: 0; }
+.public-audience > span { color: #5e55c9; font-weight: 750; letter-spacing: .1em; }
+.public-page-heading { max-width: 900px; display: grid; gap: 15px; padding: 78px 0 44px; }
+.public-page-heading h1, .public-report-detail > header h1, .public-case-detail > header h1 { margin: 0; font-size: clamp(38px, 5vw, 64px); line-height: 1.02; letter-spacing: -.05em; }
+.public-page-heading > p, .public-report-detail > header > p, .public-case-detail > header > p { max-width: 760px; margin: 0; color: #625f5a; font-size: 16px; line-height: 1.65; }
+.public-category-list { display: flex; gap: 7px; flex-wrap: wrap; padding-bottom: 30px; }
+.public-category-list span, .public-meta span, .public-meta time { padding: 7px 10px; border: 1px solid #d5d2ca; border-radius: 999px; color: #615e59; font-size: 12px; }
+.public-report-grid { display: grid; gap: 18px; padding-bottom: 70px; }
+.public-report-card { display: grid; grid-template-columns: minmax(240px, .36fr) minmax(0, 1fr); border: 1px solid #d7d4cc; background: #fff; }
+.public-cover-placeholder { min-height: 230px; display: flex; flex-direction: column; justify-content: space-between; padding: 22px; background: #17181c; color: #fff; }
+.public-cover-placeholder span { color: #aaa3ff; font-size: 12px; font-weight: 750; letter-spacing: .12em; }
+.public-cover-placeholder b { font-size: 24px; letter-spacing: -.03em; }
+.public-cover-placeholder.large { min-height: 320px; }
+.public-report-card-copy { min-width: 0; display: grid; align-content: start; gap: 14px; padding: 28px; }
+.public-meta { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.public-report-card h2, .public-case-card h2 { margin: 8px 0 0; font-size: clamp(21px, 2.5vw, 30px); letter-spacing: -.035em; }
+.public-report-card p, .public-case-card > p { margin: 0; color: #625f5a; font-size: 13px; line-height: 1.65; }
+.public-report-card footer { align-self: end; display: flex; justify-content: space-between; gap: 18px; margin-top: 18px; color: #77736c; font-size: 12px; }
+.public-report-detail, .public-case-detail { padding: 55px 0 80px; }
+.public-report-detail > header, .public-case-detail > header { max-width: 930px; display: grid; gap: 18px; padding-bottom: 45px; }
+.public-back-link { width: fit-content; color: #5b52bd; font-size: 13px; font-weight: 700; }
+.public-report-layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(280px, .55fr); gap: 50px; align-items: start; border-top: 1px solid #d5d2ca; padding-top: 44px; }
+.public-markdown { min-width: 0; font-size: 14px; line-height: 1.75; }
+.public-markdown h1 { display: none; }
+.public-markdown h2 { margin: 45px 0 14px; font-size: 27px; letter-spacing: -.03em; }
+.public-markdown h3 { margin: 30px 0 10px; font-size: 18px; }
+.public-markdown p, .public-markdown li { color: #4f4c48; }
+.public-markdown code, .public-related-events code, .public-case-detail code, .public-case-card code { overflow-wrap: anywhere; font-size: 12px; }
+.public-markdown table { width: 100%; border-collapse: collapse; overflow: hidden; }
+.public-markdown th, .public-markdown td { padding: 10px; border: 1px solid #d8d5cd; text-align: left; vertical-align: top; }
+.public-report-layout > aside { position: sticky; top: 20px; display: grid; gap: 14px; }
+.public-report-layout > aside h2 { margin: 14px 0 0; font-size: 17px; }
+.public-report-layout > aside > p { margin: 0; color: #77736c; font-size: 12px; line-height: 1.55; }
+.public-related-events { display: grid; gap: 7px; }
+.public-related-events a { display: grid; gap: 4px; padding: 11px; border: 1px solid #d7d4cc; background: #fff; }
+.public-related-events span { color: #5e55c9; font-size: 12px; }
+.public-case-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; padding-bottom: 75px; }
+.public-case-card { min-width: 0; display: grid; align-content: start; gap: 15px; padding: 24px; border: 1px solid #d7d4cc; background: #fff; }
+.public-case-card dl { display: grid; gap: 8px; margin: 10px 0 0; }
+.public-case-card dl div { padding: 10px; border: 1px solid #e0ddd6; }
+.public-case-card dt { color: #77736c; font-size: 12px; }
+.public-case-card dd { margin: 5px 0 0; font-size: 13px; line-height: 1.45; }
+.public-case-card > a { margin-top: 12px; }
+.public-case-verdict { width: fit-content; display: grid; gap: 3px; padding: 10px 13px; border-left: 3px solid #5e55c9; background: #ebe8ff; }
+.public-case-verdict span { color: #605c56; font-size: 12px; }
+.public-case-verdict strong { font-size: 14px; }
+.public-case-facts { display: grid; grid-template-columns: 1.25fr .75fr; border: 1px solid #d7d4cc; background: #fff; }
+.public-case-facts section { min-width: 0; display: grid; align-content: start; gap: 10px; padding: 23px; border-right: 1px solid #d7d4cc; }
+.public-case-facts section:last-child { border-right: 0; }
+.public-case-facts section > span { color: #5e55c9; font-size: 12px; font-weight: 750; letter-spacing: .1em; }
+.public-case-facts a { width: fit-content; color: #5147b7; font-size: 12px; }
+.public-case-facts p { margin: 0; font-size: 14px; line-height: 1.6; }
+.public-case-sections { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid #d7d4cc; border-top: 0; }
+.public-case-sections section { padding: 23px; border-right: 1px solid #d7d4cc; }
+.public-case-sections section:last-child { border-right: 0; }
+.public-case-sections section.limitations { background: #f1efe9; }
+.public-case-sections h2 { margin: 0 0 13px; font-size: 18px; }
+.public-case-sections ul { display: grid; gap: 9px; margin: 0; padding-left: 17px; color: #56534f; font-size: 13px; line-height: 1.55; }
+.public-tier-grid, .public-product-detail-grid, .public-api-grid, .public-about-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid #d7d4cc; background: #fff; }
+.public-tier-grid article, .public-product-detail-grid article, .public-api-grid article, .public-about-grid article { min-width: 0; display: grid; align-content: start; gap: 13px; padding: 24px; border-right: 1px solid #d7d4cc; }
+.public-tier-grid article:last-child, .public-product-detail-grid article:last-child, .public-api-grid article:last-child, .public-about-grid article:last-child { border-right: 0; }
+.public-tier-grid article.featured { background: #ebe8ff; }
+.public-tier-grid article > span, .public-api-grid article > span { color: #5e55c9; font-size: 12px; font-weight: 750; letter-spacing: .1em; }
+.public-tier-grid h2, .public-product-detail-grid h2, .public-api-grid h2, .public-about-grid h2 { margin: 12px 0 0; font-size: 20px; }
+.public-tier-grid p, .public-product-detail-grid p, .public-api-grid p, .public-about-grid p { margin: 0; color: #65625d; font-size: 13px; line-height: 1.6; }
+.public-tier-grid ul, .public-product-detail-grid ul { min-height: 150px; margin: 10px 0; padding-left: 17px; color: #55524e; font-size: 13px; line-height: 1.8; }
+.public-tier-grid a { width: fit-content; margin-top: auto; color: #5147b7; font-size: 13px; font-weight: 750; }
+.public-boundary-note { margin: 20px 0 70px; padding: 15px 17px; border: 1px solid #d7d4cc; background: #efede7; color: #625f5a; font-size: 12px; line-height: 1.55; }
+.public-product-detail-grid article { min-height: 390px; }
+.public-cta { display: flex; align-items: center; justify-content: space-between; gap: 35px; margin: 35px 0 75px; padding: 34px; background: #17181c; color: #fff; }
+.public-cta > div { max-width: 760px; display: grid; gap: 12px; }
+.public-cta p { color: #a4a5ad; }
+.public-api-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.public-api-grid article { min-height: 260px; }
+.public-about-grid article { min-height: 270px; }
+.public-principles { display: grid; grid-template-columns: 1.5fr repeat(4, 1fr); margin: 30px 0 75px; border: 1px solid #d7d4cc; }
+.public-principles > * { min-height: 110px; display: grid; align-content: center; gap: 8px; margin: 0; padding: 20px; border-right: 1px solid #d7d4cc; }
+.public-principles > *:last-child { border-right: 0; }
+.public-principles span { color: #5e55c9; font-size: 12px; font-weight: 750; }
+.public-principles p { margin: 0; font-size: 13px; }
+.public-success { display: flex; gap: 12px; padding: 15px 18px; border: 1px solid #a8cbb3; background: #edf8ef; color: #215a31; }
+.public-success span { color: #3f6749; }
+.public-pilot-layout { display: grid; grid-template-columns: minmax(0, .9fr) minmax(360px, .7fr); gap: 55px; align-items: start; padding-bottom: 75px; }
+.public-pilot-layout > div > h2 { margin: 0 0 20px; font-size: 24px; }
+.public-pilot-layout ol { display: grid; margin: 0; padding: 0; border: 1px solid #d7d4cc; list-style: none; }
+.public-pilot-layout ol li { display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 12px; padding: 18px; border-bottom: 1px solid #d7d4cc; }
+.public-pilot-layout ol li:last-child { border-bottom: 0; }
+.public-pilot-layout ol b { color: #5e55c9; font-size: 12px; }
+.public-pilot-layout ol span { display: grid; gap: 6px; color: #625f5a; font-size: 13px; }
+.public-pilot-layout ol strong { color: #171719; font-size: 14px; }
+.public-pilot-form { display: grid; gap: 15px; padding: 25px; border: 1px solid #d7d4cc; background: #fff; }
+.public-pilot-form label { gap: 7px; color: #4f4c48; font-size: 12px; font-weight: 700; }
+.public-pilot-form input, .public-pilot-form textarea, .public-pilot-form select { border-color: #cbc8c1; background: #faf9f7; }
+.public-pilot-form small { color: #77736c; font-size: 12px; line-height: 1.5; }
+.public-publication-note { display: flex; justify-content: space-between; gap: 20px; margin: 0 0 22px; padding: 15px 18px; border-left: 3px solid #5e55c9; background: #ebe8ff; color: #4f4c65; font-size: 13px; }
+.public-evidence-filters { display: grid; grid-template-columns: repeat(6, minmax(120px, 1fr)) auto auto; gap: 10px; align-items: end; padding: 18px; border: 1px solid #d7d4cc; background: #fff; }
+.public-evidence-filters label { display: grid; gap: 7px; color: #625f5a; font-size: 12px; font-weight: 700; }
+.public-evidence-filters input, .public-evidence-filters select { min-width: 0; border-color: #cbc8c1; background: #faf9f7; }
+.public-evidence-filters > a { align-self: center; padding: 8px; color: #5147b7; font-size: 12px; font-weight: 750; }
+.public-evidence-list-head { display: flex; justify-content: space-between; gap: 18px; padding: 24px 0 12px; color: #67635e; font-size: 12px; }
+.public-evidence-list { display: grid; gap: 10px; padding-bottom: 75px; }
+.public-evidence-row { min-width: 0; display: grid; grid-template-columns: 165px 110px minmax(170px, .9fr) minmax(220px, 1.25fr) 155px auto; gap: 14px; align-items: center; padding: 17px; border: 1px solid #d7d4cc; background: #fff; }
+.public-evidence-row > div { min-width: 0; display: grid; gap: 5px; }
+.public-evidence-row small { color: #77736c; font-size: 12px; }
+.public-evidence-row strong { font-size: 13px; line-height: 1.4; }
+.public-evidence-row time, .public-evidence-row span { color: #67635e; font-size: 12px; line-height: 1.4; }
+.public-evidence-row code { overflow: hidden; color: #77736c; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.public-evidence-row p { display: -webkit-box; overflow: hidden; margin: 0; color: #4f4c48; font-size: 12px; line-height: 1.5; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+.public-evidence-row > a { color: #5147b7; font-size: 12px; font-weight: 750; white-space: nowrap; }
+.public-evidence-status { width: fit-content; display: inline-flex; padding: 5px 8px; border-radius: 999px; font-size: 12px; font-weight: 800; line-height: 1; }
+.public-evidence-status.verified { border: 1px solid #a8cbb3; background: #edf8ef; color: #215a31; }
+.public-evidence-status.detected { border: 1px solid #dac78e; background: #fff7dc; color: #69550f; }
+.public-evidence-empty { display: grid; gap: 8px; padding: 35px; border: 1px dashed #c9c5bc; color: #625f5a; text-align: center; }
+.public-evidence-empty a { color: #5147b7; font-weight: 750; }
+.public-evidence-detail { padding: 55px 0 80px; }
+.public-evidence-detail > header { max-width: 990px; display: grid; gap: 18px; padding-bottom: 40px; }
+.public-evidence-detail > header h1 { margin: 0; font-size: clamp(38px, 5vw, 64px); line-height: 1.02; letter-spacing: -.05em; }
+.public-evidence-detail > header > p { max-width: 850px; margin: 0; color: #4f4c48; font-size: 17px; line-height: 1.65; }
+.public-evidence-detail .eyebrow, .public-api-section .eyebrow, .public-engagement .eyebrow, .public-api-access .eyebrow, .public-evidence-limitations .eyebrow { width: fit-content; color: #5e55c9; font-size: 12px; font-weight: 750; letter-spacing: .11em; }
+.public-evidence-verdict { display: flex; gap: 8px; flex-wrap: wrap; }
+.public-evidence-verdict > div { min-width: 240px; display: grid; gap: 5px; padding: 12px 14px; border-left: 3px solid #5e55c9; background: #ebe8ff; }
+.public-evidence-verdict span { color: #67635e; font-size: 12px; }
+.public-evidence-verdict strong { font-size: 14px; }
+.public-evidence-warning { display: flex; gap: 13px; align-items: center; padding: 13px 15px; border: 1px solid #dac78e; background: #fff7dc; }
+.public-evidence-warning strong { color: #69550f; font-size: 13px; white-space: nowrap; }
+.public-evidence-warning span { color: #695f3b; font-size: 12px; }
+.public-evidence-facts { display: grid; grid-template-columns: 1.1fr .9fr; border: 1px solid #d7d4cc; background: #fff; }
+.public-evidence-facts section { min-width: 0; display: grid; align-content: start; gap: 10px; padding: 24px; border-right: 1px solid #d7d4cc; }
+.public-evidence-facts section:last-child { border-right: 0; }
+.public-evidence-facts section > span { color: #5e55c9; font-size: 12px; font-weight: 750; letter-spacing: .1em; }
+.public-evidence-facts code { overflow-wrap: anywhere; font-size: 12px; }
+.public-evidence-facts p { margin: 0; font-size: 14px; line-height: 1.6; }
+.public-evidence-facts a { width: fit-content; color: #5147b7; font-size: 12px; font-weight: 700; }
+.public-evidence-detail-section { display: grid; gap: 10px; padding: 45px 0; }
+.public-evidence-detail-section h2, .public-evidence-limitations h2 { margin: 0; font-size: 28px; letter-spacing: -.03em; }
+.public-execution-timeline { display: grid; margin: 8px 0 0; padding: 0; border: 1px solid #d7d4cc; background: #fff; list-style: none; }
+.public-execution-timeline li { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 14px; padding: 18px; border-bottom: 1px solid #d7d4cc; }
+.public-execution-timeline li:last-child { border-bottom: 0; }
+.public-execution-timeline li > b { color: #5e55c9; font-size: 12px; }
+.public-execution-timeline li div { display: grid; gap: 6px; }
+.public-execution-timeline span { font-size: 14px; font-weight: 750; }
+.public-execution-timeline p { margin: 0; color: #625f5a; font-size: 13px; line-height: 1.55; }
+.public-evidence-columns { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid #d7d4cc; background: #fff; }
+.public-evidence-columns section { min-width: 0; padding: 24px; border-right: 1px solid #d7d4cc; }
+.public-evidence-columns section:last-child { border-right: 0; }
+.public-evidence-columns h2 { margin: 0 0 14px; font-size: 20px; }
+.public-evidence-columns ul, .public-evidence-limitations ul { display: grid; gap: 10px; margin: 0; padding-left: 18px; color: #56534f; font-size: 13px; line-height: 1.55; }
+.public-related-entities code { overflow-wrap: anywhere; font-size: 12px; }
+.public-evidence-limitations { display: grid; gap: 10px; margin-top: 25px; padding: 25px; border: 1px solid #d7d4cc; background: #efede7; }
+.public-solution-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid #d7d4cc; background: #fff; }
+.public-solution-grid article { min-height: 370px; display: grid; align-content: start; gap: 13px; padding: 30px; border-right: 1px solid #d7d4cc; border-bottom: 1px solid #d7d4cc; }
+.public-solution-grid article:nth-child(2n) { border-right: 0; }
+.public-solution-grid article:nth-last-child(-n+2) { border-bottom: 0; }
+.public-solution-grid article > span { color: #5e55c9; font-size: 12px; font-weight: 750; letter-spacing: .1em; }
+.public-solution-grid h2 { margin: 18px 0 0; font-size: 28px; letter-spacing: -.03em; }
+.public-solution-grid p { margin: 0; color: #625f5a; font-size: 14px; line-height: 1.6; }
+.public-solution-grid ul { margin: 10px 0 20px; padding-left: 18px; color: #4f4c48; font-size: 13px; line-height: 1.9; }
+.public-solution-grid a { width: fit-content; margin-top: auto; color: #5147b7; font-size: 13px; font-weight: 750; }
+.public-engagement { display: grid; gap: 20px; padding: 75px 0 0; }
+.public-engagement header { max-width: 780px; display: grid; gap: 10px; }
+.public-engagement h2, .public-api-section h2, .public-api-access h2 { margin: 0; font-size: 32px; letter-spacing: -.035em; }
+.public-engagement .public-tier-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.public-engagement .public-tier-grid article { min-height: 330px; }
+.public-tier-grid h3, .public-api-grid h3 { margin: 12px 0 0; font-size: 20px; }
+.public-product-boundary { display: grid; grid-template-columns: 1fr 1fr; margin: 30px 0 75px; border: 1px solid #d7d4cc; }
+.public-product-boundary div { display: grid; gap: 8px; padding: 22px; border-right: 1px solid #d7d4cc; }
+.public-product-boundary div:last-child { border-right: 0; background: #ebe8ff; }
+.public-product-boundary span { color: #5e55c9; font-size: 12px; font-weight: 750; }
+.public-product-boundary strong { font-size: 14px; line-height: 1.5; }
+.public-api-section { display: grid; gap: 22px; }
+.public-api-section > header { max-width: 780px; display: grid; gap: 10px; }
+.public-api-section > header p { margin: 0; color: #625f5a; font-size: 14px; }
+.public-api-access { display: flex; justify-content: space-between; align-items: center; gap: 30px; margin: 35px 0 0; padding: 32px; background: #17181c; color: #fff; }
+.public-api-access > div { max-width: 760px; display: grid; gap: 10px; }
+.public-api-access p { margin: 0; color: #a4a5ad; font-size: 14px; line-height: 1.6; }
+.public-pilot-audience { display: grid; grid-template-columns: auto repeat(3, 1fr); margin-bottom: 32px; border: 1px solid #d7d4cc; }
+.public-pilot-audience > * { padding: 16px; border-right: 1px solid #d7d4cc; font-size: 12px; text-align: center; }
+.public-pilot-audience > *:last-child { border-right: 0; }
+.public-pilot-audience span { color: #5e55c9; font-weight: 750; }
+
+@media (max-width: 980px) {
+  .marketing .topbar { grid-template-columns: auto 1fr; }
+  .marketing .navlinks { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; overflow-x: auto; padding-bottom: 8px; }
+  .public-nav-actions { justify-content: flex-end; }
+  .public-hero { min-height: 0; grid-template-columns: 1fr; gap: 45px; padding: 65px 0; }
+  .public-evidence-card { max-width: 620px; }
+  .public-product-grid, .public-tier-grid, .public-product-detail-grid, .public-about-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .public-product-grid article:nth-child(2), .public-tier-grid article:nth-child(2), .public-product-detail-grid article:nth-child(2), .public-about-grid article:nth-child(2) { border-right: 0; }
+  .public-product-grid article:nth-child(-n+2), .public-tier-grid article:nth-child(-n+2), .public-product-detail-grid article:nth-child(-n+2), .public-about-grid article:nth-child(-n+2) { border-bottom: 1px solid #d7d4cc; }
+  .public-case-grid { grid-template-columns: 1fr; }
+  .public-report-layout { grid-template-columns: 1fr; }
+  .public-report-layout > aside { position: static; max-width: 500px; }
+  .public-pilot-layout { grid-template-columns: 1fr 1fr; gap: 28px; }
+  .public-evidence-filters { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .public-evidence-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .public-evidence-row > a { justify-self: start; }
+  .public-engagement .public-tier-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .public-principles { grid-template-columns: repeat(2, 1fr); }
+  .public-principles > h2 { grid-column: 1 / -1; }
+  .public-principles > * { border-bottom: 1px solid #d7d4cc; }
+}
+
+@media (max-width: 700px) {
+  .marketing .shell { width: min(100% - 28px, 1220px); }
+  .marketing .topbar { gap: 12px; }
+  .public-nav-actions .cta.secondary { display: none; }
+  .public-hero h1 { font-size: clamp(38px, 12vw, 55px); }
+  .public-proof-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .public-proof-strip div:nth-child(2) { border-right: 0; }
+  .public-proof-strip div:nth-child(-n+2) { border-bottom: 1px solid #d8d5cd; }
+  .public-product-grid, .public-tier-grid, .public-product-detail-grid, .public-api-grid, .public-about-grid { grid-template-columns: 1fr; }
+  .public-product-grid article, .public-tier-grid article, .public-product-detail-grid article, .public-api-grid article, .public-about-grid article { min-height: 0; border-right: 0; border-bottom: 1px solid #d7d4cc; }
+  .public-product-grid article:last-child, .public-tier-grid article:last-child, .public-product-detail-grid article:last-child, .public-api-grid article:last-child, .public-about-grid article:last-child { border-bottom: 0; }
+  .public-split-section, .public-report-card, .public-case-facts, .public-case-sections, .public-pilot-layout, .public-evidence-facts, .public-evidence-columns, .public-solution-grid, .public-product-boundary, .public-engagement .public-tier-grid { grid-template-columns: 1fr; }
+  .public-split-section > div:first-child, .public-case-facts section, .public-case-sections section { border-right: 0; border-bottom: 1px solid #d7d4cc; }
+  .public-evidence-columns section, .public-evidence-facts section, .public-solution-grid article, .public-product-boundary div { border-right: 0; border-bottom: 1px solid #d7d4cc; }
+  .public-evidence-columns section:last-child, .public-evidence-facts section:last-child, .public-solution-grid article:last-child, .public-product-boundary div:last-child { border-bottom: 0; }
+  .public-evidence-filters, .public-evidence-row { grid-template-columns: 1fr; }
+  .public-evidence-list-head, .public-publication-note, .public-api-access { align-items: flex-start; flex-direction: column; }
+  .public-pilot-audience { grid-template-columns: 1fr; }
+  .public-pilot-audience > * { border-right: 0; border-bottom: 1px solid #d7d4cc; }
+  .public-pilot-audience > *:last-child { border-bottom: 0; }
+  .public-audience { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .public-audience > * { border-bottom: 1px solid #d7d4cc; }
+  .public-audience > *:nth-child(2n) { border-right: 0; }
+  .public-cta { align-items: flex-start; flex-direction: column; }
+  .public-principles { grid-template-columns: 1fr; }
+  .public-principles > h2 { grid-column: auto; }
+  .public-principles > * { border-right: 0; }
+}
 
 /* Existing research surfaces inherit the new shell and terminal language. */
 .dashboard-body > .dashboard-shell:not(.ca-shell) { grid-template-columns: 226px minmax(0,1fr); }
@@ -10332,12 +24012,20 @@ tr:hover td { background: rgba(255,255,255,.018); }
 
 @media (max-width: 1180px) {
   .ca-shell { grid-template-columns: 204px minmax(0,1fr); }
-  .ca-topbar { grid-template-columns: auto minmax(240px,1fr) auto auto; }
+  .ca-topbar { grid-template-columns: minmax(420px,auto) minmax(220px,1fr); }
   .ca-chain-rail { display: none; }
   .ca-content-grid { grid-template-columns: minmax(0,1.45fr) minmax(285px,.8fr); }
   .ca-signal-grid { grid-template-columns: repeat(3,minmax(0,1fr)); }
   .ca-intel-hero { grid-template-columns: minmax(0,1.4fr) minmax(270px,.7fr); }
   .ca-supported { grid-template-columns: 1fr; }
+  .ei-attention-summary { grid-template-columns: 1fr; }
+  .ei-attention-summary dl div:first-child { border-left: 0; }
+  .ei-overview-grid { grid-template-columns: 1fr; }
+  .ei-metric-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .ei-filter-grid { grid-template-columns: repeat(4,minmax(110px,1fr)); }
+  .ei-conclusion-card dl { grid-template-columns: repeat(3,minmax(0,1fr)); }
+  .ei-conclusion-card dl div:nth-child(3) { border-right: 0; }
+  .ei-conclusion-card dl div:nth-child(-n+3) { border-bottom: 1px solid var(--line); }
 }
 
 @media (max-width: 820px) {
@@ -10359,8 +24047,9 @@ tr:hover td { background: rgba(255,255,255,.018); }
   .ca-nav a { min-width: 48px; min-height: 42px; grid-template-columns: 1fr; justify-items: center; }
   .ca-nav a > span:last-child { display: none; }
   .ca-nav-divider, .ca-nav-secondary, .ca-plan-card, .ca-usage, .ca-user-row, .ca-sidebar-spacer { display: none; }
-  .ca-topbar { position: static; min-height: 56px; padding: 8px 14px; grid-template-columns: auto minmax(0,1fr) auto; }
-  .ca-live, .ca-icon-button { display: none; }
+  .ca-topbar { position: static; min-height: 56px; padding: 8px 14px; grid-template-columns: 1fr; }
+  .ei-context-bar { grid-template-columns: repeat(3,minmax(0,1fr)) auto; }
+  .ca-live, .ca-icon-button, .ca-registry-count { display: none; }
   .ca-global-search { width: 100%; }
   .ca-main { padding: 16px 14px 30px; }
   .ca-page-heading { align-items: flex-start; }
@@ -10370,6 +24059,22 @@ tr:hover td { background: rgba(255,255,255,.018); }
   .ca-content-grid { grid-template-columns: 1fr; }
   .ca-signal-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .ca-supported-cards { grid-template-columns: 1fr; }
+  .ei-attention-summary dl { grid-template-columns: repeat(3,minmax(0,1fr)); row-gap: 12px; }
+  .ei-attention-summary dl div:nth-child(4) { border-left: 0; }
+  .ei-attention-card dl { grid-template-columns: 1fr; }
+  .ei-attention-card footer { align-items: flex-start; flex-direction: column; }
+  .ei-attention-card footer > div { justify-content: flex-start; }
+  .ei-event-list { min-width: 1100px; }
+  .ei-filter-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .ei-impact-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .ei-impact-grid > div:nth-child(2n) { border-right: 0; }
+  .ei-impact-grid > div:nth-last-child(-n+4) { border-bottom: 1px solid var(--line); }
+  .ei-impact-grid > div:nth-last-child(-n+2) { border-bottom: 0; }
+  .ei-detail-actions { grid-template-columns: 1fr; }
+  .ei-entity-search form { grid-template-columns: 1fr 1fr; }
+  .ei-entity-search button { grid-column: 1/-1; }
+  .ei-wizard-fields { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .ei-investigation-detail-grid { grid-template-columns: 1fr; }
   .dashboard-body > .dashboard-shell:not(.ca-shell) .sidebar { position: static; min-height: 0; }
 }
 
@@ -10377,7 +24082,8 @@ tr:hover td { background: rgba(255,255,255,.018); }
   .ca-sidebar { grid-template-columns: 1fr; gap: 5px; }
   .ca-brand { display: none; }
   .ca-nav a { min-width: 44px; }
-  .ca-topbar { grid-template-columns: auto minmax(0,1fr); }
+  .ca-topbar { grid-template-columns: 1fr; }
+  .ei-context-bar { grid-template-columns: 1fr 1fr; }
   .ca-chain-menu summary { min-width: 42px; width: 42px; padding: 9px; }
   .ca-chain-menu summary > span:not(.chain-dot) { display: none; }
   .ca-chain-menu summary { font-size: 0; }
@@ -10401,9 +24107,83 @@ tr:hover td { background: rgba(255,255,255,.018); }
   .ca-overview-grid > div:last-child { grid-column: 1/-1; }
   .ca-chart-footer { padding-left: 15px; flex-wrap: wrap; }
   .ca-chart-footer small { width: 100%; margin-left: 0; }
+  .ca-hourly-bars { gap: 2px; }
+  .ca-hour-bar b { display: none; }
   .ca-supported { padding: 15px; }
+  .ei-attention-summary dl { grid-template-columns: 1fr 1fr; }
+  .ei-attention-summary dl div { border-left: 0; border-top: 1px solid var(--line); padding: 8px 4px; }
+  .ei-metric-grid { grid-template-columns: 1fr 1fr; }
+  .ei-conclusion-card dl { grid-template-columns: 1fr 1fr; }
+  .ei-conclusion-card dl div { border-bottom: 1px solid var(--line); }
+  .ei-conclusion-card dl div:nth-child(even) { border-right: 0; }
+  .ei-evidence-flags, .ei-evidence-identifiers { grid-template-columns: 1fr 1fr; }
+  .ei-profile-grid { grid-template-columns: 1fr 1fr; }
+  .ei-profile-grid > div:nth-child(3n) { border-right: 1px solid var(--line); }
+  .ei-profile-grid > div:nth-child(even) { border-right: 0; }
+  .ei-entity-search form { grid-template-columns: 1fr; }
+  .ei-entity-search button { grid-column: auto; }
+  .ei-entity-title { display: grid; }
+  .ei-entity-actions { justify-content: flex-start; }
+  .ei-entity-facts { grid-template-columns: 1fr 1fr; }
+  .ei-entity-facts div { border-bottom: 1px solid var(--line); }
+  .ei-entity-facts div:nth-child(even) { border-right: 0; }
+  .ei-two-column, .ei-relationship-graph { grid-template-columns: 1fr; }
+  .ei-two-column > div { border-right: 0; border-bottom: 1px solid var(--line); }
+  .ei-relationship-nodes { grid-template-columns: 1fr 1fr; }
+  .ei-relationship-nodes a::before { display: none; }
+  .ei-economic-grid { grid-template-columns: 1fr 1fr; }
+  .ei-relationship-categories { grid-template-columns: 1fr 1fr; }
+  .ei-economic-grid > div { border-bottom: 1px solid var(--line); }
+  .ei-economic-grid > div:nth-child(even) { border-right: 0; }
+  .ei-timeline-item { grid-template-columns: 1fr; }
+  .ei-wizard-progress span { padding: 9px 6px; font-size: 0; }
+  .ei-wizard-progress b { font-size: .55rem; }
+  .ei-wizard-fields { grid-template-columns: 1fr; }
+  .ei-monitor-card dl { grid-template-columns: 1fr 1fr; }
+  .ei-investigation-form-grid { grid-template-columns: 1fr; }
+  .ei-investigation-form-grid .wide { grid-column: auto; }
 }
-"#
+"#,
+        )
+    });
+    STYLES.as_str()
+}
+
+fn enforce_minimum_ui_font_size(css: &str) -> String {
+    const MINIMUM_PX: f32 = 12.0;
+    const ROOT_PX: f32 = 16.0;
+
+    let mut output = String::with_capacity(css.len() + 512);
+    let mut remainder = css;
+    while let Some(declaration_start) = remainder.find("font-size:") {
+        let value_start = declaration_start + "font-size:".len();
+        output.push_str(&remainder[..value_start]);
+        let Some(value_end) = remainder[value_start..].find(';') else {
+            output.push_str(&remainder[value_start..]);
+            return output;
+        };
+        let raw_value = remainder[value_start..value_start + value_end].trim();
+        let px_value = raw_value
+            .strip_suffix("px")
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .or_else(|| {
+                raw_value
+                    .strip_suffix("rem")
+                    .and_then(|value| value.trim().parse::<f32>().ok())
+                    .map(|value| value * ROOT_PX)
+            });
+        if px_value.is_some_and(|value| value > 0.0 && value < MINIMUM_PX) {
+            output.push_str(" max(12px, ");
+            output.push_str(raw_value);
+            output.push(')');
+        } else {
+            output.push(' ');
+            output.push_str(raw_value);
+        }
+        remainder = &remainder[value_start + value_end..];
+    }
+    output.push_str(remainder);
+    output
 }
 
 #[cfg(test)]
@@ -10431,6 +24211,921 @@ mod web_tests {
         )
         .expect("matching chain should decode");
         assert_eq!(value["status"], "ok");
+    }
+
+    #[test]
+    fn searcher_cluster_workspace_is_evidence_first_and_not_seed_hardcoded() {
+        let source = include_str!("mod.rs");
+        for required in [
+            "/cluster?chain_id=",
+            "Candidate Searcher System",
+            "Is it making money?",
+            "What did it do?",
+            "Who is related?",
+            "How does money move?",
+            "Activity Timeline",
+            "Observed settlement inflow",
+        ] {
+            assert!(source.contains(required), "missing cluster UI {required}");
+        }
+        assert!(source.contains("ownership, same-team control"));
+    }
+
+    #[test]
+    fn cluster_asset_formatter_uses_token_decimals_without_cross_asset_sum() {
+        let assets = HashMap::from([(
+            "0x0000000000000000000000000000000000000001".to_owned(),
+            ("USDC".to_owned(), 6),
+        )]);
+        let formatted = format_cluster_amounts(
+            &json!([{
+                "asset":"0x0000000000000000000000000000000000000001",
+                "amount_raw":"190607"
+            }]),
+            &assets,
+        );
+        assert_eq!(formatted, "0.190607 USDC");
+    }
+
+    #[test]
+    fn auth_tabs_render_only_the_selected_flow() {
+        let login = render_auth_content(None, None, "login", "password", None);
+        assert_eq!(login.matches("<form").count(), 1);
+        assert!(login.contains("/auth/password-login"));
+        assert!(!login.contains("name=\"purpose\" value=\"signup\""));
+        assert!(!login.contains("Current mode"));
+        assert!(!login.contains("Verification emails are being delivered"));
+
+        let signup = render_auth_content(None, None, "signup", "password", None);
+        assert_eq!(signup.matches("<form").count(), 1);
+        assert!(signup.contains("name=\"purpose\" value=\"signup\""));
+        assert!(signup.contains("name=\"password_confirm\""));
+        assert!(!signup.contains("/auth/password-login"));
+        assert!(!signup.contains("Current mode"));
+    }
+
+    #[test]
+    fn email_code_is_an_alternative_login_tab() {
+        let login = render_auth_content(None, None, "login", "code", None);
+        assert_eq!(login.matches("<form").count(), 1);
+        assert!(login.contains("name=\"purpose\" value=\"login\""));
+        assert!(login.contains("Sign in with an email code"));
+        assert!(!login.contains("name=\"password\""));
+        assert!(login.contains("data-auth-code-form"));
+        assert!(login.contains("fetch(form.action"));
+    }
+
+    #[test]
+    fn verification_reuses_the_centered_auth_shell() {
+        let verify = render_verify_content(
+            "alice@example.com",
+            "signup",
+            Some("Verification code sent."),
+            None,
+        );
+        assert!(verify.contains("<section class=\"auth-shell\">"));
+        assert!(verify.contains("<div class=\"auth-panel\">"));
+        assert!(verify.contains("class=\"auth-tab active\""));
+        assert!(!verify.contains("verify-shell"));
+        assert_eq!(
+            verification_auth_path("alice@example.com", "signup", Some("code-sent")),
+            "/auth?mode=signup&stage=verify&email=alice%40example.com&purpose=signup&notice=code-sent"
+        );
+    }
+
+    #[test]
+    fn website_brand_and_mark_are_ledgerflow() {
+        let legacy_name = concat!("Chain", "Actors");
+        let legacy_beta = concat!("brand-", "beta");
+        let source = include_str!("mod.rs");
+        assert!(!source.contains(legacy_name));
+        assert!(!source.contains(legacy_beta));
+        let wordmark = brand_wordmark_html();
+        assert!(wordmark.contains(">LedgerFlow</span>"));
+        assert!(!wordmark.contains(legacy_beta));
+        let mark = brand_mark_svg_source();
+        assert!(mark.contains("rx=\"12\" fill=\"#111\""));
+        assert!(mark.contains("fill=\"#f60\""));
+        assert!(!mark.contains("#5B4CFF"));
+    }
+
+    #[test]
+    fn web_performance_migration_runs_without_a_transaction() {
+        let migrator = sqlx::migrate!("./migrations");
+        for version in 30..=32 {
+            let migration = migrator
+                .iter()
+                .find(|migration| {
+                    migration.version == version && !migration.migration_type.is_down_migration()
+                })
+                .unwrap_or_else(|| panic!("migration {version} should be embedded"));
+            assert!(
+                migration.no_tx,
+                "migration {version} must not open a transaction"
+            );
+            assert_eq!(
+                migration.sql.matches("CREATE INDEX CONCURRENTLY").count(),
+                1,
+                "each concurrent index must be its own PostgreSQL statement"
+            );
+        }
+    }
+
+    #[test]
+    fn today_formatters_keep_observed_values_exact() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(1_247), "1,247");
+        assert_eq!(format_count(-12_345), "-12,345");
+        assert_eq!(
+            today_route_summary("0x123456789>0xabcdef012", 4),
+            "0x123...56789 → 0xabc...ef012"
+        );
+        assert_eq!(
+            format_window_comparison(0, 0),
+            "Previous 24h window was also 0"
+        );
+        assert_eq!(format_window_comparison(10, 0), "Previous 24h window was 0");
+        assert_eq!(format_window_comparison(15, 10), "+50.0% vs previous 24h");
+    }
+
+    #[test]
+    fn today_page_source_has_no_illustrative_intelligence() {
+        let source = include_str!("mod.rs");
+        let today_renderer = source
+            .split_once("fn render_today_page(")
+            .and_then(|(_, remainder)| remainder.split_once("fn render_dashboard_page("))
+            .map(|(renderer, _)| renderer)
+            .expect("Today renderer source boundaries should exist");
+        for forbidden in [
+            "ILLUSTRATIVE DATA",
+            "42.8 ETH",
+            "3.2M",
+            "$1.48B",
+            "0x7c2...a1b2",
+            "Data updated 48 seconds ago",
+            "<b>Healthy</b>",
+        ] {
+            assert!(
+                !today_renderer.contains(forbidden),
+                "illustrative Today value returned: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_links_open_transaction_analysis_with_chain_scope() {
+        assert_eq!(
+            tx_analysis_href(
+                4_663,
+                " 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+            ),
+            "/app/tx-analysis?chain_id=4663&tx_hash=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn global_search_distinguishes_addresses_and_transaction_hashes() {
+        assert!(is_evm_hex_value(
+            "0x1111111111111111111111111111111111111111",
+            40
+        ));
+        assert!(is_evm_hex_value(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            64
+        ));
+        assert!(!is_evm_hex_value(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            40
+        ));
+        assert!(!is_evm_hex_value("0xnot-a-transaction", 64));
+    }
+
+    #[test]
+    fn observation_sidebar_hides_internal_workflow_destinations() {
+        let user = AppUser {
+            user_id: Uuid::nil(),
+            email: "pilot@example.com".to_owned(),
+            workspace_plan: "pilot".to_owned(),
+            email_verified_at: Some(Utc::now()),
+            created_at: Utc::now(),
+        };
+        let sidebar = render_app_sidebar(&user, "overview", None);
+        assert_eq!(sidebar.matches("ca-nav-icon").count(), 4);
+        for href in [
+            "/app/overview",
+            "/app/observations",
+            "/app/reports",
+            "/app/settings",
+        ] {
+            assert!(sidebar.contains(href), "missing task route {href}");
+        }
+        for hidden in [
+            "/app/events",
+            "/app/monitors",
+            "/app/investigations",
+            "/app/entities",
+            "/app/schemas",
+            "/app/bots",
+            "/app/watchlist",
+            "/app/alerts",
+            "/app/cluster-graph",
+            "/research",
+            "/app/api",
+        ] {
+            assert!(
+                !sidebar.contains(hidden),
+                "internal workflow route remained in sidebar: {hidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_address_parser_is_bounded_and_deduplicated() {
+        let address = "0x1111111111111111111111111111111111111111";
+        let parsed = parse_monitor_addresses(&format!("{address}\n{address}"))
+            .expect("valid addresses should parse");
+        assert_eq!(parsed, vec![address]);
+        assert!(parse_monitor_addresses("0xnot-an-address").is_err());
+        assert!(parse_monitor_addresses("").is_err());
+        let too_many = (0..31)
+            .map(|index| format!("0x{index:040x}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse_monitor_addresses(&too_many).is_err());
+    }
+
+    #[test]
+    fn execution_ui_migration_contains_monitor_and_investigation_models() {
+        let migrator = sqlx::migrate!("./migrations");
+        let migration = migrator
+            .iter()
+            .find(|migration| {
+                migration.version == 33 && !migration.migration_type.is_down_migration()
+            })
+            .expect("execution intelligence migration should be embedded");
+        for table in [
+            "user_monitors",
+            "user_monitor_entities",
+            "user_monitor_rules",
+            "user_monitor_destinations",
+            "user_monitor_delivery_history",
+            "execution_investigations",
+        ] {
+            assert!(migration.sql.contains(table), "missing table {table}");
+        }
+    }
+
+    #[test]
+    fn public_product_migration_contains_plan_and_bounded_pilot_intake() {
+        let migrator = sqlx::migrate!("./migrations");
+        let migration = migrator
+            .iter()
+            .find(|migration| {
+                migration.version == 40 && !migration.migration_type.is_down_migration()
+            })
+            .expect("public product migration should be embedded");
+        for required in [
+            "workspace_plan",
+            "'free'",
+            "'pilot'",
+            "'enterprise'",
+            "pilot_interest_submissions",
+            "cardinality(addresses) between 1 and 30",
+        ] {
+            assert!(
+                migration.sql.contains(required),
+                "missing public product migration contract: {required}"
+            );
+        }
+        let contact_migration = migrator
+            .iter()
+            .find(|migration| {
+                migration.version == 41 && !migration.migration_type.is_down_migration()
+            })
+            .expect("public Pilot contact migration should be embedded");
+        for required in [
+            "organization",
+            "contact",
+            "between 1 and 160",
+            "between 1 and 500",
+        ] {
+            assert!(
+                contact_migration.sql.contains(required),
+                "missing public Pilot contact contract: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_productization_migration_enforces_private_scope() {
+        let migrator = sqlx::migrate!("./migrations");
+        let migration = migrator
+            .iter()
+            .find(|migration| {
+                migration.version == 42 && !migration.migration_type.is_down_migration()
+            })
+            .expect("workspace productization migration should be embedded");
+        for required in [
+            "intelligence_workspaces",
+            "workspace_entities",
+            "workspace_monitoring_goals",
+            "workspace_notification_destinations",
+            "workspace_id uuid references intelligence_workspaces",
+            "source', 'legacy_cluster",
+        ] {
+            assert!(
+                migration.sql.contains(required),
+                "missing workspace migration contract: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_network_migration_enables_base_and_robinhood() {
+        let migrator = sqlx::migrate!("./migrations");
+        let migration = migrator
+            .iter()
+            .find(|migration| {
+                migration.version == 43 && !migration.migration_type.is_down_migration()
+            })
+            .expect("supported workspace network migration should be embedded");
+        for required in [
+            "8453",
+            "'base'",
+            "'Base'",
+            "4663",
+            "'robinhood'",
+            "'Robinhood Chain'",
+            "enabled = true",
+        ] {
+            assert!(
+                migration.sql.contains(required),
+                "missing supported workspace network contract: {required}"
+            );
+        }
+        let source = include_str!("mod.rs");
+        assert!(source.contains("value=\"My Observation Workspace\""));
+        assert!(source.contains(".onboard-choice-grid + .onboard-fields"));
+        assert!(source.contains("chain_registry.routes()"));
+    }
+
+    #[test]
+    fn demo_workspace_uses_checked_in_public_evidence_only() {
+        let events = load_demo_execution_events().expect("demo evidence should load");
+        assert_eq!(events.len(), 27);
+        assert!(events.iter().all(|event| event.chain_id == 8453));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.status == ExecutionEventStatus::Verified)
+        );
+        assert!(events.iter().all(|event| !event.participants.is_empty()));
+        let source = include_str!("mod.rs");
+        assert!(source.contains("public_data_only"));
+        assert!(source.contains("demo-base-public.yaml"));
+        assert!(
+            include_str!("../../config/pilots/demo-base-public.yaml")
+                .contains("Base Searcher Intelligence Demo")
+        );
+    }
+
+    #[test]
+    fn entity_intelligence_adapter_preserves_evidence_boundaries() {
+        let address = "0x1111111111111111111111111111111111111111";
+        let counterparty = "0x2222222222222222222222222222222222222222";
+        let summary = AddressSummaryEnvelope {
+            chain_id: 8453,
+            address: address.to_owned(),
+            analyzed_tx_count: 4,
+            gas_spent_raw: "1000000000000000".to_owned(),
+            behavior_rows: vec![AddressBehaviorSummaryRow {
+                behavior: "dex_arbitrage".to_owned(),
+                tx_count: 4,
+                gas_spent_raw: "1000000000000000".to_owned(),
+            }],
+            ..Default::default()
+        };
+        let workspace_entity = WorkspaceEntityRow {
+            workspace_entity_id: Uuid::nil(),
+            address: address.to_owned(),
+            entity_kind: "address".to_owned(),
+            role: Some("Searcher".to_owned()),
+            label: Some("Configured searcher".to_owned()),
+            created_at: Utc::now(),
+            monitoring_enabled: false,
+            observation_status: "queued".to_owned(),
+            observation_progress: json!({"percent":0}),
+            observation_error: None,
+        };
+        let event = ExecutionEvent {
+            id: "event-1".to_owned(),
+            source: "test",
+            chain_id: 8453,
+            block_number: Some(1),
+            tx_hash: format!("0x{}", "a".repeat(64)),
+            event_type: ExecutionEventType::DexArbitrage,
+            status: ExecutionEventStatus::Verified,
+            severity: EventSeverity::High,
+            conclusion: "Receipt and balance deltas verify the execution.".to_owned(),
+            economic_impact: execution_intelligence::EconomicImpact {
+                usd_value: Some(42.5),
+                ..Default::default()
+            },
+            confidence: execution_intelligence::EventConfidence {
+                score: Some(95),
+                level: Some(execution_intelligence::ConfidenceLevel::High),
+            },
+            participants: vec![
+                EntityReference {
+                    role: "Searcher".to_owned(),
+                    address: address.to_owned(),
+                    label: None,
+                },
+                EntityReference {
+                    role: "Executor contract".to_owned(),
+                    address: counterparty.to_owned(),
+                    label: None,
+                },
+            ],
+            protocols: vec!["Uniswap V3".to_owned()],
+            timeline: Vec::new(),
+            evidence: execution_intelligence::EvidenceSummary::default(),
+            occurred_at: Some(Utc::now()),
+        };
+        let profile = adapt_entity_profile(&summary, Some(&workspace_entity), &[], &[event]);
+        assert_eq!(
+            profile.roles[0].evidence_state,
+            EntityEvidenceState::Unverified
+        );
+        assert_eq!(
+            profile.behaviors[0].evidence_state,
+            EntityEvidenceState::Observed
+        );
+        assert_eq!(profile.economics.verified_usd_impact, Some(42.5));
+        assert_eq!(profile.relationships.len(), 1);
+        assert!(
+            profile
+                .limitations
+                .iter()
+                .any(|item| item.contains("ownership"))
+        );
+    }
+
+    #[test]
+    fn observed_object_routes_and_profile_sections_are_primary() {
+        let source = include_str!("mod.rs");
+        for required in [
+            "\"/app/observations/{observation_id}\"",
+            "\"/app/observations/add\"",
+            "\"/app/observations/{observation_id}/monitoring\"",
+            "What is this object?",
+            "What does this object do?",
+            "Who is it connected to?",
+            "Does this object create or capture value?",
+            "Activity Timeline",
+            "Enable Monitoring",
+            "Investigate",
+            "Create Brief",
+            "Notification Settings",
+        ] {
+            assert!(
+                source.contains(required),
+                "missing observation intelligence contract: {required}"
+            );
+        }
+        let sidebar = source
+            .split_once("fn render_app_sidebar(")
+            .and_then(|(_, rest)| rest.split_once("fn render_ca_nav_item("))
+            .map(|(body, _)| body)
+            .expect("sidebar renderer");
+        assert!(sidebar.contains("Observed Objects"));
+        assert!(!sidebar.contains("Monitors"));
+        assert!(!sidebar.contains("Investigations"));
+        assert!(!sidebar.contains(">Events<"));
+    }
+
+    #[test]
+    fn observation_flow_generates_defaults_and_centralizes_notifications() {
+        let source = include_str!("mod.rs");
+        let monitoring = source
+            .split_once("async fn enable_observation_monitoring(")
+            .and_then(|(_, rest)| rest.split_once("async fn load_address_summary_for_entities("))
+            .map(|(body, _)| body)
+            .expect("observation monitoring handler");
+        for event_type in [
+            "large_asset_flow",
+            "dex_arbitrage",
+            "liquidation",
+            "repeated_failed_attempts",
+            "unknown_material_interaction",
+        ] {
+            assert!(
+                monitoring.contains(event_type),
+                "missing default {event_type}"
+            );
+        }
+        assert!(monitoring.contains("workspace_notification_destinations"));
+        assert!(source.contains(".clamp(1, 2)"));
+        assert!(source.contains("STEP 2 OF 2"));
+        assert!(source.contains("Generate Intelligence Profile"));
+        assert!(source.contains("NOTIFICATION CHANNELS"));
+        assert!(source.contains("/app/settings/notifications"));
+    }
+
+    #[test]
+    fn entity_workspace_migration_adds_wallet_target_and_demo_name() {
+        let migrator = sqlx::migrate!("./migrations");
+        let migration = migrator
+            .iter()
+            .find(|migration| {
+                migration.version == 45 && !migration.migration_type.is_down_migration()
+            })
+            .expect("entity intelligence migration should be embedded");
+        assert!(migration.sql.contains("'wallet'"));
+        assert!(migration.sql.contains("Base Searcher Intelligence Demo"));
+    }
+
+    #[test]
+    fn public_site_uses_real_bounded_artifacts_and_exposes_limitations() {
+        let reports = public_product::reports();
+        assert_eq!(reports.len(), 3);
+        for expected_title in [
+            "Same-Flashblock Backruns on Base",
+            "Execution Evidence Framework",
+            "Base Searcher Landscape",
+        ] {
+            assert!(reports.iter().any(|report| report.title == expected_title));
+        }
+        assert!(
+            reports
+                .iter()
+                .all(|report| !report.markdown.trim().is_empty())
+        );
+        assert!(reports.iter().all(|report| {
+            !report.markdown.chars().any(
+                |character| matches!(character, '\u{3400}'..='\u{9fff}' | '\u{f900}'..='\u{faff}'),
+            )
+        }));
+        assert!(
+            reports
+                .iter()
+                .any(|report| { report.markdown.to_ascii_lowercase().contains("limitation") })
+        );
+
+        let records = public_product::evidence_records();
+        assert!(records.len() >= 3);
+        assert!(records.iter().any(|record| record.status_key == "verified"));
+        assert!(records.iter().any(|record| record.status_key == "detected"));
+        for record in records {
+            assert_eq!(record.chain_id, 8453);
+            assert!(is_evm_hex_value(record.tx_hash, 64));
+            assert!(!record.execution_timeline.is_empty());
+            assert!(!record.evidence_summary.is_empty());
+            assert!(!record.related_entities.is_empty());
+            assert!(!record.limitations.is_empty());
+        }
+    }
+
+    #[test]
+    fn public_homepage_states_positioning_and_has_no_billing_claim() {
+        let page = render_homepage_content(None);
+        assert!(page.contains("Execution Intelligence and Evidence for Onchain Operations."));
+        assert!(page.contains("Explore Evidence"));
+        assert!(page.contains("Request a Pilot"));
+        for forbidden in ["0.5 ETH", "Subscribe", "Checkout", "Guaranteed profit"] {
+            assert!(
+                !page.contains(forbidden),
+                "billing or hype claim found: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_detail_renderer_has_required_evidence_hierarchy() {
+        let source = include_str!("mod.rs");
+        let renderer = source
+            .split_once("fn render_execution_event_page(")
+            .and_then(|(_, rest)| rest.split_once("fn render_today_page("))
+            .map(|(value, _)| value)
+            .expect("event renderer boundaries should exist");
+        for section in [
+            "CONCLUSION",
+            "Economic Impact",
+            "Execution Timeline",
+            "Participants",
+            "Technical evidence and limitations",
+            "Actions",
+            "Unknown is never coerced to zero",
+        ] {
+            assert!(
+                renderer.contains(section),
+                "missing event section {section}"
+            );
+        }
+        assert!(renderer.contains("Share Evidence Pack · unavailable"));
+    }
+
+    #[test]
+    fn production_web_source_is_english_only() {
+        for (name, source) in [
+            ("web module", include_str!("mod.rs")),
+            (
+                "execution intelligence adapter",
+                include_str!("execution_intelligence.rs"),
+            ),
+            ("public product content", include_str!("public_product.rs")),
+        ] {
+            let contains_cjk = source.chars().any(|character| {
+                matches!(
+                    character,
+                    '\u{3400}'..='\u{9fff}'
+                        | '\u{f900}'..='\u{faff}'
+                        | '\u{20000}'..='\u{2fa1f}'
+                )
+            });
+            assert!(!contains_cjk, "{name} contains untranslated CJK text");
+        }
+    }
+
+    #[test]
+    fn production_styles_enforce_a_twelve_pixel_minimum() {
+        let styles = shared_styles();
+        assert!(styles.contains("font-size: max(12px, .44rem)"));
+        assert!(styles.contains("font-size: 0"));
+
+        for declaration in styles.split("font-size:").skip(1) {
+            let value = declaration
+                .split_once(';')
+                .map(|(value, _)| value.trim())
+                .unwrap_or_default();
+            let pixels = value
+                .strip_suffix("px")
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .or_else(|| {
+                    value
+                        .strip_suffix("rem")
+                        .and_then(|value| value.trim().parse::<f32>().ok())
+                        .map(|value| value * 16.0)
+                });
+            assert!(
+                !pixels.is_some_and(|pixels| pixels > 0.0 && pixels < 12.0),
+                "undersized production font declaration: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_onboarding_reuses_empty_drafts() {
+        let source = include_str!("mod.rs");
+        let handler = source
+            .split_once("async fn start_workspace_onboarding(")
+            .and_then(|(_, remainder)| remainder.split_once("async fn save_workspace_entities("))
+            .map(|(handler, _)| handler)
+            .expect("workspace onboarding handler should be present");
+        for required in [
+            "pg_advisory_xact_lock",
+            "reusable_workspace_id",
+            "select 1 from workspace_entities",
+            "remove duplicate drafts failed",
+            "reuse workspace draft failed",
+        ] {
+            assert!(
+                handler.contains(required),
+                "missing idempotent onboarding guard: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn observe_flow_creates_hidden_continuous_delivery_route() {
+        let source = include_str!("mod.rs");
+        let helper = source
+            .split_once("async fn ensure_default_observation_monitor(")
+            .map(|(_, helper)| helper)
+            .expect("automatic observation helper should be present");
+        for required in [
+            "Automatic Observations",
+            "'source','observation_defaults','hidden',true",
+            "insert into user_monitor_entities",
+            "insert into user_monitor_rules",
+            "workspace_notification_destinations",
+        ] {
+            assert!(
+                helper.contains(required),
+                "missing automatic observation behavior: {required}"
+            );
+        }
+        assert!(
+            source
+                .matches("ensure_default_observation_monitor(")
+                .count()
+                >= 3,
+            "both first-observation and subsequent Observe flows must enable the hidden route"
+        );
+    }
+
+    #[test]
+    fn route_map_contains_new_surfaces_and_compatibility_redirects() {
+        let source = include_str!("mod.rs");
+        for route in [
+            "/solutions",
+            "/research",
+            "/research/{slug}",
+            "/evidence",
+            "/evidence/{slug}",
+            "/api",
+            "/about",
+            "/pilot",
+            "/pilot/submit",
+            "/app/overview",
+            "/app/onboarding",
+            "/app/demo-workspace",
+            "/app/observations",
+            "/app/observations/{observation_id}",
+            "/app/observations/{observation_id}/monitoring",
+            "/app/events/{event_id}",
+            "/app/monitors/create",
+            "/app/investigations/{investigation_id}",
+            "/app/entities",
+            "/app/entities/{entity_id}",
+            "/app/entities/add",
+            "/app/reports",
+            "/app/schemas",
+            "/app/settings",
+            "/app/settings/notifications",
+            "/demo/base-public/weekly-report",
+        ] {
+            assert!(source.contains(route), "missing route {route}");
+        }
+        for redirect in [
+            "legacy_public_reports_redirect",
+            "legacy_public_cases_redirect",
+            "legacy_public_products_redirect",
+            "legacy_today_redirect",
+            "legacy_bots_redirect",
+            "legacy_watchlist_redirect",
+            "legacy_alerts_redirect",
+            "legacy_clusters_redirect",
+            "legacy_address_redirect",
+            "legacy_arbitrage_redirect",
+            "legacy_graph_redirect",
+        ] {
+            assert!(source.contains(redirect), "missing redirect {redirect}");
+        }
+    }
+
+    #[test]
+    fn customer_workspace_hides_internal_infrastructure_details() {
+        let source = include_str!("mod.rs");
+        let sidebar = source
+            .split_once("fn render_app_sidebar(")
+            .and_then(|(_, remainder)| remainder.split_once("fn render_ca_nav_item("))
+            .map(|(body, _)| body)
+            .expect("workspace sidebar source");
+        let overview = source
+            .split_once("fn render_execution_overview_page(")
+            .and_then(|(_, remainder)| remainder.split_once("fn render_overview_no_attention("))
+            .map(|(body, _)| body)
+            .expect("workspace overview source");
+        for forbidden in [
+            "PostgreSQL",
+            "Local RPC",
+            "ClickHouse",
+            "Trace monitor",
+            "Analysis API",
+            "worker progress",
+        ] {
+            assert!(!sidebar.contains(forbidden), "sidebar leaks {forbidden}");
+            assert!(!overview.contains(forbidden), "overview leaks {forbidden}");
+        }
+        assert!(overview.contains("render_workspace_service_status"));
+        assert!(source.contains(".route(\"/app/indexer/progress\", get(app_home))"));
+        assert!(source.contains(".route(\"/app/indexer/address-lookup\", get(app_home))"));
+        assert!(source.contains(".route(\"/dashboard\", get(app_home))"));
+    }
+
+    #[test]
+    fn public_navigation_has_six_destinations_and_pilot_cta() {
+        let page = render_marketing_page("LedgerFlow", None, String::new());
+        let nav = page
+            .split_once("<nav class=\"navlinks\"")
+            .and_then(|(_, rest)| rest.split_once("</nav>"))
+            .map(|(nav, _)| nav)
+            .expect("public nav");
+        assert_eq!(nav.matches("<a href=").count(), 6);
+        for href in [
+            "/",
+            "/solutions",
+            "/research",
+            "/evidence",
+            "/api",
+            "/about",
+        ] {
+            assert!(nav.contains(&format!("href=\"{href}\"")), "missing {href}");
+        }
+        assert!(page.contains("Request Pilot"));
+    }
+
+    #[test]
+    fn evidence_explorer_filters_and_detail_preserve_evidence_state() {
+        let records = public_product::curated_evidence_records();
+        let verified_query = PublicEvidenceQuery {
+            status: Some("verified".to_owned()),
+            ..Default::default()
+        };
+        let page = render_public_evidence_content(&records, &verified_query, "test corpus");
+        assert!(page.contains("PUBLIC EVIDENCE EXPLORER"));
+        assert!(page.contains("Verified DEX Arbitrage Accounting"));
+        assert!(!page.contains("Liquidation-like Interaction with Attribution Conflict"));
+
+        let detected = records
+            .iter()
+            .find(|record| record.slug == "base-aave-liquidation-evidence")
+            .expect("detected evidence record");
+        let detail = render_public_evidence_detail_content(detected);
+        for section in [
+            "CONCLUSION",
+            "ECONOMIC IMPACT",
+            "Execution Timeline",
+            "Participants",
+            "Evidence",
+            "Related Entities",
+            "Limitations",
+            "Detected / Unverified",
+        ] {
+            assert!(
+                detail.contains(section),
+                "missing evidence section {section}"
+            );
+        }
+    }
+
+    #[test]
+    fn pilot_form_captures_business_scope_without_billing() {
+        let page = render_pilot_content(false, None);
+        for field in [
+            "name=\"name\"",
+            "name=\"email\"",
+            "name=\"organization\"",
+            "name=\"chain_id\"",
+            "name=\"addresses\"",
+            "name=\"use_case\"",
+            "name=\"contact\"",
+        ] {
+            assert!(page.contains(field), "missing Pilot field {field}");
+        }
+        assert!(page.contains("Pilot applications are free"));
+        assert!(page.contains("No payment is collected"));
+        assert!(page.contains("10–30"));
+        assert!(!page.contains("Checkout"));
+    }
+
+    #[tokio::test]
+    async fn legacy_address_route_preserves_deep_link_context() {
+        let response = legacy_address_redirect(Query(AddressAnalysisQuery {
+            address: Some("0x1111111111111111111111111111111111111111".to_owned()),
+            chain_id: Some(8453),
+            notice: None,
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .expect("redirect location");
+        assert!(
+            location.starts_with("/app/observations/0x1111111111111111111111111111111111111111?")
+        );
+        assert!(location.contains("chain_id=8453"));
+    }
+
+    #[test]
+    fn production_event_adapter_exports_unknown_as_null_not_zero() {
+        let event = adapt_arbitrage_candidate(ArbitrageCandidateInput {
+            chain_id: 8453,
+            tx_hash: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            block_number: 1,
+            block_timestamp: None,
+            detection_source: "logs".to_owned(),
+            sender_address: None,
+            entry_contract: None,
+            detection_score: 1,
+            swap_log_count: 2,
+            distinct_pool_count: 2,
+            route: "".to_owned(),
+            route_fingerprint: "".to_owned(),
+            confirmation_status: "candidate".to_owned(),
+            profit_token_address: None,
+            profit_amount_raw: Some("999".to_owned()),
+            pool_addresses: Vec::new(),
+            economic_verification: None,
+        });
+        let payload = execution_event_json(&event);
+        assert_eq!(payload["status"], "detected");
+        assert!(payload["economic_impact"]["net_profit"].is_null());
+        assert!(payload["economic_impact"]["gas_cost"].is_null());
     }
 }
 

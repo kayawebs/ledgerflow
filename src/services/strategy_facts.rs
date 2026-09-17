@@ -75,16 +75,6 @@ pub fn strategy_type(behavior_tag: &BehaviorTag) -> &'static str {
     }
 }
 
-pub fn token_symbol(address: &str) -> Option<&'static str> {
-    match address.to_ascii_lowercase().as_str() {
-        "0x4200000000000000000000000000000000000006" => Some("WETH"),
-        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" => Some("USDC"),
-        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" => Some("USDbC"),
-        "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2" => Some("USDT"),
-        _ => None,
-    }
-}
-
 fn strategy_subtype(
     behavior_tag: &BehaviorTag,
     protocol_family: Option<&str>,
@@ -129,7 +119,7 @@ fn token_ref(address: &str) -> Option<TokenRef> {
     }
     Some(TokenRef {
         address: address.to_ascii_lowercase(),
-        symbol: token_symbol(address).map(str::to_owned),
+        symbol: None,
     })
 }
 

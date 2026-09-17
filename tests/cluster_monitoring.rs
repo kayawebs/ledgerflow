@@ -732,7 +732,9 @@ async fn strategy_analysis_rolls_up_cluster_arbitrage_behavior() {
     assert_eq!(analysis.total_gas_cost_usd, Some(12.0));
 
     let route = analysis.top_routes.first().unwrap();
-    assert_eq!(route.route, "USDC -> WETH");
+    // Token symbols are resolved from persisted metadata by the application layer.
+    // This repository-only fixture intentionally has no token registry.
+    assert_eq!(route.route, "0x833589...2913 -> 0x420000...0006");
     assert_eq!(route.tx_count, 2);
     assert_eq!(route.success_count, 1);
     assert_eq!(route.success_rate, Some(0.5));
@@ -787,7 +789,10 @@ async fn strategy_analysis_rolls_up_cluster_arbitrage_behavior() {
     assert_eq!(arbitrage_report.success_rate, Some(0.5));
     assert_eq!(arbitrage_report.estimated_pnl_usd, Some(10.0));
     assert_eq!(arbitrage_report.gas_cost_usd, Some(7.0));
-    assert_eq!(arbitrage_report.top_routes[0].route, "USDC -> WETH");
+    assert_eq!(
+        arbitrage_report.top_routes[0].route,
+        "0x833589...2913 -> 0x420000...0006"
+    );
     assert_eq!(arbitrage_report.top_protocols[0].protocol, "uniswap_v3");
     assert_eq!(
         arbitrage_report.representative_transactions[0].tx_hash,

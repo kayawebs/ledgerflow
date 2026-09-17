@@ -202,7 +202,13 @@ impl EvidenceNormalizer {
                 "is_approval": log.topics.first().map(|v| v.eq_ignore_ascii_case(APPROVAL_TOPIC)).unwrap_or(false),
             }));
 
-            if log.topics.len() >= 3 && log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC) {
+            if log.topics.len() == 3
+                && log
+                    .data
+                    .strip_prefix("0x")
+                    .is_some_and(|data| data.len() == 64)
+                && log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC)
+            {
                 let token = log.address.to_lowercase();
                 let from_address = topic_to_address(&log.topics[1]);
                 let to_address = topic_to_address(&log.topics[2]);
@@ -284,9 +290,15 @@ impl EvidenceNormalizer {
                 "tx_value_raw": hex_to_u128(Some(&bundle.tx.value)).to_string(),
                 "gas_used_raw": hex_to_u128(bundle.receipt.gas_used.as_deref()).to_string(),
                 "effective_gas_price_raw": hex_to_u128(bundle.receipt.effective_gas_price.as_deref()).to_string(),
+                "execution_gas_cost_raw": (
+                    hex_to_u128(bundle.receipt.gas_used.as_deref())
+                        * hex_to_u128(bundle.receipt.effective_gas_price.as_deref())
+                ).to_string(),
+                "l1_fee_raw": hex_to_u128(bundle.receipt.l1_fee.as_deref()).to_string(),
                 "gas_cost_raw": (
                     hex_to_u128(bundle.receipt.gas_used.as_deref())
                         * hex_to_u128(bundle.receipt.effective_gas_price.as_deref())
+                        + hex_to_u128(bundle.receipt.l1_fee.as_deref())
                 ).to_string(),
             }),
             evidence_refs: evidence_refs.clone(),

@@ -30,13 +30,19 @@ impl ClusterAlertService {
         }
     }
 
-    pub async fn refresh_cluster_alerts(&self, cluster_id: Uuid) -> LedgerResult<Vec<ClusterAlert>> {
+    pub async fn refresh_cluster_alerts(
+        &self,
+        cluster_id: Uuid,
+    ) -> LedgerResult<Vec<ClusterAlert>> {
         let cluster = self
             .repository
             .get_cluster(cluster_id)
             .await?
             .ok_or_else(|| LedgerError::NotFound(format!("cluster {cluster_id} not found")))?;
-        let snapshots = self.repository.list_cluster_metrics_snapshots(cluster_id).await?;
+        let snapshots = self
+            .repository
+            .list_cluster_metrics_snapshots(cluster_id)
+            .await?;
         let latest = latest_snapshots_by_window(&snapshots);
         let mut alerts = Vec::new();
 
@@ -48,7 +54,11 @@ impl ClusterAlertService {
                     cluster_id,
                     cluster.chain_id,
                     AlertType::RoiAnomaly,
-                    if roi > 0.05 { AlertSeverity::High } else { AlertSeverity::Medium },
+                    if roi > 0.05 {
+                        AlertSeverity::High
+                    } else {
+                        AlertSeverity::Medium
+                    },
                     "1h ROI anomaly",
                     format!("1h ROI reached {:.2}%.", roi * 100.0),
                     one_hour.timestamp,
@@ -174,7 +184,11 @@ impl ClusterAlertService {
                 cluster_id,
                 cluster.chain_id,
                 AlertType::RoiAnomaly,
-                if roi > 0.10 { AlertSeverity::High } else { AlertSeverity::Medium },
+                if roi > 0.10 {
+                    AlertSeverity::High
+                } else {
+                    AlertSeverity::Medium
+                },
                 "24h ROI anomaly",
                 format!("24h ROI reached {:.2}%.", roi * 100.0),
                 twenty_four_hours.timestamp,

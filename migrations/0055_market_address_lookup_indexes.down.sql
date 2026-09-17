@@ -1,0 +1,3 @@
+drop index if exists idx_economic_verification_results_recipient;
+drop index if exists idx_protocol_launch_trade_facts_recipient_lookup;
+drop index if exists idx_protocol_launch_trade_facts_trader_lookup;

@@ -1,0 +1,126 @@
+{
+  "schema_version": "ledgerflow.protocol-market-seeds.v1",
+  "dataset_key": "robinhood-market-protocols",
+  "dataset_version": "1.0.0",
+  "source": {
+    "source_key": "pons_official_contract_registry",
+    "display_name": "Pons official contract registry",
+    "source_kind": "official",
+    "trust_score": 0.99,
+    "owner": "Pons",
+    "homepage": "https://github.com/ponsdotdev/ponsfamily",
+    "metadata": {
+      "retrieved_at": "2026-09-08",
+      "secondary_source": "https://docs.ponsfamily.com/"
+    }
+  },
+  "domains": [
+    {
+      "domain_key": "robinhood:pons-v1-launchs",
+      "chain_id": 4663,
+      "protocol_key": "pons_v1",
+      "protocol_family": "token_launchpad",
+      "display_name_en": "Pons V1 Launches",
+      "display_name_zh": "Pons V1 发币",
+      "domain_kind": "token_launch",
+      "cluster_method_version": "pons-v1-participant-edges.v1",
+      "metadata": {
+        "venue": "uniswap_v3",
+        "quote_asset": "WETH",
+        "cluster_scope": "pons_v1_events_only"
+      },
+      "seeds": [
+        {
+          "address": "0xa5aab3f0c6eeadf30ef1d3eb997108e976351feb",
+          "seed_role": "launch_factory",
+          "label_en": "Pons V1 Launch Factory",
+          "label_zh": "Pons V1 发币工厂",
+          "confidence": 0.99,
+          "valid_from_block": 8991118,
+          "provenance_url": "https://github.com/ponsdotdev/ponsfamily",
+          "evidence": {"contract": "PonsLaunchFactory", "verified_source": true}
+        },
+        {
+          "address": "0x736d76699c26d0d966744cae304c000d471f7f35",
+          "seed_role": "locker",
+          "label_en": "Pons V1 Active Locker",
+          "label_zh": "Pons V1 流动性锁仓合约",
+          "confidence": 0.99,
+          "provenance_url": "https://docs.ponsfamily.com/",
+          "evidence": {"official_docs": true}
+        },
+        {
+          "address": "0x1f7d7550b1b028f7571e69a784071f0205fd2efa",
+          "seed_role": "factory",
+          "label_en": "Robinhood Uniswap V3 Factory",
+          "label_zh": "Robinhood Uniswap V3 工厂",
+          "confidence": 0.99,
+          "provenance_url": "https://docs.ponsfamily.com/",
+          "evidence": {"dependency_of": "pons_v1"}
+        },
+        {
+          "address": "0x73991a25c818bf1f1128deaab1492d45638de0d3",
+          "seed_role": "position_manager",
+          "label_en": "Robinhood Uniswap V3 Position Manager",
+          "label_zh": "Robinhood Uniswap V3 头寸管理器",
+          "confidence": 0.99,
+          "provenance_url": "https://docs.ponsfamily.com/",
+          "evidence": {"dependency_of": "pons_v1"}
+        },
+        {
+          "address": "0xcaf681a66d020601342297493863e78c959e5cb2",
+          "seed_role": "router",
+          "label_en": "Robinhood Swap Router",
+          "label_zh": "Robinhood Swap 路由器",
+          "confidence": 0.99,
+          "provenance_url": "https://docs.ponsfamily.com/",
+          "evidence": {"dependency_of": "pons_v1"}
+        },
+        {
+          "address": "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7",
+          "seed_role": "quoter",
+          "label_en": "Robinhood Quoter V2",
+          "label_zh": "Robinhood Quoter V2",
+          "confidence": 0.99,
+          "provenance_url": "https://docs.ponsfamily.com/",
+          "evidence": {"dependency_of": "pons_v1"}
+        },
+        {
+          "address": "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+          "seed_role": "quote_asset",
+          "label_en": "Wrapped Ether",
+          "label_zh": "封装以太币",
+          "confidence": 1.0,
+          "provenance_url": "https://docs.ponsfamily.com/",
+          "evidence": {"symbol": "WETH", "chain_id": 4663}
+        }
+      ]
+    },
+    {
+      "domain_key": "robinhood:pons-v2-launchs",
+      "chain_id": 4663,
+      "protocol_key": "pons_v2",
+      "protocol_family": "token_launchpad",
+      "display_name_en": "Pons V2 Launches",
+      "display_name_zh": "Pons V2 发币",
+      "domain_kind": "token_launch",
+      "cluster_method_version": "pons-v2-participant-edges.v1",
+      "metadata": {
+        "venue": "bonding_curve_then_uniswap_v4",
+        "cluster_scope": "pons_v2_events_only"
+      },
+      "seeds": [
+        {
+          "address": "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e",
+          "seed_role": "launch_factory",
+          "label_en": "Pons V2 Launch Factory",
+          "label_zh": "Pons V2 发币工厂",
+          "confidence": 0.99,
+          "valid_from_block": 26841846,
+          "provenance_url": "https://github.com/ponsdotdev/ponsfamily",
+          "evidence": {"contract": "PonsV2LaunchFactory", "verified_source": true}
+        }
+      ]
+    }
+  ]
+}

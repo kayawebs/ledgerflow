@@ -30,6 +30,8 @@ pub struct RawReceipt {
     pub status: u64,
     pub gas_used: Option<String>,
     pub effective_gas_price: Option<String>,
+    #[serde(default)]
+    pub l1_fee: Option<String>,
     pub logs: Vec<RawLog>,
 }
 

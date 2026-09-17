@@ -11,9 +11,9 @@ use crate::{
     ingestion::rpc::RpcClient,
 };
 
-const ERC20_SYMBOL_SELECTOR: &str = "0x95d89b41";
-const ERC20_NAME_SELECTOR: &str = "0x06fdde03";
-const ERC20_DECIMALS_SELECTOR: &str = "0x313ce567";
+pub(crate) const ERC20_SYMBOL_SELECTOR: &str = "0x95d89b41";
+pub(crate) const ERC20_NAME_SELECTOR: &str = "0x06fdde03";
+pub(crate) const ERC20_DECIMALS_SELECTOR: &str = "0x313ce567";
 
 #[derive(Clone, Debug)]
 pub struct Erc20TokenMetadata {
@@ -84,7 +84,7 @@ impl TokenMetadataService {
         Ok(())
     }
 
-    async fn get_or_fetch(
+    pub async fn get_or_fetch(
         &self,
         chain_id: u64,
         token_address: &str,
@@ -140,25 +140,20 @@ impl TokenMetadataService {
         token_address: &str,
         block_number: Option<u64>,
     ) -> LedgerResult<Erc20TokenMetadata> {
-        let symbol = self
-            .fetch_string(chain_id, token_address, ERC20_SYMBOL_SELECTOR, block_number)
-            .await
-            .ok()
-            .flatten();
-        let name = self
-            .fetch_string(chain_id, token_address, ERC20_NAME_SELECTOR, block_number)
-            .await
-            .ok()
-            .flatten();
-        let decimals = self
-            .rpc_client
-            .eth_call(
-                chain_id,
-                token_address,
-                ERC20_DECIMALS_SELECTOR,
-                block_number,
-            )
-            .await
+        let symbol_call =
+            self.fetch_string(chain_id, token_address, ERC20_SYMBOL_SELECTOR, block_number);
+        let name_call =
+            self.fetch_string(chain_id, token_address, ERC20_NAME_SELECTOR, block_number);
+        let decimals_call = self.rpc_client.eth_call(
+            chain_id,
+            token_address,
+            ERC20_DECIMALS_SELECTOR,
+            block_number,
+        );
+        let (symbol, name, decimals) = tokio::join!(symbol_call, name_call, decimals_call);
+        let symbol = symbol.ok().flatten();
+        let name = name.ok().flatten();
+        let decimals = decimals
             .ok()
             .and_then(|value| parse_uint_hex(&value))
             .and_then(|value| u8::try_from(value).ok());
@@ -223,7 +218,7 @@ impl TokenMetadataService {
 }
 
 impl Erc20TokenMetadata {
-    fn to_json(&self) -> Value {
+    pub fn to_json(&self) -> Value {
         json!({
             "symbol": self.symbol.as_deref().unwrap_or("Unknown ERC20"),
             "name": self.name.as_deref().unwrap_or("Unlabeled token"),
@@ -271,11 +266,11 @@ fn row_to_metadata(row: sqlx::postgres::PgRow) -> LedgerResult<Erc20TokenMetadat
     })
 }
 
-fn parse_uint_hex(raw: &str) -> Option<u128> {
+pub(crate) fn parse_uint_hex(raw: &str) -> Option<u128> {
     u128::from_str_radix(raw.trim_start_matches("0x"), 16).ok()
 }
 
-fn decode_erc20_string(raw: &str) -> Option<String> {
+pub(crate) fn decode_erc20_string(raw: &str) -> Option<String> {
     let hex = raw.trim_start_matches("0x");
     if hex.is_empty() {
         return None;

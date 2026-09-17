@@ -76,12 +76,14 @@ impl ChainRegistry {
                     explorer_base_url: row
                         .try_get("explorer_base_url")
                         .map_err(|err| LedgerError::Persistence(err.to_string()))?,
-                    api_base_url: row
-                        .try_get("api_base_url")
-                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    api_base_url: normalize_base_url(
+                        &row.try_get::<String, _>("api_base_url")
+                            .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                    ),
                     indexer_api_base_url: row
-                        .try_get("indexer_api_base_url")
-                        .map_err(|err| LedgerError::Persistence(err.to_string()))?,
+                        .try_get::<Option<String>, _>("indexer_api_base_url")
+                        .map_err(|err| LedgerError::Persistence(err.to_string()))?
+                        .map(|value| normalize_base_url(&value)),
                     api_bearer_token: chain_secret("LEDGERFLOW_CHAIN_API_BEARER_TOKEN", chain_id),
                     indexer_api_bearer_token: chain_secret(
                         "LEDGERFLOW_CHAIN_INDEXER_BEARER_TOKEN",
@@ -105,8 +107,10 @@ impl ChainRegistry {
                 display_name: fallback_display_name(requested_default_chain_id),
                 native_symbol: "ETH".to_owned(),
                 explorer_base_url: fallback_explorer(requested_default_chain_id),
-                api_base_url: legacy_api_base_url,
-                indexer_api_base_url: legacy_indexer_api_base_url,
+                api_base_url: normalize_base_url(&legacy_api_base_url),
+                indexer_api_base_url: legacy_indexer_api_base_url
+                    .as_deref()
+                    .map(|value| normalize_base_url(value)),
                 api_bearer_token: chain_secret(
                     "LEDGERFLOW_CHAIN_API_BEARER_TOKEN",
                     requested_default_chain_id,
@@ -160,6 +164,43 @@ fn chain_secret(prefix: &str, chain_id: u64) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
+}
+
+/// Accept the common operator typo `http app 3000` while keeping normal URLs unchanged.
+/// Values still flow through reqwest's URL parser after this narrow normalization.
+fn normalize_base_url(value: &str) -> String {
+    let trimmed = value.trim();
+    let mut parts = trimmed.split_whitespace();
+    let Some(scheme) = parts.next() else {
+        return trimmed.to_owned();
+    };
+    let Some(host) = parts.next() else {
+        return trimmed.to_owned();
+    };
+    let Some(port) = parts.next() else {
+        return trimmed.to_owned();
+    };
+    if parts.next().is_some()
+        || !matches!(scheme, "http" | "https")
+        || host.is_empty()
+        || port.is_empty()
+        || !port.chars().all(|character| character.is_ascii_digit())
+    {
+        return trimmed.to_owned();
+    }
+    format!("{scheme}://{host}:{port}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_base_url;
+
+    #[test]
+    fn normalizes_operator_spaced_http_urls() {
+        assert_eq!(normalize_base_url("http app 3000"), "http://app:3000");
+        assert_eq!(normalize_base_url(" http://app:3000 "), "http://app:3000");
+        assert_eq!(normalize_base_url("http app nope"), "http app nope");
+    }
 }
 
 fn fallback_slug(chain_id: u64) -> String {

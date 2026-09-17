@@ -1,7 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::accounting::rollups::AccountingService;
@@ -123,6 +124,9 @@ impl AnalysisService {
                 warn!(%tx_hash, error = %err, "token metadata enrichment failed");
             }
         }
+        if let Err(err) = self.attach_protocol_evidence(&mut analysis).await {
+            warn!(%tx_hash, error = %err, "protocol deployment evidence unavailable");
+        }
 
         info!(stage = "recognition", %tx_hash, "run_recognizers");
         analysis.recognizer_results = self
@@ -172,6 +176,64 @@ impl AnalysisService {
             warn!(%tx_hash, error = %err, "address intelligence enqueue failed");
         }
         Ok((analysis, pack))
+    }
+
+    async fn attach_protocol_evidence(
+        &self,
+        analysis: &mut TransactionAnalysis,
+    ) -> LedgerResult<()> {
+        let mut addresses = analysis
+            .normalized_execution_facts
+            .participants
+            .iter()
+            .map(|address| address.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        if let Some(touched) = analysis
+            .normalized_execution_facts
+            .derived_facts
+            .get("touched_contracts")
+            .and_then(Value::as_array)
+        {
+            addresses.extend(
+                touched
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_ascii_lowercase),
+            );
+        }
+        let addresses = addresses.into_iter().collect::<Vec<_>>();
+        let mut evidence = self
+            .repository
+            .list_protocol_address_metadata(analysis.chain_id, &addresses, analysis.block_number)
+            .await?;
+        evidence.sort_by(|a, b| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then_with(|| a.protocol_name.cmp(&b.protocol_name))
+                .then_with(|| a.address.cmp(&b.address))
+        });
+        let evidence = serde_json::to_value(evidence)
+            .map_err(|err| LedgerError::MalformedEvidence(err.to_string()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(analysis.input_digest.as_bytes());
+        hasher.update(
+            serde_json::to_vec(&evidence)
+                .map_err(|err| LedgerError::MalformedEvidence(err.to_string()))?,
+        );
+        let protocol_evidence_digest = hex::encode(hasher.finalize());
+        analysis.input_digest = protocol_evidence_digest.clone();
+        if let Some(facts) = analysis
+            .normalized_execution_facts
+            .derived_facts
+            .as_object_mut()
+        {
+            facts.insert("protocol_evidence".to_owned(), evidence);
+            facts.insert(
+                "protocol_evidence_digest".to_owned(),
+                Value::String(protocol_evidence_digest),
+            );
+        }
+        Ok(())
     }
 
     async fn enqueue_address_intelligence(

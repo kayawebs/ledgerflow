@@ -13,6 +13,10 @@ fn pad_address(address: &str) -> String {
     format!("0x{:0>64}", address.trim_start_matches("0x").to_lowercase())
 }
 
+fn pad_u256(value: u64) -> String {
+    format!("0x{value:064x}")
+}
+
 #[derive(Clone)]
 pub struct MockRpcClient {
     pub include_trace: bool,
@@ -118,7 +122,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x9999999999999999999999999999999999999999"),
                             pad_address("0x2222222222222222222222222222222222222222")
                         ],
-                        "data": format!("0x{:x}", 43u64)
+                        "data": pad_u256(43)
                     },
                     {
                         "logIndex": "0x1",
@@ -139,7 +143,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x2222222222222222222222222222222222222222"),
                             pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb")
                         ],
-                        "data": format!("0x{:x}", 2u64)
+                        "data": pad_u256(2)
                     },
                     {
                         "logIndex": "0x3",
@@ -149,7 +153,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb"),
                             pad_address("0x2222222222222222222222222222222222222222")
                         ],
-                        "data": format!("0x{:x}", 1394u64)
+                        "data": pad_u256(1394)
                     }
                 ]
             }));
@@ -168,7 +172,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x2222222222222222222222222222222222222222"),
                             pad_address("0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24")
                         ],
-                        "data": format!("0x{:x}", 5000u64)
+                        "data": pad_u256(5000)
                     },
                     {
                         "logIndex": "0x1",
@@ -178,7 +182,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x2222222222222222222222222222222222222222"),
                             pad_address("0x3333333333333333333333333333333333333333")
                         ],
-                        "data": format!("0x{:x}", 100u64)
+                        "data": pad_u256(100)
                     },
                     {
                         "logIndex": "0x2",
@@ -188,7 +192,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x3333333333333333333333333333333333333333"),
                             pad_address("0x2222222222222222222222222222222222222222")
                         ],
-                        "data": format!("0x{:x}", 250u64)
+                        "data": pad_u256(250)
                     }
                 ]
             }));
@@ -207,7 +211,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x2222222222222222222222222222222222222222"),
                             pad_address("0x3333333333333333333333333333333333333333")
                         ],
-                        "data": format!("0x{:x}", 100u64)
+                        "data": pad_u256(100)
                     },
                     {
                         "logIndex": "0x1",
@@ -217,7 +221,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x3333333333333333333333333333333333333333"),
                             pad_address("0x2222222222222222222222222222222222222222")
                         ],
-                        "data": format!("0x{:x}", 90u64)
+                        "data": pad_u256(90)
                     },
                     {
                         "logIndex": "0x2",
@@ -227,7 +231,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x2222222222222222222222222222222222222222"),
                             pad_address("0x4444444444444444444444444444444444444444")
                         ],
-                        "data": format!("0x{:x}", 90u64)
+                        "data": pad_u256(90)
                     },
                     {
                         "logIndex": "0x3",
@@ -237,7 +241,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x4444444444444444444444444444444444444444"),
                             pad_address("0x2222222222222222222222222222222222222222")
                         ],
-                        "data": format!("0x{:x}", 105u64)
+                        "data": pad_u256(105)
                     }
                 ]
             }));
@@ -267,7 +271,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x2222222222222222222222222222222222222222"),
                             pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb")
                         ],
-                        "data": format!("0x{:x}", 42u64)
+                        "data": pad_u256(42)
                     },
                     {
                         "logIndex": "0x2",
@@ -277,7 +281,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb"),
                             pad_address("0x2222222222222222222222222222222222222222")
                         ],
-                        "data": format!("0x{:x}", 1394u64)
+                        "data": pad_u256(1394)
                     },
                     {
                         "logIndex": "0x3",
@@ -287,7 +291,7 @@ impl RpcClient for MockRpcClient {
                             pad_address("0x2222222222222222222222222222222222222222"),
                             pad_address("0xbbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb")
                         ],
-                        "data": format!("0x{:x}", 42u64)
+                        "data": pad_u256(42)
                     }
                 ]
             }));
@@ -305,7 +309,7 @@ impl RpcClient for MockRpcClient {
                         pad_address("0x1111111111111111111111111111111111111111"),
                         pad_address("0x2222222222222222222222222222222222222222")
                     ],
-                    "data": format!("0x{:x}", 5000u64)
+                    "data": pad_u256(5000)
                 },
                 {
                     "logIndex": "0x1",
@@ -315,7 +319,7 @@ impl RpcClient for MockRpcClient {
                         pad_address("0x1111111111111111111111111111111111111111"),
                         pad_address("0x3333333333333333333333333333333333333333")
                     ],
-                    "data": format!("0x{:x}", 100u64)
+                    "data": pad_u256(100)
                 },
                 {
                     "logIndex": "0x2",
@@ -325,7 +329,7 @@ impl RpcClient for MockRpcClient {
                         pad_address("0x4444444444444444444444444444444444444444"),
                         pad_address("0x1111111111111111111111111111111111111111")
                     ],
-                    "data": format!("0x{:x}", 95u64)
+                    "data": pad_u256(95)
                 }
             ]
         }))

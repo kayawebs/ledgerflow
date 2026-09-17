@@ -73,6 +73,47 @@ impl RpcClient for MockRpcClient {
 }
 
 #[tokio::test]
+async fn address_worker_only_claims_jobs_for_its_configured_chain() {
+    let repo: DynRepository = Arc::new(InMemoryAnalysisRepository::default());
+    let base = "0x1111111111111111111111111111111111111111".to_owned();
+    let robinhood = "0x2222222222222222222222222222222222222222".to_owned();
+    repo.enqueue_address_analysis_candidates(
+        8453,
+        &[AddressAnalysisCandidate {
+            address: base.clone(),
+            priority: 1,
+            metadata: json!({"source":"canonical_address_facts","roles":["transaction_sender"]}),
+        }],
+    )
+    .await
+    .unwrap();
+    repo.enqueue_address_analysis_candidates(
+        4663,
+        &[AddressAnalysisCandidate {
+            address: robinhood.clone(),
+            priority: 10,
+            metadata: json!({"source":"canonical_address_facts","roles":["transaction_sender"]}),
+        }],
+    )
+    .await
+    .unwrap();
+
+    let service = AddressIntelligenceService::new(Arc::clone(&repo), Arc::new(MockRpcClient))
+        .with_worker_chain_id(4663);
+    let profile = service.process_next_job().await.unwrap().unwrap();
+    assert_eq!(profile.chain_id, 4663);
+    assert_eq!(profile.address, robinhood);
+
+    let remaining = repo
+        .claim_next_address_analysis_job()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(remaining.chain_id, 8453);
+    assert_eq!(remaining.address, base);
+}
+
+#[tokio::test]
 async fn address_worker_uses_curated_assertions_for_known_token_candidates() {
     let repo: DynRepository = Arc::new(InMemoryAnalysisRepository::default());
     let weth = "0x4200000000000000000000000000000000000006".to_owned();
@@ -114,6 +155,44 @@ async fn address_worker_uses_curated_assertions_for_known_token_candidates() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn address_worker_defers_generic_jobs_above_the_seed_priority_ceiling() {
+    let repo: DynRepository = Arc::new(InMemoryAnalysisRepository::default());
+    let seed = "0x1111111111111111111111111111111111111111".to_owned();
+    let generic = "0x2222222222222222222222222222222222222222".to_owned();
+    repo.enqueue_address_analysis_candidates(
+        4663,
+        &[
+            AddressAnalysisCandidate {
+                address: generic.clone(),
+                priority: 80,
+                metadata: json!({"source":"canonical_address_facts","roles":["transaction_sender"]}),
+            },
+            AddressAnalysisCandidate {
+                address: seed.clone(),
+                priority: 10,
+                metadata: json!({"source":"seed_intelligence","roles":["arbitrage_executor_candidate"]}),
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    let service = AddressIntelligenceService::new(repo.clone(), Arc::new(MockRpcClient))
+        .with_maximum_job_priority(39);
+    let profile = service.process_next_job().await.unwrap().unwrap();
+    assert_eq!(profile.address, seed);
+    assert!(service.process_next_job().await.unwrap().is_none());
+
+    let deferred = repo
+        .claim_next_address_analysis_job()
+        .await
+        .unwrap()
+        .expect("generic job remains available for an explicit future backfill");
+    assert_eq!(deferred.address, generic);
+    assert_eq!(deferred.priority, 80);
 }
 
 fn curated_assertion(
@@ -187,4 +266,128 @@ async fn address_worker_detects_dex_pool_shape() {
     );
     let labels = repo.list_address_labels(8453, &[pool]).await.unwrap();
     assert!(labels.iter().any(|label| label.label == "dex_pool"));
+}
+
+#[tokio::test]
+async fn suspected_token_role_requeues_a_completed_job_only_once() {
+    let repo: DynRepository = Arc::new(InMemoryAnalysisRepository::default());
+    let token = "0x4444444444444444444444444444444444444444".to_owned();
+    repo.enqueue_address_analysis_candidates(
+        4663,
+        &[AddressAnalysisCandidate {
+            address: token.clone(),
+            priority: 30,
+            metadata: json!({"source": "legacy_discovery", "roles": ["touched_contract"]}),
+        }],
+    )
+    .await
+    .unwrap();
+    let first = repo
+        .claim_next_address_analysis_job()
+        .await
+        .unwrap()
+        .unwrap();
+    repo.complete_address_analysis_job(first.chain_id, &first.address)
+        .await
+        .unwrap();
+
+    let token_candidate = AddressAnalysisCandidate {
+        address: token.clone(),
+        priority: 30,
+        metadata: json!({
+            "source": "validated_dex_pool_inventory",
+            "roles": ["suspected_token"]
+        }),
+    };
+    assert_eq!(
+        repo.enqueue_address_analysis_candidates(4663, &[token_candidate.clone()])
+            .await
+            .unwrap(),
+        1
+    );
+    let second = repo
+        .claim_next_address_analysis_job()
+        .await
+        .unwrap()
+        .unwrap();
+    repo.complete_address_analysis_job(second.chain_id, &second.address)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repo.enqueue_address_analysis_candidates(4663, &[token_candidate])
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        repo.claim_next_address_analysis_job()
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn canonical_fact_roles_are_merged_and_each_new_role_requeues_once() {
+    let repo: DynRepository = Arc::new(InMemoryAnalysisRepository::default());
+    let address = "0x5555555555555555555555555555555555555555".to_owned();
+    let initial = AddressAnalysisCandidate {
+        address: address.clone(),
+        priority: 90,
+        metadata: json!({
+            "source": "canonical_address_facts",
+            "roles": ["transaction_recipient"]
+        }),
+    };
+    repo.enqueue_address_analysis_candidates(4663, &[initial.clone()])
+        .await
+        .unwrap();
+    let first = repo
+        .claim_next_address_analysis_job()
+        .await
+        .unwrap()
+        .unwrap();
+    repo.complete_address_analysis_job(first.chain_id, &first.address)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.enqueue_address_analysis_candidates(4663, &[initial])
+            .await
+            .unwrap(),
+        0
+    );
+
+    let sender = AddressAnalysisCandidate {
+        address: address.clone(),
+        priority: 80,
+        metadata: json!({
+            "source": "canonical_address_facts",
+            "roles": ["transaction_sender"]
+        }),
+    };
+    assert_eq!(
+        repo.enqueue_address_analysis_candidates(4663, &[sender.clone()])
+            .await
+            .unwrap(),
+        1
+    );
+    let second = repo
+        .claim_next_address_analysis_job()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        second.metadata["roles"],
+        json!(["transaction_recipient", "transaction_sender"])
+    );
+    repo.complete_address_analysis_job(second.chain_id, &second.address)
+        .await
+        .unwrap();
+    assert_eq!(
+        repo.enqueue_address_analysis_candidates(4663, &[sender])
+            .await
+            .unwrap(),
+        0
+    );
 }

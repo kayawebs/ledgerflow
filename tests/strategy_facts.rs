@@ -23,12 +23,9 @@ fn strategy_fact_normalizes_arbitrage_route_and_protocol_family() {
     assert_eq!(fact.strategy_subtype, "token_pair_arbitrage");
     assert_eq!(fact.protocol_name.as_deref(), Some("uniswap_v3"));
     assert_eq!(fact.protocol_family.as_deref(), Some("uniswap"));
-    assert_eq!(fact.route.route_key, "USDC -> WETH");
-    assert_eq!(fact.route.token_in.unwrap().symbol.as_deref(), Some("WETH"));
-    assert_eq!(
-        fact.route.token_out.unwrap().symbol.as_deref(),
-        Some("USDC")
-    );
+    assert_eq!(fact.route.route_key, "0x833589...2913 -> 0x420000...0006");
+    assert_eq!(fact.route.token_in.unwrap().symbol, None);
+    assert_eq!(fact.route.token_out.unwrap().symbol, None);
     assert_eq!(fact.outcome.report_success, true);
     assert_eq!(fact.outcome.failure_reason, None);
     assert_eq!(fact.pnl_to_gas_ratio, Some(4.0));
