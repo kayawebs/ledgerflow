@@ -226,6 +226,44 @@ impl IndexerRpcClient {
             .await
     }
 
+    /// Fetches receipts for many transactions in one JSON-RPC batch. Missing
+    /// receipts are returned as `Value::Null` in input order.
+    pub async fn get_transaction_receipts(&self, tx_hashes: &[String]) -> LedgerResult<Vec<Value>> {
+        if tx_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests = tx_hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "eth_getTransactionReceipt",
+                    "params": [hash],
+                })
+            })
+            .collect::<Vec<_>>();
+        let responses = self.call_batch(requests).await?;
+        let ids = (0..tx_hashes.len() as u64).collect::<Vec<_>>();
+        Ok(
+            batch_results_by_numeric_id(&ids, responses, "transaction receipt")?
+                .into_iter()
+                .map(|(_, receipt)| receipt)
+                .collect(),
+        )
+    }
+
+    /// Executes a read-only `eth_call` at `latest` and returns the raw hex result.
+    pub async fn eth_call(&self, to: &str, data: &str) -> LedgerResult<String> {
+        let result = self
+            .call("eth_call", json!([{ "to": to, "data": data }, "latest"]))
+            .await?;
+        result.as_str().map(str::to_owned).ok_or_else(|| {
+            LedgerError::MalformedEvidence("eth_call result is not a hex string".to_owned())
+        })
+    }
+
     async fn call(&self, method: &str, params: Value) -> LedgerResult<Value> {
         let payload = self
             .send_json(json!({
