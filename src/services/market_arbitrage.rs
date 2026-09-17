@@ -26,7 +26,7 @@ use crate::{
     services::market_data::NATIVE_ASSET_ADDRESS,
 };
 
-pub const ARBITRAGE_METHODOLOGY_VERSION: &str = "market_arbitrage_receipt_scope_v3";
+pub const ARBITRAGE_METHODOLOGY_VERSION: &str = "market_arbitrage_receipt_scope_v4";
 /// Largest |net| / gross outflow value accepted as an arbitrage margin.
 const MAX_MARGIN_ON_OUTFLOW: f64 = 0.2;
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -547,6 +547,28 @@ with priced as (
   ) price on true
   where verification.chain_id = $1 and verification.tx_hash = any($2)
     and verification.result_status = 'verified'
+), reliable as (
+  -- Every scope token priced from pool state or a stablecoin anchor.
+  select delta.tx_hash, bool_and(
+           delta.token_address = $3
+           or delta.token_address = (
+             select address from public.protocol_deployments
+             where chain_id = $1 and contract_role = 'l2_weth' and status = 'active'
+             order by confidence desc limit 1
+           )
+           or exists (
+             select 1 from public.address_label_assertions assertion
+             join public.intelligence_sources source
+               on source.source_key = assertion.source_key and source.status = 'active'
+             where assertion.chain_id = $1 and assertion.address = delta.token_address
+               and assertion.label_key = 'stablecoin' and assertion.status = 'active'
+               and assertion.assertion_value
+               and (assertion.expires_at is null or assertion.expires_at > now())
+           )
+         ) as all_reliable
+  from market.arbitrage_estimate_deltas delta
+  where delta.chain_id = $1 and delta.tx_hash = any($2)
+  group by delta.tx_hash
 ), native as (
   select estimate.tx_hash,
          (select p.price_usd from market.asset_usd_prices p
@@ -560,6 +582,7 @@ with priced as (
 update market.arbitrage_estimates estimate
 set gas_usd = estimate.gas_native * native.native_usd,
     outflow_usd = totals.outflow_usd,
+    reliable_pricing = coalesce(reliable.all_reliable, true),
     gross_usd = case
       when verified.usd is not null then verified.usd
       when coalesce(totals.all_priced, true) then coalesce(totals.gross, 0) end,
@@ -607,6 +630,7 @@ set gas_usd = estimate.gas_native * native.native_usd,
 from native
 left join totals on totals.tx_hash = native.tx_hash
 left join verified on verified.tx_hash = native.tx_hash
+left join reliable on reliable.tx_hash = native.tx_hash
 where estimate.chain_id = $1 and estimate.tx_hash = native.tx_hash
 "#;
 
@@ -616,16 +640,18 @@ with scoped as (
   where chain_id = $1 and block_time >= now() - make_interval(hours => $3::int)
 ), bots as (
   select bot_address,
-         coalesce(sum(net_usd) filter (where status = 'estimated'), 0) as net,
-         coalesce(sum(gross_usd) filter (where status = 'estimated'), 0) as gross,
-         coalesce(sum(gas_usd) filter (where status = 'estimated'), 0) as gas,
+         coalesce(sum(net_usd) filter (where status = 'estimated' and reliable_pricing), 0) as net,
+         coalesce(sum(gross_usd) filter (where status = 'estimated' and reliable_pricing), 0) as gross,
+         coalesce(sum(gas_usd) filter (where status = 'estimated' and reliable_pricing), 0) as gas,
          count(*)::int as executions,
-         (count(*) filter (where status = 'estimated' and net_usd > 0))::int as profitable,
-         (count(*) filter (where status = 'unknown'))::int as unknown,
+         (count(*) filter (where status = 'estimated' and reliable_pricing and net_usd > 0))::int
+           as profitable,
+         (count(*) filter (where status = 'unknown' or not reliable_pricing))::int as unknown,
          count(distinct sender_address)::int as senders,
          (count(*) filter (where is_verified))::int as verified,
-         (array_agg(tx_hash order by net_usd desc nulls last))[1] as best_tx,
-         max(net_usd) as best_net,
+         (array_agg(tx_hash order by net_usd desc nulls last)
+            filter (where status = 'estimated' and reliable_pricing))[1] as best_tx,
+         max(net_usd) filter (where status = 'estimated' and reliable_pricing) as best_net,
          max(block_time) as last_at
   from scoped
   group by bot_address

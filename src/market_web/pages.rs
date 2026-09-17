@@ -39,7 +39,7 @@ pub fn fragment_ticker(context: &PageContext<'_>, ticker: &MarketTicker) -> Stri
          <span>{grad_label}<b data-k=\"t-grad\">{grad}</b></span>{gainer}",
         live = l.text("Live · Robinhood Chain", "实时 · Robinhood Chain"),
         eth = ui::price_usd(ticker.native_usd),
-        vol_label = l.text("24h Pons volume", "24h Pons 成交额"),
+        vol_label = l.text("24h volume (reliable-priced)", "24h 成交额（可靠定价）"),
         vol = ui::usd(Some(ticker.volume_24h_usd)),
         trades_label = l.text("24h trades", "24h 成交笔数"),
         trades = ui::count(ticker.trades_24h),
@@ -93,7 +93,7 @@ fn overview_stats(context: &PageContext<'_>, ticker: &MarketTicker) -> String {
     };
     [
         stat(
-            l.text("24h volume", "24h 成交额"),
+            l.text("24h volume (reliable-priced)", "24h 成交额（可靠定价）"),
             ui::usd(Some(ticker.volume_24h_usd)),
             format!(
                 "{} {}",
@@ -342,8 +342,8 @@ pub fn launches(context: &PageContext<'_>, query: &LaunchTableQuery<'_>, table: 
         search = l.text("Search", "搜索"),
         refresh = escape_html(&launch_table_url(context, query, None, "/fragments/launches")),
         note = l.text(
-            "Gainers and losers require at least $250 of 24h volume. Market cap = price × total supply. Graduated tokens include Uniswap V4 pool trades. ≈ marks USD derived from swap medians (stock-token quotes).",
-            "涨跌榜要求 24h 成交额至少 $250。市值 = 价格 × 总供应量。已毕业代币包含 Uniswap V4 池内成交。≈ 表示美元价由成交中位数推导（股票代币报价）。"
+            "USD totals and the trending, volume and market-cap boards only count tokens quoted in ETH/WETH or a registry stablecoin. ≈ marks USD derived from swap medians (stock- or meme-token quotes): shown for context, never summed or ranked. Price change is measured in the quote asset, so it is unaffected. Market cap = price × total supply; graduated tokens include Uniswap V4 pool trades.",
+            "美元总额与热门/成交额/市值榜只统计以 ETH/WETH 或注册表稳定币计价的代币。≈ 表示美元价由成交中位数推导（股票或 meme 代币报价），仅供参考，不计入总额、不参与排名。涨跌幅按报价资产计算，不受影响。市值 = 价格 × 总供应量；已毕业代币包含 Uniswap V4 池内成交。"
         ),
     )
 }
@@ -450,8 +450,16 @@ fn token_table_row(context: &PageContext<'_>, row: &TokenRow, position: usize) -
         c5 = ui::change(row.change_5m_pct),
         c1 = ui::change(row.change_1h_pct),
         c24 = ui::change(row.change_24h_pct),
-        volume = ui::usd(row.volume_24h_usd),
-        mcap = ui::usd(row.market_cap_usd),
+        volume = graded_usd(
+            row,
+            ui::usd(row.volume_24h_usd),
+            row.volume_24h_usd.is_some()
+        ),
+        mcap = graded_usd(
+            row,
+            ui::usd(row.market_cap_usd),
+            row.market_cap_usd.is_some()
+        ),
         buyers = row
             .buyers_24h
             .map(|value| ui::count(value.into()))
@@ -811,11 +819,17 @@ fn with_params(context: &PageContext<'_>, path: &str) -> String {
 /// USD price, prefixed with `≈` when the quote asset's USD price is derived
 /// from swap medians rather than pool state or a stablecoin anchor.
 fn graded_price(row: &TokenRow) -> String {
-    let price = ui::price_usd(row.price_usd);
-    if row.price_grade.as_deref() == Some("derived") && row.price_usd.is_some() {
-        format!("<span title=\"USD derived from swap medians\">≈{price}</span>")
+    graded_usd(row, ui::price_usd(row.price_usd), row.price_usd.is_some())
+}
+
+/// Same marker for any other USD figure of the token.
+fn graded_usd(row: &TokenRow, rendered: String, has_value: bool) -> String {
+    if row.price_grade.as_deref() == Some("derived") && has_value {
+        format!(
+            "<span title=\"USD derived from swap medians; not summed into totals\">≈{rendered}</span>"
+        )
     } else {
-        price
+        rendered
     }
 }
 

@@ -198,8 +198,11 @@ impl MarketReadService {
                  (select price_usd::float8 from market.asset_usd_prices
                   where chain_id = $1 and asset_address = $2
                   order by bucket_start desc limit 1) as native_usd,
+                 -- Only assets priced from pool state or a stablecoin anchor
+                 -- may be summed; swap-derived quotes are not trustworthy.
                  (select coalesce(sum(volume_24h_usd), 0)::float8 from market.token_stats
-                  where chain_id = $1 and trades_24h > 0) as volume_24h,
+                  where chain_id = $1 and trades_24h > 0
+                    and price_grade = 'reliable') as volume_24h,
                  (select coalesce(sum(trades_24h), 0)::bigint from market.token_stats
                   where chain_id = $1 and trades_24h > 0) as trades_24h,
                  (select count(*) from market.token_stats
@@ -227,7 +230,7 @@ impl MarketReadService {
             r#"select launch_id, symbol, change_24h_pct::float8 as change
                from market.token_stats
                where chain_id = $1 and trades_24h > 0 and volume_24h_usd >= $2
-                 and change_24h_pct is not null
+                 and price_grade = 'reliable' and change_24h_pct is not null
                order by change_24h_pct desc
                limit 1"#,
         )
@@ -924,6 +927,7 @@ pub struct ArbitrageRow {
     pub gas_usd: Option<f64>,
     pub status: String,
     pub is_verified: bool,
+    pub reliable_pricing: bool,
     pub tokens: Option<String>,
 }
 
@@ -971,7 +975,7 @@ pub struct LiquidationRow {
 const ARBITRAGE_ROW_COLUMNS: &str = r#"
   e.tx_hash, e.bot_address, e.sender_address, e.block_time, e.swap_count, e.pool_count,
   e.net_usd::float8 as net_usd, e.gross_usd::float8 as gross_usd, e.gas_usd::float8 as gas_usd,
-  e.status, e.is_verified,
+  e.status, e.is_verified, e.reliable_pricing,
   (select string_agg(coalesce(m.symbol, left(d.token_address, 8)), ' · ')
    from market.arbitrage_estimate_deltas d
    left join public.erc20_token_metadata m
@@ -995,11 +999,17 @@ impl MarketReadService {
     ) -> LedgerResult<ArbitrageOverview> {
         let row = sqlx::query(
             r#"select count(*) as executions,
-                      count(*) filter (where status = 'estimated') as estimated,
-                      count(*) filter (where status = 'estimated' and net_usd > 0) as profitable,
-                      coalesce(sum(net_usd) filter (where status = 'estimated'), 0)::float8 as net,
-                      coalesce(sum(gross_usd) filter (where status = 'estimated'), 0)::float8 as gross,
-                      coalesce(sum(gas_usd) filter (where status = 'estimated'), 0)::float8 as gas,
+                      count(*) filter (where status = 'estimated' and reliable_pricing)
+                        as estimated,
+                      count(*) filter (where status = 'estimated' and reliable_pricing
+                        and net_usd > 0) as profitable,
+                      -- Only reliably priced executions are summed.
+                      coalesce(sum(net_usd) filter (where status = 'estimated' and reliable_pricing),
+                        0)::float8 as net,
+                      coalesce(sum(gross_usd) filter (where status = 'estimated'
+                        and reliable_pricing), 0)::float8 as gross,
+                      coalesce(sum(gas_usd) filter (where status = 'estimated' and reliable_pricing),
+                        0)::float8 as gas,
                       count(distinct bot_address) as bots,
                       count(*) filter (where is_verified) as verified,
                       max(block_time) as latest_at
@@ -1056,7 +1066,7 @@ impl MarketReadService {
     ) -> LedgerResult<Vec<ArbitrageRow>> {
         let sql = format!(
             "select {ARBITRAGE_ROW_COLUMNS} from market.arbitrage_estimates e
-             where e.chain_id = $1 and e.status = 'estimated'
+             where e.chain_id = $1 and e.status = 'estimated' and e.reliable_pricing
                and e.block_time >= now() - make_interval(hours => $2)
              order by e.net_usd desc nulls last limit $3"
         );
@@ -1212,7 +1222,7 @@ impl MarketReadService {
 fn board_clause(board: TokenBoard) -> (&'static str, &'static str) {
     match board {
         TokenBoard::Hot => (
-            "s.trades_24h > 0 and $5::float8 is not null",
+            "s.trades_24h > 0 and s.price_grade = 'reliable' and $5::float8 is not null",
             "s.hot_score desc, s.launch_id",
         ),
         TokenBoard::Gainers => (
@@ -1224,7 +1234,7 @@ fn board_clause(board: TokenBoard) -> (&'static str, &'static str) {
             "s.change_24h_pct asc nulls last, s.launch_id",
         ),
         TokenBoard::Volume => (
-            "s.trades_24h > 0 and $5::float8 is not null",
+            "s.trades_24h > 0 and s.price_grade = 'reliable' and $5::float8 is not null",
             "s.volume_24h_usd desc, s.launch_id",
         ),
         TokenBoard::New => (
@@ -1240,7 +1250,8 @@ fn board_clause(board: TokenBoard) -> (&'static str, &'static str) {
             "s.graduated_at desc nulls last, s.launch_id",
         ),
         TokenBoard::MarketCap => (
-            "s.trades_24h > 0 and s.market_cap_usd is not null and $5::float8 is not null",
+            "s.trades_24h > 0 and s.price_grade = 'reliable' and s.market_cap_usd is not null
+              and $5::float8 is not null",
             "s.market_cap_usd desc nulls last, s.launch_id",
         ),
     }

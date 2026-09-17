@@ -113,8 +113,8 @@ pub fn arbitrage(context: &PageContext<'_>, page: &ArbitragePage<'_>) -> String 
         feed = page.feed,
         verified = page.verified_section,
         method = l.text(
-            "Estimated profit nets ERC-20 transfers into and out of the transaction sender and its entry contract, values each token at the hourly USD price and subtracts exact gas. Profits settled to other addresses and native transfers are not counted. Deterministically verified executions are listed separately.",
-            "估算利润 = 交易发送者及其入口合约的 ERC-20 净流入按小时美元价格估值，再减去精确 gas。结算到其他地址的利润及原生币转账不计入。经确定性验证的执行单独列出。"
+            "Estimated profit nets ERC-20 transfers into and out of the transaction sender and its entry contract, values each token at the hourly USD price and subtracts exact gas. Totals and rankings count only executions whose every token is priced from pool state or a stablecoin anchor; ≈ marks a result that depends on swap-median prices. Profits settled to other addresses and native transfers are not counted, and deterministically verified executions supersede the estimate.",
+            "估算利润 = 交易发送者及其入口合约的 ERC-20 净流入按小时美元价格估值，再减去精确 gas。总额与排行只统计所有相关代币都有可靠价格（池子状态或稳定币锚定）的执行；≈ 表示该结果依赖成交中位数推导的价格。结算到其他地址的利润及原生币转账不计入；有确定性验证结果时以验证值为准。"
         ),
     )
 }
@@ -222,8 +222,11 @@ pub fn arbitrage_list(context: &PageContext<'_>, rows: &[ArbitrageRow]) -> Strin
                 class = match row.net_usd { Some(value) if value < 0.0 => "down", _ => "up" },
                 net = if row.status == "unknown" {
                     ui::trust(l, ui::Trust::Unknown)
-                } else {
+                } else if row.reliable_pricing {
                     ui::signed_usd(row.net_usd)
+                } else {
+                    // Cross-token result priced from swap medians.
+                    format!("≈{}", ui::signed_usd(row.net_usd))
                 },
                 gas = ui::usd(row.gas_usd),
             )
