@@ -473,13 +473,15 @@ impl ClickHouseClient {
         deserialize_rows(&payload)
     }
 
-    /// Newest block with ingested logs for `chain_id`.
-    pub async fn max_log_block(&self, chain_id: u32) -> LedgerResult<Option<u64>> {
+    /// Newest block with ingested logs for `chain_id` at or above `from_block`.
+    /// The lower bound lets ClickHouse prune partitions; an unbounded max()
+    /// reads every row of the log table.
+    pub async fn max_log_block(&self, chain_id: u32, from_block: u64) -> LedgerResult<Option<u64>> {
         let payload = self
             .query_json(&format!(
                 "SELECT max(block_number) AS max_block, count() > 0 AS present \
-                 FROM {}.logs_raw WHERE chain_id = {} FORMAT JSON",
-                self.database, chain_id
+                 FROM {}.logs_raw WHERE chain_id = {} AND block_number >= {} FORMAT JSON",
+                self.database, chain_id, from_block
             ))
             .await?;
         let Some(row) = payload["data"].as_array().and_then(|rows| rows.first()) else {

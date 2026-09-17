@@ -369,7 +369,11 @@ impl PoolIndexer {
             .saturating_sub(self.config.head_lag_blocks);
         if let Some(logs) = &self.logs {
             // Only scan what the log store has ingested.
-            match logs.max_log_block(self.config.chain_id as u32).await? {
+            let floor = self.load_cursor().await?.unwrap_or_default();
+            match logs
+                .max_log_block(self.config.chain_id as u32, floor)
+                .await?
+            {
                 Some(ingested) => {
                     head = head.min(ingested.saturating_sub(self.config.head_lag_blocks))
                 }
