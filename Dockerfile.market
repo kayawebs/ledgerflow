@@ -1,0 +1,39 @@
+# Market web and market projector only. Built separately from the shared
+# `ledgerflow` image so deploying the market product never changes the image
+# of other services, and with capped parallelism because the host also runs
+# the chain node and other stacks.
+FROM rust:1.92-bookworm AS builder
+
+ARG CARGO_BUILD_JOBS=8
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY migrations ./migrations
+COPY migrations_market ./migrations_market
+COPY assets ./assets
+COPY config ./config
+COPY schemas ./schemas
+COPY demo ./demo
+COPY reports/public ./reports/public
+COPY src ./src
+
+RUN cargo build --release --locked \
+    --bin ledgerflow_market_web \
+    --bin ledgerflow_market_projector
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/ledgerflow_market_web /usr/local/bin/ledgerflow_market_web
+COPY --from=builder /app/target/release/ledgerflow_market_projector /usr/local/bin/ledgerflow_market_projector
+
+ENV RUST_LOG=info
+
+CMD ["ledgerflow_market_web"]
