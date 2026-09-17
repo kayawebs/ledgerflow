@@ -3,7 +3,7 @@
 计划：[`docs/product/market-mvp-plan.md`](../product/market-mvp-plan.md)
 分支：`feat/market-mvp`
 运行环境：Robinhood Chain 4663，本地节点（robinhood-nitro，经 rpc-gateway）+ LedgerFlow PostgreSQL / ClickHouse
-开发实例：`http://127.0.0.1:3401`（release 构建，读生产库）；生产 `3001` 未改动
+生产：`http://127.0.0.1:3001`（`market-web` + `market-projector` 容器，2026-09-17 13:10 UTC 起）；验收阶段使用开发实例 3401
 状态图例：`PASS` 通过 · `PARTIAL` 部分通过（附限制）· `FAIL` 未通过 · `PENDING` 未开始
 
 所有数值为 2026-09-17 实测。可复现证据：`scripts/market_mvp_acceptance.sql`、`scripts/market_web_latency.sh`、单元测试、截图。
