@@ -22,8 +22,10 @@ protocol-scoped address clusters with their earnings.
   go through `rpc-gateway`) plus LedgerFlow's own databases. No third-party price,
   indexer or explorer APIs.
 - Never touch the production `robinhood-arb-*` containers.
-- Schema changes only via additive SQLx migrations in `migrations/` (next free
-  number after the highest existing one, always with a `.down.sql`).
+- Market MVP schema changes go in `migrations_market/` (schema `market`, own
+  `_sqlx_migrations` table) so binaries built from older code never meet unknown
+  public migrations. Never edit an applied migration; add a new one. Public
+  schema changes still need additive migrations in `migrations/`.
 - Request handlers must read precomputed tables; never scan
   `protocol_launch_trade_facts` (24M+ rows, 46 GB) on a page request.
 - Every displayed amount carries a trust label: verified / estimated / unknown.
@@ -45,6 +47,7 @@ Query quickly: `sudo -n docker exec -i ledgerflow-chainactors-v2-db-1 psql -U po
 
 ```bash
 cargo check --bin ledgerflow_market_web          # fast compile check
+cargo test --lib market                          # market unit tests
 cargo test --lib market                          # focused unit tests
 cargo fmt && cargo clippy --all-targets
 cargo test --all-targets                         # full suite before tagging
@@ -56,6 +59,15 @@ Git commits need `-c user.name=peter -c user.email=wcy19960411@gmail.com`
 (no global identity is configured).
 
 ## Code map (market-related)
+
+- `src/bin/ledgerflow_market_projector.rs` – runs all market tasks (prices, candles,
+  stats, positions/leaderboards, arbitrage estimates, pool swaps, liquidations);
+  see `docs/operations/market-projector.md`.
+- `src/services/market_data.rs`, `market_pnl.rs`, `market_arbitrage.rs`,
+  `market_pools.rs`, `market_liquidations.rs` – the projector stages.
+- `src/services/market_read.rs` – read queries for the web (never scan trade facts).
+- `src/market_web/{ui,pages,intel,execution}.rs` – components and pages.
+- `scripts/market_mvp_acceptance.sql` – reproducible acceptance checks.
 
 - `src/market_web/` – server-rendered pages, inline CSS/JS, wallet auth, JSON APIs.
 - `src/services/protocol_market.rs` – read models used by the web + seed import.

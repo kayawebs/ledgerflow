@@ -18,6 +18,7 @@ pub mod market_arbitrage;
 pub mod market_data;
 pub mod market_liquidations;
 pub mod market_pnl;
+pub mod market_pools;
 pub mod market_read;
 pub mod metrics;
 pub mod monitor_reporter;

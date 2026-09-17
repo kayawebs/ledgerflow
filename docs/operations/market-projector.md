@@ -16,6 +16,7 @@ startup. Every table is derived, so the schema can be rebuilt from scratch:
 truncate market.projector_checkpoints, market.asset_usd_prices,
   market.token_candles_1m, market.token_stats, market.wallet_positions,
   market.wallet_leaderboard, market.cluster_leaderboard;
+-- candles wait for pool swaps: keep or re-seed pool_swaps:<chain>
 ```
 
 (`market.arbitrage_*`, `market.lending_*` and `market.price_assets` can be
@@ -34,6 +35,7 @@ kept; they carry RPC-sourced data that is expensive to refetch.)
 | Arbitrage | `arbitrage_estimates:<chain>` (block time, µs) | `arbitrage_estimates`, `arbitrage_estimate_deltas`, `arbitrage_bot_leaderboard` |
 | Price assets | — | new tokens in `price_assets` receive 30 days of price history |
 | Liquidations | `liquidations:<chain>` (block) | `lending_markets`, `lending_liquidations` |
+| Graduated pools | `pool_swaps:<chain>` (block) | `token_pools` (V4 pool id from the graduation receipt's `Initialize`), `pool_swap_facts`; candles never pass this cursor |
 
 ## Run
 
@@ -82,3 +84,8 @@ where block_time > now() - interval '24 hours' group by 1;
   settled elsewhere is not counted and unpriced tokens make a result unknown.
 - Liquidation bonus is seized collateral value minus repaid debt value, before
   gas.
+- Rankings use realized profit; unrealized inventory is shown for context only.
+- Post-graduation V4 swaps feed prices, volume and candles; their `sender` is
+  usually a router, so wallet positions remain curve-only.
+- Hourly USD prices anchor on the 7-day median of stored prices and drop hours
+  backed by one swap-derived observation.

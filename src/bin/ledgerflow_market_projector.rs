@@ -11,6 +11,7 @@ use ledgerflow::{
         market_data::{MarketProjector, MarketProjectorConfig, run_market_migrations},
         market_liquidations::{LiquidationIndexer, LiquidationIndexerConfig},
         market_pnl::{MarketPnlConfig, MarketPnlProjector},
+        market_pools::{PoolIndexer, PoolIndexerConfig},
     },
 };
 use sqlx::postgres::PgPoolOptions;
@@ -125,6 +126,46 @@ async fn main() {
             ),
         },
     );
+    if let Some(rpc) = rpc.clone() {
+        let mut pools = PoolIndexer::new(
+            pool.clone(),
+            rpc,
+            PoolIndexerConfig {
+                chain_id: config.chain_id,
+                ..PoolIndexerConfig::default()
+            },
+        );
+        tokio::spawn(async move {
+            loop {
+                let delay = match pools.process_once().await {
+                    Ok(iteration) => {
+                        if iteration.has_backlog() || iteration.swaps > 0 {
+                            info!(
+                                mapped = iteration.mapped,
+                                unmapped = iteration.unmapped,
+                                from = iteration.from_block,
+                                to = iteration.to_block,
+                                head = iteration.head_block,
+                                swaps = iteration.swaps,
+                                range = iteration.range,
+                                "market pool swap indexing completed"
+                            );
+                        }
+                        if iteration.has_backlog() {
+                            Duration::from_millis(100)
+                        } else {
+                            Duration::from_secs(3)
+                        }
+                    }
+                    Err(pool_error) => {
+                        error!(error = %pool_error, "market pool swap indexing failed");
+                        Duration::from_secs(20)
+                    }
+                };
+                tokio::time::sleep(delay).await;
+            }
+        });
+    }
     if let Some(rpc) = rpc.clone() {
         let defaults = LiquidationIndexerConfig::default();
         let mut indexer = LiquidationIndexer::new(

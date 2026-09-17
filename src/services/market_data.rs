@@ -305,6 +305,15 @@ impl MarketProjector {
                 first - 1
             }
         };
+        // Graduated pools feed the same candles; never pass their swap cursor.
+        let pool_cursor = self
+            .load_checkpoint(&format!("pool_swaps:{}", self.config.chain_id))
+            .await?;
+        let head = match pool_cursor {
+            Some(pool_cursor) => head.min(pool_cursor.position),
+            None => head,
+        };
+        summary.candle_head_block = head;
         let end = (cursor + self.config.candle_block_batch).min(head);
         let start = if end >= head {
             // Caught up: re-derive a trailing window so late canonical flips and
@@ -756,40 +765,72 @@ const PRICE_ROLLUP_SQL: &str = r#"with observations as materialized (
 /// always rebuilt from all of its facts. Buckets whose facts all became
 /// non-canonical are deleted.
 const CANDLE_PROJECTION_SQL: &str = r#"
-with touched as materialized (
+with touched_facts as (
+  select launch_id, occurred_at
+  from public.protocol_launch_trade_facts
+  where chain_id = $1 and block_number between $2 and $3 and occurred_at is not null
+  union all
+  select launch_id, occurred_at
+  from market.pool_swap_facts
+  where chain_id = $1 and block_number between $2 and $3 and occurred_at is not null
+), touched as materialized (
   select launch_id,
          date_trunc('minute', min(occurred_at)) as first_bucket,
          date_trunc('minute', max(occurred_at)) as last_bucket
-  from public.protocol_launch_trade_facts
-  where chain_id = $1 and block_number between $2 and $3 and occurred_at is not null
+  from touched_facts
   group by launch_id
-), facts as materialized (
-  select fact.launch_id, fact.domain_id, launch.quote_token_address,
-         date_trunc('minute', fact.occurred_at) as bucket_start,
-         fact.trade_side, fact.trader_address, fact.block_number, fact.tx_index, fact.log_index,
-         fact.quote_amount_raw::numeric * power(10::numeric, -(quote_decimals.value)) as quote_amount,
-         fact.token_amount_raw::numeric * power(10::numeric, -(token_meta.decimals)) as token_amount,
-         fact.fee_amount_raw::numeric * power(10::numeric, -(quote_decimals.value)) as fee_amount,
-         fact.tax_amount_raw::numeric * power(10::numeric, -(quote_decimals.value)) as tax_amount
+), launch_meta as materialized (
+  select touched.launch_id, touched.first_bucket, touched.last_bucket,
+         launch.domain_id, launch.quote_token_address,
+         token_meta.decimals as token_decimals,
+         coalesce(quote_meta.decimals,
+           case when launch.quote_token_address = $7 then 18 end) as quote_decimals,
+         pool.token_is_currency0,
+         case when pool.token_is_currency0 then pool.currency1 else pool.currency0 end
+           as pool_quote_currency
   from touched
-  join public.protocol_launch_trade_facts fact
-    on fact.launch_id = touched.launch_id and fact.is_canonical
-   and fact.block_number between $2 - $4 and $3
-   and fact.occurred_at >= touched.first_bucket
-   and fact.occurred_at < touched.last_bucket + interval '1 minute'
-  join public.protocol_token_launches launch on launch.launch_id = fact.launch_id
-  join public.erc20_token_metadata token_meta
-    on token_meta.chain_id = fact.chain_id and token_meta.token_address = fact.token_address
-   and token_meta.fetch_status = 'ok' and token_meta.decimals is not null
+  join public.protocol_token_launches launch on launch.launch_id = touched.launch_id
+  left join public.erc20_token_metadata token_meta
+    on token_meta.chain_id = launch.chain_id and token_meta.token_address = launch.token_address
+   and token_meta.fetch_status = 'ok'
   left join public.erc20_token_metadata quote_meta
     on quote_meta.chain_id = launch.chain_id
    and quote_meta.token_address = launch.quote_token_address
    and quote_meta.fetch_status = 'ok'
-  cross join lateral (
-    select coalesce(quote_meta.decimals,
-             case when launch.quote_token_address = $7 then 18 end) as value
-  ) quote_decimals
-  where quote_decimals.value is not null
+  left join market.token_pools pool
+    on pool.launch_id = launch.launch_id and pool.status = 'mapped'
+), facts as materialized (
+  select fact.launch_id, meta.domain_id, meta.quote_token_address,
+         date_trunc('minute', fact.occurred_at) as bucket_start,
+         fact.trade_side, fact.trader_address, fact.block_number, fact.tx_index, fact.log_index,
+         fact.quote_amount_raw::numeric * power(10::numeric, -(meta.quote_decimals)) as quote_amount,
+         fact.token_amount_raw::numeric * power(10::numeric, -(meta.token_decimals)) as token_amount,
+         fact.fee_amount_raw::numeric * power(10::numeric, -(meta.quote_decimals)) as fee_amount,
+         fact.tax_amount_raw::numeric * power(10::numeric, -(meta.quote_decimals)) as tax_amount,
+         true as is_curve
+  from launch_meta meta
+  join public.protocol_launch_trade_facts fact
+    on fact.launch_id = meta.launch_id and fact.is_canonical
+   and fact.block_number between $2 - $4 and $3
+   and fact.occurred_at >= meta.first_bucket
+   and fact.occurred_at < meta.last_bucket + interval '1 minute'
+  where meta.token_decimals is not null and meta.quote_decimals is not null
+  union all
+  -- Post-graduation V4 swaps against the launch's own quote currency.
+  select swap.launch_id, meta.domain_id, meta.quote_token_address,
+         date_trunc('minute', swap.occurred_at),
+         swap.trade_side, swap.sender_address, swap.block_number, 0, swap.log_index,
+         swap.quote_amount_raw * power(10::numeric, -(meta.quote_decimals)),
+         swap.token_amount_raw * power(10::numeric, -(meta.token_decimals)),
+         0, 0, false
+  from launch_meta meta
+  join market.pool_swap_facts swap
+    on swap.launch_id = meta.launch_id
+   and swap.block_number between $2 - $4 and $3
+   and swap.occurred_at >= meta.first_bucket
+   and swap.occurred_at < meta.last_bucket + interval '1 minute'
+  where meta.token_decimals is not null and meta.quote_decimals is not null
+    and meta.pool_quote_currency = meta.quote_token_address
 ), priced as (
   select facts.*,
          case when token_amount > 0 then quote_amount / token_amount end as price
@@ -807,8 +848,8 @@ with touched as materialized (
          coalesce(sum(token_amount) filter (where trade_side = 'buy'), 0) as buy_token,
          coalesce(sum(token_amount) filter (where trade_side = 'sell'), 0) as sell_token,
          coalesce(sum(fee_amount), 0) as fee_quote,
-         coalesce(sum(case when trade_side = 'buy'
-                    then quote_amount - fee_amount - tax_amount
+         coalesce(sum(case when not is_curve then 0
+                    when trade_side = 'buy' then quote_amount - fee_amount - tax_amount
                     else -(quote_amount + fee_amount + tax_amount) end), 0) as reserve_delta,
          count(*)::int as trade_count,
          (count(*) filter (where trade_side = 'buy'))::int as buy_count,
