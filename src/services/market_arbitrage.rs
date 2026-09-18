@@ -656,8 +656,12 @@ with scoped as (
   from scoped
   group by bot_address
 ), ranked as (
+  -- A bot whose every execution is unpriced has no known profit: ranking it at
+  -- $0 would pad the board with rows that say nothing. It stays in the
+  -- "profit unknown" count on the page instead.
   select bots.*, row_number() over (order by net desc, bot_address) as rank
   from bots
+  where bots.net <> 0 or bots.profitable > 0
   order by net desc
   limit $4
 )

@@ -344,6 +344,10 @@ async fn main() {
     info!(chain_id = config.chain_id, "market projector started");
 
     let mut last_repair = Instant::now();
+    // Retention runs a few times a day; the first pass happens right away so a
+    // long-lived deployment cannot sit on an unbounded table.
+    let page_view_retention_days: i32 = env_parse("LEDGERFLOW_MARKET_PAGE_VIEW_RETENTION_DAYS", 90);
+    let mut last_prune = Instant::now() - Duration::from_secs(21_600);
     loop {
         let started = Instant::now();
         let delay = match projector.project_once().await {
@@ -386,6 +390,16 @@ async fn main() {
             Err(backfill_error) => {
                 warn!(error = %backfill_error, "market price asset backfill failed")
             }
+        }
+        if last_prune.elapsed() >= Duration::from_secs(21_600) {
+            match projector.prune_page_views(page_view_retention_days).await {
+                Ok(0) => {}
+                Ok(rows) => info!(rows, "market page view pruning completed"),
+                Err(prune_error) => {
+                    warn!(error = %prune_error, "market page view pruning failed")
+                }
+            }
+            last_prune = Instant::now();
         }
         if last_repair.elapsed() >= repair_interval {
             match projector.repair_candle_prices().await {

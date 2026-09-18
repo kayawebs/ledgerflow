@@ -182,6 +182,24 @@ impl MarketProjector {
         Ok(summary)
     }
 
+    /// Drops page views past the retention window. Traffic history is only
+    /// needed to read a campaign, and the digests in it are meaningless after
+    /// their day, so nothing is kept indefinitely.
+    pub async fn prune_page_views(&self, retention_days: i32) -> LedgerResult<u64> {
+        if retention_days <= 0 {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "delete from market.page_views
+             where occurred_at < now() - make_interval(days => $1)",
+        )
+        .bind(retention_days)
+        .execute(&self.pool)
+        .await
+        .map_err(db_error)?;
+        Ok(result.rows_affected())
+    }
+
     /// Fills candles whose quote price was unknown at projection time. Runs on
     /// a slower cadence because it scans recent candles.
     pub async fn repair_candle_prices(&self) -> LedgerResult<u64> {

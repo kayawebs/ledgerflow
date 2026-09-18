@@ -65,11 +65,24 @@ pub fn arbitrage(context: &PageContext<'_>, page: &ArbitragePage<'_>) -> String 
         stat(
             l.text("Active bots", "活跃机器人"),
             ui::count(overview.bots),
-            format!(
-                "{} {}",
-                l.text("latest", "最新"),
-                ui::age(overview.latest_at, l)
-            ),
+            // Bots whose every execution is unpriced cannot be ranked, so the
+            // gap between the two counts is stated rather than shown as $0.
+            match overview.bots - overview.priced_bots {
+                0 => format!(
+                    "{} {}",
+                    l.text("latest", "最新"),
+                    ui::age(overview.latest_at, l)
+                ),
+                unranked => format!(
+                    "{} {} {}",
+                    ui::count(overview.priced_bots),
+                    l.text("ranked ·", "个可排名 ·"),
+                    l.text_owned(
+                        format!("{} profit unknown", ui::count(unranked)),
+                        format!("{} 个收益未知", ui::count(unranked)),
+                    )
+                ),
+            },
             false,
         ),
         stat(
@@ -263,13 +276,17 @@ pub fn liquidations(context: &PageContext<'_>, page: &LiquidationPage<'_>) -> St
         )
     };
     let stats = [
+        // Debt repaid leads because every liquidation carries it; the reward
+        // is only known for the subset that could be priced, so it follows
+        // with its coverage stated.
         stat(
-            l.text("Liquidator bonus · 30d", "清算奖励 · 30d"),
+            l.text("Debt repaid · 30d", "偿还债务 · 30d"),
+            ui::usd(Some(overview.repaid_usd)),
             format!(
-                "<span class=\"up\">{}</span>",
-                ui::signed_usd(Some(overview.bonus_usd))
+                "{} {}",
+                l.text("collateral seized", "没收抵押"),
+                ui::usd(Some(overview.seized_usd))
             ),
-            ui::trust(l, ui::Trust::Estimated),
             true,
         ),
         stat(
@@ -283,23 +300,49 @@ pub fn liquidations(context: &PageContext<'_>, page: &LiquidationPage<'_>) -> St
             false,
         ),
         stat(
-            l.text("Debt repaid", "偿还债务"),
-            ui::usd(Some(overview.repaid_usd)),
+            l.text("Liquidator bonus", "清算奖励"),
             format!(
-                "{} {}",
-                l.text("collateral seized", "没收抵押"),
-                ui::usd(Some(overview.seized_usd))
+                "<span class=\"up\">{}</span>",
+                ui::signed_usd(Some(overview.bonus_usd))
+            ),
+            l.text_owned(
+                format!(
+                    "priced for {} of {} {}",
+                    ui::count(overview.priced_bonuses),
+                    ui::count(overview.liquidations),
+                    ui::trust(l, ui::Trust::Estimated)
+                ),
+                format!(
+                    "{} / {} 笔可定价 {}",
+                    ui::count(overview.priced_bonuses),
+                    ui::count(overview.liquidations),
+                    ui::trust(l, ui::Trust::Estimated)
+                ),
             ),
             false,
         ),
         stat(
             l.text("Active liquidators", "活跃清算人"),
             ui::count(overview.liquidators),
-            format!(
-                "{} {}",
-                l.text("latest", "最新"),
-                ui::age(overview.latest_at, l)
-            ),
+            match overview.liquidators - overview.ranked_liquidators {
+                0 => format!(
+                    "{} {}",
+                    l.text("latest", "最新"),
+                    ui::age(overview.latest_at, l)
+                ),
+                unranked => l.text_owned(
+                    format!(
+                        "{} ranked · {} reward unknown",
+                        ui::count(overview.ranked_liquidators),
+                        ui::count(unranked)
+                    ),
+                    format!(
+                        "{} 个可排名 · {} 个奖励未知",
+                        ui::count(overview.ranked_liquidators),
+                        ui::count(unranked)
+                    ),
+                ),
+            },
             false,
         ),
         stat(

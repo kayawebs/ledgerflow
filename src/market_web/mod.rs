@@ -24,6 +24,7 @@ mod execution;
 mod intel;
 mod og;
 mod pages;
+mod ratelimit;
 mod share;
 mod ui;
 
@@ -278,6 +279,10 @@ pub fn router(state: MarketWebState) -> Router {
         // holding the table, and they reset whenever the site restarts.
         salt: Uuid::new_v4().to_string(),
     });
+    let limiter = Arc::new(ratelimit::RateLimiter::new(
+        env_u32("LEDGERFLOW_MARKET_RATE_LIMIT_PER_MINUTE", 300),
+        env_u32("LEDGERFLOW_MARKET_CARD_RATE_LIMIT_PER_MINUTE", 60),
+    ));
     Router::new()
         .route("/", get(overview_page))
         .route("/launches", get(launches_page))
@@ -329,6 +334,11 @@ pub fn router(state: MarketWebState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             analytics,
             analytics::record_view,
+        ))
+        // Outermost, so a throttled caller costs nothing beyond the check.
+        .layer(axum::middleware::from_fn_with_state(
+            limiter,
+            ratelimit::enforce,
         ))
 }
 
@@ -2765,6 +2775,15 @@ fn upstream_error(message: impl Into<String>) -> MarketWebError {
         status: StatusCode::BAD_GATEWAY,
         message: message.into(),
     }
+}
+
+/// Reads a positive integer setting, falling back to the default when unset or
+/// unparseable. Zero is a valid value and disables the limit it configures.
+fn env_u32(key: &str, default: u32) -> u32 {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
 }
 
 fn internal_error(error: impl std::fmt::Display) -> MarketWebError {

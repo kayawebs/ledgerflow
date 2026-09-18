@@ -890,6 +890,9 @@ pub struct ArbitrageOverview {
     pub gross_usd: f64,
     pub gas_usd: f64,
     pub bots: i64,
+    /// Bots with at least one reliably priced execution, so a profit can be
+    /// ranked for them.
+    pub priced_bots: i64,
     pub verified: i64,
     pub latest_at: Option<DateTime<Utc>>,
 }
@@ -939,6 +942,10 @@ pub struct LiquidationOverview {
     pub seized_usd: f64,
     pub bonus_usd: f64,
     pub liquidators: i64,
+    /// Liquidations whose reward could be priced and passed the plausibility
+    /// check; the rest report no reward.
+    pub priced_bonuses: i64,
+    pub ranked_liquidators: i64,
     pub borrowers: i64,
     pub bad_debt_events: i64,
     pub latest_at: Option<DateTime<Utc>>,
@@ -1011,6 +1018,10 @@ impl MarketReadService {
                       coalesce(sum(gas_usd) filter (where status = 'estimated' and reliable_pricing),
                         0)::float8 as gas,
                       count(distinct bot_address) as bots,
+                      -- Bots with at least one reliably priced execution: the
+                      -- rest cannot be ranked and are reported as unknown.
+                      count(distinct bot_address) filter (where status = 'estimated'
+                        and reliable_pricing) as priced_bots,
                       count(*) filter (where is_verified) as verified,
                       max(block_time) as latest_at
                from market.arbitrage_estimates
@@ -1029,6 +1040,7 @@ impl MarketReadService {
             gross_usd: row.get("gross"),
             gas_usd: row.get("gas"),
             bots: row.get("bots"),
+            priced_bots: row.get("priced_bots"),
             verified: row.get("verified"),
             latest_at: row.get("latest_at"),
         })
@@ -1132,6 +1144,12 @@ impl MarketReadService {
                       coalesce(sum(seized_usd), 0)::float8 as seized,
                       coalesce(sum(bonus_usd), 0)::float8 as bonus,
                       count(distinct liquidator) as liquidators,
+                      -- Rewards are only published when the seized/repaid ratio
+                      -- is plausible and both legs are priced, so the page says
+                      -- how much of the window that covers.
+                      count(*) filter (where bonus_usd is not null) as priced_bonuses,
+                      count(distinct liquidator) filter (where bonus_usd is not null)
+                        as ranked_liquidators,
                       count(distinct borrower) as borrowers,
                       count(*) filter (where bad_debt_raw > 0) as bad_debt,
                       max(block_time) as latest_at,
@@ -1152,6 +1170,8 @@ impl MarketReadService {
             seized_usd: row.get("seized"),
             bonus_usd: row.get("bonus"),
             liquidators: row.get("liquidators"),
+            priced_bonuses: row.get("priced_bonuses"),
+            ranked_liquidators: row.get("ranked_liquidators"),
             borrowers: row.get("borrowers"),
             bad_debt_events: row.get("bad_debt"),
             latest_at: row.get("latest_at"),
@@ -1175,6 +1195,9 @@ impl MarketReadService {
                from market.lending_liquidations
                where chain_id = $1 and block_time >= now() - make_interval(days => $2)
                group by liquidator
+               -- A liquidator with no priced reward would rank as a dash: it is
+               -- counted on the page instead of padding the table.
+               having count(*) filter (where bonus_usd is not null) > 0
                order by sum(bonus_usd) desc nulls last, count(*) desc
                limit $3"#,
         )
