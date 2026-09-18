@@ -196,3 +196,27 @@
 
 复核结论：**页面数字全部来自链上真实数据**，并且在修复上述 4 个口径缺陷后，不可靠的推导值要么被排除出排行与总量，要么被显式标注为“估算 / 未知”。
 
+
+## M9 分享与增长基建（2026-09-18）
+
+目标：让推文里的链接自带数字，让第一次来的访客能立刻查到与自己相关的东西，并且能衡量一次宣传的效果。
+
+| # | 验收项 | 状态 | 证据 |
+|---|---|---|---|
+| 9.1 | 社交卡片 | PASS | 服务端渲染 1200×630 PNG（`src/market_web/og.rs`，resvg 光栅化，字体内嵌）：币种卡（价格 / 24h 涨跌 / 成交额 / 市值 / 24h 走势）、地址卡（已实现收益 / 胜率 / 最佳倍数 / 排名）、榜单卡（涨幅榜、成交额榜等 8 个 Tab）、收益榜卡（前 5 名钱包）。首帧 0.63 s，缓存命中 0.02 s |
+| 9.2 | OG / Twitter meta | PASS | 生产实测 `og:title`、`og:description`、`og:image`（绝对 https 地址）、`og:url`、`canonical`、`twitter:card=summary_large_image` |
+| 9.3 | CDN 缓存 | PASS | `cache-control: public, s-maxage=600, stale-while-revalidate=600`；Cloudflare `cf-cache-status: HIT`，抓取风暴不会打到进程 |
+| 9.4 | 一键分享 | PASS | 币页、地址页、发币榜、收益榜各有「分享到 X / 复制链接」；推文文案服务端生成并带数字，URL 由前端取自地址栏（代理与自定义域名下都正确） |
+| 9.5 | 地址查询入口 | PASS | 首页 `page-head` 的查询框 → `/lookup` 303 跳转到 `/address/{addr}`；纯 GET 表单，无脚本也可用；不需要连接钱包 |
+| 9.6 | 钱包连接有回报 | PASS | 签名验证成功后跳转到访客自己的地址页，而不是原地刷新 |
+| 9.7 | 访问统计 | PASS | `market.page_views` 中间件：路径、来源域名、`utm_source`、国家、设备类别、按天轮换的加盐摘要；不写 IP 与 User-Agent；批量写入（256 条或 5 秒）不阻塞请求；读数脚本 `scripts/market_traffic.sql` |
+| 9.8 | 收录基础 | PASS | `/robots.txt`（屏蔽 fragments / api / auth）与 `/sitemap.xml`（5 个稳定入口） |
+| 9.9 | 空链提示 | PASS | 网络选择器中 Base 标注「即将」，因为该链暂无行情数据 |
+| 9.10 | 生产部署 | PASS | 镜像 `ledgerflow-market:market-share-rc1`；`LEDGERFLOW_MARKET_WEB_BASE_URL=https://ledgerflow.top`（社交卡片绝对地址与会话 Cookie 的 Secure 标记都取自它） |
+
+### 发推前仍建议处理
+
+- 套利机器人榜中净收益为 $0 的行会填满榜单，宣传前应过滤或折叠。
+- 清算页全历史只有 176 条、33 条有美元奖励，不适合作为宣传落地页。
+- `/og/address/{addr}/card.png` 会按地址触发查询，可被枚举；目前依赖 Cloudflare 缓存与索引，后续可加应用层限流。
+- `market.page_views` 没有保留策略，建议加定期清理（例如保留 90 天）。
