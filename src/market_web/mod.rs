@@ -301,6 +301,7 @@ pub fn router(state: MarketWebState) -> Router {
         .route("/wins", get(wins_page))
         .route("/wins/{launch_id}/{address}", get(win_detail_page))
         .route("/fragments/wins", get(wins_fragment))
+        .route("/fragments/sharp", get(sharp_fragment))
         .route("/og/win/{launch_id}/{address}/card.png", get(og_win_card))
         .route("/og/wins/card.png", get(og_wins_card))
         .route("/creators", get(creators_page))
@@ -2429,6 +2430,12 @@ async fn wins_page(
         session_address(&state, &headers),
     )?;
     let feed = wins::feed(&context, &latest);
+    let access = access::Access::of(wallet.as_deref());
+    let sharp_buys = state
+        .market
+        .sharp_buys(chain_id, wins::sharp_delay(access), 20)
+        .await?;
+    let sharp = wins::sharp_section(&context, &wins::sharp_feed(&context, &sharp_buys), access);
     let social = share::wins_social(context.locale, &summary);
     Ok(Html(layout_social(
         &context,
@@ -2444,6 +2451,7 @@ async fn wins_page(
                 summary: &summary,
                 wins: &wins,
                 feed: &feed,
+                sharp: &sharp,
             },
         ),
     )))
@@ -2506,6 +2514,21 @@ async fn wins_fragment(
         )
         .await?;
     Ok(Html(wins::feed(&context, &wins)))
+}
+
+async fn sharp_fragment(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    let wallet = session_address(&state, &headers).await?;
+    let access = access::Access::of(wallet.as_deref());
+    let buys = state
+        .market
+        .sharp_buys(context.chain_id, wins::sharp_delay(access), 20)
+        .await?;
+    Ok(Html(wins::sharp_feed(&context, &buys)))
 }
 
 async fn og_win_card(

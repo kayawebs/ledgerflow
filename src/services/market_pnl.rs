@@ -102,6 +102,7 @@ pub struct MarketPnlSummary {
     pub positions_deleted: i64,
     pub wallet_rows: u64,
     pub cluster_rows: u64,
+    pub sharp_wallets: u64,
     pub position_ms: u64,
     pub leaderboard_ms: u64,
 }
@@ -147,7 +148,34 @@ impl MarketPnlProjector {
             last_rebuilt[index] = Some(Instant::now());
         }
         summary.leaderboard_ms = started.elapsed().as_millis() as u64;
+        drop(last_rebuilt);
+        summary.sharp_wallets = self.rebuild_sharp_wallets().await?;
         Ok(summary)
+    }
+
+    /// Rebuilds the set of wallets that have closed several large wins lately.
+    /// The set is what the live "what are they buying" feed is keyed on, so it
+    /// is kept small and honest: a win is a fully closed position that returned
+    /// at least five times a stake of twenty dollars or more.
+    pub async fn rebuild_sharp_wallets(&self) -> LedgerResult<u64> {
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let started: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("select now()")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        let result = sqlx::query(SHARP_WALLET_SQL)
+            .bind(self.config.chain_id as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        sqlx::query("delete from market.sharp_wallets where chain_id = $1 and computed_at < $2")
+            .bind(self.config.chain_id as i64)
+            .bind(started)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(result.rows_affected())
     }
 
     /// Accumulates positions over blocks that are at least
@@ -499,6 +527,48 @@ static WALLET_LEADERBOARD_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("with {POSITION_PNL_CTE}{WALLET_LEADERBOARD_SQL_BODY}"));
 static CLUSTER_LEADERBOARD_SQL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| format!("with {POSITION_PNL_CTE}{CLUSTER_LEADERBOARD_SQL_BODY}"));
+
+/// Wallets with at least three large wins in the last week, ranked by how many
+/// they have closed and then by the money taken off the table.
+const SHARP_WALLET_SQL: &str = r#"
+with closed as (
+  select address,
+         count(*) as positions,
+         count(*) filter (where proceeds_usd >= cost_usd) as wins,
+         count(*) filter (where proceeds_usd >= cost_usd * 5 and cost_usd >= 20) as big_wins,
+         sum(proceeds_usd - cost_usd) as realized_usd,
+         max(proceeds_usd / nullif(cost_usd, 0)) as best_multiple,
+         max(last_trade_at) filter (where proceeds_usd >= cost_usd * 5 and cost_usd >= 20)
+           as last_win_at
+  from market.wallet_positions
+  where chain_id = $1 and sold_token >= bought_token and cost_usd > 0
+    and last_trade_at > now() - interval '7 days'
+  group by address
+), ranked as (
+  select closed.*,
+         row_number() over (order by big_wins desc, realized_usd desc nulls last) as rank
+  from closed
+  where big_wins >= 3 and realized_usd > 0
+  order by big_wins desc, realized_usd desc nulls last
+  limit 200
+)
+insert into market.sharp_wallets (
+  chain_id, address, rank, big_wins, wins, positions, realized_usd,
+  best_multiple, last_win_at, computed_at
+)
+select $1, address, rank::int, big_wins::int, wins::int, positions::int, realized_usd,
+       best_multiple, last_win_at, now()
+from ranked
+on conflict (chain_id, address) do update set
+  rank = excluded.rank,
+  big_wins = excluded.big_wins,
+  wins = excluded.wins,
+  positions = excluded.positions,
+  realized_usd = excluded.realized_usd,
+  best_multiple = excluded.best_multiple,
+  last_win_at = excluded.last_win_at,
+  computed_at = excluded.computed_at
+"#;
 
 fn db_error(error: impl std::fmt::Display) -> LedgerError {
     LedgerError::Persistence(error.to_string())

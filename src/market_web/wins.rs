@@ -6,9 +6,23 @@
 //! are settled positions, not predictions — the page promises nothing about
 //! whether the next one works.
 
-use crate::services::market_read::{WinBoard, WinRow, WinSummary};
+use crate::services::market_read::{SharpTradeRow, WinBoard, WinRow, WinSummary};
 
-use super::{PageContext, escape_html, intel::address_url, share, ui};
+use super::{
+    PageContext, access, access::Access, access::Tier, escape_html, intel::address_url, share, ui,
+};
+
+/// How far behind the live feed a reader who has not connected is held.
+pub const SHARP_DELAY_SECONDS: i64 = 600;
+
+/// The delay that applies to this reader.
+pub fn sharp_delay(access: Access) -> i64 {
+    if access.allows(Tier::Connected) {
+        0
+    } else {
+        SHARP_DELAY_SECONDS
+    }
+}
 
 pub struct WinsPage<'a> {
     pub board: WinBoard,
@@ -16,6 +30,7 @@ pub struct WinsPage<'a> {
     pub summary: &'a WinSummary,
     pub wins: &'a [WinRow],
     pub feed: &'a str,
+    pub sharp: &'a str,
 }
 
 fn board_label(context: &PageContext<'_>, board: WinBoard) -> &'static str {
@@ -151,6 +166,93 @@ fn held_for(context: &PageContext<'_>, win: &WinRow) -> String {
     }
 }
 
+/// One buy by a wallet that has been winning.
+fn sharp_row(context: &PageContext<'_>, buy: &SharpTradeRow) -> String {
+    let l = context.locale;
+    let graduated = buy.lifecycle_phase == "pool_created";
+    format!(
+        "<a class=\"row win\" href=\"{href}\"><span class=\"avatar\" style=\"--h:32\">🎯</span>\
+         <div class=\"name\"><strong>${symbol} {badge}</strong>\
+         <small><span class=\"mono\">{address}</span> · {wins} {wins_label}</small></div>\
+         <div class=\"val\"><strong>{amount}</strong><small>{age}</small></div></a>",
+        href = context.url(&format!("/launches/{}", buy.launch_id)),
+        symbol = escape_html(buy.symbol.as_deref().unwrap_or("?")),
+        badge = if graduated {
+            format!(
+                "<span class=\"badge\">🎓 {}</span>",
+                l.text("graduated", "已毕业")
+            )
+        } else {
+            match buy.bonding_progress_pct {
+                Some(pct) if pct >= 50.0 => format!("<span class=\"badge hot\">{pct:.0}%</span>"),
+                _ => String::new(),
+            }
+        },
+        address = escape_html(&ui::short_address(&buy.address)),
+        wins = buy.big_wins,
+        wins_label = escape_html(l.text("big wins this week", "次本周大赚")),
+        amount = ui::usd(buy.usd_value),
+        age = ui::age(Some(buy.occurred_at), l),
+    )
+}
+
+/// The feed body: the same facts for everyone, later for readers who have not
+/// connected.
+pub fn sharp_feed(context: &PageContext<'_>, buys: &[SharpTradeRow]) -> String {
+    let l = context.locale;
+    if buys.is_empty() {
+        return format!(
+            "<div class=\"empty\">{}</div>",
+            l.text("Nothing bought in this window", "该时间窗内暂无买入")
+        );
+    }
+    buys.iter().map(|buy| sharp_row(context, buy)).collect()
+}
+
+/// The section that carries the feed, with its delay stated plainly and the way
+/// to remove it.
+pub fn sharp_section(context: &PageContext<'_>, feed: &str, access: Access) -> String {
+    let l = context.locale;
+    let live = access.allows(Tier::Connected);
+    let state = if live {
+        format!(
+            "<span class=\"live-tag\">{}</span>",
+            escape_html(l.text("live", "实时"))
+        )
+    } else {
+        format!(
+            "<span class=\"muted\">{}</span>",
+            escape_html(l.text("delayed 10 minutes", "延迟 10 分钟"))
+        )
+    };
+    let unlock = if live {
+        String::new()
+    } else {
+        format!(
+            "<div class=\"unlock\"><span>{prompt}</span><button class=\"wallet\" type=\"button\" data-wallet-connect data-stay>{action}</button></div>",
+            prompt = escape_html(l.text(
+                "You are seeing this feed ten minutes late.",
+                "你看到的是十分钟前的买入。"
+            )),
+            action = escape_html(l.text("Connect for live", "连接钱包看实时")),
+        )
+    };
+    format!(
+        "<article class=\"card\"><div class=\"card-head\"><h2>🎯 {title}</h2>{state}</div>\
+         {unlock}<div class=\"card-body feed\" data-refresh=\"{url}\" data-every=\"15\">{feed}</div>\
+         <div class=\"card-foot note\">{note}</div></article>",
+        title = escape_html(l.text(
+            "What the winners are buying",
+            "刚赢过的人在买什么"
+        )),
+        url = super::pages::fragment_url(context, "/fragments/sharp", ""),
+        note = escape_html(l.text(
+            "Wallets that closed three or more 5x wins in the last week. Their buys, not a recommendation: most launches go to zero.",
+            "过去一周至少三次 5 倍以上落袋的钱包。这是他们的买入，不是建议——绝大多数新币归零。"
+        )),
+    )
+}
+
 pub fn page(context: &PageContext<'_>, page: &WinsPage<'_>) -> String {
     let l = context.locale;
     let summary = page.summary;
@@ -243,8 +345,11 @@ pub fn page(context: &PageContext<'_>, page: &WinsPage<'_>) -> String {
          <div class=\"toolbar\"><nav class=\"tabs\">{tabs}</nav></div>\
          <section class=\"grid2\">\
            <article class=\"card\"><div class=\"card-head\"><h2>{board_title}</h2><span class=\"muted\">{window_label}</span></div>{table}</article>\
-           <article class=\"card\"><div class=\"card-head\"><h2>⚡ {feed_title}</h2><span class=\"muted\">{feed_note}</span></div>\
-             <div class=\"card-body feed\" data-refresh=\"{feed_url}\" data-every=\"10\">{feed}</div></article>\
+           <div>\
+             <article class=\"card\" style=\"margin-bottom:12px\"><div class=\"card-head\"><h2>⚡ {feed_title}</h2><span class=\"muted\">{feed_note}</span></div>\
+               <div class=\"card-body feed\" data-refresh=\"{feed_url}\" data-every=\"10\">{feed}</div></article>\
+             {sharp}\
+           </div>\
          </section>\
          <p class=\"note\">{method}</p>",
         title = l.text("Who just got paid", "谁刚刚赚到了"),
@@ -258,6 +363,7 @@ pub fn page(context: &PageContext<'_>, page: &WinsPage<'_>) -> String {
         feed_note = l.text("live", "实时"),
         feed_url = super::pages::fragment_url(context, "/fragments/wins", ""),
         feed = page.feed,
+        sharp = page.sharp,
         method = l.text(
             "A win is a position that was fully sold for at least twice what it cost, with at least $20 put in, by average cost and excluding gas. Curve trades only. Past results say nothing about what the next trade does.",
             "战绩的口径：完全卖出、拿回至少两倍成本、投入不低于 $20 的仓位，平均成本法，不含 gas，只统计曲线成交。历史战绩不代表下一笔会怎样。"

@@ -1709,6 +1709,110 @@ impl MarketReadService {
     }
 }
 
+/// A wallet that has been closing large wins lately.
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct SharpWalletRow {
+    pub address: String,
+    pub rank: i32,
+    pub big_wins: i32,
+    pub wins: i32,
+    pub positions: i32,
+    pub realized_usd: Option<f64>,
+    pub best_multiple: Option<f64>,
+    pub last_win_at: Option<DateTime<Utc>>,
+}
+
+/// A buy by one of those wallets.
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct SharpTradeRow {
+    pub address: String,
+    pub rank: i32,
+    pub big_wins: i32,
+    pub launch_id: Uuid,
+    pub symbol: Option<String>,
+    pub token_address: String,
+    pub quote_symbol: Option<String>,
+    pub quote_amount: Option<f64>,
+    pub usd_value: Option<f64>,
+    pub lifecycle_phase: String,
+    pub bonding_progress_pct: Option<f64>,
+    pub tx_hash: String,
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl MarketReadService {
+    pub async fn sharp_wallets(
+        &self,
+        chain_id: u64,
+        limit: i64,
+    ) -> LedgerResult<Vec<SharpWalletRow>> {
+        sqlx::query_as::<_, SharpWalletRow>(
+            r#"select address, rank, big_wins, wins, positions,
+                      realized_usd::float8 as realized_usd,
+                      best_multiple::float8 as best_multiple, last_win_at
+               from market.sharp_wallets
+               where chain_id = $1 order by rank limit $2"#,
+        )
+        .bind(chain_id as i64)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)
+    }
+
+    /// What those wallets have been buying. `delay_seconds` holds the feed back
+    /// for readers who have not connected: the same facts, later.
+    pub async fn sharp_buys(
+        &self,
+        chain_id: u64,
+        delay_seconds: i64,
+        limit: i64,
+    ) -> LedgerResult<Vec<SharpTradeRow>> {
+        sqlx::query_as::<_, SharpTradeRow>(
+            r#"select sharp.address, sharp.rank, sharp.big_wins, stats.launch_id, stats.symbol,
+                      stats.token_address, stats.quote_symbol, stats.lifecycle_phase,
+                      stats.bonding_progress_pct::float8 as bonding_progress_pct,
+                      (trade.quote_amount_raw::numeric
+                        * power(10::numeric, -(coalesce(
+                            (select decimals from public.erc20_token_metadata meta
+                             where meta.chain_id = stats.chain_id
+                               and meta.token_address = stats.quote_token_address),
+                            case when stats.quote_token_address = $4 then 18 end))))::float8
+                        as quote_amount,
+                      (trade.quote_amount_raw::numeric
+                        * power(10::numeric, -(coalesce(
+                            (select decimals from public.erc20_token_metadata meta
+                             where meta.chain_id = stats.chain_id
+                               and meta.token_address = stats.quote_token_address),
+                            case when stats.quote_token_address = $4 then 18 end)))
+                        * stats.quote_usd_price)::float8 as usd_value,
+                      trade.tx_hash, trade.occurred_at
+               from market.sharp_wallets sharp
+               cross join lateral (
+                 select fact.launch_id, fact.quote_amount_raw, fact.tx_hash, fact.occurred_at
+                 from public.protocol_launch_trade_facts fact
+                 where fact.chain_id = sharp.chain_id and fact.trader_address = sharp.address
+                   and fact.is_canonical and fact.trade_side = 'buy'
+                 order by fact.block_number desc
+                 limit 8
+               ) trade
+               join market.token_stats stats on stats.launch_id = trade.launch_id
+               where sharp.chain_id = $1
+                 and trade.occurred_at <= now() - make_interval(secs => $2)
+                 and trade.occurred_at > now() - interval '24 hours'
+               order by trade.occurred_at desc
+               limit $3"#,
+        )
+        .bind(chain_id as i64)
+        .bind(delay_seconds as f64)
+        .bind(limit.clamp(1, 100))
+        .bind(NATIVE_ASSET_ADDRESS)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
