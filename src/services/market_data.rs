@@ -35,6 +35,8 @@ const PRICE_OUTLIER_FACTOR: f64 = 1.6;
 const MAX_QUOTE_ASSET_USD: f64 = 10_000_000.0;
 /// History given to newly registered assets: 30 days of 20-second buckets.
 const PRICE_BACKFILL_BUCKETS: i64 = 30 * 24 * 180;
+/// Smallest raw amount on either leg of a trade that may set a price.
+const MIN_PRICE_RAW_UNITS: i64 = 1_000;
 
 static MARKET_MIGRATOR: Migrator = sqlx::migrate!("./migrations_market");
 
@@ -343,6 +345,7 @@ impl MarketProjector {
             .bind(self.config.max_quote_price_age_hours as i32)
             .bind(MARKET_METHODOLOGY_VERSION)
             .bind(NATIVE_ASSET_ADDRESS)
+            .bind(MIN_PRICE_RAW_UNITS)
             .fetch_one(&self.pool)
             .await
             .map_err(db_error)?;
@@ -812,6 +815,8 @@ with touched_facts as (
          fact.trade_side, fact.trader_address, fact.block_number, fact.tx_index, fact.log_index,
          fact.quote_amount_raw::numeric * power(10::numeric, -(meta.quote_decimals)) as quote_amount,
          fact.token_amount_raw::numeric * power(10::numeric, -(meta.token_decimals)) as token_amount,
+         fact.quote_amount_raw::numeric as quote_amount_raw,
+         fact.token_amount_raw::numeric as token_amount_raw,
          fact.fee_amount_raw::numeric * power(10::numeric, -(meta.quote_decimals)) as fee_amount,
          fact.tax_amount_raw::numeric * power(10::numeric, -(meta.quote_decimals)) as tax_amount,
          true as is_curve
@@ -829,6 +834,7 @@ with touched_facts as (
          swap.trade_side, swap.sender_address, swap.block_number, 0, swap.log_index,
          swap.quote_amount_raw * power(10::numeric, -(meta.quote_decimals)),
          swap.token_amount_raw * power(10::numeric, -(meta.token_decimals)),
+         swap.quote_amount_raw, swap.token_amount_raw,
          0, 0, false
   from launch_meta meta
   join market.pool_swap_facts swap
@@ -840,7 +846,10 @@ with touched_facts as (
     and meta.pool_quote_currency = meta.quote_token_address
 ), priced as (
   select facts.*,
-         case when token_amount > 0 then quote_amount / token_amount end as price
+         -- Dust trades (a few raw units on either leg) carry no price
+         -- information: a 1-wei-in/1-wei-out swap implies a price of 1.
+         case when token_amount > 0 and quote_amount_raw >= $8 and token_amount_raw >= $8
+           then quote_amount / token_amount end as price
   from facts
 ), aggregated as (
   select launch_id, bucket_start, domain_id, quote_token_address,
