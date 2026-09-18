@@ -50,6 +50,23 @@ pub fn fragment_ticker(context: &PageContext<'_>, ticker: &MarketTicker) -> Stri
     )
 }
 
+/// The one thing a first-time visitor wants to do is look themselves up, so
+/// the lookup is a plain GET form: it works before any script has run and the
+/// resulting address page is shareable.
+pub fn wallet_lookup(context: &PageContext<'_>) -> String {
+    let l = context.locale;
+    format!(
+        "<form class=\"lookup\" action=\"/lookup\" method=\"get\"><input type=\"hidden\" name=\"lang\" value=\"{lang}\"><input type=\"hidden\" name=\"chain_id\" value=\"{chain}\"><input name=\"address\" placeholder=\"{placeholder}\" spellcheck=\"false\" autocomplete=\"off\" maxlength=\"64\"><button type=\"submit\">{action}</button></form>",
+        lang = context.locale.code(),
+        chain = context.chain_id,
+        placeholder = l.text(
+            "Paste a wallet to see its Pons profit",
+            "粘贴地址，查看其 Pons 收益"
+        ),
+        action = l.text("Check", "查询"),
+    )
+}
+
 pub fn overview(
     context: &PageContext<'_>,
     ticker: &MarketTicker,
@@ -58,7 +75,7 @@ pub fn overview(
 ) -> String {
     let l = context.locale;
     format!(
-        "<section class=\"page-head\"><div><h1>{title}</h1><p>{subtitle}</p></div></section>\
+        "<section class=\"page-head\"><div><h1>{title}</h1><p>{subtitle}</p></div>{lookup}</section>\
          <section class=\"stats\">{stats}</section>\
          <section data-refresh=\"{boards_url}\" data-every=\"20\">{boards}</section>\
          <section class=\"grid2\">\
@@ -66,6 +83,7 @@ pub fn overview(
              <div class=\"card-body feed\" data-refresh=\"{feed_url}\" data-every=\"10\">{feed}</div></article>\
            <article class=\"card\"><div class=\"card-head\"><h2>🧭 {explore_title}</h2></div><div class=\"card-body\">{explore}</div></article>\
          </section>",
+        lookup = wallet_lookup(context),
         title = l.text("Pons market, live", "Pons 实时行情"),
         subtitle = l.text(
             "Every figure is computed from Robinhood Chain data read through LedgerFlow's own node.",
@@ -583,7 +601,7 @@ pub fn token_detail(context: &PageContext<'_>, detail: &TokenDetail<'_>) -> Stri
     format!(
         "<a class=\"note\" href=\"{back}\">← {back_label}</a>\
          <section class=\"token-hero\"><div class=\"id\">{avatar}<div><h1>{symbol} {badges}</h1><div class=\"muted\">{name} · <code>{address}</code></div><div class=\"note\">{creator_label} <code>{creator}</code> · {quote_label} {quote}</div></div></div>\
-           <div class=\"price\"><strong data-k=\"hero-price\">{price}</strong><div>{changes}</div></div></section>\
+           <div class=\"price\"><strong data-k=\"hero-price\">{price}</strong><div>{changes}</div>{share}</div></section>\
          <section class=\"grid2\"><article class=\"card\"><div class=\"card-head\"><h2>{chart_title}</h2><nav class=\"windows\">{intervals}</nav></div><div class=\"chart\">{chart}</div></article>\
            <article class=\"card\"><div class=\"card-head\"><h2>{stats_title}</h2>{trust}</div><div class=\"kv\">{stats}</div></article></section>\
          <article class=\"card\"><div class=\"card-head\"><h2>{trades_title}</h2><span class=\"muted\">{trades_note}</span></div><div data-refresh=\"{trades_url}\" data-every=\"10\">{trades}</div></article>",
@@ -604,6 +622,7 @@ pub fn token_detail(context: &PageContext<'_>, detail: &TokenDetail<'_>) -> Stri
         quote = escape_html(token.quote_symbol.as_deref().unwrap_or("ETH")),
         price = graded_price(token),
         changes = changes,
+        share = super::share::share_bar(context, &super::share::token_tweet(token, l)),
         chart_title = l.text("Price (USD)", "价格 (USD)"),
         intervals = intervals,
         chart = candle_chart(context, detail.candles),

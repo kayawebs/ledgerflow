@@ -304,6 +304,8 @@ pub fn trust(locale: Locale, level: Trust) -> String {
 pub const STYLES: &str = r#"
 :root{color-scheme:dark;--bg:#07080a;--panel:#0f1115;--panel2:#141821;--line:#20242d;--line2:#2b303b;--text:#eef0f4;--muted:#8b93a3;--dim:#5d6473;--orange:#ff6a00;--orange2:#ff9447;--up:#1fd286;--up-bg:rgba(31,210,134,.12);--down:#ff5c6c;--down-bg:rgba(255,92,108,.12);--gold:#f5c542;--violet:#9d8cff}
 *{box-sizing:border-box}html{font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);-webkit-text-size-adjust:100%}body{margin:0;background:radial-gradient(1200px 500px at 90% -10%,rgba(255,106,0,.08),transparent 60%),var(--bg)}a{color:inherit;text-decoration:none}button,select,input{font:inherit}code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.lookup{display:flex;gap:8px;flex:none}.lookup input{height:38px;min-width:280px;border:1px solid var(--line2);border-radius:9px;background:var(--panel);color:var(--text);padding:0 12px;font-size:13px}.lookup input:focus{outline:none;border-color:var(--orange)}.lookup button{height:38px;border:1px solid var(--orange);border-radius:9px;background:var(--orange);color:#fff;font-weight:700;font-size:13px;padding:0 16px;cursor:pointer}
+.share{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}.share button{height:32px;border:1px solid var(--line2);border-radius:8px;background:var(--panel);color:var(--text);padding:0 12px;font-size:12px;font-weight:700;cursor:pointer}.share .share-x{background:var(--orange);border-color:var(--orange);color:#fff}.share button:hover{filter:brightness(1.12)}
 .num{font-variant-numeric:tabular-nums}.muted{color:var(--muted)}.dim{color:var(--dim)}.up{color:var(--up)}.down{color:var(--down)}
 header.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:20;background:rgba(7,8,10,.92);backdrop-filter:blur(14px);border-bottom:1px solid var(--line)}
 .bar{display:flex;align-items:center;gap:18px;height:60px;padding:0 20px;max-width:1600px;margin:0 auto}.brand{display:flex;align-items:center;gap:9px;flex:none}.brand>span{width:30px;height:30px}.brand svg{width:100%;height:100%}.brand strong{font-size:16px;letter-spacing:-.02em}.brand small{display:block;font-size:12px;color:var(--muted);letter-spacing:.12em}
@@ -373,6 +375,20 @@ document.addEventListener('click',e=>{
   if(e.target.closest('a,button,input,select'))return;
   const row=e.target.closest('[data-href]');if(row)location.href=row.dataset.href;
 });
+// Share uses the address bar rather than a server-rendered URL so the link is
+// right behind any proxy, custom domain or language switch.
+const shareUrl=()=>location.origin+location.pathname;
+document.querySelectorAll('[data-tweet]').forEach(b=>b.addEventListener('click',()=>{
+  const u=new URL('https://twitter.com/intent/tweet');
+  u.searchParams.set('text',b.dataset.tweet);u.searchParams.set('url',shareUrl());
+  window.open(u.toString(),'_blank','noopener');
+}));
+document.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{
+  const label=b.textContent;
+  try{await navigator.clipboard.writeText(shareUrl());b.textContent='✓';}
+  catch(e){b.textContent='⌘C';}
+  setTimeout(()=>{b.textContent=label},1500);
+}));
 })();
 </script>"#;
 

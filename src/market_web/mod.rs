@@ -19,9 +19,12 @@ use sqlx::{Row, postgres::PgPoolOptions};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+mod analytics;
 mod execution;
 mod intel;
+mod og;
 mod pages;
+mod share;
 mod ui;
 
 use crate::services::market_data::run_market_migrations;
@@ -47,6 +50,29 @@ pub struct MarketWebState {
     wallet_challenge_ttl: chrono::Duration,
     wallet_session_ttl: chrono::Duration,
     remote_evidence: Arc<RwLock<Option<RemoteEvidenceCache>>>,
+    og_cache: Arc<RwLock<BTreeMap<String, CachedCard>>>,
+}
+
+/// A rendered social card. Cards are pure functions of numbers that move every
+/// few seconds, so they are cached briefly and served with a longer edge TTL.
+#[derive(Clone)]
+struct CachedCard {
+    rendered_at: std::time::Instant,
+    bytes: Arc<Vec<u8>>,
+}
+
+const OG_CACHE_TTL: Duration = Duration::from_secs(120);
+const OG_CACHE_CAPACITY: usize = 256;
+
+/// Social crawlers need absolute URLs, and they fetch them without a request
+/// of ours to copy the host from, so the public origin is remembered here.
+static PUBLIC_BASE_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn public_base_url() -> &'static str {
+    PUBLIC_BASE_URL
+        .get()
+        .map(String::as_str)
+        .unwrap_or("https://ledgerflow.top")
 }
 
 /// Overview aggregates change at most every few seconds; caching them keeps
@@ -92,6 +118,14 @@ impl Locale {
     }
 
     fn text<'a>(self, en: &'a str, zh: &'a str) -> &'a str {
+        match self {
+            Self::En => en,
+            Self::Zh => zh,
+        }
+    }
+
+    /// Same choice for strings that have to be built before they are picked.
+    fn text_owned(self, en: String, zh: String) -> String {
         match self {
             Self::En => en,
             Self::Zh => zh,
@@ -197,6 +231,7 @@ pub async fn router_from_env() -> Result<(Router, SocketAddr), Box<dyn std::erro
         .parse::<SocketAddr>()?;
     let public_base_url = env::var("LEDGERFLOW_MARKET_WEB_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned());
+    let public_base_url_setting = public_base_url.clone();
     let base_evidence_url = env::var("LEDGERFLOW_MARKET_BASE_EVIDENCE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3201/public/evidence/events.json".to_owned());
     let remote_cache_ttl = env::var("LEDGERFLOW_MARKET_REMOTE_CACHE_TTL_SECONDS")
@@ -213,6 +248,7 @@ pub async fn router_from_env() -> Result<(Router, SocketAddr), Box<dyn std::erro
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
     run_market_migrations(&database_url).await?;
+    let _ = PUBLIC_BASE_URL.set(public_base_url_setting.clone());
     let state = MarketWebState {
         market: Arc::new(MarketReadService::new(pool.clone())),
         overview_cache: Arc::new(RwLock::new(None)),
@@ -224,6 +260,7 @@ pub async fn router_from_env() -> Result<(Router, SocketAddr), Box<dyn std::erro
         wallet_challenge_ttl,
         wallet_session_ttl,
         remote_evidence: Arc::new(RwLock::new(None)),
+        og_cache: Arc::new(RwLock::new(BTreeMap::new())),
     };
     let warm_state = state.clone();
     tokio::spawn(async move {
@@ -235,6 +272,12 @@ pub async fn router_from_env() -> Result<(Router, SocketAddr), Box<dyn std::erro
 }
 
 pub fn router(state: MarketWebState) -> Router {
+    let analytics = Arc::new(analytics::AnalyticsState {
+        recorder: analytics::Recorder::spawn(state.service.pool().clone()),
+        // A per-process salt: visitor digests cannot be reproduced by anyone
+        // holding the table, and they reset whenever the site restarts.
+        salt: Uuid::new_v4().to_string(),
+    });
     Router::new()
         .route("/", get(overview_page))
         .route("/launches", get(launches_page))
@@ -246,6 +289,13 @@ pub fn router(state: MarketWebState) -> Router {
         .route("/liquidations", get(liquidations_page))
         .route("/seed-library", get(seed_library_page))
         .route("/assets/ledgerflow-mark.svg", get(brand_mark_svg))
+        .route("/lookup", get(wallet_lookup))
+        .route("/og/home.png", get(og_home_card))
+        .route("/og/launch/{launch_id}/card.png", get(og_launch_card))
+        .route("/og/address/{address}/card.png", get(og_address_card))
+        .route("/og/board/{board}/card.png", get(og_board_card))
+        .route("/robots.txt", get(robots_txt))
+        .route("/sitemap.xml", get(sitemap_xml))
         .route("/auth/wallet/challenge", post(wallet_challenge))
         .route("/auth/wallet/verify", post(wallet_verify))
         .route("/auth/wallet/logout", post(wallet_logout))
@@ -275,6 +325,10 @@ pub fn router(state: MarketWebState) -> Router {
         .route("/ready", get(readiness))
         .route("/metrics", get(metrics))
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            analytics,
+            analytics::record_view,
+        ))
 }
 
 async fn overview_page(
@@ -292,11 +346,13 @@ async fn overview_page(
         render_overview_feed(&state, &context),
         session_address(&state, &headers),
     )?;
-    Ok(Html(layout(
+    let social = share::home_social(context.locale, &ticker);
+    Ok(Html(layout_social(
         &context,
         context.locale.text("Pons market", "Pons 行情"),
         "overview",
         wallet.as_deref(),
+        Some(&social),
         &pages::overview(&context, &ticker, &boards, &feed),
     ))
     .into_response())
@@ -454,12 +510,15 @@ async fn launches_page(
         render_token_table(&state, &context, &query),
         session_address(&state, &headers),
     )?;
-    Ok(Html(layout(
+    let table_query = launch_table_query(&query);
+    let social = share::board_social(table_query.board, context.locale);
+    Ok(Html(layout_social(
         &context,
         context.locale.text("Launches", "发币"),
         "launches",
         wallet.as_deref(),
-        &pages::launches(&context, &launch_table_query(&query), &table),
+        Some(&social),
+        &pages::launches(&context, &table_query, &table),
     )))
 }
 
@@ -499,11 +558,13 @@ async fn launch_detail_page(
             state.market.recent_trades(launch_id, 30),
         )?;
         let title = token.symbol.clone().unwrap_or_else(|| "Token".to_owned());
-        return Ok(Html(layout(
+        let social = share::token_social(&token, context.locale);
+        return Ok(Html(layout_social(
             &context,
             &title,
             "launches",
             wallet.as_deref(),
+            Some(&social),
             &pages::token_detail(
                 &context,
                 &pages::TokenDetail {
@@ -685,11 +746,13 @@ async fn address_page(
         (EarningsWindow::Week, week),
         (EarningsWindow::Month, month),
     ];
-    Ok(Html(layout(
+    let social = share::address_social(&address, &earnings, context.locale);
+    Ok(Html(layout_social(
         &context,
         &ui::short_address(&address),
         "clusters",
         wallet.as_deref(),
+        Some(&social),
         &intel::address(
             &context,
             &intel::AddressPage {
@@ -2267,6 +2330,171 @@ fn metric_card(index: &str, label: &str, value: &str, window: &str, _note: &str)
     )
 }
 
+/// Resolves the wallet lookup box. A redirect rather than a rendered page so
+/// the visitor lands on the canonical, shareable address URL.
+async fn wallet_lookup(Query(query): Query<PageQuery>) -> Response {
+    let context = PageContext::new(&query);
+    let target = query
+        .address
+        .as_deref()
+        .map(str::trim)
+        .and_then(|address| normalize_address(address).ok())
+        .map(|address| context.url(&format!("/address/{address}")))
+        .unwrap_or_else(|| context.url("/clusters"));
+    (StatusCode::SEE_OTHER, [(header::LOCATION, target)]).into_response()
+}
+
+/// Serves a social card. Cards are rendered off the async workers because
+/// rasterising is CPU work, and repeated crawls of the same link reuse the
+/// cached bytes instead of re-querying the market tables.
+async fn card_response(
+    state: &MarketWebState,
+    key: String,
+    card: og::Card,
+) -> Result<Response, MarketWebError> {
+    let bytes = tokio::task::spawn_blocking(move || og::render(&card))
+        .await
+        .map_err(internal_error)?
+        .map_err(internal_error)?;
+    let bytes = Arc::new(bytes);
+    let mut cache = state.og_cache.write().await;
+    if cache.len() >= OG_CACHE_CAPACITY {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        CachedCard {
+            rendered_at: std::time::Instant::now(),
+            bytes: bytes.clone(),
+        },
+    );
+    drop(cache);
+    Ok(png_response(bytes))
+}
+
+async fn cached_card(state: &MarketWebState, key: &str) -> Option<Arc<Vec<u8>>> {
+    let cache = state.og_cache.read().await;
+    cache
+        .get(key)
+        .filter(|cached| cached.rendered_at.elapsed() < OG_CACHE_TTL)
+        .map(|cached| cached.bytes.clone())
+}
+
+fn png_response(bytes: Arc<Vec<u8>>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            // Short browser life, longer edge life: the numbers move, but a
+            // crawl storm on one link should not reach this process.
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=120, s-maxage=600, stale-while-revalidate=600",
+            ),
+        ],
+        bytes.as_slice().to_vec(),
+    )
+        .into_response()
+}
+
+async fn og_home_card(State(state): State<MarketWebState>) -> Result<Response, MarketWebError> {
+    let key = "home".to_owned();
+    if let Some(bytes) = cached_card(&state, &key).await {
+        return Ok(png_response(bytes));
+    }
+    let data = overview_data(&state).await?;
+    let card = share::home_card(&data.ticker, &data.gainers);
+    card_response(&state, key, card).await
+}
+
+async fn og_launch_card(
+    State(state): State<MarketWebState>,
+    Path(launch_id): Path<Uuid>,
+) -> Result<Response, MarketWebError> {
+    let key = format!("launch:{launch_id}");
+    if let Some(bytes) = cached_card(&state, &key).await {
+        return Ok(png_response(bytes));
+    }
+    let Some(token) = state.market.token(ROBINHOOD_CHAIN_ID, launch_id).await? else {
+        // A crawler must still get an image, so unknown links fall back to the
+        // site card rather than a broken preview.
+        return og_home_card(State(state)).await;
+    };
+    let card = share::token_card(&token);
+    card_response(&state, key, card).await
+}
+
+async fn og_address_card(
+    State(state): State<MarketWebState>,
+    Path(address): Path<String>,
+) -> Result<Response, MarketWebError> {
+    let address = normalize_address(&address)?;
+    let key = format!("address:{address}");
+    if let Some(bytes) = cached_card(&state, &key).await {
+        return Ok(png_response(bytes));
+    }
+    let (earnings, rank) = tokio::try_join!(
+        async {
+            state
+                .market
+                .address_earnings(ROBINHOOD_CHAIN_ID, &address)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .wallet_rank(ROBINHOOD_CHAIN_ID, "24h", &address)
+                .await
+                .map_err(MarketWebError::from)
+        },
+    )?;
+    let card = share::address_card(&address, &earnings, rank.as_ref());
+    card_response(&state, key, card).await
+}
+
+async fn og_board_card(
+    State(state): State<MarketWebState>,
+    Path(board): Path<String>,
+) -> Result<Response, MarketWebError> {
+    let board = TokenBoard::parse(Some(board.as_str()));
+    let key = format!("board:{}", board.key());
+    if let Some(bytes) = cached_card(&state, &key).await {
+        return Ok(png_response(bytes));
+    }
+    let tokens = state.market.board(ROBINHOOD_CHAIN_ID, board, 5).await?;
+    let (title, subline) = share::board_title(board);
+    let card = share::board_card(title, subline, &tokens);
+    card_response(&state, key, card).await
+}
+
+/// Crawlers get an explicit invitation to the pages worth indexing, and an
+/// explicit refusal for the fragment and API routes that only serve the UI.
+async fn robots_txt() -> Response {
+    let body = format!(
+        "User-agent: *\nAllow: /\nDisallow: /fragments/\nDisallow: /api/\nDisallow: /auth/\nSitemap: {}/sitemap.xml\n",
+        public_base_url().trim_end_matches('/')
+    );
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
+}
+
+/// Only the stable hubs are listed. Individual launches turn over by the
+/// thousand per day, so listing them would be stale before it was fetched.
+async fn sitemap_xml() -> Response {
+    let base = public_base_url().trim_end_matches('/');
+    let urls: String = ["/", "/launches", "/clusters", "/arbitrage", "/liquidations"]
+        .into_iter()
+        .map(|path| format!("<url><loc>{base}{path}</loc><changefreq>hourly</changefreq></url>"))
+        .collect();
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>"#
+    );
+    (
+        [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
 fn layout(
     context: &PageContext<'_>,
     title: &str,
@@ -2274,7 +2502,28 @@ fn layout(
     wallet: Option<&str>,
     content: &str,
 ) -> String {
+    layout_social(context, title, active, wallet, None, content)
+}
+
+/// Same page, with the social preview a shareable page declares for itself.
+fn layout_social(
+    context: &PageContext<'_>,
+    title: &str,
+    active: &str,
+    wallet: Option<&str>,
+    social: Option<&share::Social>,
+    content: &str,
+) -> String {
     let l = context.locale;
+    let fallback;
+    let social = match social {
+        Some(social) => social,
+        None => {
+            fallback = share::Social::site(l, "");
+            &fallback
+        }
+    };
+    let social_meta = share::meta_tags(social, public_base_url());
     let nav = pages::NAV
         .into_iter()
         .map(|(key, path, en, zh)| {
@@ -2302,12 +2551,16 @@ fn layout(
     let other_lang = if l == Locale::En { "zh" } else { "en" };
     let language_label = if l == Locale::En { "中文" } else { "EN" };
     format!(
-        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>{title} · LedgerFlow</title><link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{legacy}{styles}</style></head><body>
-<header class="top"><div class="bar"><a class="brand" href="{home}"><span>{mark}</span><div><strong>LedgerFlow</strong><small>MARKET INTELLIGENCE</small></div></a><nav class="main">{nav}</nav><div class="tools"><form><input type="hidden" name="lang" value="{lang}"><select name="chain_id" onchange="this.form.submit()" aria-label="Network"><option value="4663" {rh}>Robinhood</option><option value="8453" {base}>Base</option></select></form><a class="lang" href="?lang={other_lang}&chain_id={chain_id}">{language_label}</a>{wallet_button}</div></div>
+        r#"<!doctype html><html lang="{lang}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>{title} · LedgerFlow</title>{social_meta}<link rel="icon" type="image/svg+xml" href="/assets/ledgerflow-mark.svg"><style>{legacy}{styles}</style></head><body>
+<header class="top"><div class="bar"><a class="brand" href="{home}"><span>{mark}</span><div><strong>LedgerFlow</strong><small>MARKET INTELLIGENCE</small></div></a><nav class="main">{nav}</nav><div class="tools"><form><input type="hidden" name="lang" value="{lang}"><select name="chain_id" onchange="this.form.submit()" aria-label="Network"><option value="4663" {rh}>Robinhood</option><option value="8453" {base}>{base_label}</option></select></form><a class="lang" href="?lang={other_lang}&chain_id={chain_id}">{language_label}</a>{wallet_button}</div></div>
 <div class="ticker"><div data-refresh="{ticker_url}" data-every="15" data-eager></div></div></header>
 <main>{content}</main><footer class="site"><span>{footer_copy}</span><a href="{seed_url}">{seed_label} →</a></footer>{wallet_script}{script}</body></html>"#,
         lang = l.code(),
         title = escape_html(title),
+        social_meta = social_meta,
+        // Base carries no market data yet, so the option says so rather than
+        // dropping a visitor onto an empty site.
+        base_label = l.text("Base (soon)", "Base（即将）"),
         legacy = LEGACY_STYLES,
         styles = ui::STYLES,
         home = context.url("/"),
@@ -2658,7 +2911,7 @@ fn brand_mark_svg_source() -> &'static str {
 
 const WALLET_SCRIPT: &str = r#"<script>
 const connect=document.querySelector('[data-wallet-connect]');
-if(connect) connect.addEventListener('click',async()=>{try{if(!window.ethereum)throw new Error(document.documentElement.lang==='zh'?'未检测到浏览器钱包':'No browser wallet detected');connect.disabled=true;connect.textContent=document.documentElement.lang==='zh'?'连接中…':'Connecting…';const [address]=await window.ethereum.request({method:'eth_requestAccounts'});const chainHex=await window.ethereum.request({method:'eth_chainId'});const challenge=await fetch('/auth/wallet/challenge',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({address,chain_id:parseInt(chainHex,16)})}).then(async r=>{const v=await r.json();if(!r.ok)throw new Error(v.error);return v});const signature=await window.ethereum.request({method:'personal_sign',params:[challenge.message,address]});await fetch('/auth/wallet/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:challenge.challenge_id,address,signature})}).then(async r=>{const v=await r.json();if(!r.ok)throw new Error(v.error)});location.reload()}catch(error){alert(error.message);connect.disabled=false;connect.textContent=document.documentElement.lang==='zh'?'连接钱包':'Connect wallet'}});
+if(connect) connect.addEventListener('click',async()=>{try{if(!window.ethereum)throw new Error(document.documentElement.lang==='zh'?'未检测到浏览器钱包':'No browser wallet detected');connect.disabled=true;connect.textContent=document.documentElement.lang==='zh'?'连接中…':'Connecting…';const [address]=await window.ethereum.request({method:'eth_requestAccounts'});const chainHex=await window.ethereum.request({method:'eth_chainId'});const challenge=await fetch('/auth/wallet/challenge',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({address,chain_id:parseInt(chainHex,16)})}).then(async r=>{const v=await r.json();if(!r.ok)throw new Error(v.error);return v});const signature=await window.ethereum.request({method:'personal_sign',params:[challenge.message,address]});await fetch('/auth/wallet/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:challenge.challenge_id,address,signature})}).then(async r=>{const v=await r.json();if(!r.ok)throw new Error(v.error)});location.href='/address/'+address.toLowerCase()+'?lang='+document.documentElement.lang}catch(error){alert(error.message);connect.disabled=false;connect.textContent=document.documentElement.lang==='zh'?'连接钱包':'Connect wallet'}});
 const logout=document.querySelector('[data-wallet-logout]');if(logout) logout.addEventListener('click',async()=>{await fetch('/auth/wallet/logout',{method:'POST'});location.reload()});
 </script>"#;
 

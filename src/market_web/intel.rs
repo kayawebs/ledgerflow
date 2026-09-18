@@ -397,7 +397,7 @@ pub fn address(context: &PageContext<'_>, page: &AddressPage<'_>) -> String {
     format!(
         "<a class=\"note\" href=\"{back}\">← {back_label}</a>\
          <section class=\"token-hero\"><div class=\"id\"><span class=\"avatar\" style=\"--h:{hue}\">🧠</span><div><h1 class=\"mono\" style=\"font-size:20px\">{address}</h1><div>{rank_badges}</div></div></div>\
-           <div class=\"price\"><strong class=\"{class}\">{pnl}</strong><div class=\"muted\">{pnl_label} {trust}</div></div></section>\
+           <div class=\"price\"><strong class=\"{class}\">{pnl}</strong><div class=\"muted\">{pnl_label} {trust}</div>{share}</div></section>\
          <article class=\"card\" style=\"margin-bottom:12px\"><div class=\"kv\">{stats}</div></article>\
          <section class=\"grid2\"><article class=\"card\"><div class=\"card-head\"><h2>{positions_title}</h2><span class=\"muted\">{positions_note}</span></div>{positions}</article>\
            <article class=\"card\"><div class=\"card-head\"><h2>{clusters_title}</h2></div><div class=\"card-body\">{clusters}</div></article></section>{arbitrage}",
@@ -413,6 +413,7 @@ pub fn address(context: &PageContext<'_>, page: &AddressPage<'_>) -> String {
         },
         pnl = ui::signed_usd(Some(earnings.realized_usd)),
         pnl_label = l.text("Pons realized profit", "Pons 已实现收益"),
+        share = super::share::share_bar(context, &super::share::address_tweet(earnings, l)),
         trust = ui::trust(l, ui::Trust::Estimated),
         stats = stats,
         positions_title = l.text("Positions", "持仓与交易"),
