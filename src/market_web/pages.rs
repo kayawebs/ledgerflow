@@ -10,9 +10,10 @@ use crate::services::market_read::{
 };
 
 /// Header navigation entries: key, path, English, Chinese.
-pub const NAV: [(&str, &str, &str, &str); 5] = [
+pub const NAV: [(&str, &str, &str, &str); 6] = [
     ("overview", "/", "Overview", "总览"),
     ("launches", "/launches", "Launches", "发币"),
+    ("creators", "/creators", "Creators", "创建者"),
     ("clusters", "/clusters", "Address Intelligence", "地址情报"),
     ("arbitrage", "/arbitrage", "Arbitrage", "套利"),
     ("liquidations", "/liquidations", "Liquidations", "清算"),
@@ -447,6 +448,35 @@ pub fn fragment_launch_table(
     )
 }
 
+/// A launch table without the board's sortable headers, for places that show
+/// somebody's tokens rather than a ranking.
+pub fn token_rows(context: &PageContext<'_>, rows: &[TokenRow]) -> String {
+    let l = context.locale;
+    if rows.is_empty() {
+        return format!(
+            "<div class=\"empty\">{}</div>",
+            l.text("No tokens", "暂无代币")
+        );
+    }
+    let body = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| token_table_row(context, row, index + 1))
+        .collect::<String>();
+    format!(
+        "<div class=\"table-wrap\"><table class=\"market\"><thead><tr><th class=\"l\">#</th><th class=\"l\">{}</th>\
+         <th>{}</th><th>5m</th><th>1h</th><th>24h</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>24H</th><th>{}</th></tr></thead>\
+         <tbody>{body}</tbody></table></div>",
+        l.text("Token", "代币"),
+        l.text("Price", "价格"),
+        l.text("Volume 24h", "24h 成交额"),
+        l.text("Market cap", "市值"),
+        l.text("Buyers 24h", "24h 买家"),
+        l.text("Progress", "毕业进度"),
+        l.text("Age", "上线"),
+    )
+}
+
 fn token_table_row(context: &PageContext<'_>, row: &TokenRow, position: usize) -> String {
     let l = context.locale;
     let spark = row
@@ -519,6 +549,9 @@ pub struct TokenDetail<'a> {
     pub candles: &'a [CandleRow],
     pub interval: i32,
     pub trades: &'a [TradeRow],
+    /// The creator's record, rendered by the creators module because how much
+    /// of it shows depends on the reader's access.
+    pub creator_strip: &'a str,
 }
 
 pub fn token_detail(context: &PageContext<'_>, detail: &TokenDetail<'_>) -> String {
@@ -603,6 +636,7 @@ pub fn token_detail(context: &PageContext<'_>, detail: &TokenDetail<'_>) -> Stri
         "<a class=\"note\" href=\"{back}\">← {back_label}</a>\
          <section class=\"token-hero\"><div class=\"id\">{avatar}<div><h1>{symbol} {badges}</h1><div class=\"muted\">{name} · <code>{address}</code></div><div class=\"note\">{creator_label} <code>{creator}</code> · {quote_label} {quote}</div></div></div>\
            <div class=\"price\"><strong data-k=\"hero-price\">{price}</strong><div>{changes}</div>{share}</div></section>\
+         {creator_strip}\
          <section class=\"grid2\"><article class=\"card\"><div class=\"card-head\"><h2>{chart_title}</h2><nav class=\"windows\">{intervals}</nav></div><div class=\"chart\">{chart}</div></article>\
            <article class=\"card\"><div class=\"card-head\"><h2>{stats_title}</h2>{trust}</div><div class=\"kv\">{stats}</div></article></section>\
          <article class=\"card\"><div class=\"card-head\"><h2>{trades_title}</h2><span class=\"muted\">{trades_note}</span></div><div data-refresh=\"{trades_url}\" data-every=\"10\">{trades}</div></article>",
@@ -621,6 +655,7 @@ pub fn token_detail(context: &PageContext<'_>, detail: &TokenDetail<'_>) -> Stri
             .unwrap_or_else(|| "—".to_owned()),
         quote_label = l.text("Quote", "报价资产"),
         quote = escape_html(token.quote_symbol.as_deref().unwrap_or("ETH")),
+        creator_strip = detail.creator_strip,
         price = graded_price(token),
         changes = changes,
         share = super::share::share_bar(context, &super::share::token_tweet(token, l)),

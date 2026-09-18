@@ -19,7 +19,9 @@ use sqlx::{Row, postgres::PgPoolOptions};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+mod access;
 mod analytics;
+mod creators;
 mod execution;
 mod intel;
 mod og;
@@ -61,6 +63,10 @@ struct CachedCard {
     rendered_at: std::time::Instant,
     bytes: Arc<Vec<u8>>,
 }
+
+/// A track record needs more than one launch behind it, so the creator boards
+/// only rank accounts that have launched repeatedly.
+const CREATOR_BOARD_MIN_LAUNCHES: i32 = 5;
 
 const OG_CACHE_TTL: Duration = Duration::from_secs(120);
 const OG_CACHE_CAPACITY: usize = 256;
@@ -142,6 +148,8 @@ struct PageQuery {
     address: Option<String>,
     category: Option<String>,
     tab: Option<String>,
+    /// Which creator ranking to show on the creators page.
+    board: Option<String>,
     sort: Option<String>,
     dir: Option<String>,
     q: Option<String>,
@@ -287,6 +295,8 @@ pub fn router(state: MarketWebState) -> Router {
         .route("/", get(overview_page))
         .route("/launches", get(launches_page))
         .route("/launches/{launch_id}", get(launch_detail_page))
+        .route("/creators", get(creators_page))
+        .route("/creators/{address}", get(creator_detail_page))
         .route("/clusters", get(clusters_page))
         .route("/clusters/{cluster_id}", get(cluster_detail_page))
         .route("/address/{address}", get(address_page))
@@ -568,6 +578,15 @@ async fn launch_detail_page(
             state.market.candles(launch_id, interval, 120),
             state.market.recent_trades(launch_id, 30),
         )?;
+        let creator = state
+            .market
+            .launch_creator(context.chain_id, launch_id)
+            .await?;
+        let creator_strip = creators::launch_strip(
+            &context,
+            creator.as_ref(),
+            access::Access::of(wallet.as_deref()),
+        );
         let title = token.symbol.clone().unwrap_or_else(|| "Token".to_owned());
         let social = share::token_social(&token, context.locale);
         return Ok(Html(layout_social(
@@ -583,6 +602,7 @@ async fn launch_detail_page(
                     candles: &candles,
                     interval,
                     trades: &trades,
+                    creator_strip: &creator_strip,
                 },
             ),
         ))
@@ -2343,6 +2363,93 @@ fn metric_card(index: &str, label: &str, value: &str, window: &str, _note: &str)
     )
 }
 
+async fn creators_page(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    let board = crate::services::market_read::CreatorBoard::parse(query.board.as_deref());
+    let chain_id = context.chain_id;
+    let (coverage, creators, wallet) = tokio::try_join!(
+        async {
+            state
+                .market
+                .creator_coverage(chain_id)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .creator_board(chain_id, board, CREATOR_BOARD_MIN_LAUNCHES, 50)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        session_address(&state, &headers),
+    )?;
+    let access = access::Access::of(wallet.as_deref());
+    Ok(Html(layout(
+        &context,
+        context.locale.text("Creators", "创建者"),
+        "creators",
+        wallet.as_deref(),
+        &creators::board(
+            &context,
+            &creators::BoardPage {
+                board,
+                coverage: &coverage,
+                creators: &creators,
+                access,
+            },
+        ),
+    )))
+}
+
+async fn creator_detail_page(
+    State(state): State<MarketWebState>,
+    Path(address): Path<String>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    let address = normalize_address(&address)?;
+    let chain_id = context.chain_id;
+    let (profile, launches, wallet) = tokio::try_join!(
+        async {
+            state
+                .market
+                .creator_profile(chain_id, &address)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .creator_launches(chain_id, &address, 50)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        session_address(&state, &headers),
+    )?;
+    let access = access::Access::of(wallet.as_deref());
+    Ok(Html(layout(
+        &context,
+        &ui::short_address(&address),
+        "creators",
+        wallet.as_deref(),
+        &creators::profile(
+            &context,
+            &creators::ProfilePage {
+                address: &address,
+                profile: profile.as_ref(),
+                launches: &launches,
+                access,
+            },
+        ),
+    )))
+}
+
 /// Resolves the wallet lookup box. A redirect rather than a rendered page so
 /// the visitor lands on the canonical, shareable address URL.
 async fn wallet_lookup(Query(query): Query<PageQuery>) -> Response {
@@ -2949,8 +3056,27 @@ fn brand_mark_svg_source() -> &'static str {
 }
 
 const WALLET_SCRIPT: &str = r#"<script>
-const connect=document.querySelector('[data-wallet-connect]');
-if(connect) connect.addEventListener('click',async()=>{try{if(!window.ethereum)throw new Error(document.documentElement.lang==='zh'?'未检测到浏览器钱包':'No browser wallet detected');connect.disabled=true;connect.textContent=document.documentElement.lang==='zh'?'连接中…':'Connecting…';const [address]=await window.ethereum.request({method:'eth_requestAccounts'});const chainHex=await window.ethereum.request({method:'eth_chainId'});const challenge=await fetch('/auth/wallet/challenge',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({address,chain_id:parseInt(chainHex,16)})}).then(async r=>{const v=await r.json();if(!r.ok)throw new Error(v.error);return v});const signature=await window.ethereum.request({method:'personal_sign',params:[challenge.message,address]});await fetch('/auth/wallet/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:challenge.challenge_id,address,signature})}).then(async r=>{const v=await r.json();if(!r.ok)throw new Error(v.error)});location.href='/address/'+address.toLowerCase()+'?lang='+document.documentElement.lang}catch(error){alert(error.message);connect.disabled=false;connect.textContent=document.documentElement.lang==='zh'?'连接钱包':'Connect wallet'}});
+// Every connect control is wired, not just the one in the header: a gated
+// section offers its own. A control marked data-stay returns the reader to the
+// page they were reading; the header button sends them to their own address
+// page, which is the reward for connecting there.
+const t=(en,zh)=>document.documentElement.lang==='zh'?zh:en;
+document.querySelectorAll('[data-wallet-connect]').forEach(connect=>{
+  const label=connect.textContent;
+  connect.addEventListener('click',async()=>{
+    try{
+      if(!window.ethereum)throw new Error(t('No browser wallet detected','未检测到浏览器钱包'));
+      connect.disabled=true;connect.textContent=t('Connecting…','连接中…');
+      const [address]=await window.ethereum.request({method:'eth_requestAccounts'});
+      const chainHex=await window.ethereum.request({method:'eth_chainId'});
+      const challenge=await fetch('/auth/wallet/challenge',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({address,chain_id:parseInt(chainHex,16)})}).then(async r=>{const v=await r.json();if(!r.ok)throw new Error(v.error);return v});
+      const signature=await window.ethereum.request({method:'personal_sign',params:[challenge.message,address]});
+      await fetch('/auth/wallet/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({challenge_id:challenge.challenge_id,address,signature})}).then(async r=>{const v=await r.json();if(!r.ok)throw new Error(v.error)});
+      if(connect.dataset.stay!==undefined){location.reload()}
+      else{location.href='/address/'+address.toLowerCase()+'?lang='+document.documentElement.lang}
+    }catch(error){alert(error.message);connect.disabled=false;connect.textContent=label}
+  });
+});
 const logout=document.querySelector('[data-wallet-logout]');if(logout) logout.addEventListener('click',async()=>{await fetch('/auth/wallet/logout',{method:'POST'});location.reload()});
 </script>"#;
 

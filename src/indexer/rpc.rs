@@ -254,6 +254,40 @@ impl IndexerRpcClient {
         )
     }
 
+    /// Senders of many transactions in one JSON-RPC batch, in input order.
+    /// An entry is `None` when the node does not know the transaction.
+    pub async fn get_transaction_senders(
+        &self,
+        tx_hashes: &[String],
+    ) -> LedgerResult<Vec<Option<String>>> {
+        if tx_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests = tx_hashes
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": index,
+                    "method": "eth_getTransactionByHash",
+                    "params": [hash],
+                })
+            })
+            .collect::<Vec<_>>();
+        let responses = self.call_batch(requests).await?;
+        let ids = (0..tx_hashes.len() as u64).collect::<Vec<_>>();
+        Ok(batch_results_by_numeric_id(&ids, responses, "transaction")?
+            .into_iter()
+            .map(|(_, transaction)| {
+                transaction
+                    .get("from")
+                    .and_then(Value::as_str)
+                    .map(|sender| sender.to_ascii_lowercase())
+            })
+            .collect())
+    }
+
     /// Executes many read-only `eth_call`s in one JSON-RPC batch. Each entry is
     /// `Ok(hex)` or the per-call error message, in input order.
     pub async fn eth_call_batch(

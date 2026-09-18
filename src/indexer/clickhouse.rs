@@ -3,6 +3,11 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::core::errors::{LedgerError, LedgerResult};
+
+/// Transaction hashes per sender lookup. A hash literal costs 69 characters,
+/// so this keeps the query text well inside ClickHouse's 256 KiB
+/// `max_query_size` default.
+const SENDER_LOOKUP_CHUNK: usize = 2_000;
 use crate::indexer::models::{
     AddressTxDirection, AddressTxRef, CanonicalAddressObservation, CanonicalBlock,
     ChainReorganization, IndexedBlock, IndexerApiKeyRecord, IndexerApiKeyStatus,
@@ -491,6 +496,68 @@ impl ClickHouseClient {
             return Ok(None);
         }
         Ok(row.get("max_block").and_then(value_as_u64))
+    }
+
+    /// Senders of the given transactions, looked up inside a block range so the
+    /// table's primary key is used instead of scanning it. A protocol event
+    /// records `msg.sender`, which is a contract whenever the caller went
+    /// through a router or multicall; the transaction sender is the account
+    /// that actually acted.
+    pub async fn transaction_senders(
+        &self,
+        chain_id: u32,
+        from_block: u64,
+        to_block: u64,
+        tx_hashes: &[String],
+    ) -> LedgerResult<Vec<(String, String)>> {
+        if from_block > to_block || tx_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let valid = |value: &str| {
+            value.strip_prefix("0x").is_some_and(|body| {
+                body.len() == 64 && body.chars().all(|character| character.is_ascii_hexdigit())
+            })
+        };
+        if let Some(invalid) = tx_hashes.iter().find(|hash| !valid(hash)) {
+            return Err(LedgerError::MalformedEvidence(format!(
+                "invalid transaction hash: {invalid}"
+            )));
+        }
+        let mut senders = Vec::with_capacity(tx_hashes.len());
+        // A hash literal costs 69 characters, so the list is split to stay well
+        // inside the server's `max_query_size`.
+        for chunk in tx_hashes.chunks(SENDER_LOOKUP_CHUNK) {
+            let hashes = chunk
+                .iter()
+                .map(|hash| format!("'{}'", hash.to_ascii_lowercase()))
+                .collect::<Vec<_>>()
+                .join(",");
+            let payload = self
+                .query_json(&format!(
+                    r#"
+                SELECT lower(tx_hash) AS tx_hash, lower(from_address) AS from_address
+                FROM {db}.transactions_canonical
+                WHERE chain_id = {chain}
+                  AND block_number BETWEEN {from} AND {to}
+                  AND lower(tx_hash) IN ({hashes})
+                FORMAT JSON
+                "#,
+                    db = self.database,
+                    chain = chain_id,
+                    from = from_block,
+                    to = to_block,
+                ))
+                .await?;
+            let Some(rows) = payload["data"].as_array() else {
+                continue;
+            };
+            senders.extend(rows.iter().filter_map(|row| {
+                let hash = row.get("tx_hash")?.as_str()?.to_owned();
+                let sender = row.get("from_address")?.as_str()?.to_owned();
+                (!sender.is_empty()).then_some((hash, sender))
+            }));
+        }
+        Ok(senders)
     }
 
     /// Canonical logs emitted by `address` with `topic0` whose first indexed

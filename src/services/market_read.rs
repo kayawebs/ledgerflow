@@ -1299,6 +1299,230 @@ fn db_error(error: impl std::fmt::Display) -> LedgerError {
     LedgerError::Persistence(error.to_string())
 }
 
+/// A creator's track record, as the creator pages show it.
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct CreatorProfileRow {
+    pub creator_address: String,
+    pub attribution: String,
+    pub launches: i32,
+    pub graduated: i32,
+    pub graduation_rate: Option<f64>,
+    pub launches_7d: i32,
+    pub launches_24h: i32,
+    pub first_launch_at: Option<DateTime<Utc>>,
+    pub last_launch_at: Option<DateTime<Utc>>,
+    pub best_ath_mcap_usd: Option<f64>,
+    pub median_ath_mcap_usd: Option<f64>,
+    pub traded_launches: i32,
+    pub dead_launches: i32,
+    pub buyers: i32,
+    pub losing_buyers: i32,
+    pub buyer_cost_usd: Option<f64>,
+    pub buyer_realized_usd: Option<f64>,
+    pub computed_at: DateTime<Utc>,
+}
+
+/// Which way to rank creators.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum CreatorBoard {
+    /// Buyers lost the most money on their launches.
+    Damage,
+    /// Launched the most tokens.
+    Prolific,
+    /// Launched repeatedly and never once graduated.
+    NeverGraduated,
+    /// Actually produced graduating tokens.
+    Builders,
+}
+
+impl CreatorBoard {
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or("damage") {
+            "prolific" => Self::Prolific,
+            "serial" => Self::NeverGraduated,
+            "builders" => Self::Builders,
+            _ => Self::Damage,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Damage => "damage",
+            Self::Prolific => "prolific",
+            Self::NeverGraduated => "serial",
+            Self::Builders => "builders",
+        }
+    }
+
+    pub const ALL: [CreatorBoard; 4] = [
+        Self::Damage,
+        Self::Prolific,
+        Self::NeverGraduated,
+        Self::Builders,
+    ];
+
+    /// Ordering and floor for each board. The floor keeps one-off creators out
+    /// of a ranking that is about a track record.
+    fn clause(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Damage => (
+                "buyer_realized_usd is not null and buyer_realized_usd < 0 and launches >= $2",
+                "buyer_realized_usd asc",
+            ),
+            Self::Prolific => ("launches >= $2", "launches desc"),
+            Self::NeverGraduated => (
+                "graduated = 0 and launches >= $2",
+                "launches desc, dead_launches desc",
+            ),
+            Self::Builders => ("graduated > 0 and launches >= $2", "graduated desc"),
+        }
+    }
+}
+
+const CREATOR_COLUMNS: &str = r#"
+  creator_address, attribution, launches, graduated,
+  graduation_rate::float8 as graduation_rate, launches_7d, launches_24h,
+  first_launch_at, last_launch_at, best_ath_mcap_usd::float8 as best_ath_mcap_usd,
+  median_ath_mcap_usd::float8 as median_ath_mcap_usd, traded_launches, dead_launches,
+  buyers, losing_buyers, buyer_cost_usd::float8 as buyer_cost_usd,
+  buyer_realized_usd::float8 as buyer_realized_usd, computed_at
+"#;
+
+/// Coverage of the creator data, so a page can say how much of it rests on the
+/// resolved transaction sender rather than the protocol's msg.sender.
+#[derive(Clone, Debug, Serialize)]
+pub struct CreatorCoverage {
+    pub creators: i64,
+    pub by_origin: i64,
+    pub launches: i64,
+    pub serial_creators: i64,
+    pub serial_launches: i64,
+    pub never_graduated_creators: i64,
+    pub never_graduated_launches: i64,
+}
+
+impl MarketReadService {
+    pub async fn creator_board(
+        &self,
+        chain_id: u64,
+        board: CreatorBoard,
+        min_launches: i32,
+        limit: i64,
+    ) -> LedgerResult<Vec<CreatorProfileRow>> {
+        let (filter, order) = board.clause();
+        let sql = format!(
+            "select {CREATOR_COLUMNS} from market.creator_profiles
+             where chain_id = $1 and {filter}
+             order by {order} limit $3"
+        );
+        sqlx::query_as::<_, CreatorProfileRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(min_launches)
+            .bind(limit.clamp(1, 200))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+
+    pub async fn creator_profile(
+        &self,
+        chain_id: u64,
+        address: &str,
+    ) -> LedgerResult<Option<CreatorProfileRow>> {
+        let sql = format!(
+            "select {CREATOR_COLUMNS} from market.creator_profiles
+             where chain_id = $1 and creator_address = $2"
+        );
+        sqlx::query_as::<_, CreatorProfileRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(address)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+
+    /// The creator behind a launch, resolved to the transaction sender when
+    /// that is known.
+    pub async fn launch_creator(
+        &self,
+        chain_id: u64,
+        launch_id: Uuid,
+    ) -> LedgerResult<Option<CreatorProfileRow>> {
+        let sql = format!(
+            "select {CREATOR_COLUMNS} from market.creator_profiles profile
+             where profile.chain_id = $1
+               and profile.creator_address = (
+                 select coalesce(origin.origin_address, launch.creator_address)
+                 from public.protocol_token_launches launch
+                 left join market.launch_origins origin on origin.launch_id = launch.launch_id
+                 where launch.launch_id = $2
+               )"
+        );
+        sqlx::query_as::<_, CreatorProfileRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(launch_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+
+    /// A creator's launches, newest first.
+    pub async fn creator_launches(
+        &self,
+        chain_id: u64,
+        address: &str,
+        limit: i64,
+    ) -> LedgerResult<Vec<TokenRow>> {
+        let sql = format!(
+            "select {TOKEN_COLUMNS} from market.token_stats s
+             where s.chain_id = $1
+               and s.launch_id in (
+                 select launch.launch_id from public.protocol_token_launches launch
+                 left join market.launch_origins origin on origin.launch_id = launch.launch_id
+                 where launch.chain_id = $1
+                   and coalesce(origin.origin_address, launch.creator_address) = $2
+               )
+             order by s.launched_at desc nulls last
+             limit $3"
+        );
+        sqlx::query_as::<_, TokenRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(address)
+            .bind(limit.clamp(1, 200))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+
+    pub async fn creator_coverage(&self, chain_id: u64) -> LedgerResult<CreatorCoverage> {
+        let row = sqlx::query(
+            r#"select count(*) as creators,
+                      count(*) filter (where attribution = 'origin') as by_origin,
+                      coalesce(sum(launches), 0) as launches,
+                      count(*) filter (where launches >= 10) as serial_creators,
+                      coalesce(sum(launches) filter (where launches >= 10), 0) as serial_launches,
+                      count(*) filter (where launches >= 10 and graduated = 0)
+                        as never_graduated_creators,
+                      coalesce(sum(launches) filter (where launches >= 10 and graduated = 0), 0)
+                        as never_graduated_launches
+               from market.creator_profiles where chain_id = $1"#,
+        )
+        .bind(chain_id as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)?;
+        Ok(CreatorCoverage {
+            creators: row.get("creators"),
+            by_origin: row.get("by_origin"),
+            launches: row.get("launches"),
+            serial_creators: row.get("serial_creators"),
+            serial_launches: row.get("serial_launches"),
+            never_graduated_creators: row.get("never_graduated_creators"),
+            never_graduated_launches: row.get("never_graduated_launches"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

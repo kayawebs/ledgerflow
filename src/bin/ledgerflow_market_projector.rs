@@ -8,6 +8,7 @@ use ledgerflow::{
     indexer::{clickhouse::ClickHouseClient, rpc::IndexerRpcClient},
     services::{
         market_arbitrage::{MarketArbitrageConfig, MarketArbitrageEstimator},
+        market_creators::{CreatorIntelligence, CreatorIntelligenceConfig},
         market_data::{MarketProjector, MarketProjectorConfig, run_market_migrations},
         market_liquidations::{LiquidationIndexer, LiquidationIndexerConfig},
         market_pnl::{MarketPnlConfig, MarketPnlProjector},
@@ -126,6 +127,80 @@ async fn main() {
             ),
         },
     );
+    // Creator attribution needs the transaction store, not the node: the launch
+    // event only reports msg.sender.
+    if let Some(store) = clickhouse_client() {
+        let creators = CreatorIntelligence::new(
+            pool.clone(),
+            store,
+            rpc.clone(),
+            CreatorIntelligenceConfig {
+                chain_id: config.chain_id,
+                resolve_batch: env_parse(
+                    "LEDGERFLOW_MARKET_ORIGIN_BATCH",
+                    CreatorIntelligenceConfig::default().resolve_batch,
+                ),
+                ..CreatorIntelligenceConfig::default()
+            },
+        );
+        let profile_interval = Duration::from_secs(env_parse(
+            "LEDGERFLOW_MARKET_CREATOR_PROFILE_INTERVAL_SECONDS",
+            900_u64,
+        ));
+        tokio::spawn(async move {
+            let mut last_profiles: Option<Instant> = None;
+            loop {
+                let delay = match creators.resolve_origins_once().await {
+                    Ok(summary) => {
+                        if summary.launches > 0 {
+                            info!(
+                                launches = summary.launches,
+                                resolved = summary.resolved,
+                                from = summary.from_block,
+                                to = summary.to_block,
+                                "market launch origin resolution completed"
+                            );
+                        }
+                        if summary.backlog {
+                            Duration::from_millis(100)
+                        } else {
+                            Duration::from_secs(10)
+                        }
+                    }
+                    Err(origin_error) => {
+                        error!(error = %origin_error, "market launch origin resolution failed");
+                        Duration::from_secs(30)
+                    }
+                };
+                // With the store's backlog drained, fill in what it could not
+                // answer for by asking the node.
+                if delay >= Duration::from_secs(10) {
+                    match creators.backfill_missing_origins().await {
+                        Ok(0) => {}
+                        Ok(resolved) => {
+                            info!(resolved, "market launch origin node backfill completed")
+                        }
+                        Err(backfill_error) => {
+                            warn!(error = %backfill_error, "market launch origin node backfill failed")
+                        }
+                    }
+                }
+                // Profiles are rebuilt in full, so they wait until the backlog
+                // is drained rather than competing with it.
+                let due = last_profiles.is_none_or(|at| at.elapsed() >= profile_interval);
+                if due && delay >= Duration::from_secs(10) {
+                    match creators.rebuild_profiles().await {
+                        Ok(rows) => info!(rows, "market creator profiles rebuilt"),
+                        Err(profile_error) => {
+                            warn!(error = %profile_error, "market creator profile rebuild failed")
+                        }
+                    }
+                    last_profiles = Some(Instant::now());
+                }
+                tokio::time::sleep(delay).await;
+            }
+        });
+    }
     if let Some(rpc) = rpc.clone() {
         let log_store = env::var("LEDGERFLOW_MARKET_CLICKHOUSE_URL")
             .or_else(|_| env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_URL"))
@@ -415,6 +490,24 @@ async fn main() {
         }
         tokio::time::sleep(delay).await;
     }
+}
+
+/// The shared transaction and log store, when one is configured.
+fn clickhouse_client() -> Option<ClickHouseClient> {
+    env::var("LEDGERFLOW_MARKET_CLICKHOUSE_URL")
+        .or_else(|_| env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_URL"))
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| {
+            ClickHouseClient::new(
+                url,
+                env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_DATABASE")
+                    .unwrap_or_else(|_| "ledgerflow_indexer".to_owned()),
+                env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_USER")
+                    .unwrap_or_else(|_| "ledgerflow".to_owned()),
+                env::var("LEDGERFLOW_INDEXER_CLICKHOUSE_PASSWORD").ok(),
+            )
+        })
 }
 
 fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
