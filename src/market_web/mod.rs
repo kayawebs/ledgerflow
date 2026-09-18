@@ -294,6 +294,7 @@ pub fn router(state: MarketWebState) -> Router {
         .route("/og/launch/{launch_id}/card.png", get(og_launch_card))
         .route("/og/address/{address}/card.png", get(og_address_card))
         .route("/og/board/{board}/card.png", get(og_board_card))
+        .route("/og/wallets/{window}/card.png", get(og_wallets_card))
         .route("/robots.txt", get(robots_txt))
         .route("/sitemap.xml", get(sitemap_xml))
         .route("/auth/wallet/challenge", post(wallet_challenge))
@@ -661,11 +662,13 @@ async fn clusters_page(
         },
         session_address(&state, &headers),
     )?;
-    Ok(Html(layout(
+    let social = share::wallets_social(window.key(), context.locale);
+    Ok(Html(layout_social(
         &context,
         context.locale.text("Address Intelligence", "地址情报"),
         "clusters",
         wallet.as_deref(),
+        Some(&social),
         &intel::intel(
             &context,
             &intel::IntelPage {
@@ -2464,6 +2467,23 @@ async fn og_board_card(
     let tokens = state.market.board(ROBINHOOD_CHAIN_ID, board, 5).await?;
     let (title, subline) = share::board_title(board);
     let card = share::board_card(title, subline, &tokens);
+    card_response(&state, key, card).await
+}
+
+async fn og_wallets_card(
+    State(state): State<MarketWebState>,
+    Path(window): Path<String>,
+) -> Result<Response, MarketWebError> {
+    let window = EarningsWindow::parse(Some(window.as_str()));
+    let key = format!("wallets:{}", window.key());
+    if let Some(bytes) = cached_card(&state, &key).await {
+        return Ok(png_response(bytes));
+    }
+    let rows = state
+        .market
+        .wallet_leaderboard(ROBINHOOD_CHAIN_ID, window.key(), 5, 0)
+        .await?;
+    let card = share::wallets_card(window.key(), &rows);
     card_response(&state, key, card).await
 }
 

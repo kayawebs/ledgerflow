@@ -46,7 +46,7 @@ pub fn intel(context: &PageContext<'_>, page: &IntelPage<'_>) -> String {
         .map(|row| ui::age(Some(row.computed_at), l))
         .unwrap_or_else(|| "—".to_owned());
     format!(
-        "<section class=\"page-head\"><div><h1>{title}</h1><p>{subtitle}</p></div><nav class=\"windows\">{window_tabs}</nav></section>\
+        "<section class=\"page-head\"><div><h1>{title}</h1><p>{subtitle}</p></div><div><nav class=\"windows\">{window_tabs}</nav>{share}</div></section>\
          <div class=\"toolbar\">{domain_tabs}<form class=\"search\" action=\"/clusters\"><input type=\"hidden\" name=\"lang\" value=\"{lang}\"><input type=\"hidden\" name=\"chain_id\" value=\"{chain}\"><input name=\"address\" placeholder=\"{placeholder}\" autocomplete=\"off\"><button>{search}</button></form></div>\
          {error}\
          <section class=\"podium\">{podium}</section>\
@@ -54,6 +54,7 @@ pub fn intel(context: &PageContext<'_>, page: &IntelPage<'_>) -> String {
            <article class=\"card\"><div class=\"card-head\"><h2>🆕 {new_title}</h2><span class=\"muted\">{new_note}</span></div><div class=\"card-body\">{newest}</div></article></section>\
          <article class=\"card\"><div class=\"card-head\"><h2>👥 {cluster_title}</h2><span class=\"muted\">{cluster_note}</span></div>{clusters}</article>\
          <p class=\"note\">{method}</p>",
+        share = super::share::share_bar(context, &super::share::wallets_tweet(page.wallets, l)),
         title = l.text("Who is making money", "谁在赚钱"),
         subtitle = l.text(
             "Ranked earnings of Pons traders and protocol-scoped clusters, computed from every curve trade.",

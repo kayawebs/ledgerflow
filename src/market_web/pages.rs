@@ -341,12 +341,13 @@ pub fn launches(context: &PageContext<'_>, query: &LaunchTableQuery<'_>, table: 
         })
         .collect::<String>();
     format!(
-        "<section class=\"page-head\"><div><h1>{title}</h1><p>{subtitle}</p></div></section>\
+        "<section class=\"page-head\"><div><h1>{title}</h1><p>{subtitle}</p></div>{share}</section>\
          <div class=\"toolbar\"><nav class=\"tabs\">{tabs}</nav>\
            <form class=\"search\" action=\"/launches\"><input type=\"hidden\" name=\"lang\" value=\"{lang}\"><input type=\"hidden\" name=\"chain_id\" value=\"{chain}\"><input type=\"hidden\" name=\"tab\" value=\"{tab}\">\
            <input name=\"q\" value=\"{q}\" placeholder=\"{placeholder}\" autocomplete=\"off\"><button>{search}</button></form></div>\
          <article class=\"card\" data-refresh=\"{refresh}\" data-every=\"15\">{table}</article>\
          <p class=\"note\">{note}</p>",
+        share = super::share::share_bar(context, &super::share::board_tweet(query.board, &[], l)),
         title = l.text("Launches", "发币"),
         subtitle = l.text(
             "Pons launches ranked like an exchange. Prices are curve execution prices converted to USD.",

@@ -348,6 +348,98 @@ pub fn board_card(title: &str, subline: &str, tokens: &[TokenRow]) -> og::Card {
     }
 }
 
+/// Leaderboard card: the ranked wallets are the page's whole point, so the
+/// card is the list itself.
+pub fn wallets_card(window_label: &str, rows: &[WalletRankRow]) -> og::Card {
+    let entries = rows
+        .iter()
+        .take(5)
+        .map(|row| og::Row {
+            rank: row.rank as usize,
+            name: ui::short_address(&row.address),
+            detail: format!(
+                "{} tokens · {}% win rate",
+                ui::count(row.tokens_traded as i64),
+                if row.tokens_traded > 0 {
+                    (row.winning_tokens as f64 / row.tokens_traded as f64 * 100.0).round() as i64
+                } else {
+                    0
+                }
+            ),
+            value: ui::signed_usd(Some(row.realized_usd)),
+            tone: og::Tone::of(Some(row.realized_usd)),
+        })
+        .collect();
+    og::Card {
+        eyebrow: "PONS TRADERS · ROBINHOOD CHAIN".to_string(),
+        headline: format!("Who is making money, {window_label}"),
+        subline: Some("Ranked by realized profit on Pons launches".to_string()),
+        rows: entries,
+        ..og::Card::default()
+    }
+}
+
+pub fn wallets_social(window: &str, locale: Locale) -> Social {
+    Social {
+        title: locale.text_owned(
+            format!("Top Pons traders, {window} · LedgerFlow"),
+            format!("Pons 收益排行 {window} · LedgerFlow"),
+        ),
+        description: locale.text(
+            "Wallets and address clusters ranked by realized profit on Pons launches, computed from every curve trade.",
+            "按 Pons 已实现收益排序的钱包与地址集群，基于全部联合曲线成交计算。",
+        ).to_string(),
+        image_path: format!("/og/wallets/{window}/card.png"),
+        canonical_path: "/clusters".to_string(),
+    }
+}
+
+pub fn wallets_tweet(rows: &[WalletRankRow], locale: Locale) -> String {
+    match rows.first() {
+        Some(top) => locale.text_owned(
+            format!(
+                "Top Pons trader is up {} across {} tokens right now. Full ranking on LedgerFlow:",
+                ui::signed_usd(Some(top.realized_usd)),
+                ui::count(top.tokens_traded as i64)
+            ),
+            format!(
+                "Pons 收益榜首已实现 {}，覆盖 {} 个代币。完整排行在 LedgerFlow：",
+                ui::signed_usd(Some(top.realized_usd)),
+                ui::count(top.tokens_traded as i64)
+            ),
+        ),
+        None => locale
+            .text(
+                "Who is making money on Pons, ranked by realized profit:",
+                "谁在 Pons 上赚钱，按已实现收益排行：",
+            )
+            .to_string(),
+    }
+}
+
+pub fn board_tweet(
+    board: crate::services::market_read::TokenBoard,
+    tokens: &[TokenRow],
+    locale: Locale,
+) -> String {
+    let (title, _) = board_title(board);
+    match tokens.first() {
+        Some(top) => locale.text_owned(
+            format!(
+                "{title} on Pons: {} leads at {}. Live board on LedgerFlow:",
+                symbol_of(top),
+                percent(top.change_24h_pct)
+            ),
+            format!(
+                "Pons {title}：{} 领涨 {}。实时榜单在 LedgerFlow：",
+                symbol_of(top),
+                percent(top.change_24h_pct)
+            ),
+        ),
+        None => format!("{title} on Pons, live on LedgerFlow:"),
+    }
+}
+
 /// Win rate over the tokens a wallet actually closed out.
 fn win_rate(earnings: &AddressEarnings) -> Option<f64> {
     (earnings.tokens > 0).then(|| earnings.winning_tokens as f64 / earnings.tokens as f64 * 100.0)
