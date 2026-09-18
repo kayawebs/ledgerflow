@@ -50,8 +50,10 @@ pub fn arbitrage(context: &PageContext<'_>, page: &ArbitragePage<'_>) -> String 
                 ui::usd(Some(overview.gross_usd)),
                 ui::trust(l, ui::Trust::Estimated)
             ),
-            true,
+            false,
         ),
+        // Executions lead: the aggregate net is often negative because most
+        // attempts lose their gas, which is a real finding but a poor headline.
         stat(
             l.text("Arbitrage executions", "套利执行"),
             ui::count(overview.executions),
@@ -60,7 +62,7 @@ pub fn arbitrage(context: &PageContext<'_>, page: &ArbitragePage<'_>) -> String 
                 percent(overview.profitable, overview.estimated),
                 l.text("profitable", "盈利")
             ),
-            false,
+            true,
         ),
         stat(
             l.text("Active bots", "活跃机器人"),
