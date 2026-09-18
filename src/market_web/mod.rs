@@ -29,6 +29,7 @@ mod pages;
 mod ratelimit;
 mod share;
 mod ui;
+mod wins;
 
 use crate::services::market_data::run_market_migrations;
 use crate::services::market_pnl::EarningsWindow;
@@ -150,6 +151,8 @@ struct PageQuery {
     tab: Option<String>,
     /// Which creator ranking to show on the creators page.
     board: Option<String>,
+    /// Window for the win boards, in hours.
+    hours: Option<i32>,
     sort: Option<String>,
     dir: Option<String>,
     q: Option<String>,
@@ -295,6 +298,11 @@ pub fn router(state: MarketWebState) -> Router {
         .route("/", get(overview_page))
         .route("/launches", get(launches_page))
         .route("/launches/{launch_id}", get(launch_detail_page))
+        .route("/wins", get(wins_page))
+        .route("/wins/{launch_id}/{address}", get(win_detail_page))
+        .route("/fragments/wins", get(wins_fragment))
+        .route("/og/win/{launch_id}/{address}/card.png", get(og_win_card))
+        .route("/og/wins/card.png", get(og_wins_card))
         .route("/creators", get(creators_page))
         .route("/creators/{address}", get(creator_detail_page))
         .route("/clusters", get(clusters_page))
@@ -361,10 +369,23 @@ async fn overview_page(
     if context.chain_id != ROBINHOOD_CHAIN_ID {
         return legacy_overview_page(state, query, headers).await;
     }
-    let (ticker, boards, feed, wallet) = tokio::try_join!(
+    let (ticker, boards, feed, wins_feed, wallet) = tokio::try_join!(
         async { overview_data(&state).await.map(|data| data.ticker) },
         render_overview_boards(&state, &context),
         render_overview_feed(&state, &context),
+        async {
+            let rows = state
+                .market
+                .big_wins(
+                    context.chain_id,
+                    crate::services::market_read::WinBoard::Latest,
+                    24,
+                    12,
+                )
+                .await
+                .map_err(MarketWebError::from)?;
+            Ok::<String, MarketWebError>(wins::feed(&context, &rows))
+        },
         session_address(&state, &headers),
     )?;
     let social = share::home_social(context.locale, &ticker);
@@ -374,7 +395,7 @@ async fn overview_page(
         "overview",
         wallet.as_deref(),
         Some(&social),
-        &pages::overview(&context, &ticker, &boards, &feed),
+        &pages::overview(&context, &ticker, &boards, &feed, &wins_feed),
     ))
     .into_response())
 }
@@ -2361,6 +2382,166 @@ fn metric_card(index: &str, label: &str, value: &str, window: &str, _note: &str)
         value,
         escape_html(window),
     )
+}
+
+/// Hours of history the win boards cover.
+const WIN_WINDOW_HOURS: [i32; 2] = [24, 168];
+
+async fn wins_page(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    let board = crate::services::market_read::WinBoard::parse(query.board.as_deref());
+    let hours = query
+        .hours
+        .filter(|hours| WIN_WINDOW_HOURS.contains(hours))
+        .unwrap_or(24);
+    let chain_id = context.chain_id;
+    let (summary, wins, latest, wallet) = tokio::try_join!(
+        async {
+            state
+                .market
+                .win_summary(chain_id, hours)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .big_wins(chain_id, board, hours, 50)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        async {
+            state
+                .market
+                .big_wins(
+                    chain_id,
+                    crate::services::market_read::WinBoard::Latest,
+                    24,
+                    16,
+                )
+                .await
+                .map_err(MarketWebError::from)
+        },
+        session_address(&state, &headers),
+    )?;
+    let feed = wins::feed(&context, &latest);
+    let social = share::wins_social(context.locale, &summary);
+    Ok(Html(layout_social(
+        &context,
+        context.locale.text("Wins", "战绩"),
+        "wins",
+        wallet.as_deref(),
+        Some(&social),
+        &wins::page(
+            &context,
+            &wins::WinsPage {
+                board,
+                hours,
+                summary: &summary,
+                wins: &wins,
+                feed: &feed,
+            },
+        ),
+    )))
+}
+
+async fn win_detail_page(
+    State(state): State<MarketWebState>,
+    Path((launch_id, address)): Path<(Uuid, String)>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Result<Response, MarketWebError> {
+    let context = PageContext::new(&query);
+    let address = normalize_address(&address)?;
+    let wallet = session_address(&state, &headers).await?;
+    let Some(win) = state
+        .market
+        .win(context.chain_id, launch_id, &address)
+        .await?
+    else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Html(layout(
+                &context,
+                context.locale.text("Win not found", "未找到该战绩"),
+                "wins",
+                wallet.as_deref(),
+                &empty_state(
+                    &context,
+                    "This position has not been settled.",
+                    "该仓位尚未结算。",
+                ),
+            )),
+        )
+            .into_response());
+    };
+    let social = share::win_social(&win, context.locale);
+    Ok(Html(layout_social(
+        &context,
+        context.locale.text("Win", "战绩"),
+        "wins",
+        wallet.as_deref(),
+        Some(&social),
+        &wins::detail(&context, &win),
+    ))
+    .into_response())
+}
+
+async fn wins_fragment(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    let wins = state
+        .market
+        .big_wins(
+            context.chain_id,
+            crate::services::market_read::WinBoard::Latest,
+            24,
+            16,
+        )
+        .await?;
+    Ok(Html(wins::feed(&context, &wins)))
+}
+
+async fn og_win_card(
+    State(state): State<MarketWebState>,
+    Path((launch_id, address)): Path<(Uuid, String)>,
+) -> Result<Response, MarketWebError> {
+    let address = normalize_address(&address)?;
+    let key = format!("win:{launch_id}:{address}");
+    if let Some(bytes) = cached_card(&state, &key).await {
+        return Ok(png_response(bytes));
+    }
+    let Some(win) = state
+        .market
+        .win(ROBINHOOD_CHAIN_ID, launch_id, &address)
+        .await?
+    else {
+        return og_home_card(State(state)).await;
+    };
+    card_response(&state, key, share::win_card(&win)).await
+}
+
+async fn og_wins_card(State(state): State<MarketWebState>) -> Result<Response, MarketWebError> {
+    let key = "wins".to_owned();
+    if let Some(bytes) = cached_card(&state, &key).await {
+        return Ok(png_response(bytes));
+    }
+    let wins = state
+        .market
+        .big_wins(
+            ROBINHOOD_CHAIN_ID,
+            crate::services::market_read::WinBoard::Multiple,
+            24,
+            5,
+        )
+        .await?;
+    card_response(&state, key, share::wins_card(&wins)).await
 }
 
 async fn creators_page(

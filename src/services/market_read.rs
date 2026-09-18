@@ -1523,6 +1523,192 @@ impl MarketReadService {
     }
 }
 
+/// A closed position that multiplied: the unit of the win feed.
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct WinRow {
+    pub address: String,
+    pub launch_id: Uuid,
+    pub symbol: Option<String>,
+    pub token_address: String,
+    pub cost_usd: f64,
+    pub proceeds_usd: f64,
+    pub profit_usd: f64,
+    pub multiple: f64,
+    pub buy_count: i32,
+    pub sell_count: i32,
+    pub opened_at: Option<DateTime<Utc>>,
+    pub closed_at: Option<DateTime<Utc>>,
+}
+
+/// How to rank wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum WinBoard {
+    /// Newest first: the live feed.
+    Latest,
+    /// Biggest multiple: what a small stake turned into.
+    Multiple,
+    /// Biggest dollar profit.
+    Profit,
+}
+
+impl WinBoard {
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.unwrap_or("multiple") {
+            "latest" => Self::Latest,
+            "profit" => Self::Profit,
+            _ => Self::Multiple,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Multiple => "multiple",
+            Self::Profit => "profit",
+        }
+    }
+
+    pub const ALL: [WinBoard; 3] = [Self::Multiple, Self::Profit, Self::Latest];
+
+    /// Ordering over the position table, for picking a wallet's best win.
+    fn order(self) -> &'static str {
+        match self {
+            Self::Latest => "position.last_trade_at desc",
+            Self::Multiple => "position.proceeds_usd / position.cost_usd desc",
+            Self::Profit => "position.proceeds_usd - position.cost_usd desc",
+        }
+    }
+
+    /// The same ordering over the already-projected columns.
+    fn plain_order(self) -> &'static str {
+        match self {
+            Self::Latest => "closed_at desc",
+            Self::Multiple => "multiple desc",
+            Self::Profit => "profit_usd desc",
+        }
+    }
+}
+
+const WIN_COLUMNS: &str = r#"
+  position.address, position.launch_id, stats.symbol, stats.token_address,
+  position.cost_usd::float8 as cost_usd, position.proceeds_usd::float8 as proceeds_usd,
+  (position.proceeds_usd - position.cost_usd)::float8 as profit_usd,
+  (position.proceeds_usd / nullif(position.cost_usd, 0))::float8 as multiple,
+  position.buy_count, position.sell_count,
+  position.first_trade_at as opened_at, position.last_trade_at as closed_at
+"#;
+
+/// The floor for a position to count as a win. Dust positions multiply easily
+/// and say nothing.
+pub const WIN_MIN_COST_USD: f64 = 20.0;
+pub const WIN_MIN_MULTIPLE: f64 = 2.0;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WinSummary {
+    pub wins: i64,
+    pub wins_10x: i64,
+    pub wins_20x: i64,
+    pub total_profit_usd: f64,
+    pub biggest_profit_usd: Option<f64>,
+    pub biggest_multiple: Option<f64>,
+    pub winners: i64,
+}
+
+impl MarketReadService {
+    /// Closed positions that at least doubled, for the feed and the boards.
+    pub async fn big_wins(
+        &self,
+        chain_id: u64,
+        board: WinBoard,
+        hours: i32,
+        limit: i64,
+    ) -> LedgerResult<Vec<WinRow>> {
+        // One row per wallet: a single operator with dozens of wins would
+        // otherwise fill the board, which hides how many different people are
+        // winning.
+        let sql = format!(
+            "select * from (
+               select {WIN_COLUMNS},
+                      row_number() over (partition by position.address order by {order}) as per_wallet
+               from market.wallet_positions position
+               join market.token_stats stats on stats.launch_id = position.launch_id
+               where position.chain_id = $1
+                 and position.sold_token >= position.bought_token
+                 and position.cost_usd >= {WIN_MIN_COST_USD}
+                 and position.proceeds_usd >= position.cost_usd * {WIN_MIN_MULTIPLE}
+                 and position.last_trade_at > now() - make_interval(hours => $2)
+             ) ranked
+             where per_wallet = 1
+             order by {plain_order} limit $3",
+            order = board.order(),
+            plain_order = board.plain_order(),
+        );
+        sqlx::query_as::<_, WinRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(hours)
+            .bind(limit.clamp(1, 200))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+
+    /// One win, for its own page and social card.
+    pub async fn win(
+        &self,
+        chain_id: u64,
+        launch_id: Uuid,
+        address: &str,
+    ) -> LedgerResult<Option<WinRow>> {
+        let sql = format!(
+            "select {WIN_COLUMNS}
+             from market.wallet_positions position
+             join market.token_stats stats on stats.launch_id = position.launch_id
+             where position.chain_id = $1 and position.launch_id = $2 and position.address = $3
+               and position.sold_token >= position.bought_token
+               and position.cost_usd >= {WIN_MIN_COST_USD}
+               and position.proceeds_usd >= position.cost_usd * {WIN_MIN_MULTIPLE}"
+        );
+        sqlx::query_as::<_, WinRow>(&sql)
+            .bind(chain_id as i64)
+            .bind(launch_id)
+            .bind(address)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_error)
+    }
+
+    pub async fn win_summary(&self, chain_id: u64, hours: i32) -> LedgerResult<WinSummary> {
+        let row = sqlx::query(&format!(
+            r#"select count(*) as wins,
+                      count(*) filter (where proceeds_usd >= cost_usd * 10) as wins_10x,
+                      count(*) filter (where proceeds_usd >= cost_usd * 20) as wins_20x,
+                      coalesce(sum(proceeds_usd - cost_usd), 0)::float8 as total_profit,
+                      max(proceeds_usd - cost_usd)::float8 as biggest_profit,
+                      max(proceeds_usd / nullif(cost_usd, 0))::float8 as biggest_multiple,
+                      count(distinct address) as winners
+               from market.wallet_positions
+               where chain_id = $1 and sold_token >= bought_token
+                 and cost_usd >= {WIN_MIN_COST_USD}
+                 and proceeds_usd >= cost_usd * {WIN_MIN_MULTIPLE}
+                 and last_trade_at > now() - make_interval(hours => $2)"#
+        ))
+        .bind(chain_id as i64)
+        .bind(hours)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)?;
+        Ok(WinSummary {
+            wins: row.get("wins"),
+            wins_10x: row.get("wins_10x"),
+            wins_20x: row.get("wins_20x"),
+            total_profit_usd: row.get("total_profit"),
+            biggest_profit_usd: row.get("biggest_profit"),
+            biggest_multiple: row.get("biggest_multiple"),
+            winners: row.get("winners"),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

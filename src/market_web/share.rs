@@ -440,6 +440,158 @@ pub fn board_tweet(
     }
 }
 
+/// The card for a single settled win. This is the artifact people paste.
+pub fn win_card(win: &crate::services::market_read::WinRow) -> og::Card {
+    let symbol = win
+        .symbol
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "?".to_owned());
+    let multiple = if win.multiple >= 10.0 {
+        format!("{:.1}x", win.multiple)
+    } else {
+        format!("{:.2}x", win.multiple)
+    };
+    og::Card {
+        eyebrow: "PONS · ROBINHOOD CHAIN".to_string(),
+        headline: format!(
+            "{} → {}",
+            ui::usd(Some(win.cost_usd)),
+            ui::usd(Some(win.proceeds_usd))
+        ),
+        subline: Some(format!("{} on ${symbol}", ui::short_address(&win.address))),
+        hero_label: Some("MULTIPLE".to_string()),
+        hero_value: Some(multiple),
+        hero_tone: og::Tone::Up,
+        hero_delta: None,
+        stats: vec![
+            og::Stat::toned("PROFIT", ui::signed_usd(Some(win.profit_usd)), og::Tone::Up),
+            og::Stat::new("PUT IN", ui::usd(Some(win.cost_usd))),
+            og::Stat::new("TOOK OUT", ui::usd(Some(win.proceeds_usd))),
+            og::Stat::new(
+                "TRADES",
+                format!("{}B / {}S", win.buy_count, win.sell_count),
+            ),
+        ],
+        note: Some(
+            "Settled on chain · average cost, excluding gas · past results are not a forecast"
+                .to_string(),
+        ),
+        ..og::Card::default()
+    }
+}
+
+pub fn win_social(win: &crate::services::market_read::WinRow, locale: Locale) -> Social {
+    let symbol = win
+        .symbol
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "?".to_owned());
+    Social {
+        title: format!(
+            "{} → {} on ${symbol}",
+            ui::usd(Some(win.cost_usd)),
+            ui::usd(Some(win.proceeds_usd))
+        ),
+        description: locale.text_owned(
+            format!(
+                "{} turned {} into {} on a Pons launch. Settled on chain, computed from every curve trade.",
+                ui::short_address(&win.address),
+                ui::usd(Some(win.cost_usd)),
+                ui::usd(Some(win.proceeds_usd))
+            ),
+            format!(
+                "{} 在一个 Pons 发币上把 {} 变成了 {}。链上已结算，由全部曲线成交计算。",
+                ui::short_address(&win.address),
+                ui::usd(Some(win.cost_usd)),
+                ui::usd(Some(win.proceeds_usd))
+            ),
+        ),
+        image_path: format!("/og/win/{}/{}/card.png", win.launch_id, win.address),
+        canonical_path: format!("/wins/{}/{}", win.launch_id, win.address),
+    }
+}
+
+pub fn win_tweet(win: &crate::services::market_read::WinRow, locale: Locale) -> String {
+    let symbol = win
+        .symbol
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "?".to_owned());
+    let multiple = format!("{:.1}x", win.multiple);
+    locale.text_owned(
+        format!(
+            "{} → {} ({multiple}) on ${symbol}. Every Pons win, as it settles:",
+            ui::usd(Some(win.cost_usd)),
+            ui::usd(Some(win.proceeds_usd))
+        ),
+        format!(
+            "${symbol} 上 {} 变 {}，{multiple}。Pons 上每一笔落袋战绩：",
+            ui::usd(Some(win.cost_usd)),
+            ui::usd(Some(win.proceeds_usd))
+        ),
+    )
+}
+
+pub fn wins_social(locale: Locale, summary: &crate::services::market_read::WinSummary) -> Social {
+    Social {
+        title: locale
+            .text("Who just got paid on Pons", "谁刚刚在 Pons 上赚到了")
+            .to_string(),
+        description: locale.text_owned(
+            format!(
+                "{} closed wins in 24h, {} of them above 10x, biggest single win {}.",
+                ui::count(summary.wins),
+                ui::count(summary.wins_10x),
+                ui::usd(summary.biggest_profit_usd)
+            ),
+            format!(
+                "24 小时内 {} 笔落袋战绩，其中 {} 笔超过 10 倍，最大一笔 {}。",
+                ui::count(summary.wins),
+                ui::count(summary.wins_10x),
+                ui::usd(summary.biggest_profit_usd)
+            ),
+        ),
+        image_path: "/og/wins/card.png".to_string(),
+        canonical_path: "/wins".to_string(),
+    }
+}
+
+/// The scoreboard card: the day's biggest multiples.
+pub fn wins_card(wins: &[crate::services::market_read::WinRow]) -> og::Card {
+    let rows = wins
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, win)| og::Row {
+            rank: index + 1,
+            name: format!(
+                "{} → {}",
+                ui::usd(Some(win.cost_usd)),
+                ui::usd(Some(win.proceeds_usd))
+            ),
+            detail: format!(
+                "${} · {}",
+                win.symbol.clone().unwrap_or_else(|| "?".to_owned()),
+                ui::short_address(&win.address)
+            ),
+            value: if win.multiple >= 10.0 {
+                format!("{:.1}x", win.multiple)
+            } else {
+                format!("{:.2}x", win.multiple)
+            },
+            tone: og::Tone::Up,
+        })
+        .collect();
+    og::Card {
+        eyebrow: "PONS · ROBINHOOD CHAIN".to_string(),
+        headline: "Who just got paid".to_string(),
+        subline: Some("Settled positions on Pons launches, last 24h".to_string()),
+        rows,
+        ..og::Card::default()
+    }
+}
+
 /// Win rate over the tokens a wallet actually closed out.
 fn win_rate(earnings: &AddressEarnings) -> Option<f64> {
     (earnings.tokens > 0).then(|| earnings.winning_tokens as f64 / earnings.tokens as f64 * 100.0)

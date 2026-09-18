@@ -10,8 +10,9 @@ use crate::services::market_read::{
 };
 
 /// Header navigation entries: key, path, English, Chinese.
-pub const NAV: [(&str, &str, &str, &str); 6] = [
+pub const NAV: [(&str, &str, &str, &str); 7] = [
     ("overview", "/", "Overview", "总览"),
+    ("wins", "/wins", "Wins", "战绩"),
     ("launches", "/launches", "Launches", "发币"),
     ("creators", "/creators", "Creators", "创建者"),
     ("clusters", "/clusters", "Address Intelligence", "地址情报"),
@@ -73,6 +74,7 @@ pub fn overview(
     ticker: &MarketTicker,
     boards: &str,
     feed: &str,
+    wins_feed: &str,
 ) -> String {
     let l = context.locale;
     format!(
@@ -80,6 +82,8 @@ pub fn overview(
          <section class=\"stats\">{stats}</section>\
          <section data-refresh=\"{boards_url}\" data-every=\"20\">{boards}</section>\
          <section class=\"grid2\">\
+           <article class=\"card\"><div class=\"card-head\"><h2>🚀 {wins_title}</h2><a href=\"{wins_url}\">{wins_all} →</a></div>\
+             <div class=\"card-body feed\" data-refresh=\"{wins_feed_url}\" data-every=\"10\">{wins_feed}</div></article>\
            <article class=\"card\"><div class=\"card-head\"><h2>🐋 {feed_title}</h2><span class=\"muted\">{feed_note}</span></div>\
              <div class=\"card-body feed\" data-refresh=\"{feed_url}\" data-every=\"10\">{feed}</div></article>\
            <article class=\"card\"><div class=\"card-head\"><h2>🧭 {explore_title}</h2></div><div class=\"card-body\">{explore}</div></article>\
@@ -93,6 +97,11 @@ pub fn overview(
         stats = overview_stats(context, ticker),
         boards_url = fragment_url(context, "/fragments/overview/boards", ""),
         boards = boards,
+        wins_title = l.text("Just got paid", "刚刚落袋"),
+        wins_url = context.url("/wins"),
+        wins_all = l.text("All wins", "全部战绩"),
+        wins_feed_url = fragment_url(context, "/fragments/wins", ""),
+        wins_feed = wins_feed,
         feed_title = l.text("Whale trades", "大额成交"),
         feed_note = l.text("≥ $100 · last few minutes", "≥ $100 · 最近几分钟"),
         feed_url = fragment_url(context, "/fragments/overview/feed", ""),
