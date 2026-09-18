@@ -29,6 +29,18 @@ pub fn arbitrage(context: &PageContext<'_>, page: &ArbitragePage<'_>) -> String 
         )
     };
     let stats = [
+        // Executions lead: the aggregate net is often negative because most
+        // attempts lose their gas, which is a real finding but a poor headline.
+        stat(
+            l.text("Arbitrage executions", "套利执行"),
+            ui::count(overview.executions),
+            format!(
+                "{} {}",
+                percent(overview.profitable, overview.estimated),
+                l.text("profitable", "盈利")
+            ),
+            true,
+        ),
         stat(
             &format!(
                 "{} · {}",
@@ -51,18 +63,6 @@ pub fn arbitrage(context: &PageContext<'_>, page: &ArbitragePage<'_>) -> String 
                 ui::trust(l, ui::Trust::Estimated)
             ),
             false,
-        ),
-        // Executions lead: the aggregate net is often negative because most
-        // attempts lose their gas, which is a real finding but a poor headline.
-        stat(
-            l.text("Arbitrage executions", "套利执行"),
-            ui::count(overview.executions),
-            format!(
-                "{} {}",
-                percent(overview.profitable, overview.estimated),
-                l.text("profitable", "盈利")
-            ),
-            true,
         ),
         stat(
             l.text("Active bots", "活跃机器人"),
