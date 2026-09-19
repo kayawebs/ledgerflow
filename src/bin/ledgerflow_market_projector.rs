@@ -7,6 +7,7 @@ use ledgerflow::{
     core::{config::AppConfig, env::load_dotenv, logging::init_logging},
     indexer::{clickhouse::ClickHouseClient, rpc::IndexerRpcClient},
     services::{
+        market_arb_scanner::{ArbCandidateScanner, ArbScannerConfig},
         market_arbitrage::{MarketArbitrageConfig, MarketArbitrageEstimator},
         market_creators::{CreatorIntelligence, CreatorIntelligenceConfig},
         market_data::{MarketProjector, MarketProjectorConfig, run_market_migrations},
@@ -127,6 +128,54 @@ async fn main() {
             ),
         },
     );
+    // Arbitrage candidate detection reads every block from the log store. The
+    // trace monitor also detects candidates, but it stays at the chain head and
+    // drops the blocks it falls behind on.
+    if let Some(store) = clickhouse_client() {
+        let defaults = ArbScannerConfig::default();
+        let scanner = ArbCandidateScanner::new(
+            pool.clone(),
+            store,
+            ArbScannerConfig {
+                chain_id: config.chain_id,
+                block_batch: env_parse("LEDGERFLOW_MARKET_ARB_SCAN_BATCH", defaults.block_batch),
+                min_swaps: env_parse("LEDGERFLOW_MARKET_ARB_SCAN_MIN_SWAPS", defaults.min_swaps),
+                initial_lookback_blocks: env_parse(
+                    "LEDGERFLOW_MARKET_ARB_SCAN_LOOKBACK_BLOCKS",
+                    defaults.initial_lookback_blocks,
+                ),
+                ..defaults
+            },
+        );
+        tokio::spawn(async move {
+            loop {
+                let delay = match scanner.scan_once().await {
+                    Ok(summary) => {
+                        if summary.candidates > 0 || summary.backlog {
+                            info!(
+                                from = summary.from_block,
+                                to = summary.to_block,
+                                head = summary.head_block,
+                                candidates = summary.candidates,
+                                rows = summary.rows,
+                                "market arbitrage candidate scan completed"
+                            );
+                        }
+                        if summary.backlog {
+                            Duration::from_millis(50)
+                        } else {
+                            Duration::from_secs(2)
+                        }
+                    }
+                    Err(scan_error) => {
+                        error!(error = %scan_error, "market arbitrage candidate scan failed");
+                        Duration::from_secs(15)
+                    }
+                };
+                tokio::time::sleep(delay).await;
+            }
+        });
+    }
     // Creator attribution needs the transaction store, not the node: the launch
     // event only reports msg.sender.
     if let Some(store) = clickhouse_client() {

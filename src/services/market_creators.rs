@@ -145,7 +145,10 @@ impl CreatorIntelligence {
                 &lookups,
             )
             .await?;
-        let senders: std::collections::HashMap<String, String> = senders.into_iter().collect();
+        let senders: std::collections::HashMap<String, String> = senders
+            .into_iter()
+            .map(|(hash, sender, _entry)| (hash, sender))
+            .collect();
 
         let origins: Vec<Option<String>> = hashes
             .iter()

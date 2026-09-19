@@ -8,6 +8,13 @@ use crate::core::errors::{LedgerError, LedgerResult};
 /// so this keeps the query text well inside ClickHouse's 256 KiB
 /// `max_query_size` default.
 const SENDER_LOOKUP_CHUNK: usize = 2_000;
+
+/// The swap event topics an arbitrage route can be built from.
+pub struct ArbitrageTopics<'a> {
+    pub v2: &'a str,
+    pub v3: &'a str,
+    pub v4: &'a str,
+}
 use crate::indexer::models::{
     AddressTxDirection, AddressTxRef, CanonicalAddressObservation, CanonicalBlock,
     ChainReorganization, IndexedBlock, IndexerApiKeyRecord, IndexerApiKeyStatus,
@@ -498,18 +505,91 @@ impl ClickHouseClient {
         Ok(row.get("max_block").and_then(value_as_u64))
     }
 
-    /// Senders of the given transactions, looked up inside a block range so the
-    /// table's primary key is used instead of scanning it. A protocol event
-    /// records `msg.sender`, which is a contract whenever the caller went
-    /// through a router or multicall; the transaction sender is the account
-    /// that actually acted.
+    /// Transactions in `from_block..=to_block` that touched at least
+    /// `min_swaps` swap logs across two or more distinct pools: the shape of an
+    /// arbitrage route. Covers Uniswap V2, V3 and V4. V4 routes every pool
+    /// through one PoolManager, so its pool identity is the pool id in the
+    /// first indexed topic rather than the emitting address.
+    pub async fn arbitrage_candidate_txs(
+        &self,
+        chain_id: u32,
+        from_block: u64,
+        to_block: u64,
+        min_swaps: u32,
+        topics: &ArbitrageTopics<'_>,
+    ) -> LedgerResult<Vec<Value>> {
+        if from_block > to_block {
+            return Ok(Vec::new());
+        }
+        let payload = self
+            .query_json(&format!(
+                r#"
+                SELECT swaps.tx_hash AS tx_hash,
+                       swaps.block_number AS block_number,
+                       swaps.tx_index AS tx_index,
+                       swaps.swap_count AS swap_count,
+                       swaps.v2_count AS v2_count,
+                       swaps.v3_count AS v3_count,
+                       swaps.v4_count AS v4_count,
+                       swaps.pool_count AS pool_count,
+                       toUnixTimestamp(blocks.timestamp) AS block_timestamp
+                FROM (
+                  SELECT lower(tx_hash) AS tx_hash,
+                         any(block_number) AS block_number,
+                         any(tx_index) AS tx_index,
+                         count() AS swap_count,
+                         countIf(topic0 = '{v2}') AS v2_count,
+                         countIf(topic0 = '{v3}') AS v3_count,
+                         countIf(topic0 = '{v4}') AS v4_count,
+                         uniqExact(pool_key) AS pool_count
+                  FROM (
+                    SELECT tx_hash, block_number, tx_index,
+                           lower(topics[1]) AS topic0,
+                           if(lower(topics[1]) = '{v4}',
+                              lower(topics[2]), lower(address)) AS pool_key
+                    FROM {db}.logs_canonical
+                    WHERE chain_id = {chain}
+                      AND block_number BETWEEN {from} AND {to}
+                      AND lower(topics[1]) IN ('{v2}', '{v3}', '{v4}')
+                  )
+                  GROUP BY tx_hash
+                  HAVING swap_count >= {min_swaps} AND pool_count >= 2
+                ) AS swaps
+                LEFT JOIN (
+                  SELECT block_number, any(timestamp) AS timestamp
+                  FROM {db}.canonical_blocks
+                  WHERE chain_id = {chain} AND block_number BETWEEN {from} AND {to}
+                    AND is_canonical = 1
+                  GROUP BY block_number
+                ) AS blocks ON blocks.block_number = swaps.block_number
+                ORDER BY swaps.block_number, swaps.tx_index
+                FORMAT JSON
+                "#,
+                db = self.database,
+                chain = chain_id,
+                from = from_block,
+                to = to_block,
+                min_swaps = min_swaps.max(2),
+                v2 = topics.v2.to_ascii_lowercase(),
+                v3 = topics.v3.to_ascii_lowercase(),
+                v4 = topics.v4.to_ascii_lowercase(),
+            ))
+            .await?;
+        Ok(payload["data"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Senders and callees of the given transactions, looked up inside a block
+    /// range so the table's primary key is used instead of scanning it. A
+    /// protocol event records `msg.sender`, which is a contract whenever the
+    /// caller went through a router or multicall; the transaction sender is the
+    /// account that actually acted, and the callee is the contract it entered.
     pub async fn transaction_senders(
         &self,
         chain_id: u32,
         from_block: u64,
         to_block: u64,
         tx_hashes: &[String],
-    ) -> LedgerResult<Vec<(String, String)>> {
+    ) -> LedgerResult<Vec<(String, String, Option<String>)>> {
         if from_block > to_block || tx_hashes.is_empty() {
             return Ok(Vec::new());
         }
@@ -535,7 +615,8 @@ impl ClickHouseClient {
             let payload = self
                 .query_json(&format!(
                     r#"
-                SELECT lower(tx_hash) AS tx_hash, lower(from_address) AS from_address
+                SELECT lower(tx_hash) AS tx_hash, lower(from_address) AS from_address,
+                       lower(coalesce(to_address, '')) AS to_address
                 FROM {db}.transactions_canonical
                 WHERE chain_id = {chain}
                   AND block_number BETWEEN {from} AND {to}
@@ -554,7 +635,12 @@ impl ClickHouseClient {
             senders.extend(rows.iter().filter_map(|row| {
                 let hash = row.get("tx_hash")?.as_str()?.to_owned();
                 let sender = row.get("from_address")?.as_str()?.to_owned();
-                (!sender.is_empty()).then_some((hash, sender))
+                let entry = row
+                    .get("to_address")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                (!sender.is_empty()).then_some((hash, sender, entry))
             }));
         }
         Ok(senders)
