@@ -1813,6 +1813,33 @@ impl MarketReadService {
     }
 }
 
+/// A recorded verdict from the pipeline checks.
+#[derive(Clone, Debug, Serialize, FromRow)]
+pub struct HealthRow {
+    pub check_key: String,
+    pub status: String,
+    pub observed: Option<f64>,
+    pub threshold: Option<f64>,
+    pub detail: String,
+    pub failing_since: Option<DateTime<Utc>>,
+    pub checked_at: DateTime<Utc>,
+}
+
+impl MarketReadService {
+    pub async fn pipeline_health(&self, chain_id: u64) -> LedgerResult<Vec<HealthRow>> {
+        sqlx::query_as::<_, HealthRow>(
+            r#"select check_key, status, observed, threshold, detail, failing_since, checked_at
+               from market.pipeline_health where chain_id = $1
+               order by case status when 'fail' then 0 when 'warn' then 1
+                                    when 'unknown' then 2 else 3 end, check_key"#,
+        )
+        .bind(chain_id as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

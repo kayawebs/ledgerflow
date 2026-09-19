@@ -348,6 +348,7 @@ pub fn router(state: MarketWebState) -> Router {
         )
         .route("/health", get(health))
         .route("/ready", get(readiness))
+        .route("/status", get(status_page))
         .route("/metrics", get(metrics))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
@@ -1502,24 +1503,133 @@ async fn readiness(State(state): State<MarketWebState>) -> Response {
     }
 }
 
+/// The public record of whether the numbers are still trustworthy. It exists
+/// because every defect that reached production was found by a person reading
+/// a page and doubting it; this is that doubt, run continuously and published.
+async fn status_page(
+    State(state): State<MarketWebState>,
+    Query(query): Query<PageQuery>,
+    headers: HeaderMap,
+) -> Result<Html<String>, MarketWebError> {
+    let context = PageContext::new(&query);
+    let (checks, wallet) = tokio::try_join!(
+        async {
+            state
+                .market
+                .pipeline_health(context.chain_id)
+                .await
+                .map_err(MarketWebError::from)
+        },
+        session_address(&state, &headers),
+    )?;
+    let l = context.locale;
+    let rows = checks
+        .iter()
+        .map(|check| {
+            let (tone, label) = match check.status.as_str() {
+                "ok" => ("up", l.text("passing", "正常")),
+                "warn" => ("", l.text("watch", "注意")),
+                "fail" => ("down", l.text("failing", "异常")),
+                _ => ("muted", l.text("unknown", "未知")),
+            };
+            format!(
+                "<tr><td class=\"l\"><code>{key}</code></td><td class=\"{tone}\"><strong>{label}</strong></td>\
+                 <td class=\"l muted\">{detail}</td><td class=\"muted\">{age}</td></tr>",
+                key = escape_html(&check.check_key),
+                detail = escape_html(&check.detail),
+                age = ui::age(Some(check.checked_at), l),
+            )
+        })
+        .collect::<String>();
+    let failing = checks.iter().filter(|check| check.status == "fail").count();
+    let body = if checks.is_empty() {
+        format!(
+            "<div class=\"empty\">{}</div>",
+            l.text("Checks have not run yet", "检查尚未运行")
+        )
+    } else {
+        format!(
+            "<div class=\"table-wrap\"><table class=\"market\"><thead><tr><th class=\"l\">{}</th><th>{}</th>\
+             <th class=\"l\">{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div>",
+            l.text("Check", "检查项"),
+            l.text("State", "状态"),
+            l.text("Observed", "实测"),
+            l.text("Last run", "最近运行"),
+        )
+    };
+    Ok(Html(layout(
+        &context,
+        l.text("Data status", "数据状态"),
+        "status",
+        wallet.as_deref(),
+        &format!(
+            "<section class=\"page-head\"><div><h1>{title}</h1><p>{subtitle}</p></div></section>\
+             <section class=\"stats\"><div class=\"stat{glow}\"><span>{headline_label}</span>\
+               <strong class=\"num {tone}\">{headline}</strong><small>{checks_note}</small></div></section>\
+             <article class=\"card\">{body}</article><p class=\"note\">{method}</p>",
+            title = l.text("Is this data still true?", "这些数据还是真的吗"),
+            subtitle = l.text(
+                "Every figure on this site is a projection of chain data, and a projection can break quietly. These checks assert that it has not.",
+                "站上每个数字都是链上数据的投影，而投影会悄悄坏掉。这些检查用来断言它没有坏。"
+            ),
+            glow = if failing > 0 { "" } else { " glow" },
+            tone = if failing > 0 { "down" } else { "up" },
+            headline_label = l.text("Checks failing", "异常检查项"),
+            headline = failing,
+            checks_note = l.text_owned(
+                format!("of {} running continuously", checks.len()),
+                format!("共 {} 项，持续运行", checks.len())
+            ),
+            method = l.text(
+                "Each check exists because something it would have caught reached production: a block scan covering a ninth of the chain, a cursor window that skipped most of its input, dust trades setting a price. Failures are recorded here whether or not anyone is looking.",
+                "每一项检查的存在，都是因为它本该拦住的问题真的上线过：只扫了九分之一区块的扫描器、跳过大半输入的游标窗口、用灰尘成交定出来的价格。无论有没有人在看，异常都会记在这里。"
+            ),
+        ),
+    )))
+}
+
 async fn metrics(State(state): State<MarketWebState>) -> Response {
     let stats = state.service.overview(ROBINHOOD_CHAIN_ID, "24h").await.ok();
-    let body = format!(
-        "# TYPE ledgerflow_market_up gauge\nledgerflow_market_up 1\nledgerflow_market_protocol_domains {}\nledgerflow_market_protocol_seeds {}\nledgerflow_market_launch_data_ready {}\nledgerflow_market_verified_arbitrage_archive {}\n",
-        stats
-            .as_ref()
-            .map(|value| value.protocol_domain_count)
-            .unwrap_or_default(),
-        stats
-            .as_ref()
-            .map(|value| value.protocol_seed_count)
-            .unwrap_or_default(),
-        u8::from(stats.as_ref().is_some_and(|value| value.launch_data_ready)),
-        stats
-            .as_ref()
-            .map(|value| value.verified_arbitrage_archive)
-            .unwrap_or_default(),
+    // Each correctness check is exported as a gauge so an alarm can watch the
+    // data, not just the process.
+    let health = state
+        .market
+        .pipeline_health(ROBINHOOD_CHAIN_ID)
+        .await
+        .unwrap_or_default();
+    let mut checks = String::from(
+        "# TYPE ledgerflow_market_check gauge\n# TYPE ledgerflow_market_check_value gauge\n",
     );
+    for row in &health {
+        let key = row.check_key.replace(['.', '-'], "_");
+        let failing = u8::from(row.status == "fail");
+        checks.push_str(&format!(
+            "ledgerflow_market_check{{check=\"{key}\",status=\"{}\"}} {failing}\n",
+            row.status
+        ));
+        if let Some(observed) = row.observed {
+            checks.push_str(&format!(
+                "ledgerflow_market_check_value{{check=\"{key}\"}} {observed}\n"
+            ));
+        }
+    }
+    let body = checks
+        + &format!(
+            "# TYPE ledgerflow_market_up gauge\nledgerflow_market_up 1\nledgerflow_market_protocol_domains {}\nledgerflow_market_protocol_seeds {}\nledgerflow_market_launch_data_ready {}\nledgerflow_market_verified_arbitrage_archive {}\n",
+            stats
+                .as_ref()
+                .map(|value| value.protocol_domain_count)
+                .unwrap_or_default(),
+            stats
+                .as_ref()
+                .map(|value| value.protocol_seed_count)
+                .unwrap_or_default(),
+            u8::from(stats.as_ref().is_some_and(|value| value.launch_data_ready)),
+            stats
+                .as_ref()
+                .map(|value| value.verified_arbitrage_archive)
+                .unwrap_or_default(),
+        );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 

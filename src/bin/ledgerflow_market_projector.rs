@@ -11,6 +11,7 @@ use ledgerflow::{
         market_arbitrage::{MarketArbitrageConfig, MarketArbitrageEstimator},
         market_creators::{CreatorIntelligence, CreatorIntelligenceConfig},
         market_data::{MarketProjector, MarketProjectorConfig, run_market_migrations},
+        market_health::{HealthConfig, PipelineHealth},
         market_liquidations::{LiquidationIndexer, LiquidationIndexerConfig},
         market_pnl::{MarketPnlConfig, MarketPnlProjector},
         market_pools::{PoolIndexer, PoolIndexerConfig},
@@ -128,6 +129,52 @@ async fn main() {
             ),
         },
     );
+    // Continuous correctness checks. Every defect that reached production so
+    // far violated an assertion that can be made here instead of found by hand.
+    {
+        let health = PipelineHealth::new(
+            pool.clone(),
+            HealthConfig {
+                chain_id: config.chain_id,
+                ..HealthConfig::default()
+            },
+        );
+        let interval = Duration::from_secs(env_parse(
+            "LEDGERFLOW_MARKET_HEALTH_INTERVAL_SECONDS",
+            60_u64,
+        ));
+        tokio::spawn(async move {
+            loop {
+                match health.run_once().await {
+                    Ok(results) => {
+                        let failing: Vec<&str> = results
+                            .iter()
+                            .filter(|result| {
+                                matches!(
+                                    result.status,
+                                    ledgerflow::services::market_health::Status::Fail
+                                )
+                            })
+                            .map(|result| result.key.as_str())
+                            .collect();
+                        if failing.is_empty() {
+                            info!(checks = results.len(), "market pipeline health ok");
+                        } else {
+                            error!(
+                                checks = results.len(),
+                                failing = failing.join(","),
+                                "market pipeline health check failing"
+                            );
+                        }
+                    }
+                    Err(health_error) => {
+                        warn!(error = %health_error, "market pipeline health run failed")
+                    }
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
     // Arbitrage candidate detection reads every block from the log store. The
     // trace monitor also detects candidates, but it stays at the chain head and
     // drops the blocks it falls behind on.

@@ -18,6 +18,7 @@ pub mod market_arb_scanner;
 pub mod market_arbitrage;
 pub mod market_creators;
 pub mod market_data;
+pub mod market_health;
 pub mod market_liquidations;
 pub mod market_pnl;
 pub mod market_pools;
