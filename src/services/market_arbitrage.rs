@@ -128,6 +128,11 @@ pub struct MarketArbitrageConfig {
     pub receipt_batch_size: usize,
     pub receipt_concurrency: usize,
     pub leaderboard_size: i64,
+    /// How far behind the cursor to re-read. Candidates are written by the
+    /// scanner a few seconds after their block time, so a cursor that has
+    /// already moved past that second would never see them. Re-reading is free:
+    /// anything already estimated is excluded by the not-exists clause.
+    pub catchup_window_seconds: i64,
 }
 
 impl Default for MarketArbitrageConfig {
@@ -139,6 +144,7 @@ impl Default for MarketArbitrageConfig {
             receipt_batch_size: 50,
             receipt_concurrency: 4,
             leaderboard_size: 200,
+            catchup_window_seconds: 300,
         }
     }
 }
@@ -196,14 +202,16 @@ impl MarketArbitrageEstimator {
         let cursor = cursor_micros
             .and_then(|micros| DateTime::<Utc>::from_timestamp_micros(micros))
             .unwrap_or_else(|| Utc::now() - chrono::Duration::days(self.config.backfill_days));
-        // Re-read one second behind the cursor: many candidates share a timestamp.
+        // Re-read well behind the cursor: candidates land a few seconds after
+        // their block time, so a cursor that has already passed that second
+        // would otherwise skip them for good.
         let rows = sqlx::query(
             r#"select candidate.tx_hash, candidate.block_number, candidate.block_timestamp,
                       candidate.sender_address, candidate.entry_contract,
                       candidate.swap_log_count, candidate.distinct_pool_count
                from public.arbitrage_candidates candidate
                where candidate.chain_id = $1
-                 and candidate.block_timestamp >= $2 - interval '1 second'
+                 and candidate.block_timestamp >= $2 - make_interval(secs => $4::int)
                  and not exists (
                    select 1 from market.arbitrage_estimates estimate
                    where estimate.chain_id = candidate.chain_id
@@ -215,6 +223,7 @@ impl MarketArbitrageEstimator {
         .bind(chain_id)
         .bind(cursor)
         .bind(self.config.batch_size)
+        .bind(self.config.catchup_window_seconds)
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;

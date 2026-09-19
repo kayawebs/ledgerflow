@@ -390,6 +390,10 @@ async fn main() {
                     "LEDGERFLOW_MARKET_ARBITRAGE_LEADERBOARD_SIZE",
                     defaults.leaderboard_size,
                 ),
+                catchup_window_seconds: env_parse(
+                    "LEDGERFLOW_MARKET_ARBITRAGE_CATCHUP_WINDOW_SECONDS",
+                    defaults.catchup_window_seconds,
+                ),
             },
         );
         let poll = Duration::from_millis(env_parse(
