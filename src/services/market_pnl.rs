@@ -21,7 +21,11 @@ use crate::{
     services::market_data::NATIVE_ASSET_ADDRESS,
 };
 
-pub const PNL_METHODOLOGY_VERSION: &str = "market_wallet_pnl_v3_with_pool_swaps";
+/// How often the sharp-wallet set is rebuilt. It is a full aggregate over
+/// every position, so it cannot run on the projection's cadence.
+const SHARP_REBUILD_INTERVAL: Duration = Duration::from_secs(600);
+
+pub const PNL_METHODOLOGY_VERSION: &str = "market_wallet_pnl_v2_realized_rank";
 /// Blocks kept between the candle cursor and applied positions so canonical
 /// flips near the chain head never reach an already-applied increment.
 const POSITION_SAFETY_LAG_BLOCKS: i64 = 600;
@@ -118,6 +122,7 @@ pub struct MarketPnlProjector {
     pool: PgPool,
     config: MarketPnlConfig,
     last_rebuilt: Arc<Mutex<[Option<Instant>; 3]>>,
+    last_sharp_rebuild: Arc<Mutex<Option<Instant>>>,
 }
 
 impl MarketPnlProjector {
@@ -126,6 +131,7 @@ impl MarketPnlProjector {
             pool,
             config,
             last_rebuilt: Arc::new(Mutex::new([None; 3])),
+            last_sharp_rebuild: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -149,7 +155,14 @@ impl MarketPnlProjector {
         }
         summary.leaderboard_ms = started.elapsed().as_millis() as u64;
         drop(last_rebuilt);
-        summary.sharp_wallets = self.rebuild_sharp_wallets().await?;
+        // The sharp set is a full aggregate over every position, so it runs on
+        // its own slow cadence. Rebuilding it every pass starved the position
+        // projection and froze the cursor.
+        let mut last_sharp = self.last_sharp_rebuild.lock().await;
+        if last_sharp.is_none_or(|at: Instant| at.elapsed() >= SHARP_REBUILD_INTERVAL) {
+            summary.sharp_wallets = self.rebuild_sharp_wallets().await?;
+            *last_sharp = Some(Instant::now());
+        }
         Ok(summary)
     }
 
@@ -225,15 +238,13 @@ impl MarketPnlProjector {
             summary.position_to_block = limit;
             return Ok(());
         }
-        // Both venues move a wallet's position, so both decide which launches
-        // this increment has to touch.
+        // Pool swaps are attributed to a trader but not yet folded in here: the
+        // projection could not finish a pass with both venues in it, so the
+        // integration waits for the query work rather than freezing the
+        // scoreboard. See docs/research/pool-pnl-integration.md.
         let launch_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
             r#"select distinct launch_id from public.protocol_launch_trade_facts
-               where chain_id = $1 and block_number between $2 and $3
-               union
-               select distinct launch_id from market.pool_swap_facts
-               where chain_id = $1 and block_number between $2 and $3
-                 and trader_address is not null"#,
+               where chain_id = $1 and block_number between $2 and $3"#,
         )
         .bind(chain_id)
         .bind(start)
@@ -351,22 +362,6 @@ with launches as materialized (
   from public.protocol_launch_trade_facts fact
   join launches launch on launch.launch_id = fact.launch_id
   where fact.chain_id = $1 and fact.block_number between $2 and $3 and fact.is_canonical
-    and launch.token_decimals is not null and launch.quote_decimals is not null
-  union all
-  -- Pool swaps carry the router as their sender, so the trade belongs to the
-  -- resolved transaction sender. Swaps still unresolved are left for a later
-  -- pass rather than attributed to the router.
-  select swap.launch_id, launch.domain_id, launch.creator_address,
-         swap.trader_address as owner,
-         swap.trade_side, swap.block_number, swap.occurred_at,
-         abs(swap.quote_amount_raw::numeric) * power(10::numeric, -(launch.quote_decimals))
-           as quote_amount,
-         abs(swap.token_amount_raw::numeric) * power(10::numeric, -(launch.token_decimals))
-           as token_amount
-  from market.pool_swap_facts swap
-  join launches launch on launch.launch_id = swap.launch_id
-  where swap.chain_id = $1 and swap.block_number between $2 and $3
-    and swap.trader_address is not null
     and launch.token_decimals is not null and launch.quote_decimals is not null
 ), priced as (
   select facts.*, candle.quote_usd_price

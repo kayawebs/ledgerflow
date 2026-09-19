@@ -92,7 +92,10 @@ impl Default for HealthConfig {
     fn default() -> Self {
         Self {
             chain_id: 4663,
-            cursor_stale_warn: 120.0,
+            // The position projection batches and rebuilds leaderboards between
+            // passes, so a couple of minutes between cursor writes is its
+            // normal cadence, not a stall.
+            cursor_stale_warn: 300.0,
             cursor_stale_fail: 600.0,
         }
     }

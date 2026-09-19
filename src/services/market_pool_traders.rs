@@ -67,8 +67,10 @@ impl PoolTraderResolver {
     }
 
     pub async fn resolve_once(&self) -> LedgerResult<PoolTraderSummary> {
-        // Oldest first, so the backlog drains in order and the position
-        // projection downstream sees a contiguous history.
+        // Newest first. The position projection walks forward from a cursor near
+        // the chain head, so those are the swaps it is about to read; a history
+        // of thirty-six million older swaps would otherwise be in front of them
+        // in the queue and the live scoreboard would wait half a day.
         let pending = sqlx::query(
             r#"select tx_hash, block_number
                from market.pool_swap_facts
@@ -76,7 +78,7 @@ impl PoolTraderResolver {
                  and block_number <= (
                    select max(block_number) - $3 from market.pool_swap_facts where chain_id = $1
                  )
-               order by block_number
+               order by block_number desc
                limit $2"#,
         )
         .bind(self.config.chain_id as i64)
