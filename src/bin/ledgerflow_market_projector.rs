@@ -14,6 +14,7 @@ use ledgerflow::{
         market_health::{HealthConfig, PipelineHealth},
         market_liquidations::{LiquidationIndexer, LiquidationIndexerConfig},
         market_pnl::{MarketPnlConfig, MarketPnlProjector},
+        market_pool_traders::{PoolTraderConfig, PoolTraderResolver},
         market_pools::{PoolIndexer, PoolIndexerConfig},
     },
 };
@@ -129,6 +130,47 @@ async fn main() {
             ),
         },
     );
+    // Pool swaps record the router, not the trader. Resolving the transaction
+    // sender is what lets wallet profit and loss cover the pools at all.
+    if let Some(store) = clickhouse_client() {
+        let defaults = PoolTraderConfig::default();
+        let resolver = PoolTraderResolver::new(
+            pool.clone(),
+            store,
+            PoolTraderConfig {
+                chain_id: config.chain_id,
+                batch_size: env_parse("LEDGERFLOW_MARKET_POOL_TRADER_BATCH", defaults.batch_size),
+                ..defaults
+            },
+        );
+        tokio::spawn(async move {
+            loop {
+                let delay = match resolver.resolve_once().await {
+                    Ok(summary) => {
+                        if summary.resolved > 0 {
+                            info!(
+                                swaps = summary.swaps,
+                                resolved = summary.resolved,
+                                from = summary.from_block,
+                                to = summary.to_block,
+                                "market pool trader resolution completed"
+                            );
+                        }
+                        if summary.backlog {
+                            Duration::from_millis(100)
+                        } else {
+                            Duration::from_secs(3)
+                        }
+                    }
+                    Err(resolve_error) => {
+                        error!(error = %resolve_error, "market pool trader resolution failed");
+                        Duration::from_secs(20)
+                    }
+                };
+                tokio::time::sleep(delay).await;
+            }
+        });
+    }
     // Continuous correctness checks. Every defect that reached production so
     // far violated an assertion that can be made here instead of found by hand.
     {

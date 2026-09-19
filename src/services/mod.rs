@@ -21,6 +21,7 @@ pub mod market_data;
 pub mod market_health;
 pub mod market_liquidations;
 pub mod market_pnl;
+pub mod market_pool_traders;
 pub mod market_pools;
 pub mod market_read;
 pub mod metrics;

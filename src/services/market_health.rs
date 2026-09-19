@@ -117,6 +117,7 @@ impl PipelineHealth {
         results.push(self.price_sanity().await?);
         results.push(self.stats_freshness().await?);
         results.push(self.candle_agreement().await?);
+        results.push(self.pool_trader_attribution().await?);
         self.record(&results).await?;
         Ok(results)
     }
@@ -323,10 +324,20 @@ impl PipelineHealth {
                  where c.bucket_start > now() - interval '2 hours'
                  group by c.launch_id
                ), facts as (
-                 select f.launch_id, count(*)::float8 as trades
-                 from public.protocol_launch_trade_facts f join sample using (launch_id)
-                 where f.is_canonical and f.occurred_at > now() - interval '2 hours'
-                 group by f.launch_id
+                 -- Candles project curve trades and post-graduation pool swaps
+                 -- together, so both sides of the reconciliation must.
+                 select launch_id, sum(trades)::float8 as trades from (
+                   select f.launch_id, count(*) as trades
+                   from public.protocol_launch_trade_facts f join sample using (launch_id)
+                   where f.is_canonical and f.occurred_at > now() - interval '2 hours'
+                   group by f.launch_id
+                   union all
+                   select p.launch_id, count(*)
+                   from market.pool_swap_facts p join sample using (launch_id)
+                   where p.occurred_at > now() - interval '2 hours'
+                   group by p.launch_id
+                 ) combined
+                 group by launch_id
                )
                select count(*)::float8 as compared,
                       count(*) filter (
@@ -359,6 +370,48 @@ impl PipelineHealth {
             Some(share),
             0.25,
             format!("{mismatched:.0} of {compared:.0} sampled tokens disagree with their trades"),
+        ))
+    }
+
+    /// Pool swaps must have their trader resolved before the position
+    /// projection passes their block, or the trade is dropped from wallet
+    /// profit and loss without a trace. This measures the race directly.
+    async fn pool_trader_attribution(&self) -> LedgerResult<CheckResult> {
+        let row = sqlx::query(
+            r#"with cursor as (
+                 select last_position from market.projector_checkpoints
+                 where checkpoint_key = 'positions:' || $1::text
+               )
+               select count(*)::float8 as total,
+                      count(*) filter (where trader_address is null)::float8 as unresolved
+               from market.pool_swap_facts, cursor
+               where chain_id = $1
+                 and block_number between cursor.last_position - 20000 and cursor.last_position"#,
+        )
+        .bind(self.config.chain_id as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)?;
+        let total: f64 = row.get("total");
+        let unresolved: f64 = row.get("unresolved");
+        if total < 1.0 {
+            return Ok(CheckResult::new(
+                "attribution.pool_traders",
+                Status::Unknown,
+                None,
+                0.1,
+                "no pool swaps below the position cursor".to_owned(),
+            ));
+        }
+        let share = unresolved / total;
+        Ok(CheckResult::new(
+            "attribution.pool_traders",
+            grade_max(share, 0.02, 0.10),
+            Some(share),
+            0.10,
+            format!(
+                "{unresolved:.0} of {total:.0} pool swaps already passed by the position cursor have no trader"
+            ),
         ))
     }
 
