@@ -14,6 +14,7 @@ pub mod discovery;
 pub mod economic_verifier;
 pub mod indexer_client;
 pub mod intelligence_import;
+pub mod load_guard;
 pub mod market_arb_scanner;
 pub mod market_arbitrage;
 pub mod market_creators;

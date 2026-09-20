@@ -28,6 +28,12 @@ pub struct PoolTraderConfig {
     /// Blocks held back from the newest swap, so a block still being written is
     /// not resolved half-indexed.
     pub safety_lag_blocks: i64,
+    /// How far back from the head live attribution reaches. Swaps older than
+    /// this are history, and history is only walked when backfill is on: the
+    /// two jobs have completely different urgency and cost.
+    pub live_window_blocks: i64,
+    /// Whether to walk the whole table rather than just the live window.
+    pub backfill: bool,
     pub idle_delay: Duration,
 }
 
@@ -37,6 +43,8 @@ impl Default for PoolTraderConfig {
             chain_id: 4663,
             batch_size: 4_000,
             safety_lag_blocks: 30,
+            live_window_blocks: 200_000,
+            backfill: false,
             idle_delay: Duration::from_secs(3),
         }
     }
@@ -71,6 +79,14 @@ impl PoolTraderResolver {
         // the chain head, so those are the swaps it is about to read; a history
         // of thirty-six million older swaps would otherwise be in front of them
         // in the queue and the live scoreboard would wait half a day.
+        // In live mode the floor keeps this off the thirty-seven million rows of
+        // history; with backfill on it is lifted and the whole table is walked,
+        // newest first.
+        let floor = if self.config.backfill {
+            i64::MIN
+        } else {
+            self.config.live_window_blocks
+        };
         let pending = sqlx::query(
             r#"select tx_hash, block_number
                from market.pool_swap_facts
@@ -78,12 +94,16 @@ impl PoolTraderResolver {
                  and block_number <= (
                    select max(block_number) - $3 from market.pool_swap_facts where chain_id = $1
                  )
+                 and ($4 = -9223372036854775808 or block_number >= (
+                   select max(block_number) - $4 from market.pool_swap_facts where chain_id = $1
+                 ))
                order by block_number desc
                limit $2"#,
         )
         .bind(self.config.chain_id as i64)
         .bind(self.config.batch_size)
         .bind(self.config.safety_lag_blocks)
+        .bind(floor)
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;

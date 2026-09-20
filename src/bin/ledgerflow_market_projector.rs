@@ -7,6 +7,7 @@ use ledgerflow::{
     core::{config::AppConfig, env::load_dotenv, logging::init_logging},
     indexer::{clickhouse::ClickHouseClient, rpc::IndexerRpcClient},
     services::{
+        load_guard::LoadGuard,
         market_arb_scanner::{ArbCandidateScanner, ArbScannerConfig},
         market_arbitrage::{MarketArbitrageConfig, MarketArbitrageEstimator},
         market_creators::{CreatorIntelligence, CreatorIntelligenceConfig},
@@ -130,6 +131,19 @@ async fn main() {
             ),
         },
     );
+    // Background work backs off when the host is busy, because this stack
+    // shares a machine with a chain node. Backfills are off unless asked for:
+    // a fresh start should catch up with the chain, not with its history.
+    let load_guard = LoadGuard::from_env();
+    let backfills_enabled = env::var("LEDGERFLOW_MARKET_BACKFILL_ENABLED")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    info!(
+        backfills_enabled,
+        load_per_core = load_guard.load_per_core().unwrap_or_default(),
+        "market projector background policy"
+    );
+
     // Pool swaps record the router, not the trader. Resolving the transaction
     // sender is what lets wallet profit and loss cover the pools at all.
     if let Some(store) = clickhouse_client() {
@@ -140,11 +154,18 @@ async fn main() {
             PoolTraderConfig {
                 chain_id: config.chain_id,
                 batch_size: env_parse("LEDGERFLOW_MARKET_POOL_TRADER_BATCH", defaults.batch_size),
+                live_window_blocks: env_parse(
+                    "LEDGERFLOW_MARKET_POOL_TRADER_LIVE_WINDOW_BLOCKS",
+                    defaults.live_window_blocks,
+                ),
+                backfill: backfills_enabled,
                 ..defaults
             },
         );
+        let guard = load_guard.clone();
         tokio::spawn(async move {
             loop {
+                guard.wait_while_busy().await;
                 let delay = match resolver.resolve_once().await {
                     Ok(summary) => {
                         if summary.resolved > 0 {
@@ -167,7 +188,7 @@ async fn main() {
                         Duration::from_secs(20)
                     }
                 };
-                tokio::time::sleep(delay).await;
+                tokio::time::sleep(guard.stretch(delay)).await;
             }
         });
     }
@@ -236,6 +257,7 @@ async fn main() {
                 ..defaults
             },
         );
+        let scan_guard = load_guard.clone();
         tokio::spawn(async move {
             loop {
                 let delay = match scanner.scan_once().await {
@@ -261,7 +283,7 @@ async fn main() {
                         Duration::from_secs(15)
                     }
                 };
-                tokio::time::sleep(delay).await;
+                tokio::time::sleep(scan_guard.stretch(delay)).await;
             }
         });
     }
@@ -285,6 +307,7 @@ async fn main() {
             "LEDGERFLOW_MARKET_CREATOR_PROFILE_INTERVAL_SECONDS",
             900_u64,
         ));
+        let creator_guard = load_guard.clone();
         tokio::spawn(async move {
             let mut last_profiles: Option<Instant> = None;
             loop {
@@ -311,8 +334,9 @@ async fn main() {
                     }
                 };
                 // With the store's backlog drained, fill in what it could not
-                // answer for by asking the node.
-                if delay >= Duration::from_secs(10) {
+                // answer for by asking the node. That walk is history, so it
+                // only runs when backfills are asked for.
+                if backfills_enabled && delay >= Duration::from_secs(10) {
                     match creators.backfill_missing_origins().await {
                         Ok(0) => {}
                         Ok(resolved) => {
@@ -326,7 +350,11 @@ async fn main() {
                 // Profiles are rebuilt in full, so they wait until the backlog
                 // is drained rather than competing with it.
                 let due = last_profiles.is_none_or(|at| at.elapsed() >= profile_interval);
-                if due && delay >= Duration::from_secs(10) {
+                // A full rebuild over every launch waits for a calm host.
+                if due
+                    && delay >= Duration::from_secs(10)
+                    && creator_guard.wait_while_busy().await == 0
+                {
                     match creators.rebuild_profiles().await {
                         Ok(rows) => info!(rows, "market creator profiles rebuilt"),
                         Err(profile_error) => {

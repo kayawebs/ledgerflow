@@ -13,6 +13,20 @@ x-ledgerflow-image: &ledgerflow-image
     context: .
 
 # Market web and projector ship in their own image (Dockerfile.market).
+# Hard ceilings for the market services. This stack shares a host with a chain
+# node, and an unthrottled backfill once took the load average from six to
+# twenty and starved it. Override per deployment with the LEDGERFLOW_MARKET_*
+# limit variables when the analytics stack has a machine of its own.
+x-market-projector-limits: &market-projector-limits
+  cpus: ${LEDGERFLOW_MARKET_PROJECTOR_CPUS:-6}
+  mem_limit: ${LEDGERFLOW_MARKET_PROJECTOR_MEMORY:-8g}
+  pids_limit: 512
+
+x-market-web-limits: &market-web-limits
+  cpus: ${LEDGERFLOW_MARKET_WEB_CPUS:-2}
+  mem_limit: ${LEDGERFLOW_MARKET_WEB_MEMORY:-2g}
+  pids_limit: 256
+
 x-ledgerflow-market-image: &ledgerflow-market-image
   image: ${LEDGERFLOW_MARKET_IMAGE:-ledgerflow-market:latest}
   build:
@@ -114,7 +128,7 @@ services:
     restart: unless-stopped
 
   market-web:
-    <<: [*ledgerflow-env, *ledgerflow-market-image]
+    <<: [*ledgerflow-env, *ledgerflow-market-image, *market-web-limits]
     command: ["ledgerflow_market_web"]
     environment:
       LEDGERFLOW_MARKET_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
@@ -188,7 +202,7 @@ services:
     restart: unless-stopped
 
   market-projector:
-    <<: [*ledgerflow-env, *ledgerflow-market-image]
+    <<: [*ledgerflow-env, *ledgerflow-market-image, *market-projector-limits]
     command: ["ledgerflow_market_projector"]
     environment:
       LEDGERFLOW_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ledgerflow}
@@ -204,6 +218,16 @@ services:
       LEDGERFLOW_MARKET_ARBITRAGE_BACKFILL_DAYS: ${LEDGERFLOW_MARKET_ARBITRAGE_BACKFILL_DAYS:-2}
       LEDGERFLOW_MARKET_ARBITRAGE_RECEIPT_CONCURRENCY: ${LEDGERFLOW_MARKET_ARBITRAGE_RECEIPT_CONCURRENCY:-4}
       LEDGERFLOW_MARKET_LIQUIDATION_START_BLOCK: ${LEDGERFLOW_MARKET_LIQUIDATION_START_BLOCK:-0}
+      # Backfills walk whole tables and are off unless asked for; a fresh start
+      # should catch up with the chain, not with its history.
+      LEDGERFLOW_MARKET_BACKFILL_ENABLED: ${LEDGERFLOW_MARKET_BACKFILL_ENABLED:-false}
+      # Background work slows above the soft threshold and waits above the hard
+      # one, both measured per core so they travel between machines.
+      LEDGERFLOW_LOAD_SOFT_PER_CORE: ${LEDGERFLOW_LOAD_SOFT_PER_CORE:-0.7}
+      LEDGERFLOW_LOAD_HARD_PER_CORE: ${LEDGERFLOW_LOAD_HARD_PER_CORE:-1.1}
+      LEDGERFLOW_MARKET_LEADERBOARD_24H_SECONDS: ${LEDGERFLOW_MARKET_LEADERBOARD_24H_SECONDS:-300}
+      LEDGERFLOW_MARKET_LEADERBOARD_7D_SECONDS: ${LEDGERFLOW_MARKET_LEADERBOARD_7D_SECONDS:-1800}
+      LEDGERFLOW_MARKET_LEADERBOARD_30D_SECONDS: ${LEDGERFLOW_MARKET_LEADERBOARD_30D_SECONDS:-7200}
     depends_on:
       rpc-gateway:
         condition: service_started

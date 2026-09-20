@@ -66,12 +66,27 @@ impl EarningsWindow {
 
     /// How stale a leaderboard may become before it is rebuilt.
     fn refresh_every(self) -> Duration {
+        // Rebuilds scan every position traded in the window and a 30-day pass
+        // measured at 60 to 112 seconds, so the cadence is deliberately slow
+        // and configurable: on a shared host this is the single most expensive
+        // thing the projector does.
+        let seconds = |key: &str, default: u64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
         match self {
-            // Rebuilds scan every position traded in the window (30d: ~5M rows,
-            // ~2 min), so longer windows refresh less often on the shared host.
-            Self::Day => Duration::from_secs(120),
-            Self::Week => Duration::from_secs(900),
-            Self::Month => Duration::from_secs(3_600),
+            Self::Day => {
+                Duration::from_secs(seconds("LEDGERFLOW_MARKET_LEADERBOARD_24H_SECONDS", 300))
+            }
+            Self::Week => {
+                Duration::from_secs(seconds("LEDGERFLOW_MARKET_LEADERBOARD_7D_SECONDS", 1_800))
+            }
+            Self::Month => {
+                Duration::from_secs(seconds("LEDGERFLOW_MARKET_LEADERBOARD_30D_SECONDS", 7_200))
+            }
         }
     }
 }
